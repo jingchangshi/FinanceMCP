@@ -97,7 +97,7 @@ You can also use our shared service without API keys (may have rate limits):
 - **5 Core Indicators** - MACD, RSI, KDJ, BOLL, MA
 
 ### 🌍 Comprehensive Market Coverage
-- **9 Major Markets** - A-shares, US stocks, HK stocks, forex, futures, funds, bonds, options
+- **10 Major Markets + Crypto** - A-shares, US stocks, HK stocks, forex, futures, funds, bonds, options, and crypto via CoinGecko
 - **Real-time News** - Smart search across 7+ major financial media
 - **Macro Data** - 11 economic indicators (GDP, CPI, PPI, PMI, etc.)
 - **Company Analysis** - Financial statements, management info, shareholder structure
@@ -108,7 +108,7 @@ You can also use our shared service without API keys (may have rate limits):
 |-----------|---------------------|---------------|
 | 🕐 **current_timestamp** | Current timestamp | UTC+8 timezone, multiple output formats |
 | 📰 **finance_news** | Financial news search | Baidu News crawler; input: `query` (space-separated keywords, OR filter) |
-| 📈 **stock_data** | Stock + technical indicators | 9 markets + 5 technical indicators, smart pre-fetching |
+| 📈 **stock_data** | Stocks/Crypto + technical indicators | 10 markets + crypto (CoinGecko) + 5 indicators, smart pre-fetching |
 | 📊 **index_data** | Index data | Major market indices historical data |
 | 🧱 **csi_index_constituents** | CSI index constituents summary | CSI-only; index range + all constituents with weights and returns |
 | 📉 **macro_econ** | Macroeconomic data | 11 indicators: GDP/CPI/PPI/PMI/Shibor, etc. |
@@ -165,6 +165,17 @@ After configuration, simply ask questions directly in Claude!
 "Analyze Moutai (600519.SH) technical status, calculate MACD(12,26,9), RSI(14), KDJ(9,3,3)"
 "Check CATL (300750.SZ) Bollinger Bands BOLL(20,2) and four moving averages MA(5,10,20,60)"
 "Apple Inc. (AAPL) stock trend and MACD indicator analysis for the past month"
+```
+
+</details>
+
+<details>
+<summary><strong>🪙 Crypto Assets</strong></summary>
+
+```
+"View Bitcoin (BTC-USD) trend from 2024-01-01 to 2024-06-30 and calculate MACD(12,26,9), RSI(14)"
+"View USDT against CNY daily trend: market_type=crypto, code=USDT.CNY, start_date=20240101, end_date=20240630"
+"Use CoinGecko id directly: market_type=crypto, code=bitcoin.usd, indicators=\"boll(20,2) ma(5) ma(10)\""
 ```
 
 </details>

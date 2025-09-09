@@ -109,7 +109,7 @@
 |---------|---------|---------|
 | 🕐 **current_timestamp** | 当前时间戳 | UTC+8时区，多种输出格式 |
 | 📰 **finance_news** | 财经新闻搜索 | 百度新闻爬虫；入参：`query`（空格分隔多关键词，OR 过滤） |
-| 📈 **stock_data** | 股票+技术指标 | 10大市场+5技术指标，智能预取 |
+| 📈 **stock_data** | 股票/加密 + 技术指标 | 10大市场+加密(CoinGecko)+5技术指标，智能预取 |
 | 📊 **index_data** | 指数数据 | 主要市场指数历史数据 |
 | 🧱 **csi_index_constituents** | CSI指数成分与权重摘要 | 仅支持中证指数公司(CSI)，指数区间行情 + 成分股权重与区间涨跌幅 + 估值/财务指标（PE、PB、股息率、ROE、ROA、净利率、经营现金流、资产负债率、营收同比、资产周转率、毛利率、三费比率、现金分红率） |
 | 📉 **macro_econ** | 宏观经济数据 | 11指标：GDP/CPI/PPI/PMI/Shibor等 |
@@ -242,6 +242,17 @@
 "获取苹果(AAPL)资产负债表，重点关注现金储备和负债结构"
 "对比特斯拉(TSLA)多期财务指标，分析盈利能力变化趋势"
 "查看微软(MSFT)综合财务指标，包括ROE、ROA、毛利率等"
+```
+
+</details>
+
+<details>
+<summary><strong>🪙 加密资产</strong></summary>
+
+```
+"查看比特币(BTC-USD) 2024-01-01 至 2024-06-30 的走势，计算 MACD(12,26,9) 和 RSI(14)"
+"查看 USDT 对 CNY 的日线走势：market_type=crypto, code=USDT.CNY, start_date=20240101, end_date=20240630"
+"使用 CoinGecko id 查询：market_type=crypto, code=bitcoin.usd, indicators=\"boll(20,2) ma(5) ma(10)\""
 ```
 
 </details>

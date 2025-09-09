@@ -14,17 +14,17 @@ import {
 
 export const stockData = {
   name: "stock_data",
-  description: "获取指定股票的历史行情数据，支持A股、美股、港股、外汇、期货、基金、债券逆回购、可转债、期权",
+  description: "获取指定股票/加密资产的历史行情数据，支持A股、美股、港股、外汇、期货、基金、债券逆回购、可转债、期权、加密货币(通过CoinGecko)",
   parameters: {
     type: "object",
     properties: {
       code: {
         type: "string",
-        description: "股票代码，如'000001.SZ'表示平安银行(A股)，'AAPL'表示苹果(美股)，'00700.HK'表示腾讯(港股)，'USDCNH.FXCM'表示美元人民币(外汇)，'CU2501.SHF'表示铜期货，'159919.SZ'表示沪深300ETF(基金)，'204001.SH'表示GC001国债逆回购，'113008.SH'表示可转债，'10001313.SH'表示期权合约"
+        description: "股票/合约/加密资产代码。股票示例：'000001.SZ'(A股平安银行)、'AAPL'(美股)、'00700.HK'(港股)、'USDCNH.FXCM'(外汇)、'CU2501.SHF'(期货)、'159919.SZ'(基金)、'204001.SH'(逆回购)、'113008.SH'(可转债)、'10001313.SH'(期权)。加密示例(需 market_type=crypto)：'BTC-USD' 或 'ETH/USDT'，或 CoinGecko id 写法 'bitcoin.usd'、'tether.cny'、也可仅写 'BTC'（默认vs=usd）"
       },
       market_type: {
         type: "string",
-        description: "市场类型（必需），可选值：cn(A股),us(美股),hk(港股),fx(外汇),futures(期货),fund(基金),repo(债券逆回购),convertible_bond(可转债),options(期权)"
+        description: "市场类型（必需），可选值：cn(A股),us(美股),hk(港股),fx(外汇),futures(期货),fund(基金),repo(债券逆回购),convertible_bond(可转债),options(期权),crypto(加密货币/CoinGecko)"
       },
       start_date: {
         type: "string",
@@ -86,9 +86,264 @@ export const stockData = {
       }
 
       // 验证市场类型
-      const validMarkets = ['cn', 'us', 'hk', 'fx', 'futures', 'fund', 'repo', 'convertible_bond', 'options'];
+      const validMarkets = ['cn', 'us', 'hk', 'fx', 'futures', 'fund', 'repo', 'convertible_bond', 'options', 'crypto'];
       if (!validMarkets.includes(marketType)) {
         throw new Error(`不支持的市场类型: ${marketType}。支持的类型有: ${validMarkets.join(', ')}`);
+      }
+      
+      // 加密货币市场（CoinGecko）分支：
+      if (marketType === 'crypto') {
+        console.log(`使用 CoinGecko 获取加密资产 ${args.code} 的行情数据`);
+        
+        // 帮助函数：日期与符号解析
+        const toYMD = (d: Date): string => {
+          const y = d.getFullYear();
+          const m = String(d.getMonth() + 1).padStart(2, '0');
+          const day = String(d.getDate()).padStart(2, '0');
+          return `${y}${m}${day}`;
+        };
+        const ymdToDate = (s: string): Date => new Date(parseInt(s.slice(0,4)), parseInt(s.slice(4,6)) - 1, parseInt(s.slice(6,8)));
+        const daysBetween = (a: string, b: string): number => {
+          const da = ymdToDate(a);
+          const db = ymdToDate(b);
+          return Math.max(1, Math.ceil((db.getTime() - da.getTime()) / 86400000) + 1);
+        };
+        const chooseDaysParam = (needDays: number): number => {
+          const opts = [1, 7, 14, 30, 90, 180, 365];
+          for (const v of opts) { if (needDays <= v) return v; }
+          return 365; // CoinGecko ohlc 最多支持到 365
+        };
+        const symbolIdMap: Record<string, string> = {
+          'BTC': 'bitcoin', 'XBT': 'bitcoin', 'ETH': 'ethereum', 'USDT': 'tether', 'USDC': 'usd-coin',
+          'BNB': 'binancecoin', 'SOL': 'solana', 'TRX': 'tron', 'DOGE': 'dogecoin', 'DOT': 'polkadot',
+          'ADA': 'cardano', 'XRP': 'ripple', 'LTC': 'litecoin', 'OKB': 'okb', 'BCH': 'bitcoin-cash',
+          'ETC': 'ethereum-classic', 'LINK': 'chainlink', 'SHIB': 'shiba-inu', 'TON': 'toncoin'
+        };
+        const vsMap: Record<string, string> = {
+          'USD': 'usd', 'USDT': 'usd', 'CNY': 'cny', 'CNH': 'cny', 'RMB': 'cny', 'EUR': 'eur', 'JPY': 'jpy',
+          'GBP': 'gbp', 'BTC': 'btc', 'ETH': 'eth'
+        };
+        const parseCryptoCode = (code: string): { id: string; vs: string } => {
+          const trimmed = code.trim();
+          // 格式: id.vs 或 ticker.vs
+          if (trimmed.includes('.')) {
+            const [left, right] = trimmed.split('.');
+            const id = symbolIdMap[left.toUpperCase()] || left.toLowerCase();
+            const vs = vsMap[right.toUpperCase()] || right.toLowerCase();
+            return { id, vs };
+          }
+          // 格式: TICKER-QUOTE 或 TICKER/QUOTE
+          if (trimmed.includes('-') || trimmed.includes('/')) {
+            const sep = trimmed.includes('-') ? '-' : '/';
+            const [base, quote] = trimmed.split(sep);
+            const id = symbolIdMap[base.toUpperCase()] || base.toLowerCase();
+            const vs = vsMap[quote.toUpperCase()] || quote.toLowerCase();
+            return { id, vs };
+          }
+          // 纯 TICKER 或 CoinGecko id，默认 usd
+          const upper = trimmed.toUpperCase();
+          const id = symbolIdMap[upper] || trimmed.toLowerCase();
+          return { id, vs: 'usd' };
+        };
+        
+        const { id: cgId, vs } = parseCryptoCode(args.code);
+        const needDays = daysBetween(actualStartDate, actualEndDate) + 15; // 预留缓冲
+        const daysParam = chooseDaysParam(needDays);
+        const base = 'https://api.coingecko.com/api/v3';
+        
+        const ohlcUrl = `${base}/coins/${encodeURIComponent(cgId)}/ohlc?vs_currency=${encodeURIComponent(vs)}&days=${daysParam}`;
+        const volUrl = `${base}/coins/${encodeURIComponent(cgId)}/market_chart?vs_currency=${encodeURIComponent(vs)}&days=${daysParam}&interval=daily`;
+        
+        console.log('CoinGecko OHLC URL:', ohlcUrl);
+        console.log('CoinGecko Volume URL:', volUrl);
+        
+        const [ohlcResp, volResp] = await Promise.all([
+          fetch(ohlcUrl),
+          fetch(volUrl)
+        ]);
+        if (!ohlcResp.ok) throw new Error(`CoinGecko OHLC 请求失败: ${ohlcResp.status}`);
+        if (!volResp.ok) throw new Error(`CoinGecko Volume 请求失败: ${volResp.status}`);
+        
+        const ohlcData = await ohlcResp.json();
+        const volJson = await volResp.json();
+        if (!Array.isArray(ohlcData)) {
+          throw new Error('CoinGecko 返回的 OHLC 数据格式异常');
+        }
+        const volumesArr: Array<[number, number]> = Array.isArray(volJson?.total_volumes) ? volJson.total_volumes : [];
+        const volMap = new Map<string, number>();
+        for (const v of volumesArr) {
+          const d = toYMD(new Date(v[0]));
+          const vol = typeof v[1] === 'number' ? v[1] : Number(v[1]);
+          if (!isNaN(vol)) volMap.set(d, vol);
+        }
+        
+        // 组装为与现有流程兼容的数据结构（最新日期在前）
+        let stockData = (ohlcData as Array<[number, number, number, number, number]>).map(row => {
+          const d = toYMD(new Date(row[0]));
+          return {
+            trade_date: d,
+            open: row[1],
+            high: row[2],
+            low: row[3],
+            close: row[4],
+            vol: volMap.get(d)
+          } as Record<string, any>;
+        });
+        stockData.sort((a, b) => b.trade_date.localeCompare(a.trade_date));
+        console.log(`CoinGecko 返回 ${stockData.length} 条记录`);
+        
+        // 计算技术指标
+        let indicators: Record<string, any> = {};
+        if (requestedIndicators.length > 0) {
+          let closes: number[] = stockData.map(d => parseFloat(d.close)).reverse();
+          let highs: number[] = stockData.map(d => parseFloat(d.high)).reverse();
+          let lows: number[] = stockData.map(d => parseFloat(d.low)).reverse();
+          
+          for (const indicator of requestedIndicators) {
+            try {
+              const { name, params } = parseIndicatorParams(indicator);
+              switch (name) {
+                case 'macd':
+                  if (params.length !== 3) throw new Error('MACD指标需要3个参数，格式：macd(快线,慢线,信号线)');
+                  indicators.macd = calculateMACD(closes, params[0], params[1], params[2]);
+                  break;
+                case 'rsi':
+                  if (params.length !== 1) throw new Error('RSI指标需要1个参数，格式：rsi(周期)');
+                  indicators.rsi = calculateRSI(closes, params[0]);
+                  break;
+                case 'kdj':
+                  if (params.length !== 3) throw new Error('KDJ指标需要3个参数，格式：kdj(9,3,3)');
+                  indicators.kdj = calculateKDJ(highs, lows, closes, params[0], params[1], params[2]);
+                  break;
+                case 'boll':
+                  if (params.length !== 2) throw new Error('布林带指标需要2个参数，格式：boll(周期,标准差倍数)');
+                  indicators.boll = calculateBOLL(closes, params[0], params[1]);
+                  break;
+                case 'ma':
+                  if (params.length !== 1) throw new Error('移动平均线需要1个参数，格式：ma(周期)');
+                  indicators[`ma${params[0]}`] = calculateSMA(closes, params[0]);
+                  break;
+                default:
+                  throw new Error(`不支持的技术指标: ${name}`);
+              }
+            } catch (e) {
+              console.error(`解析技术指标 ${indicator} 时出错:`, e);
+              throw new Error(`技术指标参数错误: ${indicator}`);
+            }
+          }
+          // 指标逆序以匹配最新在前
+          Object.keys(indicators).forEach(key => {
+            if (typeof indicators[key] === 'object' && indicators[key] !== null) {
+              if (Array.isArray(indicators[key])) {
+                indicators[key] = indicators[key].reverse();
+              } else {
+                Object.keys(indicators[key]).forEach(subKey => {
+                  if (Array.isArray(indicators[key][subKey])) {
+                    indicators[key][subKey] = indicators[key][subKey].reverse();
+                  }
+                });
+              }
+            }
+          });
+          // 过滤到用户指定区间
+          stockData = filterDataToUserRange(stockData, userStartDate, userEndDate);
+          console.log(`过滤到用户请求时间范围，剩余${stockData.length}条记录`);
+        }
+        
+        // 表格输出（走默认分支样式）
+        const marketTitleMap: Record<string, string> = {
+          'crypto': '加密货币'
+        };
+        const fieldNameMap: Record<string, string> = {
+          'trade_date': '交易日期',
+          'open': '开盘',
+          'close': '收盘',
+          'high': '最高', 
+          'low': '最低',
+          'vol': '成交量'
+        };
+        let formattedData = '';
+        let indicatorData = '';
+        if (stockData.length > 0) {
+          const coreFields = ['trade_date', 'open', 'close', 'high', 'low', 'vol'];
+          const availableFields = Object.keys(stockData[0]);
+          const displayFields = coreFields.filter(field => availableFields.includes(field));
+          const indicatorHeaders: string[] = [];
+          const hasIndicators = Object.keys(indicators).length > 0;
+          if (hasIndicators) {
+            if (indicators.macd) indicatorHeaders.push('MACD_DIF', 'MACD_DEA', 'MACD');
+            if (indicators.rsi) indicatorHeaders.push('RSI');
+            if (indicators.kdj) indicatorHeaders.push('KDJ_K', 'KDJ_D', 'KDJ_J');
+            if (indicators.boll) indicatorHeaders.push('BOLL_UP', 'BOLL_MID', 'BOLL_LOW');
+            const maIndicators = Object.keys(indicators).filter(key => key.startsWith('ma') && key !== 'macd');
+            maIndicators.forEach(ma => indicatorHeaders.push(ma.toUpperCase()));
+          }
+          const allHeaders = [
+            ...displayFields.map(field => fieldNameMap[field] || field),
+            ...indicatorHeaders
+          ];
+          formattedData = `| ${allHeaders.join(' | ')} |\n`;
+          formattedData += `|${allHeaders.map(() => '--------').join('|')}|\n`;
+          stockData.forEach((data: Record<string, any>, index: number) => {
+            const basicRow = displayFields.map(field => data[field] ?? 'N/A');
+            const indicatorRow: string[] = [];
+            if (hasIndicators) {
+              if (indicators.macd) {
+                indicatorRow.push(
+                  isNaN(indicators.macd.dif[index]) ? 'N/A' : indicators.macd.dif[index].toFixed(4),
+                  isNaN(indicators.macd.dea[index]) ? 'N/A' : indicators.macd.dea[index].toFixed(4),
+                  isNaN(indicators.macd.macd[index]) ? 'N/A' : indicators.macd.macd[index].toFixed(4)
+                );
+              }
+              if (indicators.rsi) indicatorRow.push(isNaN(indicators.rsi[index]) ? 'N/A' : indicators.rsi[index].toFixed(2));
+              if (indicators.kdj) indicatorRow.push(
+                isNaN(indicators.kdj.k[index]) ? 'N/A' : indicators.kdj.k[index].toFixed(2),
+                isNaN(indicators.kdj.d[index]) ? 'N/A' : indicators.kdj.d[index].toFixed(2),
+                isNaN(indicators.kdj.j[index]) ? 'N/A' : indicators.kdj.j[index].toFixed(2)
+              );
+              if (indicators.boll) indicatorRow.push(
+                isNaN(indicators.boll.upper[index]) ? 'N/A' : indicators.boll.upper[index].toFixed(2),
+                isNaN(indicators.boll.middle[index]) ? 'N/A' : indicators.boll.middle[index].toFixed(2),
+                isNaN(indicators.boll.lower[index]) ? 'N/A' : indicators.boll.lower[index].toFixed(2)
+              );
+              const maIndicators = Object.keys(indicators).filter(key => key.startsWith('ma') && key !== 'macd');
+              maIndicators.forEach(ma => {
+                indicatorRow.push(isNaN(indicators[ma][index]) ? 'N/A' : indicators[ma][index].toFixed(2));
+              });
+            }
+            const fullRow = [...basicRow, ...indicatorRow];
+            formattedData += `| ${fullRow.join(' | ')} |\n`;
+          });
+        }
+        if (Object.keys(indicators).length > 0) {
+          indicatorData = `\n\n## 📊 技术指标说明\n`;
+          const indicatorParams: Record<string, string> = {};
+          for (const indicator of requestedIndicators) {
+            try {
+              const { name, params } = parseIndicatorParams(indicator);
+              indicatorParams[name] = formatIndicatorParams(name, params);
+            } catch {}
+          }
+          if (indicators.macd) indicatorData += `- **MACD${indicatorParams.macd || '(参数未知)'}**: DIF(快线)、DEA(慢线)、MACD(柱状图)\n`;
+          if (indicators.rsi) indicatorData += `- **RSI${indicatorParams.rsi || '(参数未知)'}**: 相对强弱指标，范围0-100，>70超买，<30超卖\n`;
+          if (indicators.kdj) indicatorData += `- **KDJ${indicatorParams.kdj || '(参数未知)'}**: 随机指标，K线、D线、J线，>80超买，<20超卖\n`;
+          if (indicators.boll) indicatorData += `- **BOLL${indicatorParams.boll || '(参数未知)'}**: 布林带，上轨、中轨、下轨\n`;
+          const maIndicators = Object.keys(indicators).filter(key => key.startsWith('ma') && key !== 'macd');
+          if (maIndicators.length > 0) {
+            maIndicators.forEach(ma => {
+              const period = ma.replace('ma', '');
+              indicatorData += `- **${ma.toUpperCase()}(${period})**: 移动平均线，常用判断趋势方向\n`;
+            });
+          }
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `# ${args.code} ${marketTitleMap[marketType]}行情数据\n\n${formattedData}${indicatorData}`
+            }
+          ]
+        };
       }
       
       // 构建请求参数
@@ -299,7 +554,7 @@ export const stockData = {
         // 计算技术指标
         let indicators: Record<string, any> = {};
         
-        if (requestedIndicators.length > 0 && ['cn', 'us', 'hk', 'fund', 'futures', 'convertible_bond', 'options', 'fx'].includes(marketType)) {
+        if (requestedIndicators.length > 0 && ['cn', 'us', 'hk', 'fund', 'futures', 'convertible_bond', 'options', 'fx', 'crypto'].includes(marketType)) {
           // 对具有可用于OHLC的市场计算技术指标
           // 构建按时间正序的价格序列
           const mid = (a: any, b: any): number => {
@@ -403,7 +658,8 @@ export const stockData = {
           'fund': '基金',
           'repo': '债券逆回购',
           'convertible_bond': '可转债',
-          'options': '期权'
+          'options': '期权',
+          'crypto': '加密货币'
         };
 
         // 金额（amount）统一以“万元”为单位展示：amount(千) -> amount/10(万)
