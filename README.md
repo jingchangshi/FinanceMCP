@@ -109,7 +109,7 @@
 |---------|---------|---------|
 | 🕐 **current_timestamp** | 当前时间戳 | UTC+8时区，多种输出格式 |
 | 📰 **finance_news** | 财经新闻搜索 | 百度新闻爬虫；入参：`query`（空格分隔多关键词，OR 过滤） |
-| 📈 **stock_data** | 股票/加密 + 技术指标 | 10大市场+加密(CoinGecko)+5技术指标，智能预取 |
+| 📈 **stock_data** | 股票/加密 + 技术指标 | 10大市场+加密(Binance默认)+5技术指标，智能预取 |
 | 📊 **index_data** | 指数数据 | 主要市场指数历史数据 |
 | 🧱 **csi_index_constituents** | CSI指数成分与权重摘要 | 仅支持中证指数公司(CSI)，指数区间行情 + 成分股权重与区间涨跌幅 + 估值/财务指标（PE、PB、股息率、ROE、ROA、净利率、经营现金流、资产负债率、营收同比、资产周转率、毛利率、三费比率、现金分红率） |
 | 📉 **macro_econ** | 宏观经济数据 | 11指标：GDP/CPI/PPI/PMI/Shibor等 |
@@ -360,18 +360,7 @@ npm run start:sse
       "url": "http://localhost:3000/mcp",
       "timeout": 600,
       "headers": {
-        "X-Tushare-Token": "your_tushare_token",
-        // 也可使用以下任一方式（与上方三选一）：
-        // "Authorization": "Bearer your_tushare_token",
-        // "X-Api-Key": "your_tushare_token",
-
-        // CoinGecko（仅需其一，按你的计划选择一个）
-        // Demo：
-        // "X-CG-DEMO-API-KEY": "your_demo_key",
-        // 免费/标准：
-        // "X-CG-API-KEY": "your_standard_key",
-        // 专业版(Pro)：
-        // "X-CG-PRO-API-KEY": "your_pro_key"
+        "X-Tushare-Token": "your_tushare_token"
       }
     }
   }
@@ -384,10 +373,7 @@ npm run start:sse
 - 再次回退读取 `X-Api-Key`；
 - 若 Header 中未提供，则回退使用服务端环境变量 `TUSHARE_TOKEN`（可选）。
 
-**CoinGecko Key 解析规则（仅 crypto 市场使用，三选一传入即可）**
-- `X-CG-PRO-API-KEY` → 使用 `https://pro-api.coingecko.com/api/v3`
-- `X-CG-API-KEY` 或 `X-CG-DEMO-API-KEY` → 使用 `https://api.coingecko.com/api/v3`
-- 也可在服务端通过环境变量提供：`COINGECKO_API_KEY`、`COINGECKO_DEMO_API_KEY`、`COINGECKO_PRO_API_KEY`
+（加密市场默认使用 Binance 公共行情接口，无需任何加密货币 API Key）
 
 ### 验证安装
 配置完成后，重启Claude桌面版并询问："获取当前时间"。如果返回时间信息，说明安装成功。

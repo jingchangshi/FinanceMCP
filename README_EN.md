@@ -108,7 +108,7 @@ You can also use our shared service without API keys (may have rate limits):
 |-----------|---------------------|---------------|
 | 🕐 **current_timestamp** | Current timestamp | UTC+8 timezone, multiple output formats |
 | 📰 **finance_news** | Financial news search | Baidu News crawler; input: `query` (space-separated keywords, OR filter) |
-| 📈 **stock_data** | Stocks/Crypto + technical indicators | 10 markets + crypto (CoinGecko) + 5 indicators, smart pre-fetching |
+| 📈 **stock_data** | Stocks/Crypto + technical indicators | 10 markets + crypto (Binance by default) + 5 indicators, smart pre-fetching |
 | 📊 **index_data** | Index data | Major market indices historical data |
 | 🧱 **csi_index_constituents** | CSI index constituents summary | CSI-only; index range + all constituents with weights and returns |
 | 📉 **macro_econ** | Macroeconomic data | 11 indicators: GDP/CPI/PPI/PMI/Shibor, etc. |
@@ -384,10 +384,7 @@ Configuration file locations:
 - Fallback to `X-Api-Key`.
 - If none provided, server may fallback to `TUSHARE_TOKEN` env var (optional).
 
-**CoinGecko Key Resolution (crypto market only, choose ONE)**
-- `X-CG-PRO-API-KEY` → `https://pro-api.coingecko.com/api/v3`
-- `X-CG-API-KEY` or `X-CG-DEMO-API-KEY` → `https://api.coingecko.com/api/v3`
-- Alternatively, set env vars: `COINGECKO_API_KEY`, `COINGECKO_DEMO_API_KEY`, `COINGECKO_PRO_API_KEY`
+(Crypto market now defaults to Binance public market data; no crypto API key is required.)
 
 ### Verify Installation
 After configuration, restart Claude Desktop and ask: "Get current time". If it returns time information, the installation is successful.

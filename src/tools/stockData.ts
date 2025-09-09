@@ -1,4 +1,4 @@
-import { TUSHARE_CONFIG, COINGECKO_CONFIG } from '../config.js';
+import { TUSHARE_CONFIG } from '../config.js';
 import { 
   calculateMACD, 
   calculateKDJ, 
@@ -20,7 +20,7 @@ export const stockData = {
     properties: {
       code: {
         type: "string",
-        description: "股票/合约/加密资产代码。股票示例：'000001.SZ'(A股平安银行)、'AAPL'(美股)、'00700.HK'(港股)、'USDCNH.FXCM'(外汇)、'CU2501.SHF'(期货)、'159919.SZ'(基金)、'204001.SH'(逆回购)、'113008.SH'(可转债)、'10001313.SH'(期权)。加密示例(需 market_type=crypto)：'BTC-USD' 或 'ETH/USDT'，或 CoinGecko id 写法 'bitcoin.usd'、'tether.cny'、也可仅写 'BTC'（默认vs=usd）"
+        description: "股票/合约/加密资产代码。股票示例：'000001.SZ'(A股平安银行)、'AAPL'(美股)、'00700.HK'(港股)、'USDCNH.FXCM'(外汇)、'CU2501.SHF'(期货)、'159919.SZ'(基金)、'204001.SH'(逆回购)、'113008.SH'(可转债)、'10001313.SH'(期权)。加密示例(需 market_type=crypto，Binance)：推荐标准写法 'BTCUSDT'、'ETHUSDT'、'USDCUSDT'、'FDUSDUSDT' 等；也兼容 'BTC-USDT' 或 'BTC/USDT'。常见报价币：USDT、USDC、FDUSD、TUSD、BUSD、BTC、ETH。注意：若写 'USD' 会自动映射为 'USDT'（如 'BTC-USD' → 'BTCUSDT'）。"
       },
       market_type: {
         type: "string",
@@ -91,107 +91,82 @@ export const stockData = {
         throw new Error(`不支持的市场类型: ${marketType}。支持的类型有: ${validMarkets.join(', ')}`);
       }
       
-      // 加密货币市场（CoinGecko）分支：
+      // 加密货币市场（Binance）分支：
       if (marketType === 'crypto') {
-        console.log(`使用 CoinGecko 获取加密资产 ${args.code} 的行情数据`);
-        
-        // 帮助函数：日期与符号解析
+        console.log(`使用 Binance 获取加密资产 ${args.code} 的逐日K线 (OHLCV)`);
+
+        // 日期与符号解析
         const toYMD = (d: Date): string => {
-          const y = d.getFullYear();
-          const m = String(d.getMonth() + 1).padStart(2, '0');
-          const day = String(d.getDate()).padStart(2, '0');
+          const y = d.getUTCFullYear();
+          const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+          const day = String(d.getUTCDate()).padStart(2, '0');
           return `${y}${m}${day}`;
         };
-        const ymdToDate = (s: string): Date => new Date(parseInt(s.slice(0,4)), parseInt(s.slice(4,6)) - 1, parseInt(s.slice(6,8)));
-        const daysBetween = (a: string, b: string): number => {
-          const da = ymdToDate(a);
-          const db = ymdToDate(b);
-          return Math.max(1, Math.ceil((db.getTime() - da.getTime()) / 86400000) + 1);
+        const ymdToStartMs = (s: string): number => Date.UTC(parseInt(s.slice(0,4)), parseInt(s.slice(4,6)) - 1, parseInt(s.slice(6,8)), 0, 0, 0, 0);
+        const ymdToEndMs = (s: string): number => Date.UTC(parseInt(s.slice(0,4)), parseInt(s.slice(4,6)) - 1, parseInt(s.slice(6,8)), 23, 59, 59, 999);
+
+        const idToTicker: Record<string, string> = {
+          'bitcoin': 'BTC', 'ethereum': 'ETH', 'tether': 'USDT', 'usd-coin': 'USDC', 'solana': 'SOL',
+          'binancecoin': 'BNB', 'ripple': 'XRP', 'cardano': 'ADA', 'polkadot': 'DOT', 'chainlink': 'LINK',
+          'litecoin': 'LTC', 'shiba-inu': 'SHIB', 'tron': 'TRX', 'toncoin': 'TON', 'bitcoin-cash': 'BCH',
+          'ethereum-classic': 'ETC'
         };
-        const chooseDaysParam = (needDays: number): number => {
-          const opts = [1, 7, 14, 30, 90, 180, 365];
-          for (const v of opts) { if (needDays <= v) return v; }
-          return 365; // CoinGecko ohlc 最多支持到 365
-        };
-        const symbolIdMap: Record<string, string> = {
-          'BTC': 'bitcoin', 'XBT': 'bitcoin', 'ETH': 'ethereum', 'USDT': 'tether', 'USDC': 'usd-coin',
-          'BNB': 'binancecoin', 'SOL': 'solana', 'TRX': 'tron', 'DOGE': 'dogecoin', 'DOT': 'polkadot',
-          'ADA': 'cardano', 'XRP': 'ripple', 'LTC': 'litecoin', 'OKB': 'okb', 'BCH': 'bitcoin-cash',
-          'ETC': 'ethereum-classic', 'LINK': 'chainlink', 'SHIB': 'shiba-inu', 'TON': 'toncoin'
-        };
-        const vsMap: Record<string, string> = {
-          'USD': 'usd', 'USDT': 'usd', 'CNY': 'cny', 'CNH': 'cny', 'RMB': 'cny', 'EUR': 'eur', 'JPY': 'jpy',
-          'GBP': 'gbp', 'BTC': 'btc', 'ETH': 'eth'
-        };
-        const parseCryptoCode = (code: string): { id: string; vs: string } => {
-          const trimmed = code.trim();
-          // 格式: id.vs 或 ticker.vs
-          if (trimmed.includes('.')) {
-            const [left, right] = trimmed.split('.');
-            const id = symbolIdMap[left.toUpperCase()] || left.toLowerCase();
-            const vs = vsMap[right.toUpperCase()] || right.toLowerCase();
-            return { id, vs };
-          }
-          // 格式: TICKER-QUOTE 或 TICKER/QUOTE
-          if (trimmed.includes('-') || trimmed.includes('/')) {
-            const sep = trimmed.includes('-') ? '-' : '/';
-            const [base, quote] = trimmed.split(sep);
-            const id = symbolIdMap[base.toUpperCase()] || base.toLowerCase();
-            const vs = vsMap[quote.toUpperCase()] || quote.toLowerCase();
-            return { id, vs };
-          }
-          // 纯 TICKER 或 CoinGecko id，默认 usd
+
+        const parseBinanceSymbol = (raw: string): string => {
+          const trimmed = raw.trim();
           const upper = trimmed.toUpperCase();
-          const id = symbolIdMap[upper] || trimmed.toLowerCase();
-          return { id, vs: 'usd' };
+          const validQuotes = new Set(['USDT','USDC','FDUSD','TUSD','BUSD','BTC','ETH']);
+          // 已经是诸如 BTCUSDT
+          if (!upper.includes('-') && !upper.includes('/') && !upper.includes('.')) {
+            return upper;
+          }
+          // 支持 TICKER-QUOTE / TICKER/QUOTE / id.vs
+          let base = '';
+          let quote = '';
+          if (upper.includes('-') || upper.includes('/')) {
+            const sep = upper.includes('-') ? '-' : '/';
+            const [b, q] = upper.split(sep);
+            base = b;
+            quote = q;
+          } else if (upper.includes('.')) {
+            const [id, vs] = upper.split('.');
+            base = idToTicker[id.toLowerCase()] || id; // id -> ticker
+            quote = vs;
+          }
+          if (quote === 'USD') quote = 'USDT';
+          if (!validQuotes.has(quote)) {
+            throw new Error(`不支持的报价资产: ${quote}。支持: ${Array.from(validQuotes).join(', ')}`);
+          }
+          return `${base}${quote}`;
         };
-        
-        const { id: cgId, vs } = parseCryptoCode(args.code);
-        const needDays = daysBetween(actualStartDate, actualEndDate) + 15; // 预留缓冲
-        const daysParam = chooseDaysParam(needDays);
-        const base = COINGECKO_CONFIG.BASE_URL;
-        
-        const ohlcUrl = `${base}/coins/${encodeURIComponent(cgId)}/ohlc?vs_currency=${encodeURIComponent(vs)}&days=${daysParam}`;
-        const volUrl = `${base}/coins/${encodeURIComponent(cgId)}/market_chart?vs_currency=${encodeURIComponent(vs)}&days=${daysParam}&interval=daily`;
-        
-        console.log('CoinGecko OHLC URL:', ohlcUrl);
-        console.log('CoinGecko Volume URL:', volUrl);
-        
-        const cgHeaders = COINGECKO_CONFIG.HEADERS;
-        const [ohlcResp, volResp] = await Promise.all([
-          fetch(ohlcUrl, { headers: cgHeaders }),
-          fetch(volUrl, { headers: cgHeaders })
-        ]);
-        if (!ohlcResp.ok) throw new Error(`CoinGecko OHLC 请求失败: ${ohlcResp.status}`);
-        if (!volResp.ok) throw new Error(`CoinGecko Volume 请求失败: ${volResp.status}`);
-        
-        const ohlcData = await ohlcResp.json();
-        const volJson = await volResp.json();
-        if (!Array.isArray(ohlcData)) {
-          throw new Error('CoinGecko 返回的 OHLC 数据格式异常');
-        }
-        const volumesArr: Array<[number, number]> = Array.isArray(volJson?.total_volumes) ? volJson.total_volumes : [];
-        const volMap = new Map<string, number>();
-        for (const v of volumesArr) {
-          const d = toYMD(new Date(v[0]));
-          const vol = typeof v[1] === 'number' ? v[1] : Number(v[1]);
-          if (!isNaN(vol)) volMap.set(d, vol);
-        }
-        
-        // 组装为与现有流程兼容的数据结构（最新日期在前）
-        let stockData = (ohlcData as Array<[number, number, number, number, number]>).map(row => {
-          const d = toYMD(new Date(row[0]));
+
+        const symbol = parseBinanceSymbol(args.code);
+        const startMs = ymdToStartMs(userStartDate);
+        const endMs = ymdToEndMs(userEndDate);
+        const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1d&startTime=${startMs}&endTime=${endMs}&limit=1000`;
+        console.log('Binance Klines URL:', url);
+
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`Binance K线请求失败: ${resp.status}`);
+        const klines: any[] = await resp.json();
+        if (!Array.isArray(klines)) throw new Error('Binance 返回的 K 线数据格式异常');
+
+        let stockData = klines.map(row => {
+          const openTime = Number(row[0]);
+          const d = toYMD(new Date(openTime));
           return {
             trade_date: d,
-            open: row[1],
-            high: row[2],
-            low: row[3],
-            close: row[4],
-            vol: volMap.get(d)
+            open: Number(row[1]),
+            high: Number(row[2]),
+            low: Number(row[3]),
+            close: Number(row[4]),
+            vol: Number(row[5])
           } as Record<string, any>;
         });
+        // 严格日期过滤（无论是否传指标）
+        stockData = stockData.filter(r => r.trade_date >= userStartDate && r.trade_date <= userEndDate);
         stockData.sort((a, b) => b.trade_date.localeCompare(a.trade_date));
-        console.log(`CoinGecko 返回 ${stockData.length} 条记录`);
+        console.log(`Binance 返回 ${stockData.length} 条记录`);
         
         // 计算技术指标
         let indicators: Record<string, any> = {};
