@@ -335,7 +335,7 @@ Configuration file locations:
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-#### Latest: Streamable HTTP (Token via headers)
+#### Latest: Streamable HTTP (Tokens via headers)
 ```json
 {
   "mcpServers": {
@@ -344,10 +344,18 @@ Configuration file locations:
       "url": "http://localhost:3000/mcp",
       "timeout": 600,
       "headers": {
-        "X-Tushare-Token": "your_tushare_token"
-        // Or
-        // "Authorization": "Bearer your_tushare_token"
-        // "X-Api-Key": "your_tushare_token"
+        "X-Tushare-Token": "your_tushare_token",
+        // Or any one of the above:
+        // "Authorization": "Bearer your_tushare_token",
+        // "X-Api-Key": "your_tushare_token",
+
+        // CoinGecko (choose ONE based on your plan)
+        // Demo:
+        // "X-CG-DEMO-API-KEY": "your_demo_key",
+        // Free/Standard:
+        // "X-CG-API-KEY": "your_standard_key",
+        // Pro:
+        // "X-CG-PRO-API-KEY": "your_pro_key"
       },
       "autoApprove": [
         "current_timestamp",
@@ -375,6 +383,11 @@ Configuration file locations:
 - Fallback to `Authorization: Bearer <token>`.
 - Fallback to `X-Api-Key`.
 - If none provided, server may fallback to `TUSHARE_TOKEN` env var (optional).
+
+**CoinGecko Key Resolution (crypto market only, choose ONE)**
+- `X-CG-PRO-API-KEY` → `https://pro-api.coingecko.com/api/v3`
+- `X-CG-API-KEY` or `X-CG-DEMO-API-KEY` → `https://api.coingecko.com/api/v3`
+- Alternatively, set env vars: `COINGECKO_API_KEY`, `COINGECKO_DEMO_API_KEY`, `COINGECKO_PRO_API_KEY`
 
 ### Verify Installation
 After configuration, restart Claude Desktop and ask: "Get current time". If it returns time information, the installation is successful.

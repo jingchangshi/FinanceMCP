@@ -351,7 +351,7 @@ npm run start:sse
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-#### 最新配置：Streamable HTTP 模式（通过 Header 传入 Tushare Token）
+#### 最新配置：Streamable HTTP 模式（通过 Header 传入 Token）
 ```json
 {
   "mcpServers": {
@@ -360,10 +360,18 @@ npm run start:sse
       "url": "http://localhost:3000/mcp",
       "timeout": 600,
       "headers": {
-        "X-Tushare-Token": "your_tushare_token"
-        // 也可使用以下任一方式：
-        // "Authorization": "Bearer your_tushare_token"
-        // "X-Api-Key": "your_tushare_token"
+        "X-Tushare-Token": "your_tushare_token",
+        // 也可使用以下任一方式（与上方三选一）：
+        // "Authorization": "Bearer your_tushare_token",
+        // "X-Api-Key": "your_tushare_token",
+
+        // CoinGecko（仅需其一，按你的计划选择一个）
+        // Demo：
+        // "X-CG-DEMO-API-KEY": "your_demo_key",
+        // 免费/标准：
+        // "X-CG-API-KEY": "your_standard_key",
+        // 专业版(Pro)：
+        // "X-CG-PRO-API-KEY": "your_pro_key"
       }
     }
   }
@@ -375,6 +383,11 @@ npm run start:sse
 - 若未提供，则尝试 `Authorization: Bearer <token>`；
 - 再次回退读取 `X-Api-Key`；
 - 若 Header 中未提供，则回退使用服务端环境变量 `TUSHARE_TOKEN`（可选）。
+
+**CoinGecko Key 解析规则（仅 crypto 市场使用，三选一传入即可）**
+- `X-CG-PRO-API-KEY` → 使用 `https://pro-api.coingecko.com/api/v3`
+- `X-CG-API-KEY` 或 `X-CG-DEMO-API-KEY` → 使用 `https://api.coingecko.com/api/v3`
+- 也可在服务端通过环境变量提供：`COINGECKO_API_KEY`、`COINGECKO_DEMO_API_KEY`、`COINGECKO_PRO_API_KEY`
 
 ### 验证安装
 配置完成后，重启Claude桌面版并询问："获取当前时间"。如果返回时间信息，说明安装成功。

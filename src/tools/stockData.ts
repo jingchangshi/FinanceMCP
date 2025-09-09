@@ -1,4 +1,4 @@
-import { TUSHARE_CONFIG } from '../config.js';
+import { TUSHARE_CONFIG, COINGECKO_CONFIG } from '../config.js';
 import { 
   calculateMACD, 
   calculateKDJ, 
@@ -149,7 +149,7 @@ export const stockData = {
         const { id: cgId, vs } = parseCryptoCode(args.code);
         const needDays = daysBetween(actualStartDate, actualEndDate) + 15; // 预留缓冲
         const daysParam = chooseDaysParam(needDays);
-        const base = 'https://api.coingecko.com/api/v3';
+        const base = COINGECKO_CONFIG.BASE_URL;
         
         const ohlcUrl = `${base}/coins/${encodeURIComponent(cgId)}/ohlc?vs_currency=${encodeURIComponent(vs)}&days=${daysParam}`;
         const volUrl = `${base}/coins/${encodeURIComponent(cgId)}/market_chart?vs_currency=${encodeURIComponent(vs)}&days=${daysParam}&interval=daily`;
@@ -157,9 +157,10 @@ export const stockData = {
         console.log('CoinGecko OHLC URL:', ohlcUrl);
         console.log('CoinGecko Volume URL:', volUrl);
         
+        const cgHeaders = COINGECKO_CONFIG.HEADERS;
         const [ohlcResp, volResp] = await Promise.all([
-          fetch(ohlcUrl),
-          fetch(volUrl)
+          fetch(ohlcUrl, { headers: cgHeaders }),
+          fetch(volUrl, { headers: cgHeaders })
         ]);
         if (!ohlcResp.ok) throw new Error(`CoinGecko OHLC 请求失败: ${ohlcResp.status}`);
         if (!volResp.ok) throw new Error(`CoinGecko Volume 请求失败: ${volResp.status}`);

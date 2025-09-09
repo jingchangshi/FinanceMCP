@@ -89,6 +89,14 @@ function extractTokenFromHeaders(req: Request): string | undefined {
   return undefined;
 }
 
+function extractCoinGeckoKeys(req: Request): { cg?: string; cgPro?: string; cgDemo?: string } {
+  const h = req.headers as Record<string, any>;
+  const cg = (h['x-cg-api-key'] || h['x-cg-demo-api-key']) as string | undefined;
+  const cgPro = (h['x-cg-pro-api-key']) as string | undefined;
+  const cgDemo = (h['x-cg-demo-api-key']) as string | undefined;
+  return { cg: (cg && h['x-cg-api-key'] ? cg.trim() : undefined), cgPro: cgPro?.trim() || undefined, cgDemo: cgDemo?.trim() || undefined };
+}
+
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
@@ -96,7 +104,7 @@ app.use(cors({
   origin: '*',
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: [
-    'Content-Type','Accept','Authorization','Mcp-Session-Id','Last-Event-ID','X-Tenant-Id','X-Api-Key','X-Tushare-Token'
+    'Content-Type','Accept','Authorization','Mcp-Session-Id','Last-Event-ID','X-Tenant-Id','X-Api-Key','X-Tushare-Token','X-Cg-Api-Key','X-Cg-Pro-Api-Key','X-Cg-Demo-Api-Key'
   ],
   exposedHeaders: ['Content-Type','Mcp-Session-Id']
 }));
@@ -151,8 +159,9 @@ app.post('/mcp', async (req: Request, res: Response) => {
   if (method === 'tools/call') {
     const { name, arguments: args } = body.params || {};
     const token = extractTokenFromHeaders(req);
+    const { cg, cgPro, cgDemo } = extractCoinGeckoKeys(req);
     try {
-      const result = await runWithRequestContext(token, async () => {
+      const result = await runWithRequestContext({ tushareToken: token, coingeckoApiKey: cg, coingeckoProApiKey: cgPro, coingeckoDemoApiKey: cgDemo }, async () => {
         switch (name) {
           case 'current_timestamp':
             return await timestampTool.run({ format: args?.format ? String(args.format) : undefined });
