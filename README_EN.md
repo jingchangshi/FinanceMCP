@@ -38,7 +38,7 @@ Visit our online experience website: **[http://106.14.205.176:3090/](http://106.
 
 ### ⚙️ Claude Desktop Configuration
 
-#### 🆕 Latest Version (v4.0.0) - Streamable HTTP with Your API Key
+#### 🆕 Latest Version (v4.1.0) - Streamable HTTP with Your API Key
 **🎯 Recommended for production use with your own Tushare token:**
 
 ```json
@@ -79,7 +79,7 @@ You can also use our shared service without API keys (may have rate limits):
 ```
 
 **Service Benefits:**
-- ✅ **Latest Version (v4.0.0)** - Use your own API key for unlimited access
+- ✅ **Latest Version (v4.1.0)** - Use your own API key for unlimited access
 - ✅ **24/7 Availability** - Server runs continuously
 - ✅ **Full Features** - All 14 tools and technical indicators
 - ✅ **Real-time Data** - Connected to Tushare professional data
@@ -396,12 +396,17 @@ After configuration, restart Claude Desktop and ask: "Get current time". If it r
 
 ## 🆕 What's New
 
-### 🚀 Version 4.0.0 - Enhanced Web Experience Release
+### 🚀 Version 4.1.0 - Cryptocurrency Support Release
 
-**Latest Major Update**: We've released version 4.0.0 with comprehensive web experience and enhanced features!
+**Latest Major Update**: We've released version 4.1.0 with cryptocurrency market data support and enhanced features!
 
 <details>
-<summary><strong>🎯 New Features in v4.0.0</strong></summary>
+<summary><strong>🎯 New Features in v4.1.0</strong></summary>
+
+- **₿ Cryptocurrency Market Data** - Real-time crypto prices, trading volumes, and market analysis
+- **🔗 Multi-Exchange Support** - Data from major cryptocurrency exchanges
+- **📊 Crypto Technical Indicators** - MACD, RSI, KDJ, BOLL, MA for digital assets
+- **💹 Market Cap & Volume Analysis** - Comprehensive cryptocurrency market metrics
 
 - **🌐 Web Online Experience** - Brand new web interface at `http://106.14.205.176:3090/`
 - **🤖 Integrated AI Model** - Direct chat with AI assistant for financial analysis
