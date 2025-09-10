@@ -116,17 +116,53 @@ export const stockData = {
                     return `${base}${quote}`;
                 };
                 const symbol = parseBinanceSymbol(args.code);
-                const startMs = ymdToStartMs(userStartDate);
+                const startYmd = requestedIndicators.length > 0 ? actualStartDate : userStartDate;
+                let startMs = ymdToStartMs(startYmd);
                 const endMs = ymdToEndMs(userEndDate);
-                const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1d&startTime=${startMs}&endTime=${endMs}&limit=1000`;
-                console.log('Binance Klines URL:', url);
-                const resp = await fetch(url);
-                if (!resp.ok)
-                    throw new Error(`Binance K线请求失败: ${resp.status}`);
-                const klines = await resp.json();
-                if (!Array.isArray(klines))
-                    throw new Error('Binance 返回的 K 线数据格式异常');
-                let stockData = klines.map(row => {
+                const allKlines = [];
+                let pageIndex = 0;
+                const maxPages = 100; // 安全上限，防止极端情况下的无限循环
+                while (startMs < endMs && pageIndex < maxPages) {
+                    const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1d&startTime=${startMs}&endTime=${endMs}&limit=1000`;
+                    console.log(`Binance Klines URL[${pageIndex + 1}]:`, url);
+                    const resp = await fetch(url);
+                    if (!resp.ok) {
+                        try {
+                            const contentType = resp.headers.get('content-type') || '';
+                            if (contentType.includes('application/json')) {
+                                const errJson = await resp.json();
+                                const errMsg = errJson?.msg || `HTTP ${resp.status}`;
+                                if (Number(errJson?.code) === -1121 || /invalid symbol/i.test(String(errMsg))) {
+                                    throw new Error(`Binance 无效交易对: ${symbol}。该币对在 Binance 不存在或已下线，请更换有效币对（例如：BTCUSDT、ETHUSDT、SOLUSDT）。也支持 BTC-USDT、BTC/USDT、或 coinid.USDT 写法。`);
+                                }
+                                throw new Error(`Binance K线请求失败: ${resp.status} - ${errMsg}`);
+                            }
+                            else {
+                                const text = await resp.text();
+                                throw new Error(`Binance K线请求失败: ${resp.status}${text ? ` - ${text}` : ''}`);
+                            }
+                        }
+                        catch (e) {
+                            if (e instanceof Error)
+                                throw e;
+                            throw new Error(`Binance K线请求失败: ${resp.status}`);
+                        }
+                    }
+                    const klines = await resp.json();
+                    if (!Array.isArray(klines))
+                        throw new Error('Binance 返回的 K 线数据格式异常');
+                    if (klines.length === 0)
+                        break;
+                    allKlines.push(...klines);
+                    const lastOpenTime = Number(klines[klines.length - 1][0]);
+                    if (!(lastOpenTime > startMs))
+                        break; // 保护，避免相同时间导致死循环
+                    startMs = lastOpenTime + 1; // 下一页从最后一根K线的下一毫秒开始
+                    pageIndex += 1;
+                    if (klines.length < 1000)
+                        break; // 已取完
+                }
+                let stockData = allKlines.map(row => {
                     const openTime = Number(row[0]);
                     const d = toYMD(new Date(openTime));
                     return {
@@ -138,10 +174,13 @@ export const stockData = {
                         vol: Number(row[5])
                     };
                 });
-                // 严格日期过滤（无论是否传指标）
-                stockData = stockData.filter(r => r.trade_date >= userStartDate && r.trade_date <= userEndDate);
+                // 若未请求技术指标，才在此处严格按用户区间过滤；
+                // 若请求了技术指标，需保留扩展区间用于计算，稍后再截回用户区间
+                if (requestedIndicators.length === 0) {
+                    stockData = stockData.filter(r => r.trade_date >= userStartDate && r.trade_date <= userEndDate);
+                }
                 stockData.sort((a, b) => b.trade_date.localeCompare(a.trade_date));
-                console.log(`Binance 返回 ${stockData.length} 条记录`);
+                console.log(`Binance 分页返回 共${allKlines.length} 根K线，过滤后 ${stockData.length} 条记录`);
                 // 计算技术指标
                 let indicators = {};
                 if (requestedIndicators.length > 0) {
