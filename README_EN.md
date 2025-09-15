@@ -38,7 +38,7 @@ Visit our online experience website: **[http://106.14.205.176:3090/](http://106.
 
 ### ⚙️ Claude Desktop Configuration
 
-#### 🆕 Latest Version (v4.1.0) - Streamable HTTP with Your API Key
+#### 🆕 Latest Version (v4.2.1) - Streamable HTTP with Your API Key
 **🎯 Recommended for production use with your own Tushare token:**
 
 ```json
@@ -79,7 +79,7 @@ You can also use our shared service without API keys (may have rate limits):
 ```
 
 **Service Benefits:**
-- ✅ **Latest Version (v4.1.0)** - Use your own API key for unlimited access
+- ✅ **Latest Version (v4.2.1)** - Use your own API key for unlimited access
 - ✅ **24/7 Availability** - Server runs continuously
 - ✅ **Full Features** - All 14 tools and technical indicators
 - ✅ **Real-time Data** - Connected to Tushare professional data
@@ -393,12 +393,17 @@ After configuration, restart Claude Desktop and ask: "Get current time". If it r
 
 ## 🆕 What's New
 
-### 🚀 Version 4.1.0 - Cryptocurrency Support Release
+### 🚀 Version 4.2.1 - Minute-Level K-Line Data Release
 
-**Latest Major Update**: We've released version 4.1.0 with cryptocurrency market data support and enhanced features!
+**Latest Major Update**: We've released version 4.2.1 with minute-level K-line data query functionality!
 
 <details>
-<summary><strong>🎯 New Features in v4.1.0</strong></summary>
+<summary><strong>🎯 New Features in v4.2.1</strong></summary>
+
+- **⏱ Minute K-Line Tool** - New `stock_data_minutes` tool supporting A-share minute-level K-line data
+- **📊 Multi-Frequency Support** - Support for 1MIN/5MIN/15MIN/30MIN/60MIN time periods
+- **🕐 Precise Time Control** - Support for second-precise time range queries
+- **📈 Real-time Trading Data** - Complete data including open/high/low/close/volume/turnover
 
 - **₿ Cryptocurrency Market Data** - Real-time crypto prices, trading volumes, and market analysis
 - **🔗 Multi-Exchange Support** - Data from major cryptocurrency exchanges
