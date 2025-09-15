@@ -9,6 +9,7 @@ import {
 // ✅ 引入你自定义的财经工具
 import { financeNews } from "./tools/financeNews.js";
 import { stockData } from "./tools/stockData.js";
+import { stockDataMinutes } from "./tools/stockDataMinutes.js";
 import { indexData } from "./tools/indexData.js";
 import { macroEcon } from "./tools/macroEcon.js";
 import { companyPerformance } from "./tools/companyPerformance.js";
@@ -140,6 +141,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: stockData.parameters
       },
       {
+        name: stockDataMinutes.name,
+        description: stockDataMinutes.description,
+        inputSchema: stockDataMinutes.parameters
+      },
+      {
         name: indexData.name,
         description: indexData.description,
         inputSchema: indexData.parameters
@@ -236,6 +242,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const end_date = request.params.arguments?.end_date ? String(request.params.arguments.end_date) : undefined;
       const indicators = request.params.arguments?.indicators ? String(request.params.arguments.indicators) : undefined;
       return await stockData.run({ code, market_type, start_date, end_date, indicators });
+    }
+
+    case "stock_data_minutes": {
+      const code = String(request.params.arguments?.code);
+      const start_datetime = String(request.params.arguments?.start_datetime);
+      const end_datetime = String(request.params.arguments?.end_datetime);
+      const freq = String(request.params.arguments?.freq);
+      return await stockDataMinutes.run({ code, start_datetime, end_datetime, freq });
     }
 
     case "index_data": {

@@ -459,6 +459,29 @@ npm run start:sse
 
 </details>
 
+## ⏱ 分钟K线工具 (NEW!)
+
+新增工具 `stock_data_minutes`，用于获取A股分钟级别K线数据。
+
+- 频率：支持 `1MIN/5MIN/15MIN/30MIN/60MIN`
+- 入参：
+  - `code`: 股票代码，如 `600519.SH`、`000001.SZ`
+  - `start_datetime`: 起始时间，`YYYYMMDDHHmmss` 或 `YYYY-MM-DD HH:mm:ss`
+  - `end_datetime`: 结束时间，`YYYYMMDDHHmmss` 或 `YYYY-MM-DD HH:mm:ss`
+  - `freq`: 周期，例 `1MIN`
+- 返回：按时间倒序的表格（时间/开盘/最高/最低/收盘/成交量/成交额(万元)）
+
+示例（tools/call）：
+
+```
+name: stock_data_minutes
+arguments:
+  code: 600519.SH
+  start_datetime: 2024-09-01 09:30:00
+  end_datetime: 2024-09-01 10:30:00
+  freq: 1MIN
+```
+
 ## 📄 许可证
 
 本项目采用MIT许可证。详见[LICENSE](LICENSE)文件。

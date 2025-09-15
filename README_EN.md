@@ -464,6 +464,29 @@ After configuration, restart Claude Desktop and ask: "Get current time". If it r
 
 </details>
 
+## ⏱ Minute K-line Tool (NEW!)
+
+We added `stock_data_minutes` for A-share minute-level K-line data.
+
+- Frequencies: `1MIN/5MIN/15MIN/30MIN/60MIN` (case-insensitive)
+- Params:
+  - `code`: Stock code, e.g., `600519.SH`, `000001.SZ`
+  - `start_datetime`: Start time, `YYYYMMDDHHmmss` or `YYYY-MM-DD HH:mm:ss`
+  - `end_datetime`: End time, same formats as above
+  - `freq`: Minute interval, e.g., `1MIN`
+- Output: Table sorted by time desc with columns Time/Open/High/Low/Close/Volume/Amount(10k CNY)
+
+Example (tools/call):
+
+```
+name: stock_data_minutes
+arguments:
+  code: 600519.SH
+  start_datetime: 2024-09-01 09:30:00
+  end_datetime: 2024-09-01 10:30:00
+  freq: 1MIN
+```
+
 ## 📄 License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -7,6 +7,7 @@ import { runWithRequestContext } from "./config.js";
 // 工具导入
 import { financeNews } from "./tools/financeNews.js";
 import { stockData } from "./tools/stockData.js";
+import { stockDataMinutes } from "./tools/stockDataMinutes.js";
 import { indexData } from "./tools/indexData.js";
 import { macroEcon } from "./tools/macroEcon.js";
 import { companyPerformance } from "./tools/companyPerformance.js";
@@ -61,6 +62,7 @@ const toolList = [
   { name: timestampTool.name, description: timestampTool.description, inputSchema: timestampTool.parameters },
   { name: financeNews.name, description: financeNews.description, inputSchema: financeNews.parameters },
   { name: stockData.name, description: stockData.description, inputSchema: stockData.parameters },
+  { name: stockDataMinutes.name, description: stockDataMinutes.description, inputSchema: stockDataMinutes.parameters },
   { name: indexData.name, description: indexData.description, inputSchema: indexData.parameters },
   { name: macroEcon.name, description: macroEcon.description, inputSchema: macroEcon.parameters },
   { name: companyPerformance.name, description: companyPerformance.description, inputSchema: companyPerformance.parameters },
@@ -169,6 +171,13 @@ app.post('/mcp', async (req: Request, res: Response) => {
               start_date: args?.start_date ? String(args.start_date) : undefined,
               end_date: args?.end_date ? String(args.end_date) : undefined,
               indicators: args?.indicators ? String(args.indicators) : undefined,
+            });
+          case 'stock_data_minutes':
+            return await stockDataMinutes.run({
+              code: String(args?.code),
+              start_datetime: String(args?.start_datetime),
+              end_datetime: String(args?.end_datetime),
+              freq: String(args?.freq)
             });
           case 'index_data':
             return await indexData.run({
@@ -298,5 +307,3 @@ app.listen(PORT, () => {
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
   console.log(`Health: http://localhost:${PORT}/health`);
 });
-
-
