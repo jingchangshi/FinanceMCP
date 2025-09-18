@@ -175,6 +175,7 @@ app.post('/mcp', async (req: Request, res: Response) => {
           case 'stock_data_minutes':
             return await stockDataMinutes.run({
               code: String(args?.code),
+              market_type: String(args?.market_type),
               start_datetime: String(args?.start_datetime),
               end_datetime: String(args?.end_datetime),
               freq: String(args?.freq)

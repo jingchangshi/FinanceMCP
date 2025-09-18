@@ -38,7 +38,7 @@ Visit our online experience website: **[http://106.14.205.176:3090/](http://106.
 
 ### ⚙️ Claude Desktop Configuration
 
-#### 🆕 Latest Version (v4.2.1) - Streamable HTTP with Your API Key
+#### 🆕 Latest Version (v4.3.0) - Streamable HTTP with Your API Key
 **🎯 Recommended for production use with your own Tushare token:**
 
 ```json
@@ -79,7 +79,7 @@ You can also use our shared service without API keys (may have rate limits):
 ```
 
 **Service Benefits:**
-- ✅ **Latest Version (v4.2.1)** - Use your own API key for unlimited access
+- ✅ **Latest Version (v4.3.0)** - Use your own API key for unlimited access
 - ✅ **24/7 Availability** - Server runs continuously
 - ✅ **Full Features** - All 14 tools and technical indicators
 - ✅ **Real-time Data** - Connected to Tushare professional data
@@ -393,38 +393,21 @@ After configuration, restart Claude Desktop and ask: "Get current time". If it r
 
 ## 🆕 What's New
 
-### 🚀 Version 4.2.1 - Minute-Level K-Line Data Release
+### 🚀 Version 4.3.0 - Crypto Minutes & Binance Enhancements
 
-**Latest Major Update**: We've released version 4.2.1 with minute-level K-line data query functionality!
+**Latest Major Update**: v4.3.0 adds `market_type` to `stock_data_minutes` with Binance crypto minute-level K-lines, plus multiple enhancements to crypto daily data.
 
 <details>
-<summary><strong>🎯 New Features in v4.2.1</strong></summary>
+<summary><strong>🎯 New Features in v4.3.0</strong></summary>
 
-- **⏱ Minute K-Line Tool** - New `stock_data_minutes` tool supporting A-share minute-level K-line data
-- **📊 Multi-Frequency Support** - Support for 1MIN/5MIN/15MIN/30MIN/60MIN time periods
-- **🕐 Precise Time Control** - Support for second-precise time range queries
-- **📈 Real-time Trading Data** - Complete data including open/high/low/close/volume/turnover
+- **⏱ Minutes Tool Enhanced**: `stock_data_minutes` adds `market_type` (`cn`/`crypto`), Binance minutes supported
+- **🪙 Crypto Minutes (Binance)**: Supports `BTCUSDT`/`BTC-USDT`/`BTC/USDT`/`coinid.USDT`; frequency map `1MIN/5MIN/15MIN/30MIN/60MIN → 1m/5m/15m/30m/1h`
+- **📦 Auto Pagination**: Binance returns up to 1000 candles per request; auto-paginate to cover full range
+- **🧭 Smart Extended Fetch (Daily)**: When indicators requested, auto-extend start date to ensure enough history
+- **🧩 Friendly Errors**: Clear message when symbol is invalid/unsupported on Binance
+- **📈 A-share QFQ (Daily)**: Auto apply front-adjusted prices based on latest factor
 
-- **₿ Cryptocurrency Market Data** - Real-time crypto prices, trading volumes, and market analysis
-- **🔗 Multi-Exchange Support** - Data from major cryptocurrency exchanges
-- **📊 Crypto Technical Indicators** - MACD, RSI, KDJ, BOLL, MA for digital assets
-- **💹 Market Cap & Volume Analysis** - Comprehensive cryptocurrency market metrics
-
-- **🌐 Web Online Experience** - Brand new web interface at `http://106.14.205.176:3090/`
-- **🤖 Integrated AI Model** - Direct chat with AI assistant for financial analysis
-- **💬 Intelligent Interaction** - Natural language queries for real-time financial data
-- **📱 Multi-device Support** - Compatible with desktop, mobile, and tablet
-- **✨ Zero Configuration Experience** - No setup required, just open and use
-
-- **📦 NPM Package** - Now available as `finance-mcp` on npm registry
-- **🌐 Public Cloud Service** - Production-ready deployment at `http://106.14.205.176:8080/mcp`
-- **🔑 Custom API Keys** - Use your own Tushare token for unlimited access
-- **⚡ Streamable HTTP** - Enhanced protocol support for better performance
-- **🛡️ Production Stability** - Improved error handling and session management
-- **📈 No Rate Limits** - With your own token, enjoy unlimited API calls
-- **🔧 Easy Installation** - Simple npm install and configuration
-
-**Migration Guide**: Update your Claude configuration to use the new streamable HTTP endpoint with your own API key for the best experience.
+Migration: After upgrading to v4.3.0, `stock_data_minutes` requires `market_type` (`cn` or `crypto`).
 
 </details>
 
@@ -469,27 +452,41 @@ After configuration, restart Claude Desktop and ask: "Get current time". If it r
 
 </details>
 
-## ⏱ Minute K-line Tool (NEW!)
+## ⏱ Minute K-line Tool
 
-We added `stock_data_minutes` for A-share minute-level K-line data.
+`stock_data_minutes`: A-shares (Tushare) and Crypto (Binance) minutes.
 
 - Frequencies: `1MIN/5MIN/15MIN/30MIN/60MIN` (case-insensitive)
 - Params:
-  - `code`: Stock code, e.g., `600519.SH`, `000001.SZ`
-  - `start_datetime`: Start time, `YYYYMMDDHHmmss` or `YYYY-MM-DD HH:mm:ss`
-  - `end_datetime`: End time, same formats as above
-  - `freq`: Minute interval, e.g., `1MIN`
-- Output: Table sorted by time desc with columns Time/Open/High/Low/Close/Volume/Amount(10k CNY)
+  - `market_type`: `cn` | `crypto`
+  - `code`: A-shares like `600519.SH`; crypto like `BTCUSDT`/`BTC-USDT`/`BTC/USDT`/`bitcoin.USDT`
+  - `start_datetime`: `YYYYMMDDHHmmss` or `YYYY-MM-DD HH:mm:ss`
+  - `end_datetime`: same as above
+  - `freq`: e.g., `1MIN`
+- Output: Desc-sorted table (Time/Open/High/Low/Close/Volume; A-shares includes Amount(10k CNY))
 
-Example (tools/call):
+Example (A-shares):
 
 ```
 name: stock_data_minutes
 arguments:
+  market_type: cn
   code: 600519.SH
   start_datetime: 2024-09-01 09:30:00
   end_datetime: 2024-09-01 10:30:00
   freq: 1MIN
+```
+
+Example (Crypto):
+
+```
+name: stock_data_minutes
+arguments:
+  market_type: crypto
+  code: BTCUSDT
+  start_datetime: 2025-09-01 00:00:00
+  end_datetime: 2025-09-01 12:00:00
+  freq: 15MIN
 ```
 
 ## 📄 License

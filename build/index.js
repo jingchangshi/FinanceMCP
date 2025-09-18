@@ -219,10 +219,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         case "stock_data_minutes": {
             const code = String(request.params.arguments?.code);
+            const market_type = String(request.params.arguments?.market_type);
             const start_datetime = String(request.params.arguments?.start_datetime);
             const end_datetime = String(request.params.arguments?.end_datetime);
             const freq = String(request.params.arguments?.freq);
-            return await stockDataMinutes.run({ code, start_datetime, end_datetime, freq });
+            return await stockDataMinutes.run({ code, market_type, start_datetime, end_datetime, freq });
         }
         case "index_data": {
             const code = String(request.params.arguments?.code);

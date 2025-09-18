@@ -39,7 +39,7 @@
 
 ### ⚙️ Claude桌面版配置
 
-#### 🆕 最新版本(v4.2.1) - 使用您的API密钥
+#### 🆕 最新版本(v4.3.0) - 使用您的API密钥
 **🎯 推荐生产环境使用，配置您自己的Tushare令牌：**
 
 ```json
@@ -80,7 +80,7 @@
 ```
 
 **服务优势:**
-- ✅ **最新版本(v4.2.1)** - 使用您自己的API密钥，享受无限制访问
+- ✅ **最新版本(v4.3.0)** - 使用您自己的API密钥，享受无限制访问
 - ✅ **7×24可用** - 服务器持续运行
 - ✅ **完整功能** - 全部14个工具和技术指标
 - ✅ **实时数据** - 连接Tushare专业数据
@@ -382,38 +382,23 @@ npm run start:sse
 
 ## 🆕 最新更新
 
-### 🚀 版本 4.2.1 - 分钟K线数据版本
+### 🚀 版本 4.3.0 - 加密分钟线与 Binance 优化
 
-**最新重大更新**：我们发布了v4.2.1版本，新增分钟级别K线数据查询功能！
+**最新重大更新**：发布 v4.3.0，`stock_data_minutes` 新增 `market_type` 入参，支持加密市场（Binance）分钟级别K线；同时对加密日线做出多项优化。
 
 <details>
-<summary><strong>🎯 v4.2.1新功能</strong></summary>
+<summary><strong>🎯 v4.3.0 新功能</strong></summary>
 
-- **⏱ 分钟K线工具** - 新增 `stock_data_minutes` 工具，支持A股分钟级别K线数据
-- **📊 多频率支持** - 支持1MIN/5MIN/15MIN/30MIN/60MIN多种时间周期
-- **🕐 精确时间控制** - 支持精确到秒的时间范围查询
-- **📈 实时交易数据** - 获取开盘/最高/最低/收盘/成交量/成交额完整数据
+- **⏱ 分钟K线增强**：`stock_data_minutes` 新增 `market_type`（`cn`/`crypto`），支持 Binance 分钟线
+- **🪙 加密分钟线**：兼容 `BTCUSDT`/`BTC-USDT`/`BTC/USDT`/`coinid.USDT`；频率映射 `1MIN/5MIN/15MIN/30MIN/60MIN → 1m/5m/15m/30m/1h`
+- **📦 自动分页**：Binance 单次最多1000根K线，自动分页直至覆盖完整区间
+- **🧭 智能扩展取数（日线）**：请求技术指标时自动扩展开始日期，保证计算窗口足够
+- **🧩 友好错误提示**：无效交易对返回 400 时，明确提示“该币对在 Binance 不存在或已下线”
+- **📈 A股前复权（日线）**：自动应用前复权（基于最新交易日因子）
 
-- **₿ 虚拟货币行情数据** - 实时加密货币价格、交易量和市场分析
-- **🔗 多交易所支持** - 来自主要加密货币交易所的数据
-- **📊 加密货币技术指标** - 为数字资产提供MACD、RSI、KDJ、BOLL、MA指标
-- **💹 市值与交易量分析** - 全面的加密货币市场指标
+其他能力保持不变：Web在线体验、NPM 包、Streamable HTTP、稳定会话管理等。
 
-- **🌐 Web在线体验** - 全新Web界面 `http://106.14.205.176:3090/`
-- **🤖 集成大模型** - 直接与AI助手对话，获取金融分析
-- **💬 智能交互** - 自然语言提问，实时获取金融数据
-- **📱 多端适配** - 支持电脑、手机、平板访问
-- **✨ 零配置体验** - 无需任何设置，打开网页即用
-
-- **📦 NPM包** - 现已在npm注册表中以 `finance-mcp` 名称发布
-- **🌐 公共云服务** - 生产就绪的部署地址 `http://106.14.205.176:8080/mcp`
-- **🔑 自定义API密钥** - 使用您自己的Tushare令牌享受无限制访问
-- **⚡ Streamable HTTP** - 增强的协议支持，更好的性能
-- **🛡️ 生产稳定性** - 改进的错误处理和会话管理
-- **📈 无速率限制** - 使用您自己的令牌，享受无限API调用
-- **🔧 简易安装** - 简单的npm安装和配置
-
-**迁移指南**：更新您的Claude配置以使用新的streamable HTTP端点和您自己的API密钥，获得最佳体验。
+**迁移指南**：升级到 v4.3.0 后，分钟线新增必填 `market_type`：A股传 `cn`，加密传 `crypto`。
 
 </details>
 
@@ -464,27 +449,41 @@ npm run start:sse
 
 </details>
 
-## ⏱ 分钟K线工具 (NEW!)
+## ⏱ 分钟K线工具
 
-新增工具 `stock_data_minutes`，用于获取A股分钟级别K线数据。
+`stock_data_minutes`：A股（Tushare）与加密（Binance）分钟级别K线。
 
-- 频率：支持 `1MIN/5MIN/15MIN/30MIN/60MIN`
+- 频率：`1MIN/5MIN/15MIN/30MIN/60MIN`（不区分大小写）
 - 入参：
-  - `code`: 股票代码，如 `600519.SH`、`000001.SZ`
-  - `start_datetime`: 起始时间，`YYYYMMDDHHmmss` 或 `YYYY-MM-DD HH:mm:ss`
-  - `end_datetime`: 结束时间，`YYYYMMDDHHmmss` 或 `YYYY-MM-DD HH:mm:ss`
-  - `freq`: 周期，例 `1MIN`
-- 返回：按时间倒序的表格（时间/开盘/最高/最低/收盘/成交量/成交额(万元)）
+  - `market_type`: `cn` | `crypto`
+  - `code`: A股如 `600519.SH`；加密如 `BTCUSDT`/`BTC-USDT`/`BTC/USDT`/`bitcoin.USDT`
+  - `start_datetime`: `YYYYMMDDHHmmss` 或 `YYYY-MM-DD HH:mm:ss`
+  - `end_datetime`: 同上
+  - `freq`: 例 `1MIN`
+- 返回：倒序表格（时间/开盘/最高/最低/收盘/成交量；A股含成交额(万元)）
 
-示例（tools/call）：
+示例（A股）：
 
 ```
 name: stock_data_minutes
 arguments:
+  market_type: cn
   code: 600519.SH
   start_datetime: 2024-09-01 09:30:00
   end_datetime: 2024-09-01 10:30:00
   freq: 1MIN
+```
+
+示例（加密）：
+
+```
+name: stock_data_minutes
+arguments:
+  market_type: crypto
+  code: BTCUSDT
+  start_datetime: 2025-09-01 00:00:00
+  end_datetime: 2025-09-01 12:00:00
+  freq: 15MIN
 ```
 
 ## 📄 许可证
