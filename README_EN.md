@@ -48,7 +48,7 @@ Visit our online experience website: **[http://106.14.205.176:3090/](http://106.
       "disabled": false,
       "timeout": 600,
       "type": "streamableHttp",
-      "url": "http://106.14.205.176:8080/mcp",
+      "url": "http://47.79.147.241:3100/mcp",
       "headers": {
         "X-Tushare-Token": "your_tushare_token_here"
       }

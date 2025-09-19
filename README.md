@@ -49,7 +49,7 @@
       "disabled": false,
       "timeout": 600,
       "type": "streamableHttp",
-      "url": "http://106.14.205.176:8080/mcp",
+      "url": "http://47.79.147.241:3100/mcp",
       "headers": {
         "X-Tushare-Token": "您的tushare令牌"
       }
