@@ -1,4 +1,5 @@
 import { TUSHARE_CONFIG } from '../config.js';
+import { resolveStockCodes } from '../utils/stockCodeResolver.js';
 export const blockTrade = {
     name: "block_trade",
     description: "获取大宗交易数据，包括成交价格、成交量、买卖双方营业部等详细信息",
@@ -84,7 +85,7 @@ export const blockTrade = {
                 });
                 console.log(`成功获取到${tradeData.length}条大宗交易记录`);
                 // 格式化输出
-                const formattedOutput = formatBlockTradeData(tradeData, args.code || '全市场', args.start_date, args.end_date);
+                const formattedOutput = await formatBlockTradeData(tradeData, args.code || '全市场', args.start_date, args.end_date);
                 return {
                     content: [{ type: "text", text: formattedOutput }]
                 };
@@ -106,7 +107,7 @@ export const blockTrade = {
     }
 };
 // 格式化大宗交易数据
-function formatBlockTradeData(data, code, startDate, endDate) {
+async function formatBlockTradeData(data, code, startDate, endDate) {
     let output = `# 📊 ${code} 大宗交易数据\n\n`;
     output += `查询期间: ${startDate} - ${endDate}\n`;
     output += `交易记录: 共 ${data.length} 条\n\n`;
@@ -222,6 +223,15 @@ function formatBlockTradeData(data, code, startDate, endDate) {
         output += '\n';
     }
     output += `---\n\n*数据来源: Tushare Pro*`;
+    // 收集所有股票代码并生成说明
+    const stockCodes = [];
+    for (const trade of data) {
+        if (trade.ts_code) {
+            stockCodes.push(String(trade.ts_code));
+        }
+    }
+    const stockExplanation = await resolveStockCodes(stockCodes);
+    output += stockExplanation;
     return output;
 }
 // 辅助函数：格式化数字

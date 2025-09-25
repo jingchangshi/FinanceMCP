@@ -1,4 +1,5 @@
 import { TUSHARE_CONFIG } from '../config.js';
+import { resolveStockCodes } from '../utils/stockCodeResolver.js';
 
 type PriceSummary = {
   open_at_start: number | null;
@@ -402,8 +403,12 @@ export const csiIndexConstituents = {
         out += `| ${code} | ${num(c.weight)} | ${num(s.open_at_start)} | ${num(s.low_min)} | ${num(s.high_max)} | ${num(s.close_at_end)} | ${pct(r)} | ${fmt(val?.pe_ttm)} | ${fmt(val?.pb)} | ${val?.dividend_yield_pct == null ? 'N/A' : Number(val.dividend_yield_pct.toFixed(2))} | ${fmtPct(f?.roe_pct)} | ${fmtPct(f?.roa_pct)} | ${fmtPct(f?.netprofit_margin_pct)} | ${fmt(f?.ocfps)} | ${fmtPct(f?.debt_to_assets_pct)} | ${fmtPct(f?.revenue_yoy_pct)} | ${fmt(f?.assets_turn, 3)} | ${fmtPct(f?.grossprofit_margin_pct)} | ${fmtPct(f?.three_expense_ratio_pct)} | ${payoutPct == null ? 'N/A' : payoutPct} |\n`;
       });
 
+      // 收集所有成分股代码并生成说明
+      const stockCodes = allConstituents.map(c => normalizeIndexCode(c.ts_code));
+      const stockExplanation = await resolveStockCodes(stockCodes);
+      
       return {
-        content: [ { type: 'text', text: out } ]
+        content: [ { type: 'text', text: out + stockExplanation } ]
       };
     } catch (error) {
       return {

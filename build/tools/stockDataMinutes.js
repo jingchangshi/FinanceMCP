@@ -1,4 +1,5 @@
 import { TUSHARE_CONFIG } from '../config.js';
+import { resolveStockCodes } from '../utils/stockCodeResolver.js';
 /**
  * 分钟K线数据工具（A股/加密）
  * 说明：
@@ -147,7 +148,12 @@ export const stockDataMinutes = {
                         const amt = r[amountKey] == null ? 'N/A' : String(r[amountKey]);
                         out += `| ${t} | ${fmt(o)} | ${fmt(h)} | ${fmt(l)} | ${fmt(c)} | ${v} | ${amt} |\n`;
                     }
-                    return { content: [{ type: 'text', text: out }] };
+                    // 收集股票代码并生成说明（仅对A股）
+                    let stockExplanation = '';
+                    if (market === 'cn') {
+                        stockExplanation = await resolveStockCodes([args.code]);
+                    }
+                    return { content: [{ type: 'text', text: out + stockExplanation }] };
                 }
                 finally {
                     // 兜底清理

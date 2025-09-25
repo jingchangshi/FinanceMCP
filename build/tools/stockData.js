@@ -1,4 +1,5 @@
 import { TUSHARE_CONFIG } from '../config.js';
+import { resolveStockCodes } from '../utils/stockCodeResolver.js';
 import { calculateMACD, calculateKDJ, calculateRSI, calculateBOLL, calculateSMA, parseIndicatorParams, formatIndicatorParams, calculateRequiredDays, calculateExtendedStartDate, filterDataToUserRange } from './stockDataDetail/index.js';
 export const stockData = {
     name: "stock_data",
@@ -970,11 +971,16 @@ export const stockData = {
                         });
                     }
                 }
+                // 收集股票代码并生成说明（仅对股票市场）
+                let stockExplanation = '';
+                if (['cn', 'us', 'hk'].includes(marketType)) {
+                    stockExplanation = await resolveStockCodes([args.code]);
+                }
                 return {
                     content: [
                         {
                             type: "text",
-                            text: `# ${args.code} ${marketTitleMap[marketType]}行情数据${titleSuffix}\n\n${formattedData}${indicatorData}`
+                            text: `# ${args.code} ${marketTitleMap[marketType]}行情数据${titleSuffix}\n\n${formattedData}${indicatorData}${stockExplanation}`
                         }
                     ]
                 };

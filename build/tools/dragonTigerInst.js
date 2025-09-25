@@ -1,4 +1,5 @@
 import { TUSHARE_CONFIG } from '../config.js';
+import { resolveStockCodes } from '../utils/stockCodeResolver.js';
 export const dragonTigerInst = {
     name: 'dragon_tiger_inst',
     description: '龙虎榜机构成交明细（top_inst）。必填：交易日期；可选：股票TS代码。返回表格包含买入/卖出/净额及上榜理由等。',
@@ -85,7 +86,17 @@ export const dragonTigerInst = {
                 const title = `# 龙虎榜机构明细 ${args.trade_date}${args.ts_code ? ` - ${args.ts_code}` : ''}`;
                 const fmt = (n) => n.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
                 const summary = `\n\n## 当日资金统计\n- 买入额合计: ${fmt(totalBuy)} 元\n- 卖出额合计: ${fmt(totalSell)} 元\n- 净流入: ${fmt(totalNet)} 元`;
-                return { content: [{ type: 'text', text: `${title}\n\n${table}${summary}` }] };
+                // 收集所有股票代码并生成说明
+                const stockCodes = [];
+                for (const row of items) {
+                    const obj = {};
+                    fields.forEach((f, idx) => obj[f] = row[idx]);
+                    if (obj.ts_code) {
+                        stockCodes.push(String(obj.ts_code));
+                    }
+                }
+                const stockExplanation = await resolveStockCodes(stockCodes);
+                return { content: [{ type: 'text', text: `${title}\n\n${table}${summary}${stockExplanation}` }] };
             }
             finally {
                 clearTimeout(timeoutId);
