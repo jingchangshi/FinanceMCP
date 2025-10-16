@@ -295,7 +295,7 @@ npx finance-mcp
 
 #### Method 2: Install via Smithery
 ```bash
-npx -y @smithery/cli install @guangxiangdebizi/finance-mcp --client claude
+npx -y @smithery/cli install @guangxiangdebizi/FinanceMCP --client claude
 ```
 
 #### Method 3: Manual Installation

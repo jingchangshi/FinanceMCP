@@ -2,7 +2,7 @@
 
 # FinanceMCP - 专业金融数据MCP服务器 🚀
 
-[![smithery badge](https://smithery.ai/badge/@guangxiangdebizi/finance-mcp)](https://smithery.ai/server/@guangxiangdebizi/finance-mcp)
+[![smithery badge](https://smithery.ai/badge/@guangxiangdebizi/FinanceMCP)](https://smithery.ai/server/@guangxiangdebizi/FinanceMCP)
 
 **基于MCP协议的专业金融数据服务器，集成Tushare API，为Claude等AI助手提供实时金融数据和技术指标分析。**
 
@@ -308,7 +308,7 @@ npx finance-mcp
 
 #### 方法2：通过Smithery安装
 ```bash
-npx -y @smithery/cli install @guangxiangdebizi/finance-mcp --client claude
+npx -y @smithery/cli install @guangxiangdebizi/FinanceMCP --client claude
 ```
 
 #### 方法3：手动安装
