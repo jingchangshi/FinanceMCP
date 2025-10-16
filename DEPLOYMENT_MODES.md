@@ -8,7 +8,7 @@
 
 | 特性 | Streamable HTTP 模式 | stdio/SSE 模式 |
 |------|---------------------|---------------|
-| **命令** | `finance-mcp` | `finance-mcp:sse` |
+| **命令** | `finance-mcp` | `finance-mcp-sse` |
 | **协议** | HTTP + SSE | stdio (标准输入输出) |
 | **端口** | 监听 3000/3030 | 不需要端口 |
 | **适用场景** | 云端部署、多客户端 | Claude Desktop 本地 |
@@ -100,12 +100,12 @@ TUSHARE_TOKEN=your_token_here
 #### 1. 全局安装后启动
 ```bash
 npm install -g finance-mcp
-finance-mcp:sse
+finance-mcp-sse
 ```
 
 #### 2. 使用 npx 启动
 ```bash
-npx -y finance-mcp:sse
+npx -y finance-mcp-sse
 ```
 
 #### 3. 本地开发
@@ -139,7 +139,7 @@ npm run dev:sse
 {
   "mcpServers": {
     "finance-mcp": {
-      "command": "finance-mcp:sse",
+      "command": "finance-mcp-sse",
       "env": {
         "TUSHARE_TOKEN": "your_tushare_token_here"
       }
@@ -304,7 +304,7 @@ startCommand:
 1. 检查命令是否正确：`finance-mcp:sse`（注意冒号）
 2. 确认 TUSHARE_TOKEN 已设置
 3. 查看 Claude Desktop 日志
-4. 尝试手动运行：`npx -y finance-mcp:sse`
+4. 尝试手动运行：`npx -y finance-mcp-sse`
 
 ### HTTP 模式
 
@@ -377,8 +377,11 @@ lsof -ti:3000 | xargs kill -9
 
 ## 🆕 版本历史
 
-### v4.5.0（当前版本）
-- ✅ 添加 `finance-mcp:sse` 命令支持 stdio 模式
+### v4.5.1（当前版本）
+- ✅ 修复 bin 命令名称：`finance-mcp-sse`（npm 不支持冒号）
+
+### v4.5.0
+- ✅ 添加 `finance-mcp-sse` 命令支持 stdio 模式
 - ✅ 保留 `finance-mcp` 作为 HTTP 模式（默认）
 - ✅ 两种模式并存，满足不同使用场景
 
@@ -391,7 +394,7 @@ lsof -ti:3000 | xargs kill -9
 
 ---
 
-**版本**: 4.5.0  
+**版本**: 4.5.1  
 **最后更新**: 2025-10-16  
 **维护者**: Xingyu_Chen (guangxiangdebizi@gmail.com)
 

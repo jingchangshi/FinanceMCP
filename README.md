@@ -311,6 +311,12 @@ npx finance-mcp
 npx -y @smithery/cli install @guangxiangdebizi/FinanceMCP --client claude
 ```
 
+> **💡 提示**：FinanceMCP 支持两种部署模式
+> - **stdio 模式**（推荐本地使用）：`npx -y finance-mcp-sse`
+> - **HTTP 模式**（云端部署）：`npx -y finance-mcp`
+> 
+> 详细说明请参考 [DEPLOYMENT_MODES.md](./DEPLOYMENT_MODES.md)
+
 #### 方法3：手动安装
 ```bash
 # 1. 克隆仓库
@@ -354,7 +360,44 @@ npm run start:sse
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-#### 最新配置：Streamable HTTP 模式（通过 Header 传入 Token）
+#### ⭐ 推荐配置：stdio 模式（本地使用，零配置）
+```json
+{
+  "mcpServers": {
+    "finance-mcp": {
+      "command": "npx",
+      "args": ["-y", "finance-mcp-sse"],
+      "env": {
+        "TUSHARE_TOKEN": "your_tushare_token_here"
+      }
+    }
+  }
+}
+```
+
+**优势**：
+- ✅ 更快的响应速度（1-2ms 延迟）
+- ✅ 更低的资源占用
+- ✅ 无需管理端口
+- ✅ 开箱即用
+
+#### 备选配置：HTTP 模式（云端部署或需要远程访问）
+```json
+{
+  "mcpServers": {
+    "finance-mcp-http": {
+      "command": "npx",
+      "args": ["-y", "finance-mcp"],
+      "env": {
+        "TUSHARE_TOKEN": "your_tushare_token_here",
+        "PORT": "3000"
+      }
+    }
+  }
+}
+```
+
+或使用 streamableHttp 类型（已启动 HTTP 服务器）：
 ```json
 {
   "mcpServers": {
@@ -370,13 +413,23 @@ npm run start:sse
 }
 ```
 
-#### 传递 Token 的 Header 规则
-- 优先从 `X-Tushare-Token` 读取；
-- 若未提供，则尝试 `Authorization: Bearer <token>`；
-- 再次回退读取 `X-Api-Key`；
-- 若 Header 中未提供，则回退使用服务端环境变量 `TUSHARE_TOKEN`（可选）。
+**HTTP 模式优势**：
+- ✅ 支持远程访问
+- ✅ 支持多客户端同时连接
+- ✅ 完整的 HTTP 日志（参考 [LOGGING_GUIDE.md](./LOGGING_GUIDE.md)）
+- ✅ 便于部署到 Smithery 等云平台
+
+#### 传递 Token 的方式
+- **stdio 模式**：通过 `env.TUSHARE_TOKEN` 环境变量
+- **HTTP 模式**：
+  - 优先从 `X-Tushare-Token` Header 读取
+  - 或使用 `Authorization: Bearer <token>`
+  - 或使用 `X-Api-Key`
+  - 最后回退到环境变量 `TUSHARE_TOKEN`
 
 （加密市场默认使用 Binance 公共行情接口，无需任何加密货币 API Key）
+
+> 📖 **详细文档**：更多部署模式说明请参考 [DEPLOYMENT_MODES.md](./DEPLOYMENT_MODES.md)
 
 ### 验证安装
 配置完成后，重启Claude桌面版并询问："获取当前时间"。如果返回时间信息，说明安装成功。

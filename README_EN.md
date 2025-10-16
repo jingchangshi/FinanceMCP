@@ -298,6 +298,12 @@ npx finance-mcp
 npx -y @smithery/cli install @guangxiangdebizi/FinanceMCP --client claude
 ```
 
+> **💡 Tip**: FinanceMCP supports two deployment modes
+> - **stdio mode** (recommended for local use): `npx -y finance-mcp-sse`
+> - **HTTP mode** (for cloud deployment): `npx -y finance-mcp`
+> 
+> See [DEPLOYMENT_MODES.md](./DEPLOYMENT_MODES.md) for details
+
 #### Method 3: Manual Installation
 ```bash
 # 1. Clone the repository
@@ -335,7 +341,24 @@ Configuration file locations:
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-#### Latest: Streamable HTTP (Tokens via headers)
+#### ⭐ Recommended: stdio Mode (Local, Zero Configuration)
+```json
+{
+  "mcpServers": {
+    "finance-mcp": {
+      "command": "npx",
+      "args": ["-y", "finance-mcp-sse"],
+      "env": {
+        "TUSHARE_TOKEN": "your_tushare_token_here"
+      }
+    }
+  }
+}
+```
+
+**Benefits**: Faster response (1-2ms), lower resources, no port management, works out of the box
+
+#### Alternative: HTTP Mode (Streamable HTTP with Tokens via headers)
 ```json
 {
   "mcpServers": {
@@ -377,6 +400,10 @@ Configuration file locations:
   }
 }
 ```
+
+**HTTP Mode Benefits**: Remote access, multiple clients, complete logging, cloud deployment
+
+> 📖 **Documentation**: See [DEPLOYMENT_MODES.md](./DEPLOYMENT_MODES.md) for more deployment options
 
 #### Header Token Resolution
 - Prefer `X-Tushare-Token`.
