@@ -312,8 +312,8 @@ npx -y @smithery/cli install @guangxiangdebizi/FinanceMCP --client claude
 ```
 
 > **💡 提示**：FinanceMCP 支持两种部署模式
-> - **stdio 模式**（推荐本地使用）：`npx -y finance-mcp-sse`
-> - **HTTP 模式**（云端部署）：`npx -y finance-mcp`
+> - **stdio 模式**（默认，推荐本地使用）：`npx -y finance-mcp`
+> - **HTTP 模式**（云端部署）：`npx -y finance-mcp-http`
 > 
 > 详细说明请参考 [DEPLOYMENT_MODES.md](./DEPLOYMENT_MODES.md)
 
@@ -360,13 +360,13 @@ npm run start:sse
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-#### ⭐ 推荐配置：stdio 模式（本地使用，零配置）
+#### ⭐ 推荐配置：stdio 模式（本地使用，零配置，默认）
 ```json
 {
   "mcpServers": {
     "finance-mcp": {
       "command": "npx",
-      "args": ["-y", "finance-mcp-sse"],
+      "args": ["-y", "finance-mcp"],
       "env": {
         "TUSHARE_TOKEN": "your_tushare_token_here"
       }
@@ -382,31 +382,30 @@ npm run start:sse
 - ✅ 开箱即用
 
 #### 备选配置：HTTP 模式（云端部署或需要远程访问）
+
+**步骤 1：启动 HTTP 服务器**
+```bash
+# 方式 1：使用 npx
+npx -y finance-mcp-http
+
+# 方式 2：全局安装后启动
+npm install -g finance-mcp
+finance-mcp-http
+
+# 方式 3：本地开发
+npm run start:http
+```
+
+**步骤 2：配置 Claude Desktop**
 ```json
 {
   "mcpServers": {
     "finance-mcp-http": {
-      "command": "npx",
-      "args": ["-y", "finance-mcp"],
-      "env": {
-        "TUSHARE_TOKEN": "your_tushare_token_here",
-        "PORT": "3000"
-      }
-    }
-  }
-}
-```
-
-或使用 streamableHttp 类型（已启动 HTTP 服务器）：
-```json
-{
-  "mcpServers": {
-    "finance-data-server": {
       "type": "streamableHttp",
       "url": "http://localhost:3000/mcp",
       "timeout": 600,
       "headers": {
-        "X-Tushare-Token": "your_tushare_token"
+        "X-Tushare-Token": "your_tushare_token_here"
       }
     }
   }

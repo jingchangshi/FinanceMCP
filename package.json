@@ -1,11 +1,11 @@
 {
   "name": "finance-mcp",
-  "version": "4.5.1",
+  "version": "4.6.0",
   "description": "A Model Context Protocol server",
   "type": "module",
   "bin": {
-    "finance-mcp": "./build/httpServer.js",
-    "finance-mcp-sse": "./build/index.js"
+    "finance-mcp": "./build/index.js",
+    "finance-mcp-http": "./build/httpServer.js"
   },
   "files": [
     "build"

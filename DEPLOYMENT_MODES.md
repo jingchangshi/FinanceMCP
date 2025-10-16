@@ -8,14 +8,14 @@
 
 | 特性 | Streamable HTTP 模式 | stdio/SSE 模式 |
 |------|---------------------|---------------|
-| **命令** | `finance-mcp` | `finance-mcp-sse` |
+| **命令** | `finance-mcp-http` | `finance-mcp` |
 | **协议** | HTTP + SSE | stdio (标准输入输出) |
 | **端口** | 监听 3000/3030 | 不需要端口 |
 | **适用场景** | 云端部署、多客户端 | Claude Desktop 本地 |
 | **日志** | ✅ 详细的 HTTP 日志 | ✅ MCP 协议日志 |
 | **推荐用途** | Smithery 部署、远程访问 | 本地开发、Claude Desktop |
 
-## 🚀 模式 1：Streamable HTTP 模式（默认）
+## 🚀 模式 1：Streamable HTTP 模式
 
 ### 特点
 - ✅ 支持远程访问
@@ -34,12 +34,12 @@
 #### 1. 全局安装后启动
 ```bash
 npm install -g finance-mcp
-finance-mcp
+finance-mcp-http
 ```
 
 #### 2. 使用 npx 启动
 ```bash
-npx -y finance-mcp
+npx -y finance-mcp-http
 ```
 
 #### 3. 本地开发
@@ -56,9 +56,9 @@ npm run dev
 ```json
 {
   "mcpServers": {
-    "finance-mcp": {
+    "finance-mcp-http": {
       "command": "npx",
-      "args": ["-y", "finance-mcp"],
+      "args": ["-y", "finance-mcp-http"],
       "env": {
         "TUSHARE_TOKEN": "your_tushare_token_here"
       }
@@ -80,7 +80,7 @@ TUSHARE_TOKEN=your_token_here
 - **MCP 端点**: `http://localhost:3000/mcp`
 - **健康检查**: `http://localhost:3000/health`
 
-## 📡 模式 2：stdio/SSE 模式
+## 📡 模式 2：stdio/SSE 模式（默认，推荐）
 
 ### 特点
 - ✅ 零配置，开箱即用
@@ -100,12 +100,12 @@ TUSHARE_TOKEN=your_token_here
 #### 1. 全局安装后启动
 ```bash
 npm install -g finance-mcp
-finance-mcp-sse
+finance-mcp
 ```
 
 #### 2. 使用 npx 启动
 ```bash
-npx -y finance-mcp-sse
+npx -y finance-mcp
 ```
 
 #### 3. 本地开发
@@ -139,7 +139,7 @@ npm run dev:sse
 {
   "mcpServers": {
     "finance-mcp": {
-      "command": "finance-mcp-sse",
+      "command": "finance-mcp",
       "env": {
         "TUSHARE_TOKEN": "your_tushare_token_here"
       }
@@ -304,7 +304,7 @@ startCommand:
 1. 检查命令是否正确：`finance-mcp:sse`（注意冒号）
 2. 确认 TUSHARE_TOKEN 已设置
 3. 查看 Claude Desktop 日志
-4. 尝试手动运行：`npx -y finance-mcp-sse`
+4. 尝试手动运行：`npx -y finance-mcp`
 
 ### HTTP 模式
 
@@ -377,12 +377,16 @@ lsof -ti:3000 | xargs kill -9
 
 ## 🆕 版本历史
 
-### v4.5.1（当前版本）
-- ✅ 修复 bin 命令名称：`finance-mcp-sse`（npm 不支持冒号）
+### v4.6.0（当前版本）
+- ✅ **重大更改**：`finance-mcp` 现为 stdio 模式（默认，推荐本地使用）
+- ✅ HTTP 模式改为 `finance-mcp-http`（云端部署专用）
+- ✅ 更符合用户使用习惯：本地优先，云端可选
+
+### v4.5.1
+- ✅ 修复 bin 命令名称（npm 不支持冒号）
 
 ### v4.5.0
-- ✅ 添加 `finance-mcp-sse` 命令支持 stdio 模式
-- ✅ 保留 `finance-mcp` 作为 HTTP 模式（默认）
+- ✅ 添加双模式支持
 - ✅ 两种模式并存，满足不同使用场景
 
 ### v4.4.0
@@ -394,7 +398,7 @@ lsof -ti:3000 | xargs kill -9
 
 ---
 
-**版本**: 4.5.1  
+**版本**: 4.6.0  
 **最后更新**: 2025-10-16  
 **维护者**: Xingyu_Chen (guangxiangdebizi@gmail.com)
 

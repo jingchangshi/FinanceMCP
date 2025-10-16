@@ -299,8 +299,8 @@ npx -y @smithery/cli install @guangxiangdebizi/FinanceMCP --client claude
 ```
 
 > **💡 Tip**: FinanceMCP supports two deployment modes
-> - **stdio mode** (recommended for local use): `npx -y finance-mcp-sse`
-> - **HTTP mode** (for cloud deployment): `npx -y finance-mcp`
+> - **stdio mode** (default, recommended for local use): `npx -y finance-mcp`
+> - **HTTP mode** (for cloud deployment): `npx -y finance-mcp-http`
 > 
 > See [DEPLOYMENT_MODES.md](./DEPLOYMENT_MODES.md) for details
 
@@ -341,13 +341,13 @@ Configuration file locations:
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-#### ⭐ Recommended: stdio Mode (Local, Zero Configuration)
+#### ⭐ Recommended: stdio Mode (Local, Zero Configuration, Default)
 ```json
 {
   "mcpServers": {
     "finance-mcp": {
       "command": "npx",
-      "args": ["-y", "finance-mcp-sse"],
+      "args": ["-y", "finance-mcp"],
       "env": {
         "TUSHARE_TOKEN": "your_tushare_token_here"
       }
@@ -358,11 +358,26 @@ Configuration file locations:
 
 **Benefits**: Faster response (1-2ms), lower resources, no port management, works out of the box
 
-#### Alternative: HTTP Mode (Streamable HTTP with Tokens via headers)
+#### Alternative: HTTP Mode (Cloud Deployment or Remote Access)
+
+**Step 1: Start HTTP Server**
+```bash
+# Option 1: Using npx
+npx -y finance-mcp-http
+
+# Option 2: Global install then start
+npm install -g finance-mcp
+finance-mcp-http
+
+# Option 3: Local development
+npm run start:http
+```
+
+**Step 2: Configure Claude Desktop (streamableHttp type)**
 ```json
 {
   "mcpServers": {
-    "finance-data-server": {
+    "finance-mcp-http": {
       "type": "streamableHttp",
       "url": "http://localhost:3000/mcp",
       "timeout": 600,
