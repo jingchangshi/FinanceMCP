@@ -93,6 +93,21 @@ function extractTokenFromHeaders(req) {
 // 移除 CoinGecko 头的解析（已改为 Binance 公共行情，无需 Key）
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+// 日志中间件：记录所有请求
+app.use((req, res, next) => {
+    const timestamp = new Date().toISOString();
+    const method = req.method;
+    const url = req.url;
+    const ip = req.ip || req.socket.remoteAddress;
+    console.log(`[${timestamp}] ${method} ${url} - IP: ${ip}`);
+    // 记录请求完成时的状态码
+    const originalSend = res.send;
+    res.send = function (data) {
+        console.log(`[${timestamp}] ${method} ${url} - Status: ${res.statusCode}`);
+        return originalSend.call(this, data);
+    };
+    next();
+});
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -108,6 +123,7 @@ app.get('/health', (_req, res) => {
 app.get('/mcp', (req, res) => {
     const accept = req.headers.accept || '';
     const forceSse = req.query.sse === '1' || req.query.sse === 'true';
+    console.log(`📡 [MCP-SSE] Client connecting - Accept: ${accept}, Force SSE: ${forceSse}`);
     if (forceSse || (typeof accept === 'string' && accept.includes('text/event-stream'))) {
         res.writeHead(200, {
             'Content-Type': 'text/event-stream; charset=utf-8',
@@ -117,10 +133,15 @@ app.get('/mcp', (req, res) => {
         });
         // 仅发送注释型心跳，避免发送非 JSON-RPC 的 data 事件
         res.write(': stream established\n\n');
+        console.log(`✅ [MCP-SSE] Stream established`);
         const keep = setInterval(() => res.write(': keepalive\n\n'), 30000);
-        req.on('close', () => clearInterval(keep));
+        req.on('close', () => {
+            clearInterval(keep);
+            console.log(`🔌 [MCP-SSE] Client disconnected`);
+        });
         return;
     }
+    console.log(`❌ [MCP-SSE] Invalid Accept header`);
     return res.status(400).json({ jsonrpc: '2.0', error: { code: -32600, message: 'Accept must include text/event-stream' }, id: null });
 });
 app.post('/mcp', async (req, res) => {
@@ -130,23 +151,29 @@ app.post('/mcp', async (req, res) => {
     const isNotification = (body.id === undefined || body.id === null) && typeof body.method === 'string' && body.method.startsWith('notifications/');
     if (isNotification) {
         const sid = req.headers['mcp-session-id'];
+        console.log(`🔔 [MCP-Notification] ${body.method} - Session: ${sid || 'none'}`);
         if (sid && sessions.has(sid))
             sessions.get(sid).lastActivity = new Date();
         return res.status(204).end();
     }
     const method = body.method;
+    console.log(`🔧 [MCP-${method}] Request ID: ${body.id}`);
     if (method === 'initialize') {
         const newId = randomUUID();
         sessions.set(newId, { id: newId, createdAt: new Date(), lastActivity: new Date() });
         res.setHeader('Mcp-Session-Id', newId);
+        console.log(`✅ [MCP-initialize] New session created: ${newId}`);
         return res.json({ jsonrpc: '2.0', result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'FinanceMCP', version: '1.0.0' } }, id: body.id });
     }
     if (method === 'tools/list') {
+        console.log(`📋 [MCP-tools/list] Returning ${toolList.length} tools`);
         return res.json({ jsonrpc: '2.0', result: { tools: toolList }, id: body.id });
     }
     if (method === 'tools/call') {
         const { name, arguments: args } = body.params || {};
         const token = extractTokenFromHeaders(req);
+        const startTime = Date.now();
+        console.log(`🚀 [MCP-tools/call] Tool: ${name} | Has Token: ${!!token}`);
         try {
             const result = await runWithRequestContext({ tushareToken: token }, async () => {
                 switch (name) {
@@ -266,13 +293,18 @@ app.post('/mcp', async (req, res) => {
                         throw new Error(`Unknown tool: ${name}`);
                 }
             });
+            const duration = Date.now() - startTime;
+            console.log(`✅ [MCP-tools/call] Tool: ${name} completed in ${duration}ms`);
             return res.json({ jsonrpc: '2.0', result, id: body.id });
         }
         catch (error) {
+            const duration = Date.now() - startTime;
             const message = error?.message || String(error);
+            console.error(`❌ [MCP-tools/call] Tool: ${name} failed after ${duration}ms - Error: ${message}`);
             return res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message }, id: body.id });
         }
     }
+    console.error(`❌ [MCP] Unknown method: ${method}`);
     return res.status(400).json({ jsonrpc: '2.0', error: { code: -32601, message: `Method not found: ${method}` }, id: body.id });
 });
 // 兼容性终止路由：部分客户端在结束会话时会调用此端点
@@ -291,7 +323,15 @@ app.get('/terminate', (_req, res) => {
     return res.status(200).json({ ok: true });
 });
 app.listen(PORT, () => {
-    console.log(`Streamable HTTP MCP Server http://localhost:${PORT}`);
-    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
-    console.log(`Health: http://localhost:${PORT}/health`);
+    console.log('\n' + '='.repeat(60));
+    console.log('🚀 FinanceMCP Streamable HTTP Server Started');
+    console.log('='.repeat(60));
+    console.log(`📍 Server URL:    http://localhost:${PORT}`);
+    console.log(`📡 MCP Endpoint:  http://localhost:${PORT}/mcp`);
+    console.log(`💚 Health Check:  http://localhost:${PORT}/health`);
+    console.log(`📊 Active Sessions: ${sessions.size}`);
+    console.log(`🔧 Available Tools: ${toolList.length}`);
+    console.log('='.repeat(60));
+    console.log('📝 Server is ready to accept connections');
+    console.log('='.repeat(60) + '\n');
 });
