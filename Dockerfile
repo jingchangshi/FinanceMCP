@@ -28,5 +28,12 @@ RUN chown -R appuser:appgroup /app
 # 切换到非 root 用户
 USER appuser
 
+# 暴露端口（Smithery 平台要求）
+EXPOSE 3000
+
+# 设置环境变量
+ENV NODE_ENV=production
+ENV PORT=3000
+
 # 默认启动命令（Streamable HTTP）
 CMD ["node", "build/httpServer.js"]

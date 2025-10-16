@@ -2,7 +2,7 @@
 # 参考文档：https://smithery.ai/docs/build/project-config/smithery.yaml
 
 name: "@guangxiangdebizi/FinanceMCP"        # 服务器唯一标识
-version: "1.0.0"                             # 版本号
+version: "4.4.0"                             # 版本号
 description: "财经数据查询 & 财经新闻 & 公司财务表现分析 MCP"
 author:
   name: "Xingyu_Chen"
@@ -22,7 +22,7 @@ build:
 
 # ---------- 启动配置 ----------
 startCommand:
-  type: stdio                     # 基于 STDIO 的 MCP
+  type: http                      # 基于 Streamable HTTP 的 MCP
   # ——配置选项的 JSON Schema——
   configSchema:
     type: object
@@ -31,15 +31,16 @@ startCommand:
       TUSHARE_TOKEN:
         type: string
         title: "Tushare API Token"
-        description: "Your personal Tushare API token"
+        description: "Your personal Tushare API token for accessing financial data"
 
   # ——返回实际启动命令的 JS 函数——
   commandFunction: |-
     (config) => ({
       command: "node",
-      args: ["build/index.js"],
+      args: ["build/httpServer.js"],
       env: {
         NODE_ENV: "production",
+        PORT: "3000",
         TUSHARE_TOKEN: config.TUSHARE_TOKEN
       }
     })
