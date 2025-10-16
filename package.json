@@ -1,10 +1,11 @@
 {
   "name": "finance-mcp",
-  "version": "4.4.0",
+  "version": "4.5.0",
   "description": "A Model Context Protocol server",
   "type": "module",
   "bin": {
-    "finance-mcp": "./build/httpServer.js"
+    "finance-mcp": "./build/httpServer.js",
+    "finance-mcp:sse": "./build/index.js"
   },
   "files": [
     "build"
@@ -15,6 +16,7 @@
     "watch": "tsc --watch",
     "inspector": "npx @modelcontextprotocol/inspector build/index.js",
     "dev": "node build/httpServer.js",
+    "dev:sse": "node build/index.js",
     "setup": "node build-setup.js",
     "start:http": "node build/httpServer.js",
     "start:stdio": "node build/index.js",
