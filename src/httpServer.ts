@@ -84,10 +84,44 @@ const sessions = new Map<string, Session>();
 
 function extractTokenFromHeaders(req: Request): string | undefined {
   const h = req.headers;
+  
+  // 1. 尝试从标准请求头读取
   const tokenHeader = (h['x-tushare-token'] || h['x-api-key']) as string | undefined;
-  if (tokenHeader && tokenHeader.trim()) return tokenHeader.trim();
+  if (tokenHeader && tokenHeader.trim()) {
+    console.log(`[TOKEN] Found in X-Tushare-Token/X-Api-Key header`);
+    return tokenHeader.trim();
+  }
+  
+  // 2. 尝试从 Authorization Bearer 读取
   const auth = h['authorization'];
-  if (typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
+  if (typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
+    console.log(`[TOKEN] Found in Authorization Bearer header`);
+    return auth.slice(7).trim();
+  }
+  
+  // 3. 🔍 尝试从 Smithery 特殊头读取（可能的头名称）
+  const smitheryConfig = h['x-smithery-config'] || h['x-config'] || h['x-session-config'];
+  if (smitheryConfig) {
+    console.log(`[TOKEN] Found Smithery config header:`, smitheryConfig);
+    try {
+      const config = JSON.parse(smitheryConfig as string);
+      if (config.TUSHARE_TOKEN) {
+        console.log(`[TOKEN] Extracted from Smithery config`);
+        return config.TUSHARE_TOKEN;
+      }
+    } catch (e) {
+      console.log(`[TOKEN] Failed to parse Smithery config:`, e);
+    }
+  }
+  
+  // 4. 🔍 尝试从查询参数读取
+  const query = req.query;
+  if (query.tushare_token || query.TUSHARE_TOKEN) {
+    console.log(`[TOKEN] Found in query parameters`);
+    return (query.tushare_token || query.TUSHARE_TOKEN) as string;
+  }
+  
+  console.log(`[TOKEN] Not found in request, falling back to environment variable`);
   return undefined;
 }
 
@@ -105,6 +139,9 @@ app.use((req: Request, res: Response, next) => {
   
   console.log(`[${timestamp}] ${method} ${url} - IP: ${ip}`);
   
+  // 🔍 详细记录所有请求头，用于调试 Smithery 配置传递
+  console.log(`[DEBUG] Request Headers:`, JSON.stringify(req.headers, null, 2));
+  
   // 记录请求完成时的状态码
   const originalSend = res.send;
   res.send = function(data): any {
@@ -119,7 +156,9 @@ app.use(cors({
   origin: '*',
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: [
-    'Content-Type','Accept','Authorization','Mcp-Session-Id','Last-Event-ID','X-Tenant-Id','X-Api-Key','X-Tushare-Token'
+    'Content-Type','Accept','Authorization','Mcp-Session-Id','Last-Event-ID',
+    'X-Tenant-Id','X-Api-Key','X-Tushare-Token',
+    'X-Smithery-Config','X-Config','X-Session-Config'  // Smithery 可能的配置头
   ],
   exposedHeaders: ['Content-Type','Mcp-Session-Id']
 }));
