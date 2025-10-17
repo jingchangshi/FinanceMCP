@@ -272,10 +272,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return await blockTrade.run({ code, start_date, end_date });
         }
         case "money_flow": {
+            const query_type = request.params.arguments?.query_type ? String(request.params.arguments.query_type) : undefined;
             const ts_code = request.params.arguments?.ts_code ? String(request.params.arguments.ts_code) : undefined;
             const start_date = String(request.params.arguments?.start_date);
             const end_date = String(request.params.arguments?.end_date);
-            return await moneyFlow.run({ ts_code, start_date, end_date });
+            const content_type = request.params.arguments?.content_type ? String(request.params.arguments.content_type) : undefined;
+            const trade_date = request.params.arguments?.trade_date ? String(request.params.arguments.trade_date) : undefined;
+            return await moneyFlow.run({ query_type, ts_code, start_date, end_date, content_type, trade_date });
         }
         case "margin_trade": {
             const data_type = String(request.params.arguments?.data_type);

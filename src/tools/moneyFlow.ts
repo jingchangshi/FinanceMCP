@@ -2,13 +2,17 @@ import { TUSHARE_CONFIG } from '../config.js';
 
 export const moneyFlow = {
   name: "money_flow",
-  description: "获取个股和大盘资金流向数据，包括主力资金、超大单、大单、中单、小单的净流入净额和净占比数据",
+  description: "获取个股、大盘和板块资金流向数据，包括主力资金、超大单、大单、中单、小单的净流入净额和净占比数据",
   parameters: {
     type: "object",
     properties: {
+      query_type: {
+        type: "string",
+        description: "查询类型：stock=个股，market=大盘，sector=板块。默认根据ts_code自动判断"
+      },
       ts_code: {
         type: "string",
-        description: "股票代码，如'000001.SZ'表示平安银行个股资金流向。不填写则查询大盘资金流向数据"
+        description: "股票代码或板块代码。个股如'000001.SZ'，板块如'BK0447'(东财板块代码)。不填写则查询大盘资金流向"
       },
       start_date: {
         type: "string",
@@ -17,14 +21,25 @@ export const moneyFlow = {
       end_date: {
         type: "string",
         description: "结束日期，格式为YYYYMMDD，如'20240930'"
+      },
+      content_type: {
+        type: "string",
+        description: "板块资金类型，仅在查询板块时有效。可选：行业、概念、地域"
+      },
+      trade_date: {
+        type: "string",
+        description: "单独查询某个交易日的数据，格式为YYYYMMDD。如填写则忽略start_date和end_date"
       }
     },
     required: ["start_date", "end_date"]
   },
   async run(args: { 
+    query_type?: string;
     ts_code?: string; 
     start_date: string; 
     end_date: string;
+    content_type?: string;
+    trade_date?: string;
   }) {
     try {
       console.log('资金流向数据查询参数:', args);
@@ -36,36 +51,66 @@ export const moneyFlow = {
         throw new Error('请配置TUSHARE_TOKEN环境变量');
       }
 
-      // 判断查询类型：个股 or 大盘
-      const isMarketFlow = !args.ts_code || args.ts_code.trim() === '';
+      // 判断查询类型
+      let queryType = args.query_type;
+      if (!queryType) {
+        // 自动判断：没有ts_code=大盘，有BK开头=板块，否则=个股
+        if (!args.ts_code || args.ts_code.trim() === '') {
+          queryType = 'market';
+        } else if (args.ts_code.startsWith('BK')) {
+          queryType = 'sector';
+        } else {
+          queryType = 'stock';
+        }
+      }
       
       let result;
-      if (isMarketFlow) {
+      let targetName = '';
+      
+      if (queryType === 'market') {
         // 查询大盘资金流向
+        targetName = '大盘';
         result = await fetchMarketMoneyFlow(
+          args.trade_date || args.start_date,
+          args.trade_date || args.end_date,
+          TUSHARE_API_KEY,
+          TUSHARE_API_URL
+        );
+      } else if (queryType === 'sector') {
+        // 查询板块资金流向
+        targetName = `板块${args.ts_code || ''}`;
+        result = await fetchSectorMoneyFlow(
+          args.ts_code,
+          args.trade_date,
           args.start_date,
           args.end_date,
+          args.content_type,
           TUSHARE_API_KEY,
           TUSHARE_API_URL
         );
       } else {
         // 查询个股资金流向
+        targetName = `股票${args.ts_code}`;
         result = await fetchStockMoneyFlow(
           args.ts_code!,
-          args.start_date,
-          args.end_date,
+          args.trade_date || args.start_date,
+          args.trade_date || args.end_date,
           TUSHARE_API_KEY,
           TUSHARE_API_URL
         );
       }
 
       if (!result.data || result.data.length === 0) {
-        const target = isMarketFlow ? '大盘' : `股票${args.ts_code}`;
-        throw new Error(`未找到${target}在指定时间范围内的资金流向数据`);
+        throw new Error(`未找到${targetName}在指定时间范围内的资金流向数据`);
       }
 
       // 格式化输出
-      const formattedOutput = formatMoneyFlowData(result.data, result.fields, isMarketFlow, args.ts_code);
+      const formattedOutput = formatMoneyFlowData(
+        result.data, 
+        result.fields, 
+        queryType, 
+        args.ts_code
+      );
       
       return {
         content: [{ type: "text", text: formattedOutput }]
@@ -121,6 +166,40 @@ async function fetchStockMoneyFlow(
     },
     fields: "ts_code,trade_date,close,pct_change,net_amount,net_amount_rate,buy_elg_amount,buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,buy_md_amount,buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate"
   };
+
+  return await callTushareAPI(params, apiUrl);
+}
+
+// 获取板块资金流向数据（东财）
+async function fetchSectorMoneyFlow(
+  tsCode: string | undefined,
+  tradeDate: string | undefined,
+  startDate: string,
+  endDate: string,
+  contentType: string | undefined,
+  apiKey: string,
+  apiUrl: string
+) {
+  const params: any = {
+    api_name: "moneyflow_ind_dc",
+    token: apiKey,
+    params: {} as any,
+    fields: "trade_date,content_type,ts_code,name,pct_change,close,net_amount,net_amount_rate,buy_elg_amount,buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,buy_md_amount,buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate,rank"
+  };
+
+  // 根据参数动态构建查询条件
+  if (tsCode) {
+    params.params.ts_code = tsCode;
+  }
+  if (tradeDate) {
+    params.params.trade_date = tradeDate;
+  } else {
+    params.params.start_date = startDate;
+    params.params.end_date = endDate;
+  }
+  if (contentType) {
+    params.params.content_type = contentType;
+  }
 
   return await callTushareAPI(params, apiUrl);
 }
@@ -181,12 +260,32 @@ async function callTushareAPI(params: any, apiUrl: string) {
 }
 
 // 格式化资金流向数据输出
-function formatMoneyFlowData(data: any[], fields: string[], isMarketFlow: boolean, tsCode?: string): string {
+function formatMoneyFlowData(data: any[], fields: string[], queryType: string, tsCode?: string): string {
   // 按交易日期倒序排列（最新在前）  
   const sortedData = data.sort((a, b) => (b.trade_date || '').localeCompare(a.trade_date || ''));
   
-  const target = isMarketFlow ? '大盘' : `个股 ${tsCode}`;
+  let target = '';
+  if (queryType === 'market') {
+    target = '大盘';
+  } else if (queryType === 'sector') {
+    target = sortedData[0]?.name ? `板块【${sortedData[0].name}】` : `板块 ${tsCode || ''}`;
+  } else {
+    target = `个股 ${tsCode}`;
+  }
+  
   let output = `# 💰 ${target}资金流向数据\n\n`;
+  
+  // 板块查询显示特殊信息
+  if (queryType === 'sector' && sortedData[0]) {
+    output += `## 📋 板块基本信息\n\n`;
+    output += `- 板块代码: ${sortedData[0].ts_code || 'N/A'}\n`;
+    output += `- 板块名称: ${sortedData[0].name || 'N/A'}\n`;
+    output += `- 板块类型: ${sortedData[0].content_type || 'N/A'}\n`;
+    if (sortedData[0].rank) {
+      output += `- 资金流入排名: 第 ${sortedData[0].rank} 名\n`;
+    }
+    output += `\n`;
+  }
   
   // 数据统计摘要
   const totalDays = sortedData.length;
@@ -204,8 +303,10 @@ function formatMoneyFlowData(data: any[], fields: string[], isMarketFlow: boolea
   output += `- 累计净流入: ${formatMoney(totalNetAmount)}\n\n`;
 
   // 构建数据表格
-  if (isMarketFlow) {
+  if (queryType === 'market') {
     output += formatMarketFlowTable(sortedData);
+  } else if (queryType === 'sector') {
+    output += formatSectorFlowTable(sortedData);
   } else {
     output += formatStockFlowTable(sortedData);
   }
@@ -223,7 +324,7 @@ function formatMoneyFlowData(data: any[], fields: string[], isMarketFlow: boolea
     output += `${item.trade_date} ${trend} 主力${direction} ${formatMoney(Math.abs(netAmount))} (${Math.abs(netAmountRate).toFixed(2)}%)\n`;
   });
   
-  output += `\n---\n*数据来源: [Tushare](https://tushare.pro)*`;
+  output += `\n---\n*数据来源: [Tushare](https://tushare.pro) - 东方财富(DC)*`;
   
   return output;
 }
@@ -283,6 +384,38 @@ function formatStockFlowTable(data: any[]): string {
     output += `| ${formatMoney(lgAmount)} `;
     output += `| ${formatMoney(mdAmount)} `;
     output += `| ${formatMoney(smAmount)} |\n`;
+  });
+  
+  return output;
+}
+
+// 格式化板块资金流向表格
+function formatSectorFlowTable(data: any[]): string {
+  let output = `## 📋 板块资金流向明细\n\n`;
+  
+  output += `| 交易日期 | 板块涨跌% | 板块指数 | 主力净流入(万元) | 净占比% | 超大单净流入(万元) | 大单净流入(万元) | 中单净流入(万元) | 小单净流入(万元) | 排名 |\n`;
+  output += `|---------|----------|---------|------------|--------|------------|------------|------------|------------|------|\n`;
+  
+  data.forEach(item => {
+    const netAmount = parseFloat(item.net_amount) || 0;
+    const netAmountRate = parseFloat(item.net_amount_rate) || 0;
+    const elgAmount = parseFloat(item.buy_elg_amount) || 0;
+    const lgAmount = parseFloat(item.buy_lg_amount) || 0;
+    const mdAmount = parseFloat(item.buy_md_amount) || 0;
+    const smAmount = parseFloat(item.buy_sm_amount) || 0;
+    
+    const netFlowIcon = netAmount > 0 ? '🟢' : '🔴';
+    
+    output += `| ${item.trade_date} `;
+    output += `| ${formatPercent(item.pct_change)} `;
+    output += `| ${formatNumber(item.close)} `;
+    output += `| ${netFlowIcon} ${formatMoney(netAmount)} `;
+    output += `| ${formatPercent(netAmountRate)} `;
+    output += `| ${formatMoney(elgAmount)} `;
+    output += `| ${formatMoney(lgAmount)} `;
+    output += `| ${formatMoney(mdAmount)} `;
+    output += `| ${formatMoney(smAmount)} `;
+    output += `| ${item.rank || 'N/A'} |\n`;
   });
   
   return output;
