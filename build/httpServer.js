@@ -169,6 +169,15 @@ app.post('/mcp', async (req, res) => {
         console.log(`📋 [MCP-tools/list] Returning ${toolList.length} tools`);
         return res.json({ jsonrpc: '2.0', result: { tools: toolList }, id: body.id });
     }
+    // 明确表示不支持 resources 和 prompts（返回空列表而不是错误）
+    if (method === 'resources/list') {
+        console.log(`📋 [MCP-resources/list] Not supported, returning empty list`);
+        return res.json({ jsonrpc: '2.0', result: { resources: [] }, id: body.id });
+    }
+    if (method === 'prompts/list') {
+        console.log(`📋 [MCP-prompts/list] Not supported, returning empty list`);
+        return res.json({ jsonrpc: '2.0', result: { prompts: [] }, id: body.id });
+    }
     if (method === 'tools/call') {
         const { name, arguments: args } = body.params || {};
         const token = extractTokenFromHeaders(req);
