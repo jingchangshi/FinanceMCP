@@ -30,14 +30,19 @@
 2. 选择你的 GitHub 仓库：`guangxiangdebizi/FinanceMCP`
 3. Smithery 会自动检测 `smithery.yaml` 配置文件
 
-### 4. 配置环境变量
+### 4. 配置环境变量（可选）
 
-在部署配置界面，设置以下必需的环境变量：
+在部署配置界面，你可以选择性地设置以下环境变量：
 
-| 变量名 | 说明 | 示例值 |
-|--------|------|--------|
-| `TUSHARE_TOKEN` | Tushare API Token（必需） | `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
-| `PORT` | HTTP 服务端口（可选，默认 3000） | `3000` |
+| 变量名 | 说明 | 是否必需 | 示例值 |
+|--------|------|---------|--------|
+| `TUSHARE_TOKEN` | 默认 Tushare API Token（**可选**） | ❌ 否 | `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
+| `PORT` | HTTP 服务端口 | ❌ 否（默认 3000） | `3000` |
+
+**💡 重要说明**：
+- `TUSHARE_TOKEN` 现在是**可选**的！你可以留空，让每个使用者提供自己的 token
+- 如果你在部署时提供了 token，它将作为**默认回退值**
+- **推荐做法**：部署时留空，让用户在客户端配置中提供自己的 token
 
 ### 5. 完成部署
 
@@ -52,20 +57,32 @@
 
 ### 在 Claude Desktop 中使用
 
-部署完成后，Smithery 会提供一个 HTTP 端点。在 Claude Desktop 配置文件中添加：
+部署完成后，Smithery 会提供一个 HTTP 端点。**每个用户**在 Claude Desktop 配置文件中添加自己的 token：
 
 ```json
 {
   "mcpServers": {
     "finance-mcp": {
+      "type": "streamableHttp",
       "url": "https://your-deployment-url.smithery.ai/mcp",
       "headers": {
-        "X-Tushare-Token": "your_tushare_token_here"
+        "X-Tushare-Token": "your_personal_tushare_token_here"
       }
     }
   }
 }
 ```
+
+**🔑 Token 配置方式**（按优先级排序）：
+1. ✅ **推荐**：通过 `X-Tushare-Token` header 传递（如上所示）
+2. ✅ 通过 `Authorization: Bearer <token>` header 传递
+3. ✅ 通过 `X-Api-Key` header 传递
+4. ⚠️ 回退：使用部署时配置的默认 token（如果有）
+
+**👥 多用户场景**：
+- ✅ 每个用户在自己的 Claude Desktop 配置中使用自己的 Tushare token
+- ✅ 无需共享 API key，每个人使用自己的配额
+- ✅ 更安全，不会泄露他人的 token
 
 ### 在其他 MCP 客户端中使用
 
