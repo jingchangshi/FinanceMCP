@@ -2,7 +2,7 @@
 
 > 状态：目标架构与分阶段实施方案（2026-10-17）。
 >
-> 当前 A 股实现参考 [`ashare-v1-fix2`](../tree/ashare-v1-fix2) 功能分支。本文合入 `main` 仅表示接受架构文档，**不表示 A 股代码已合入 `main` 或真实交易日验收已完成**。实际落地状态以分支、部署日志和 [验收记录](https://github.com/jingchangshi/FinanceMCP/blob/ashare-v1-fix2/docs/ashare-acceptance.md) 为准。
+> 当前 A 股实现参考 [`ashare-v1-fix2`](https://github.com/jingchangshi/FinanceMCP/tree/ashare-v1-fix2) 功能分支。本文合入 `main` 仅表示接受架构文档，**不表示 A 股代码已合入 `main` 或真实交易日验收已完成**。实际落地状态以分支、部署日志和 [验收记录](https://github.com/jingchangshi/FinanceMCP/blob/ashare-v1-fix2/docs/ashare-acceptance.md) 为准。
 
 ## 1. 目标和非目标
 
