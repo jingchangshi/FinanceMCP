@@ -45,6 +45,9 @@ services:
       ASHARE_OAUTH_LOGIN_PASSWORD: ${ASHARE_OAUTH_LOGIN_PASSWORD:-}
       ASHARE_OAUTH_DB_PATH: /private/oauth.sqlite
       ASHARE_PRIVATE_ALLOW_STATIC_TOKEN: ${ASHARE_PRIVATE_ALLOW_STATIC_TOKEN:-0}
+      # Append tool requires research:append (and portfolio:read) on the token. Off by default:
+      # enable only after ChatGPT has re-authorized with the dual scope.
+      ASHARE_OAUTH_REQUIRE_WRITE_SCOPE: ${ASHARE_OAUTH_REQUIRE_WRITE_SCOPE:-0}
       # Expose only the five A-share tools to ChatGPT.
       FINANCE_TOOL_PROFILE: ashare_daily
       # Never take data-source credentials from requests; Tushare comes from TUSHARE_TOKEN in .env.
