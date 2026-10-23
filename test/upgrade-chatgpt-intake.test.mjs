@@ -37,19 +37,25 @@ function fresh() {
   db.file = file;
   return db;
 }
+// recorded_at is stamped from the process clock. Pin it to the bundle's own generation time (18:00 on its
+// as-of day), so the classification never depends on when the suite runs. Unpinned, this test passed only
+// until Shanghai midnight on the day after the as-of date, and then every VPS record was reclassified.
 function vps(db, asOf, reportId) {
-  recordVpsResearchSnapshot({ portfolioDb: db, accountId: ACCOUNT, bundle: { report_id: reportId, as_of_trade_date: asOf, status: 'READY', generated_at: `${asOf.slice(0, 4)}-${asOf.slice(4, 6)}-${asOf.slice(6)}T18:00:00+08:00` } });
+  atClock(at(asOf, '18:00'), () => recordVpsResearchSnapshot({ portfolioDb: db, accountId: ACCOUNT, bundle: { report_id: reportId, as_of_trade_date: asOf, status: 'READY', generated_at: `${asOf.slice(0, 4)}-${asOf.slice(4, 6)}-${asOf.slice(6)}T18:00:00+08:00` } }));
   return db;
 }
 const seeded = (asOf, reportId = 'RPT-1') => vps(fresh(), asOf, reportId);
 // The journal stamps recorded_at from the process clock, so tests pin the clock to the simulated receipt time.
-function appendAt(db, account, args, nowMs, limit) {
+function atClock(nowMs, fn) {
   const ActualDate = globalThis.Date;
   globalThis.Date = class extends ActualDate {
     constructor(...a) { super(...(a.length ? a : [nowMs])); }
     static now() { return nowMs; }
   };
-  try { return appendChatgptResearchRecord(db, account, args, nowMs, limit); } finally { globalThis.Date = ActualDate; }
+  try { return fn(); } finally { globalThis.Date = ActualDate; }
+}
+function appendAt(db, account, args, nowMs, limit) {
+  return atClock(nowMs, () => appendChatgptResearchRecord(db, account, args, nowMs, limit));
 }
 const body = (extra = {}) => ({
   report_id: 'RPT-1', as_of_trade_date: '20261022',
