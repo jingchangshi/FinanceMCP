@@ -118,6 +118,26 @@ export function parseIntakeArgs(args: Record<string, unknown>, nowMs: number) {
 }
 
 /**
+ * Why no VPS snapshot matched (account + trade date + report_id). Only the exact match links; every other case is
+ * refused with a distinct class and nothing is re-bound. Reasons are stable prefixes the caller can branch on.
+ */
+function missingBundleReason(db: DatabaseSync, accountId: string, reportId: string, asOf: string): string {
+  const sameReport = db.prepare("SELECT account_id, as_of_trade_date FROM research_journal WHERE source='vps' AND bundle_id=? LIMIT 10")
+    .all(reportId) as { account_id: string; as_of_trade_date: string }[];
+  if (sameReport.some(row => row.account_id === accountId)) {
+    const date = sameReport.find(row => row.account_id === accountId)!.as_of_trade_date;
+    return `trade_date_mismatch: report_id=${reportId} is persisted for ${date}, not as_of_trade_date=${asOf}`;
+  }
+  if (sameReport.length) return `account_mismatch: report_id=${reportId} is persisted for a different account`;
+  const sameDate = db.prepare("SELECT DISTINCT bundle_id FROM research_journal WHERE source='vps' AND account_id=? AND as_of_trade_date=? ORDER BY bundle_id LIMIT 10")
+    .all(accountId, asOf) as { bundle_id: string }[];
+  if (sameDate.length) {
+    return `bundle_identity_mismatch: report_id=${reportId} is not a persisted snapshot; this account's persisted snapshot(s) for ${asOf} are ${sameDate.map(row => row.bundle_id).join(', ')}. Re-read the bundle; its persisted_snapshot field shows whether it matches.`;
+  }
+  return `bundle_not_found: no VPS research snapshot for report_id=${reportId} as_of_trade_date=${asOf} in this account`;
+}
+
+/**
  * Append one ChatGPT research record. `accountId` must already be resolved by the caller;
  * `nowMs` is the server clock (injectable for tests only, never from the client).
  */
@@ -126,7 +146,7 @@ export function appendChatgptResearchRecord(db: DatabaseSync, accountId: string,
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get()) throw new Error(`bundle_not_found: the research journal has no VPS snapshots yet`);
   const bundles = db.prepare("SELECT record_id FROM research_journal WHERE account_id=? AND source='vps' AND bundle_id=? AND as_of_trade_date=? ORDER BY record_id LIMIT 10")
     .all(accountId, parsed.reportId, parsed.asOf) as { record_id: string }[];
-  if (!bundles.length) throw new Error(`bundle_not_found: no VPS research snapshot for report_id=${parsed.reportId} as_of_trade_date=${parsed.asOf} in this account`);
+  if (!bundles.length) throw new Error(missingBundleReason(db, accountId, parsed.reportId, parsed.asOf));
   if (parsed.correctsRecordId) {
     const target = readResearchJournal(db, parsed.correctsRecordId);
     if (!target || target.account_id !== accountId || target.source !== 'chatgpt') throw new Error('corrects_record_id must be an existing ChatGPT record of this account');

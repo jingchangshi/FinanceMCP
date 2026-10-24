@@ -110,9 +110,10 @@ test('forged source, timestamps, ids, hashes and forbidden account fields are re
 test('the bundle must exist and match; the date cannot be in the future; evidence needs real sources', () => {
   const db = seeded('20261022');
   try {
-    assert.throws(() => appendAt(db, ACCOUNT, body({ report_id: 'NOPE' }), NOW), /bundle_not_found/);
-    assert.throws(() => appendAt(db, ACCOUNT, body({ as_of_trade_date: '20261021' }), NOW), /bundle_not_found/);
-    assert.throws(() => appendAt(db, 'other-account', body(), NOW), /bundle_not_found/);
+    // A persisted snapshot exists for this account and date, so an unknown report_id is an identity mismatch, not an absence.
+    assert.throws(() => appendAt(db, ACCOUNT, body({ report_id: 'NOPE' }), NOW), /bundle_identity_mismatch/);
+    assert.throws(() => appendAt(db, ACCOUNT, body({ as_of_trade_date: '20261021' }), NOW), /trade_date_mismatch/);
+    assert.throws(() => appendAt(db, 'other-account', body(), NOW), /account_mismatch/);
     assert.throws(() => appendAt(db, ACCOUNT, body({ as_of_trade_date: '20261023' }), NOW), /later than today/);
     assert.throws(() => appendAt(db, ACCOUNT, body({ additional_evidence: [{ claim: 'c', published_at: '2026-10-22' }] }), NOW), /source_url is required/);
     assert.throws(() => appendAt(db, ACCOUNT, body({ additional_evidence: [{ claim: 'c', source_url: 'https://e.com' }] }), NOW), /published_at is required/);
