@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { canonicalJson, JOURNAL_VERSION, readResearchJournal, recordResearchJournal } from './researchJournal.js';
 import { classifyRecord, type EvidenceClass } from './forwardReview.js';
+import { inPortfolioTransaction } from './db.js';
 
 /**
  * ChatGPT 研究记录写回（最小授权，只追加）。
@@ -143,6 +144,13 @@ function missingBundleReason(db: DatabaseSync, accountId: string, reportId: stri
  */
 export function appendChatgptResearchRecord(db: DatabaseSync, accountId: string, args: Record<string, unknown>, nowMs = Date.now(), dailyLimit: number = INTAKE_LIMITS.dailyRecords): ChatgptIntakeResult {
   const parsed = parseIntakeArgs(args, nowMs);
+  // The existence check, the daily cap and the insert run in one write transaction. Without it, two writers of the
+  // same idempotency key both pass the check and the loser hits the journal's no-replace trigger, which reports a
+  // retry as an error. With it the loser waits for the lock and then replays the stored row (created:false).
+  return inPortfolioTransaction(db, () => appendParsedRecord(db, accountId, parsed, nowMs, dailyLimit));
+}
+
+function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnType<typeof parseIntakeArgs>, nowMs: number, dailyLimit: number): ChatgptIntakeResult {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get()) throw new Error(`bundle_not_found: the research journal has no VPS snapshots yet`);
   const bundles = db.prepare("SELECT record_id FROM research_journal WHERE account_id=? AND source='vps' AND bundle_id=? AND as_of_trade_date=? ORDER BY record_id LIMIT 10")
     .all(accountId, parsed.reportId, parsed.asOf) as { record_id: string }[];
