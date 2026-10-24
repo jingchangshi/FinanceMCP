@@ -227,7 +227,9 @@ export function openPortfolioDb(path = portfolioDbPath(), options: { writable?: 
   if (writable) {
     mkdirSync(dirname(resolved), { recursive: true });
     const db = new DatabaseSync(resolved);
-    db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 15000;');
+    // busy_timeout must come first: the WAL switch below needs a lock, and without the wait it fails at once when
+    // another process (the daily job, the MCP server) is writing.
+    db.exec('PRAGMA busy_timeout = 15000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
     db.exec(PORTFOLIO_SCHEMA);
     db.exec(PORTFOLIO_LEDGER_SCHEMA);
     db.exec(PORTFOLIO_COMPLETENESS_SCHEMA);

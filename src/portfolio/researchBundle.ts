@@ -130,6 +130,8 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
   const status = !coreReady ? 'DATA_INSUFFICIENT' : gaps.length || !portfolio ? 'DEGRADED' : 'READY';
   return {
     schema: RESEARCH_BUNDLE_SCHEMA, report_id: reportId, generated_at: generatedAt,
+    // Declares whether this report_id is a persisted snapshot. Derived from stored state, so it is not part of identity.
+    persisted_snapshot: persistedSnapshotStatus(input.portfolioDb, account.account_id, asOf, reportId),
     as_of_trade_date: asOf, session: clock, account_id: account.account_id, status,
     account_status: portfolio?.account_status ?? 'UNKNOWN', evidence_status: 'UNVERIFIED',
     data_quality: {
@@ -182,12 +184,36 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
   };
 }
 
+/**
+ * Identity covers what the account and market are, not how the request named them.
+ * `account_id_source` ("explicit" | "default") is request provenance: hashing its real value made the same state
+ * yield two IDs, one for a scheduled read without account_id and one for ChatGPT's explicit account_id, so the
+ * persisted snapshot could never be found by the ID a live read reported (2026-10-23 production failure).
+ * It is pinned to "default" rather than dropped: every snapshot persisted so far was hashed with "default", so
+ * pinning keeps those stored IDs reproducible without a migration or any rewrite of the journal.
+ */
+const IDENTITY_EXCLUDED_KEYS = new Set(['generated_at', 'checked_at', 'recorded_at', 'last_user_reconciled_at']);
+const IDENTITY_PINNED_VALUES: Record<string, unknown> = { account_id_source: 'default' };
+
 function stableFacts(value: unknown): string {
   const normalize = (item: any): any => Array.isArray(item) ? item.map(normalize)
     : item && typeof item === 'object' ? Object.fromEntries(Object.keys(item).sort()
-      .filter(key => !['generated_at', 'checked_at', 'recorded_at', 'last_user_reconciled_at'].includes(key))
-      .map(key => [key, normalize(item[key])])) : item;
+      .filter(key => !IDENTITY_EXCLUDED_KEYS.has(key))
+      .map(key => [key, key in IDENTITY_PINNED_VALUES ? IDENTITY_PINNED_VALUES[key] : normalize(item[key])])) : item;
   return JSON.stringify(normalize(value));
+}
+
+/**
+ * Whether this live bundle is the persisted VPS snapshot with the same identity. Read-only: it never creates
+ * the journal table and never writes. Matching is by account + trade date + report_id together.
+ */
+export function persistedSnapshotStatus(db: DatabaseSync, accountId: string, asOf: string | null, reportId: string) {
+  const none = { status: 'SNAPSHOT_NOT_FOUND', record_ids: [] as string[], content_hash: null as string | null, recorded_at: null as string | null };
+  if (!asOf || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get()) return none;
+  const rows = db.prepare("SELECT record_id, content_hash, recorded_at FROM research_journal WHERE account_id=? AND source='vps' AND as_of_trade_date=? AND bundle_id=? ORDER BY record_id LIMIT 10")
+    .all(accountId, asOf, reportId) as { record_id: string; content_hash: string; recorded_at: string }[];
+  if (!rows.length) return none;
+  return { status: 'PERSISTED', record_ids: rows.map(row => row.record_id), content_hash: rows[0].content_hash, recorded_at: rows[0].recorded_at };
 }
 
 function readTracking(db: DatabaseSync, accountId: string, asOf: string): any[] {
