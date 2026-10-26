@@ -228,10 +228,19 @@ test('S1 tools/list 按工具声明 securitySchemes；公网市场工具不声�
     const list = await server.rpc('tools/list', {}, token.access_token);
     assert.equal(list.status, 200, list.text);
     const tools = Object.fromEntries(list.body.result.tools.map(t => [t.name, t]));
-    assert.deepEqual(tools[APPEND].securitySchemes, APPEND_SCHEMES, 'append 必须声明 portfolio:read research:append');
+    // 分支按写 scope 集合（WRITE_SCOPE_TOOL_NAMES，与服务端门控同源）判定，不点名：
+    // 声明 research:append 的写工具必须走 APPEND_SCHEMES，其余（含 ashare_research_eval）
+    // 一律 READ_SCHEMES。点名漏掉新写工具时，这正是 S10 已覆盖、S1 必须同口径的缝。
+    const { WRITE_SCOPE_TOOL_NAMES } = await import('../build/ashare/definitions.js');
+    assert.ok(WRITE_SCOPE_TOOL_NAMES.has(APPEND), '已知追加工具必须在写 scope 集合内');
+    assert.ok(WRITE_SCOPE_TOOL_NAMES.has('ashare_research_thesis_append'), '研究判断单元追加必须在写 scope 集合内');
     for (const [name, tool] of Object.entries(tools)) {
-      if (name === APPEND) continue;
-      assert.deepEqual(tool.securitySchemes, READ_SCHEMES, `${name} 应只声明 portfolio:read`);
+      if (WRITE_SCOPE_TOOL_NAMES.has(name)) {
+        assert.deepEqual(tool.securitySchemes, APPEND_SCHEMES,
+          `${name} 是追加写工具，必须声明 portfolio:read research:append`);
+      } else {
+        assert.deepEqual(tool.securitySchemes, READ_SCHEMES, `${name} 应只声明 portfolio:read`);
+      }
     }
 
     // 公网 tools/list 不经过私有映射，不得出现任何 securitySchemes 或账户工具。
@@ -242,14 +251,20 @@ test('S1 tools/list 按工具声明 securitySchemes；公网市场工具不声�
   } finally { await server.stop(); }
 });
 
-test('S10 工具声明与服务端门控一致：声明追加 scope 的工具，正是门控的那一个工具', async () => {
-  const { portfolioToolDefinitions } = await import('../build/ashare/definitions.js');
+test('S10 工具声明与服务端门控一致：声明追加 scope 的工具，正是门控的那一批工具', async () => {
+  const { portfolioToolDefinitions, WRITE_SCOPE_TOOL_NAMES } = await import('../build/ashare/definitions.js');
   const { CHATGPT_INTAKE_TOOL } = await import('../build/portfolio/chatgptIntake.js');
+  const { THESIS_APPEND_TOOL } = await import('../build/portfolio/researchEval.js');
   const { OAUTH_SCOPE, OAUTH_WRITE_SCOPE } = await import('../build/oauth/config.js');
   const appendDeclared = portfolioToolDefinitions
     .filter(t => t.securitySchemes.some(s => s.scopes.includes(OAUTH_WRITE_SCOPE)))
     .map(t => t.name);
-  assert.deepEqual(appendDeclared, [CHATGPT_INTAKE_TOOL]);
+  // goal-1026 §7.2 追加研究判断单元工具：声明 research:append 的工具集与门控口径
+  // （definitions.ts WRITE_SCOPE_TOOL_NAMES）保持一致，按定义顺序。
+  assert.deepEqual(appendDeclared, [CHATGPT_INTAKE_TOOL, THESIS_APPEND_TOOL]);
+  // 声明推导出的清单必须与服务端写门控使用的导出集合逐项一致（同一口径的两面）。
+  assert.deepEqual([...appendDeclared].sort(), [...WRITE_SCOPE_TOOL_NAMES].sort(),
+    'securitySchemes 推导的写工具清单与 WRITE_SCOPE_TOOL_NAMES 不一致');
   for (const tool of portfolioToolDefinitions) {
     assert.ok(tool.securitySchemes.every(s => s.scopes.includes(OAUTH_SCOPE)),
       `${tool.name} 的每个 scheme 都必须包含读 scope（服务端先校验读 scope）`);

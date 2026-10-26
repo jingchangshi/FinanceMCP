@@ -193,16 +193,20 @@ test('daily cap applies to new records only', () => {
   } finally { db.close(); }
 });
 
-test('schema lists exactly one append-only tool privately and nothing publicly', () => {
+test('schema lists the append-only tools privately and nothing publicly', () => {
   const priv = getPrivateToolList();
   const writers = priv.filter(t => t.annotations.readOnlyHint !== true);
-  assert.deepEqual(writers.map(t => t.name), [TOOL]);
-  const schema = writers[0].inputSchema;
+  // goal-1026 §7.2 追加了研究判断单元工具：私有端点现在有两个 append-only 写工具，
+  // 其余（含 ashare_research_eval）仍必须只读。
+  assert.deepEqual(writers.map(t => t.name), [TOOL, 'ashare_research_thesis_append']);
+  const intake = writers.find(t => t.name === TOOL);
+  const schema = intake.inputSchema;
   assert.equal(schema.additionalProperties, false);
   assert.deepEqual(Object.keys(schema.properties).sort(), ['account_id', 'additional_evidence', 'corrects_record_id', 'counter_evidence', 'final_conclusion',
     'idempotency_key', 'independent_judgement', 'as_of_trade_date', 'report_id'].sort());
-  assert.equal(writers[0].annotations.destructiveHint, false);
+  assert.equal(intake.annotations.destructiveHint, false);
   assert.ok(!getAvailableToolList().some(t => t.name === TOOL));
+  assert.ok(!getAvailableToolList().some(t => t.name === 'ashare_research_thesis_append'));
 });
 
 // ------------------------------------------------------------- HTTP: auth, public isolation, end to end
