@@ -583,6 +583,27 @@ export interface DecisionResult {
     missing_codes: string[];
   };
   options: DecisionOption[];
+  /**
+   * 双轨研究状态（goal-1026 §5.1）：针对主请求方案（primary option）披露风险轨与 Alpha 轨。
+   * 风险轨只编码账户/权限/费用/行情/已确认风险策略门控，不含 Alpha 证据；
+   * Alpha 轨单独披露轮动证据状态。两者都是研究状态，不是下单授权。
+   */
+  decision_tracks: {
+    risk_track: {
+      gates_satisfied: boolean;
+      blocked_by: string[];
+      has_execution_reference: boolean;
+      blocked_by_alpha: false;
+      note: string;
+    };
+    alpha_track: {
+      status: 'VERIFIED' | 'UNVERIFIED' | 'NOT_SUPPLIED' | 'NOT_APPLICABLE';
+      evidence_verified: boolean | null;
+      reason: string | null;
+      note: string;
+    };
+    note: string;
+  };
   stock_plan: StockPlanCheck | null;
   evidence: {
     supplied: boolean;
@@ -1312,6 +1333,7 @@ export function buildDecision(input: DecisionInput): DecisionResult {
     options,
     stock_plan: stockPlan,
     evidence,
+    decision_tracks: decisionTracksOf(primary, evidence, accountStatus, tradingDayOk),
     account_status: accountStatus,
     valuation: {
       basis: 'server_cache_close_with_snapshot_fallback',
@@ -1547,6 +1569,99 @@ function statusOfReasons(reasons: Reason[], canCompute: boolean): DecisionStatus
   if (reasons.some(r => CONSTRAINT_BLOCKING_REASONS.has(r.code))) return 'NO_ACTION';
   if (reasons.some(r => SOFT_REASONS.has(r.code))) return 'ILLUSTRATIVE';
   return canCompute ? 'ACTIONABLE' : 'DATA_INSUFFICIENT';
+}
+
+// ---------------------------------------------------------------- 双轨门控（goal-1026 §5.1）
+//
+// 风险管理轨与 Alpha 轮动轨是两条逻辑独立的研究流程，共享同一套账户与交易合法性门控：
+// - 交易执行参考只由账户完整性、权限、费用、行情与用户确认的风险策略门控决定；
+//   **Alpha 优势证据缺失绝不能阻塞风险轨**。
+// - Alpha 轨状态（alpha_track）单独披露，只作用于轮动方向，不进入风险轨判定。
+// - 任何交易执行参考仍然必须满足全部既有安全约束（硬阻塞原因一个不少），
+//   拆分门控绝不降低真实交易的安全要求；本模块仍不产生下单授权。
+
+/** 硬门控：行情/数据可用性、权限、交易规则、现金与可卖性、个股计划风险。 */
+const HARD_GATE_REASON_CODES = new Set<string>([
+  ...DATA_BLOCKING_REASONS,
+  ...CONSTRAINT_BLOCKING_REASONS,
+  'risk_budget_exceeded', 'stock_not_cached',
+  // 报价过期可以做研究对照，但可执行参考必须排除（既有 SOFT 语义不变，门控单列）。
+  'quote_stale',
+]);
+
+/** 账户门控类原因：缺失或不满足时交易执行参考一律不成立。 */
+const ACCOUNT_GATE_REASON_CODES = new Set<string>([
+  'account_gate_unavailable', 'account_not_current', 'account_not_verified',
+  'account_snapshot_mismatch', 'account_reconstruction_unavailable', 'account_settlement_pending',
+  'account_completeness_undeclared', 'account_reconciliation_mismatch', 'unreported_trade_risk',
+  'account_snapshot_stale',
+]);
+
+/**
+ * Alpha 轨原因：只影响轮动方向的研究状态，**不进入风险轨判定**。
+ * （SOFT_REASONS 集合仍保留这两个码：选项 status / executable 语义不变，
+ * 存量测试的错误码断言不破坏；解耦发生在 decision_tracks 的判定上。）
+ */
+const ALPHA_TRACK_REASON_CODES = new Set<string>([
+  'rotation_advantage_unverified', 'no_demonstrated_advantage',
+]);
+
+/**
+ * 双轨状态（decision_tracks）：每个方案一份。
+ *
+ * - `risk_track.gates_satisfied`：五类门控（账户完整性、权限、费用、行情、用户确认风险策略）
+ *   是否全部满足；`blocked_by` 只列这些门控的码，**永远不含 Alpha 证据类原因**。
+ * - `risk_track.has_execution_reference`：门控通过且该方案具备可计算的交易内容
+ *   （执行腿或示意腿）。HOLD/NO_ACTION 无交易内容 → false，但门控判定照常披露。
+ * - `alpha_track.status`：仅对轮动方向（SELL_AND_BUY）评估；其余方案 NOT_APPLICABLE。
+ * - 两个字段都只是研究状态披露：`executable` / 腿的 `executable` 才是既有执行语义，
+ *   且本模块不产生任何下单授权。
+ */
+function decisionTracksOf(
+  option: DecisionOption, evidence: DecisionResult['evidence'],
+  accountStatus: AccountStatusEvaluation, tradingDayOk: boolean,
+): DecisionResult['decision_tracks'] {
+  const codes = option.reasons.map(r => r.code);
+  // 只取 evaluator 的 reasons：warning 形态的 account_snapshot_stale（账本重建成功时
+  // 快照过期）按既有语义不阻塞可执行，门控也不得阻塞，保持与 executable 同口径。
+  const accountCodes = [
+    ...accountStatus.reasons.map(r => r.code),
+    ...(accountStatus.unreported_trade_risk ? ['unreported_trade_risk'] : []),
+  ];
+  const optionHard = codes.filter(code => HARD_GATE_REASON_CODES.has(code) || ACCOUNT_GATE_REASON_CODES.has(code));
+  const blocked = [...new Set([
+    ...accountCodes.filter(code => ACCOUNT_GATE_REASON_CODES.has(code)),
+    ...optionHard,
+    ...(tradingDayOk ? [] : ['as_of_not_trading_day']),
+  ])];
+  const gates = blocked.length === 0;
+  const unverifiedAlpha = option.reasons.filter(r => ALPHA_TRACK_REASON_CODES.has(r.code));
+  const alpha: DecisionResult['decision_tracks']['alpha_track'] =
+    option.action !== 'SELL_AND_BUY'
+      ? { status: 'NOT_APPLICABLE', evidence_verified: null, reason: null,
+          note: '本方案不依赖轮动优势证据：风险轨只依据可核验事实与用户确认的风险策略约束。' }
+      : evidence.verified
+        ? { status: 'VERIFIED', evidence_verified: true, reason: null,
+            note: '轮动优势证据已通过独立复核（RESEARCH_VERIFIED + evidence_id）；交易执行参考仍须满足全部门控。' }
+        : { status: evidence.supplied ? 'UNVERIFIED' : 'NOT_SUPPLIED', evidence_verified: false,
+            reason: unverifiedAlpha[0]?.code ?? null,
+            note: evidence.supplied
+              ? '轮动优势证据未通过复核：只影响轮动方向，不阻塞风险轨研究。'
+              : '未提供轮动优势研究证据：允许 NO_ACTION；风险轨研究不因此停止。' };
+  return {
+    risk_track: {
+      gates_satisfied: gates,
+      blocked_by: blocked,
+      has_execution_reference: gates && (option.legs.length > 0 || option.illustrative_legs.length > 0),
+      blocked_by_alpha: false,
+      note: gates
+        ? '账户完整性、权限、费用、行情与用户确认风险策略门控全部满足；这是执行参考的门控前提，不是下单授权。'
+        : '交易执行参考被上述门控阻塞（blocked_by 只列账户/权限/费用/行情/已确认风险策略门控，不含 Alpha 证据）。',
+    },
+    alpha_track: alpha,
+    note: '两条研究轨共享同一套账户与交易合法性门控；风险管理研究不被 Alpha 验证缺失阻塞，'
+      + '交易执行参考仍须满足全部安全约束；未经用户确认不引入任何机械减仓阈值。',
+  };
 }
 
 /**
