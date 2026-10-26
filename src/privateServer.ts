@@ -5,7 +5,7 @@ import { SERVER_VERSION } from './version.js';
 import type { OAuthConfig } from './oauth/config.js';
 import type { OAuthStore } from './oauth/store.js';
 import { verifyOAuthAccessToken, wwwAuthenticate, hasWriteScope, type OAuthFailure } from './oauth/verify.js';
-import { CHATGPT_INTAKE_TOOL } from './portfolio/chatgptIntake.js';
+import { WRITE_SCOPE_TOOL_NAMES } from './ashare/definitions.js';
 
 /**
  * 私有账户端点 `/private/mcp`（工作包 A5）。
@@ -198,7 +198,10 @@ async function handlePrivateRpc(req: Request, res: Response): Promise<void> {
     // 写权限在**工具执行之前**、在 HTTP 入口处断言，而不是靠工具内部自觉。
     // 静态令牌是部署方显式开启的旧通道，不受此约束。
     const auth = res.locals.privateAuth as AuthOutcome | undefined;
-    if (tool === CHATGPT_INTAKE_TOOL && oauthRuntime?.config.requireWriteScope && !auth?.viaStatic
+    // 门控按**声明了写 scope 的工具集**判定（WRITE_SCOPE_TOOL_NAMES 由 definitions 的
+    // securitySchemes 推导），而不是逐个点名：新增追加类工具（如结构化判断单元）只要声明
+    // PRIVATE_APPEND_SCHEMES 就自动纳入，读 scope 令牌在 requireWriteScope 模式下永远进不来。
+    if (WRITE_SCOPE_TOOL_NAMES.has(tool) && oauthRuntime?.config.requireWriteScope && !auth?.viaStatic
         && !hasWriteScope(auth?.scope, oauthRuntime.config)) {
       console.log(`[private] tool=${tool} status=denied reason=insufficient_scope`);
       const required = [oauthRuntime.config.scope, oauthRuntime.config.writeScope];
