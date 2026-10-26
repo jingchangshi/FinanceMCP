@@ -26,6 +26,8 @@ const ACCOUNT_TOOLS = [
   'ashare_portfolio_summary', 'ashare_portfolio_scenario', 'ashare_portfolio_decision',
   'ashare_portfolio_daily_report', 'ashare_etf_candidates', 'ashare_portfolio_benchmarks',
   'ashare_investment_research_bundle', 'ashare_chatgpt_research_record_append',
+  // goal-1026 §7：结构化研究判断单元追加（append-only 写工具）与三层研究评价（只读）。
+  'ashare_research_thesis_append', 'ashare_research_eval',
 ];
 
 // 合成账户库（演示快照，不是用户真实账户）。

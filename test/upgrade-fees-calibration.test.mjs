@@ -127,8 +127,11 @@ test('priority: code rule > broker category rule > category rule > default', () 
 
 test('fee administration is a local confirmed CLI; no public or private MCP tool can write it', () => {
   for (const tool of [...portfolioToolDefinitions, ...ashareToolDefinitions]) {
-    // The single permitted exception is the append-only ChatGPT research-record intake (research_journal only).
-    if (tool.name === 'ashare_chatgpt_research_record_append') { assert.equal(tool.annotations.readOnlyHint, false); continue; }
+    // 允许的例外是两个 append-only 研究写工具：ChatGPT 研究记录写回（research_journal）
+    // 与研究判断单元追加（research_thesis）。两者都不得写费用/账本相关表。
+    if (tool.name === 'ashare_chatgpt_research_record_append' || tool.name === 'ashare_research_thesis_append') {
+      assert.equal(tool.annotations.readOnlyHint, false); continue;
+    }
     assert.doesNotMatch(tool.name, /fee|ledger|import|record|completeness|confirm|profile/, tool.name);
     assert.equal(tool.annotations.readOnlyHint, true, tool.name);
   }

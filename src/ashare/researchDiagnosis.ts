@@ -302,7 +302,7 @@ function diagnoseExecutionFactor(skipped: Record<string, number>, feesCents: num
   claims.push({
     tier: 'OBSERVED_FACT', dimension: 'execution_factor',
     statement: feeDrag === null
-      ? '初始资金未知，无法计算费用拖累。'
+      ? '诊断未提供账户费率与资金规模，费用拖累无法计算；成本是否吞掉边际在此不可判定。'
       : `费用合计 ${pct(feeDrag)}% 的初始资金。${feeDrag > 0.01 ? '费用拖累超过 1%，在低超额策略上可能吞掉全部边际。' : '费用拖累在 1% 以内，不是当期的主要解释。'}`,
     evidence: { fees_cents: feesCents, initial_cents: initialCents, fee_drag: feeDrag },
   });
@@ -318,8 +318,8 @@ function diagnoseExecutionFactor(skipped: Record<string, number>, feesCents: num
   if (netReturn !== null && feeDrag !== null && netReturn < feeDrag) {
     claims.push({
       tier: 'STATISTICAL_FINDING', dimension: 'execution_factor',
-      statement: `净收益 ${pct(netReturn)}% 低于费用拖累 ${pct(feeDrag)}%；毛信号即使为正，也被成本完全吞掉。这是一个明确的失败机制，指向成本模型而非信号质量。`,
-      evidence: { net_return: netReturn, fee_drag: feeDrag },
+      statement: `毛超额 ${pct(netReturn)}%（口径：auditWatchlist，未计交易费用）低于费用拖累 ${pct(feeDrag)}%；即使毛信号为正，按此费率也会被成本吞掉。这是一个明确的失败机制，指向成本模型而非信号质量。`,
+      evidence: { gross_excess: netReturn, fee_drag: feeDrag },
     });
   }
   return claims;
@@ -593,7 +593,7 @@ export function diagnoseWatchlist(db: DatabaseSync, options: { asOf: string; obs
     ...diagnoseMarketState(scan, usable.length, required),
     ...diagnoseFactorContribution(scan, usable.length, required),
     ...diagnoseReturnSource(scan),
-    ...diagnoseExecutionFactor({}, 0, 1, meanExcessFraction),
+    ...diagnoseExecutionFactor({}, 0, 0, meanExcessFraction),
     ...diagnosePoolConstruction(scan),
   ];
 
@@ -604,7 +604,7 @@ export function diagnoseWatchlist(db: DatabaseSync, options: { asOf: string; obs
   if (significant.length) {
     claims.push({
       tier: 'COUNTER_EVIDENCE', dimension: 'factor_contribution',
-      statement: `在预先声明的对照族中，${significant.map(c => c.model).join('、')} 与原版观察名单的差异经 Holm 校正后显著。这说明现有权重不是唯一合理的排序，需作为反证记录，而不是挑选一个有利对照来宣布改进。`,
+      statement: `在预先声明的对照族中，${significant.map(c => c.model).join('、')} 各自的超额收益经 Holm 校正后与零有显著差异（检验对象是各变体 vs 0，不是变体 vs 原版的配对差异）。若这些变体的超额同为负，则说明任何权重变体都没有免于负超额，现有权重不是问题的唯一解释，需作为反证记录，而不是挑选一个有利对照来宣布改进。`,
       evidence: Object.fromEntries(significant.map(c => [`${c.model}_p_holm`, c.p_holm])),
     });
   }

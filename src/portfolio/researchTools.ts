@@ -10,6 +10,11 @@ import { resolveResearchDate } from '../ashare/researchDate.js';
 import { buildInvestmentResearchBundle } from './researchBundle.js';
 import { loadFeeContext } from './fees.js';
 import { appendChatgptResearchRecord, CHATGPT_INTAKE_TOOL } from './chatgptIntake.js';
+import { journalFeeEstimator } from './researchJournal.js';
+import {
+  THESIS_APPEND_TOOL, THESIS_EVAL_TOOL, RESEARCH_EVAL_SCHEMA,
+  appendResearchThesis, buildResearchEval,
+} from './researchEval.js';
 
 /**
  * 私有账户端点的"研究/日报"工具实现（V1.0 C2/C6/D1）。
@@ -167,6 +172,41 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
       } finally { db.close(); }
     }
 
+    case THESIS_APPEND_TOOL: {
+      // 结构化研究判断单元追加（goal-1026 §7.2）。与 intake 同一边界：唯一以可写方式打开
+      // 的路径，且只调用只追加函数（research_thesis 触发器禁止 UPDATE/DELETE/REPLACE）；
+      // 不碰研究日志本身——旧记录永不删除、永不修改、永不重分类。
+      if (!portfolioEnabled()) throw new Error(DISABLED.message);
+      const path = portfolioDbPath();
+      if (!existsSync(path)) throw new Error(`账户数据库不存在（${path}），请先运行 finance-ashare portfolio-import`);
+      const db = openPortfolioDb(path, { writable: true });
+      try {
+        const account = resolveAccountId(db, (args ?? {}).account_id);
+        return json(appendResearchThesis(db, account.account_id, args ?? {}, Date.now()));
+      } finally { db.close(); }
+    }
+
+    case THESIS_EVAL_TOOL: {
+      // 三层×六指标研究价值评价（goal-1026 §7.3）。纯只读：研究日志 + 行情缓存 → 分层分指标
+      // 结构；无成熟样本输出 PENDING 及原因，无真实记录输出 NO_RECORDS，不补造历史表现。
+      const db = readDb();
+      try {
+        const account = resolveAccountId(db, args.account_id);
+        const asOf = ymd(args.as_of_trade_date, 'as_of_trade_date') ?? latestTradeDayOf(readOnlyMarket());
+        if (!asOf) {
+          return json({ schema: RESEARCH_EVAL_SCHEMA, status: 'DATA_INSUFFICIENT', account_id: account.account_id,
+            reason: 'market_cache_or_calendar_unavailable', detail: '本地只读市场缓存或交易日历不可用，无法确定评价截止交易日；不伪造 as_of。' });
+        }
+        const horizon = args.horizon === undefined || args.horizon === null ? undefined : Number(args.horizon);
+        if (horizon !== undefined && (!Number.isInteger(horizon) || horizon < 1 || horizon > 252)) throw new Error('horizon 需要 1–252 的整数');
+        const market = readOnlyMarket();
+        return json(buildResearchEval({
+          portfolioDb: db, marketDb: market, accountId: account.account_id, asOf, horizon,
+          feeEstimator: journalFeeEstimator(db, market, account.account_id),
+        }));
+      } finally { db.close(); }
+    }
+
     default:
       throw new Error(`Unknown research tool: ${name}`);
   }
@@ -179,4 +219,6 @@ export const RESEARCH_PRIVATE_TOOLS = new Set([
   'ashare_etf_candidates',
   'ashare_portfolio_benchmarks',
   CHATGPT_INTAKE_TOOL,
+  THESIS_APPEND_TOOL,
+  THESIS_EVAL_TOOL,
 ]);

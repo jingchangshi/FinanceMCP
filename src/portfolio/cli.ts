@@ -20,6 +20,7 @@ import { defaultTradeDate, runResearchSummaryCommand } from './researchCli.js';
 import { listConfiguredAccounts, resolveAccountId, resolveAccountSnapshot, resolveAccountState } from './accounts.js';
 import { evaluateAccountStatus } from './decision.js';
 import { buildDailyReport } from './dailyReport.js';
+import { renderDailyReport } from './reportRenderer.js';
 import { screenEtfCandidates } from '../ashare/etfUniverse.js';
 import { buildBenchmarkComparison } from './benchmarks.js';
 import { runFeeCommand, FEE_USAGE } from './feeCli.js';
@@ -109,7 +110,9 @@ ${RISK_POLICY_USAGE}
 
   收盘日报与研究候选（D1/C2/C6）：
   portfolio-daily-report --account ID [--date YYYYMMDD] [--snapshot ID] [--max-actions 0..3]
-        [--market-db PATH] [--db PATH]                 首屏给出"下一交易日最值得做的 0–3 个动作"
+        [--market-db PATH] [--db PATH] [--format json|user|technical|both]
+                                                      缺省 json=原始日报 JSON（向后兼容）；user/technical=双层
+                                                      渲染正文；both={user,technical} JSON 信封
   portfolio-etf-candidates --date YYYYMMDD [--categories broad,industry,bond,gold,cross_border]
         [--limit N] [--market-db PATH]                 适格 ETF 动态候选筛选（数据缺失显式 DEGRADED）
   portfolio-benchmarks [--start YYYYMMDD] [--end YYYYMMDD] [--market-db PATH]
@@ -550,6 +553,13 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
     case 'portfolio-daily-report': {
       // D1 收盘日报：首屏就是"下一交易日最值得做的 0–3 个动作"。
       // --account 可选：缺省与私有 MCP 同一口径（本部署唯一真实账户），不再落到 'default'。
+      // --format（goal-1026 双层输出）：缺省/json 保持原始 DailyReportResult JSON（向后兼容，
+      // 现有调用方与回放脚本不受影响）；user/technical 输出对应层的 markdown 正文；
+      // both 输出 {user, technical} 的 JSON 信封。渲染只消费 buildDailyReport 的同一份结果。
+      const format = h.arg('format') ?? 'json';
+      if (format !== 'json' && format !== 'user' && format !== 'technical' && format !== 'both') {
+        throw new Error('--format 需要 user|technical|both|json 之一');
+      }
       const dbPath = h.arg('db') ?? portfolioDbPath();
       if (!existsSync(dbPath)) throw new Error(`账户数据库不存在（${dbPath}），请先运行 finance-ashare portfolio-import`);
       const db = openPortfolioDb(dbPath, { writable: false });
@@ -568,7 +578,14 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
           snapshotId: resolved.snapshot_id,
           maxActions: maxActions === undefined ? undefined : maxActions,
         });
-        h.print(report);
+        if (format === 'json') {
+          h.print(report);
+        } else {
+          const rendered = renderDailyReport(report);
+          if (format === 'user') process.stdout.write(rendered.user + '\n');
+          else if (format === 'technical') process.stdout.write(rendered.technical + '\n');
+          else h.print({ schema: 'daily-report-rendered/1.0', user: rendered.user, technical: rendered.technical });
+        }
       } finally {
         market?.close();
         db.close();
