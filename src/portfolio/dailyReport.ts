@@ -8,6 +8,7 @@ import { calculateFees, resolveFeeRules, type FeeBreakdown } from './fees.js';
 import { loadServerQuote } from './quotes.js';
 import { resolveInstrument, normalizeSecurityCode } from './instrument.js';
 import { buildResearchSummary } from './researchSummary.js';
+import { buildScenarioMatrix, type ScenarioMatrix, type ScenarioOptionState, type ScenarioPosition } from './scenarios.js';
 import { evaluateAccountStatus, type AccountStatusEvaluation } from './decision.js';
 import { DEFAULT_FEE_RULES, DEFAULT_LOT_RULES, type FeeRules, type LotRules } from './rules.js';
 import { screenEtfCandidates, type EtfCandidateRow, type EtfCandidateScreenResult } from '../ashare/etfUniverse.js';
@@ -22,9 +23,12 @@ import { adjustmentRatio } from '../ashare/data.js';
  *   本模块**不重复实现**估值/取价/市场证据。
  * - 所有金额、费用与风险数字由程序计算；研究数量只接受显式参数，价格只取缓存。
  * - 研究情景与账户执行门控独立：即使资金与可卖性满足，未接入独立优势证据或
- *   用户已确认的持久风险策略时，也不生成交易动作；所有比较 executable:false。
+ *   用户已确认的持久风险策略时，也不生成交易动作。五方案是研究对照，
+ *   `executable` 恒为 false（研究比较不等于下单授权）；但**可执行门控的成立与否**
+ *   由 `risk_track`（账户/权限/费用/行情门控）单独披露，不被 Alpha 证据缺失涂黑——
+ *   风险管理研究轨与 Alpha 轮动轨分离（goal-1026 §5.1）。
  * - 没有证据支持的动作时返回 `NO_ACTION`，并给出明确的观察触发条件与失效条件。
- * - 研究性主张一律 `UNVERIFIED`；数据质量不足时不给“假装可执行的精确建议”。
+ * - 研究性主张一律 `UNVERIFIED`（只在研究/轮动轨字段上标注）；数据质量不足时不给“假装可执行的精确建议”。
  * - 只读：账户库与市场库都只读；历史预案跟踪读 `plan_tracking` 表（若存在），
  *   缺表时降级为 `not_available`，不写库、不补造历史。
  */
@@ -208,14 +212,37 @@ export interface HoldingResearch {
 }
 
 /**
- * 主动轮动与风险比较（任务书 D4）。
+ * 主动轮动与风险比较（任务书 D4 / goal-1026 §5.1、§5.2）。
  *
  * 这不是收益预测，也不是下单计划：五个方案并列给出同一套可复核的数字
  * （资金来源、可卖数量、一手金额、费用、交易前后集中度、压力情景），
  * 并各自说明“为什么当前不可执行”。没有 RESEARCH_VERIFIED 证据时，
  * REDUCE / ROTATE / DEFENSIVE 一律只是研究比较，绝不自动生成卖出指令。
+ *
+ * §5.1 双轨：`executable` 恒为 false（研究比较≠下单授权），但**为什么不成立**
+ * 分两轨披露——`risk_track` 只列账户/权限/费用/行情门控，`alpha_track` 单独披露
+ * 轮动证据状态；风险管理轨的研究与门控判定不再被 Alpha 证据缺失涂黑。
+ * §5.2 七情景：`scenario_matrix` 给出七情景 × 五方案的十列对照（幅度为声明式假设）。
  */
 export type RotationScenario = 'HOLD' | 'REDUCE' | 'ROTATE' | 'DEFENSIVE' | 'NO_ACTION';
+
+/** 风险轨门控状态：只编码账户完整性、权限、费用、行情（+已确认风险策略，由 risk_budget 披露）。 */
+export interface DailyRiskTrack {
+  gates_satisfied: boolean;
+  blocked_by: string[];
+  /** 该方案是否具备可执行参考的内容（执行腿/示意腿）；HOLD/NO_ACTION 恒为 false。 */
+  has_execution_reference: boolean;
+  blocked_by_alpha: false;
+  note: string;
+}
+
+/** Alpha 轮动轨证据状态：只出现在轮动轨字段，不进入风险轨判定。 */
+export interface DailyAlphaTrack {
+  status: 'VERIFIED' | 'UNVERIFIED' | 'NOT_SUPPLIED' | 'NOT_APPLICABLE';
+  evidence_verified: boolean | null;
+  reason: string | null;
+  note: string;
+}
 
 export interface DecisionComparison {
   as_of_trade_date: string;
@@ -231,6 +258,10 @@ export interface DecisionComparison {
     summary: string;
     executable: false;
     not_actionable_because: string[];
+    /** §5.1 风险轨：只由账户/权限/费用/行情门控决定，不含 Alpha 证据原因。 */
+    risk_track: DailyRiskTrack;
+    /** §5.1 Alpha 轮动轨：证据状态只在这里与 rotation_plan 出现。 */
+    alpha_track: DailyAlphaTrack;
     cash_after_cents: number | null;
     total_assets_after_cents: number | null;
     fees_cents: number;
@@ -270,6 +301,8 @@ export interface DecisionComparison {
     invalidation_conditions: string[];
     fact_meta: FactMeta;
   }[];
+  /** §5.2 七情景 × 五方案十列对照（幅度为声明式假设；情景 1 与 r1-asset-stress 同口径合并）。 */
+  scenario_matrix: ScenarioMatrix;
   note: string;
 }
 
@@ -789,11 +822,16 @@ function buildQualityTiers(
     },
     research_evidence: {
       status: 'UNVERIFIED',
-      detail: '没有经过前瞻检验的 RESEARCH_VERIFIED 证据；候选分数是启发式排序，不是换仓优势',
+      detail: '没有经过前瞻检验的 RESEARCH_VERIFIED 证据；候选分数是启发式排序，不是换仓优势（Alpha 轨状态，不阻塞风险轨研究）',
     },
     trade_plan_executability: {
       status: 'NOT_EXECUTABLE',
-      detail: '本日报没有独立复核的优势证据或用户已确认的风险策略约束；账户与行情就绪仅是前提，研究情景始终不可执行。',
+      // §5.1：可执行性只由账户/权限/费用/行情门控决定，**不再引用 Alpha 证据缺失**；
+      // status 仍为 NOT_EXECUTABLE —— 日报本身不产生任何交易动作（不是被证据“挡住”，是没有下单意图）。
+      detail: gateSatisfied
+        ? '账户、权限、费用与行情门控满足，但本日报不产生交易动作（五方案均为研究比较，executable=false，研究比较不是下单授权）。'
+        : `交易执行参考被下列门控阻塞：${gateReasons.map(reason => reason.code).join('、') || '未知'}`
+          + '（只列账户/权限/费用/行情门控；轮动优势证据状态见 research_evidence 与轮动轨字段）。',
     },
   };
 }
@@ -807,7 +845,14 @@ function buildQualityTiers(
  * - 集中度：HHI = Σ(持仓市值 / 总资产)²，交易后按“卖出所得现金 + 买入支出”重算；
  * - 压力：全部权益仓位施加声明式冲击（默认 −10%），不是历史回撤。
  *
- * 所有方案恒为 `executable: false`：本模块没有经过验证的轮换优势，也不替用户下单。
+ * goal-1026 §5.1 双轨：所有方案仍恒为 `executable: false`（研究比较 ≠ 下单授权，
+ * 安全约束一条不减），但“为什么不成立”分两轨披露：
+ * - `risk_track`：只由账户完整性、权限、费用、行情（与 risk_budget 的已确认风险策略）
+ *   门控决定；**Alpha 优势证据缺失绝不进入该判定**——风险管理研究轨不再被涂黑；
+ * - `alpha_track`：轮动证据状态只出现在轮动轨字段（ROTATE 与 rotation_plan）。
+ *
+ * goal-1026 §5.2：`scenario_matrix` 给出七个具名情景 × 五方案的十列对照，
+ * 情景幅度全部是声明式假设/预固定口径，不是预测；情景 1 与 r1-asset-stress 同口径合并。
  */
 function buildDecisionComparison(input: {
   asOf: string; holdings: HoldingAssessment[]; summary: any;
@@ -869,12 +914,28 @@ function buildDecisionComparison(input: {
   const focus = holdings.length ? holdings.reduce((best, h) => h.weight > best.weight ? h : best) : null;
   const sellable: DecisionComparison['sellable'] = {};
   for (const [code, row] of Object.entries(accountEvaluation?.sellable ?? {})) sellable[code] = { ...row };
-  const noExecution = [
-    ...input.gateReasons.map(reason => `${reason.code}: ${reason.detail}`),
-    '相对优势 UNVERIFIED；本次研究数量不是用户确认的策略约束或交易授权。',
-  ];
+  // §5.1 解耦：不可执行原因只分两轨列示。gateLines 只含账户/权限/费用/行情门控码，
+  // 绝不出现 Alpha 证据词；“研究数量不是策略约束或交易授权”是通用研究声明，不是
+  // Alpha 验证结论，保留为研究轨说明。轮动证据状态只进 ROTATE 的 alpha_track。
+  const gateLines = input.gateReasons.map(reason => `${reason.code}: ${reason.detail}`);
+  const researchNote = '研究数量不是用户确认的策略约束或交易授权。';
+  const noExecution = [...gateLines, researchNote];
+  // 风险轨：门控只由 gateReasons（账户/权限/费用/行情）与方案自身约束构成，与 Alpha 证据无关。
+  const riskTrackOf = (extraBlockers: string[] = []): DailyRiskTrack => ({
+    gates_satisfied: gateLines.length === 0 && extraBlockers.length === 0,
+    blocked_by: [...input.gateReasons.map(reason => reason.code), ...extraBlockers],
+    has_execution_reference: false, // 五方案无执行腿：日报本身不产生交易动作。
+    blocked_by_alpha: false,
+    note: gateLines.length === 0 && extraBlockers.length === 0
+      ? '账户完整性、权限、费用与行情门控满足；风险轨可继续研究与对照。本日报仍不产生交易动作，门控满足不等于下单授权。'
+      : '交易执行参考被下列门控阻塞（只列账户/权限/费用/行情门控，不含 Alpha 证据）。',
+  });
   const option = (action: RotationScenario, label: string, text: string): Option => ({
     action, label, summary: text, executable: false, not_actionable_because: [...noExecution],
+    risk_track: riskTrackOf(),
+    alpha_track: action === 'ROTATE'
+      ? { status: 'NOT_SUPPLIED', evidence_verified: false, reason: 'no_demonstrated_advantage', note: '本日报未接入独立复核的轮动优势证据。' }
+      : { status: 'NOT_APPLICABLE', evidence_verified: null, reason: null, note: '本方案是风险轨/不交易对照，不依赖轮动优势证据。' },
     decision_basis: action === 'ROTATE' ? 'ACTIVE_ROTATION' : action === 'REDUCE' || action === 'DEFENSIVE' ? 'RISK_CONTROL' : 'NO_TRADE',
     ...baseline, fees_cents: 0, fee_breakdowns: [], quantity_basis: 'no_trade', funding_status: 'NO_TRADE',
     opportunity_cost: '保留当前暴露会承担下行风险；卖出或换仓可能放弃后续上涨，并产生费用。',
@@ -894,8 +955,10 @@ function buildDecisionComparison(input: {
     target.summary = detail;
     target.not_actionable_because.push(detail);
     target.fact_meta.quality = 'DEGRADED';
+    // 风险轨在函数末尾统一按最终 funding_status 定稿（此处不改，避免与直接赋值路径不一致）。
   };
   let soldRows: Position[] | null = null;
+  let rotationRows: Position[] | null = null;
   if (scenario) {
     const code = normalizeSecurityCode(scenario.sellCode);
     const holding = holdings.find(h => h.ts_code === code);
@@ -958,6 +1021,7 @@ function buildDecisionComparison(input: {
           const existing = rows.find(p => p.ts_code === buyCode);
           if (existing) existing.value += gross;
           else rows.push({ ts_code: buyCode, value: gross, asset_class: assetClass, theme: THEME_BY_CODE[buyCode] ?? 'unknown', industry: INDUSTRY_BY_CODE[buyCode] ?? 'unclassified' });
+          rotationRows = rows;
           Object.assign(rotate, metrics(rows, budget - gross - buyFee.total_cents));
           rotate.funding_status = 'FUNDED'; rotate.sell_plan = reduce.sell_plan;
           rotate.fees_cents = reduce.fees_cents + buyFee.total_cents;
@@ -992,6 +1056,60 @@ function buildDecisionComparison(input: {
   const equityLots = holdings.filter(h => facts.get(h.ts_code)?.asset_class === 'EQUITY' && h.bar_quality === 'READY')
     .map(h => { const gross = valueCents(lots.etf_lot_size, h.price_milli); return gross + feeFor(h.ts_code, gross, 'buy').total_cents; });
   const minLot = equityLots.length ? Math.min(...equityLots) : null;
+  const sufficientForLot = (after: number | null) => (minLot === null || after === null ? null : after >= minLot);
+
+  // ROTATE 的轮动证据状态是 Alpha 轨字段：优势未复核这一事实只在轮动轨上披露，
+  // 不进入任何方案的风险轨判定（§5.1）。D4 断言依赖该行出现 UNVERIFIED。
+  rotate.not_actionable_because.push('相对优势 UNVERIFIED：本日报未接入独立复核的轮动优势证据。');
+
+  // 风险轨定稿（§5.1）：在所有 funding_status 直接赋值与 reject 路径之后统一重建，
+  // 保证 blocked_by 只反映账户/权限/费用/行情门控 + 资金可得性，永不混入 Alpha 证据。
+  for (const o of [hold, reduce, rotate, defensive, noAction]) {
+    const fundingBlocked = o.funding_status !== 'NO_TRADE' && o.funding_status !== 'FUNDED'
+      ? [`funding_status:${o.funding_status}`] : [];
+    o.risk_track = riskTrackOf(fundingBlocked);
+  }
+
+  // ---- §5.2 七情景 × 五方案（scenarios.ts；幅度为声明式假设，不是预测）。
+  const scenarioOfState = (
+    action: ScenarioOptionState['action'], rows: Position[] | null, nextCash: number,
+    state: Option, cashLot: boolean | null, unverified: string[],
+  ): ScenarioOptionState => ({
+    action,
+    positions: (rows ?? positions).map(p => ({ ts_code: p.ts_code, value: p.value, asset_class: p.asset_class, theme: p.theme, industry: p.industry })),
+    cash_cents: nextCash,
+    wealth_cents: wealth,
+    funding_status: state.funding_status,
+    fee_breakdowns: state.fee_breakdowns,
+    cash_sufficient_for_one_lot: cashLot,
+    invalidation_conditions: state.invalidation_conditions,
+    unverified_information: unverified,
+  });
+  // 只有轮动真正 FUNDED（卖出+买入都成立）时才用成交后持仓；否则回退基准持仓与基准现金。
+  const rotateRows = rotate.funding_status === 'FUNDED' ? (rotationRows ?? soldRows) : null;
+  const scenarioMatrix = buildScenarioMatrix({
+    as_of_trade_date: asOf,
+    baseline_positions: positions.map(p => ({ ts_code: p.ts_code, value: p.value, asset_class: p.asset_class, theme: p.theme, industry: p.industry })),
+    baseline_cash_cents: cash,
+    wealth_cents: wealth,
+    options: [
+      scenarioOfState('HOLD', positions, baseline.cash_after_cents, hold, sufficientForLot(baseline.cash_after_cents),
+        ['继续持有的机会成本（放弃的再平衡收益）未被独立验证。']),
+      scenarioOfState('REDUCE', soldRows, reduce.cash_after_cents ?? cash, reduce, sufficientForLot(reduce.cash_after_cents ?? null),
+        ['减仓数量是显式研究参数，不是经复核的研究结论，也不是下单授权。',
+          '减仓放弃的上涨参与度与卖出后的下行改善均未前瞻验证。']),
+      scenarioOfState('ROTATE', rotateRows, rotate.cash_after_cents ?? cash, rotate,
+        rotate.rotation_plan ? rotate.rotation_plan.cash_sufficient_for_one_lot : sufficientForLot(rotate.cash_after_cents ?? null),
+        ['轮动优势证据 UNVERIFIED：换仓候选的相对优势未接入独立复核证据，换仓后表现未前瞻验证。',
+          '研究数量是显式研究参数，不是下单授权。']),
+      scenarioOfState('DEFENSIVE', defensive.funding_status === 'FUNDED' ? positions.map(p => p.asset_class === 'EQUITY' ? { ...p, value: 0 } : p) : positions,
+        defensive.cash_after_cents ?? cash, defensive, sufficientForLot(defensive.cash_after_cents ?? null),
+        ['权益清零是声明式压力对照，不是计划操作；清零后的再投资路径未验证。']),
+      scenarioOfState('NO_ACTION', positions, baseline.cash_after_cents, noAction, sufficientForLot(baseline.cash_after_cents),
+        ['明确不操作的观察触发条件是否充分未被独立验证。']),
+    ],
+  });
+
   return {
     as_of_trade_date: asOf,
     focus: focus ? { ts_code: focus.ts_code, name: focus.name, weight: focus.weight, market_value_cents: focus.market_value_cents, quantity: focus.quantity } : null,
@@ -999,7 +1117,11 @@ function buildDecisionComparison(input: {
     concentration_before: { hhi: baseline.concentration_after.hhi, effective_positions: baseline.concentration_after.effective_positions,
       top_weight: focus?.weight ?? null, equity_weight: baseline.exposure_after.equity_weight },
     sellable, options: [hold, reduce, rotate, defensive, noAction],
-    note: '五方案均为非执行研究比较。HHI仅累加证券权重平方，分母含现金与理财；现金不作为证券加入分子。数量来自显式研究参数，费用采用账户/代码模型；缺乏优势与已确认风险策略时不生成交易动作。',
+    scenario_matrix: scenarioMatrix,
+    note: '五方案均为非执行研究比较（executable 恒为 false：研究比较不是下单授权），但风险轨与 Alpha 轨分列披露：'
+      + 'risk_track 只列账户/权限/费用/行情门控，alpha_track 只在轮动轨出现。'
+      + 'HHI仅累加证券权重平方，分母含现金与理财；现金不作为证券加入分子。数量来自显式研究参数，费用采用账户/代码模型；'
+      + '缺乏优势与已确认风险策略时不生成交易动作；情景幅度为声明式假设，不是预测。',
   };
 }
 
@@ -1455,6 +1577,9 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   } catch { portfolioRisk = null; }
 
   // 已批准政策存在时，各情景/回撤/假设字段统一引用同一份政策状态；report_id 在此之前已定，故不受影响。
+  // 注意：scenario_matrix **不注入**政策数据——它是确定性的研究矩阵，必须在政策记录前后
+  // 逐字节一致（upgrade-risk-policy 的 strip() 深比较）；政策状态由各方案 risk_budget 披露，
+  // 情景行的失效条件只放政策中立的条件引用（见 scenarios.ts）。
   if (portfolioRisk) {
     const dd = portfolioRisk.drawdown;
     const policyView = {
