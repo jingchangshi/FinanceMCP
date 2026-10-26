@@ -366,7 +366,60 @@ export const portfolioToolDefinitions: { name: string; description: string; inpu
     annotations: APPEND_ONLY,
     securitySchemes: PRIVATE_APPEND_SCHEMES,
   },
+  {
+    name: 'ashare_research_thesis_append',
+    description: '只追加：在现有研究日志之上新增一个结构化研究判断单元（goal-1026 §7.2）。不删除、不修改、不重分类任何既有 VPS/ChatGPT 记录（含 CHATGPT-20261023-0f5a44183869e077bae1 的补录属性）。必须引用一条已存在的研究日志记录（parent_record_id）；证据分类与评价资格由服务端从父记录推导（补录记录的判断单元永远是 excluded_retrospective，不能被改判为前瞻）。允许中性、证据不足与条件性判断（direction: neutral/evidence_insufficient/conditional），不强制看多看空；confidence 是未校准的主观量，不是精确概率，禁止当作决策概率使用。同 thesis_id 同内容幂等、同 id 不同内容拒绝；更正请用新 thesis_id 并填 corrects_thesis_id。created_at、account_id、thesis_id（可省略）由服务端时钟与内容哈希生成。不写账本、持仓、完整性、风险政策、费用或订单；入参不含也不会存储任何令牌或凭证。仅在受认证的 /private/mcp 提供。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
+        parent_record_id: { type: 'string', maxLength: 200, description: '所属研究日志记录 ID（VPS/ChatGPT/combined 任一），必须存在于本账户' },
+        target: { type: 'string', maxLength: 120, description: '判断对象，如 510300.SH / 沪深300 / 组合现金比例' },
+        direction: { type: 'string', enum: ['bullish', 'bearish', 'neutral', 'conditional', 'evidence_insufficient'], description: '方向判断；允许中性、条件性与证据不足，不强制看多看空' },
+        horizon: { type: 'string', enum: ['scalp', 'intraday', 'swing', 'position', 'long_term', 'unspecified'], description: '判断的时间尺度' },
+        benchmark: { type: 'string', maxLength: 120, description: '可选：对照基准（如 csi300_etf_buy_hold）' },
+        evidence_refs: { type: 'array', maxItems: 40, items: { type: 'string', maxLength: 200 }, description: '可选：关联证据引用（证据 ID / URL / 记录 ID）' },
+        confidence: { type: 'number', minimum: 0, maximum: 1, description: '可选：未校准主观置信度 [0,1]；禁止解释为精确概率' },
+        trigger: { type: 'string', maxLength: 1000, description: '可选：判断成立/触发条件（可被行情检验的事实条件优先）' },
+        invalidation: { type: 'string', maxLength: 1000, description: '可选：判断失效条件' },
+        baseline_assessment: { type: 'string', maxLength: 4000, description: '基线判断陈述（自然语言，供审计）' },
+        revised_assessment: { type: 'string', maxLength: 4000, description: '可选：修订后的判断陈述（追加，不覆盖）' },
+        decision_impact: { type: 'string', maxLength: 2000, description: '可选：对最终账户研究决策的影响说明' },
+        corrects_thesis_id: { type: 'string', description: '可选：更正此前自己提交的判断单元（作为新单元追加，不修改原单元）' },
+        thesis_id: { type: 'string', maxLength: 200, description: '可选：显式单元 ID（字母数字及 . _ : -）；省略则由内容派生' },
+      },
+      required: ['parent_record_id', 'target', 'direction', 'horizon', 'baseline_assessment'],
+    },
+    annotations: APPEND_ONLY,
+    securitySchemes: PRIVATE_APPEND_SCHEMES,
+  },
+  {
+    name: 'ashare_research_eval',
+    description: '只读：三层研究价值评价（VPS 研究 / ChatGPT 独立研究 / 综合研究）× 至少六项指标（事实预测正确率、相对收益判断有效性、风险预测有效性、反事实组合收益、费用后风险调整收益、相对简单 HOLD/被动基准的增量价值），输出可供 bundle/日报消费的只读结构（goal-1026 §7.3）。前瞻（TRUE_FORWARD）与补录（RETROSPECTIVE_RECORD/补录）分开统计，绝不合并；无成熟样本输出 PENDING 及原因（pending/pending_reasons/by_class），无真实记录输出 NO_RECORDS 且不补造历史表现；费用后风险调整比率在样本不足时保留 null 与原因。一次方向判断正确 ≠ 投资决策成功，结果带 limitations 披露。纯只读：只读取 research_journal/research_thesis 与本地行情缓存，不写任何表。仅在受认证的 /private/mcp 提供。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
+        as_of_trade_date: { type: 'string', description: '评价截止交易日 YYYYMMDD；省略取最近已收盘交易日' },
+        horizon: { type: 'integer', minimum: 1, maximum: 252, description: '评价窗口（交易日数），默认 5' },
+      },
+    },
+    annotations: READ_ONLY,
+    securitySchemes: PRIVATE_READ_SCHEMES,
+  },
 ];
 
 export const PORTFOLIO_TOOL_NAMES = new Set(portfolioToolDefinitions.map(t => t.name));
+
+/**
+ * 声明了 `research:append` 写 scope 的私有工具集。写门控（privateServer）以它为准，
+ * 而不是逐个点名工具：新增任何声明 PRIVATE_APPEND_SCHEMES 的追加类工具都自动受同一道门约束，
+ * 且与 tools/list 的 securitySchemes 声明保持一致（见 test/oauth-scope-upgrade.test.mjs S10 的口径）。
+ */
+export const WRITE_SCOPE_TOOL_NAMES: ReadonlySet<string> = new Set(
+  portfolioToolDefinitions
+    .filter(tool => tool.securitySchemes.some(s => s.scopes.includes('research:append')))
+    .map(tool => tool.name),
+);
 
