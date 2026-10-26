@@ -57,6 +57,9 @@ const researchJournal = await load('portfolio/researchJournal.js');
 const researchRecord = await load('portfolio/researchRecord.js');
 const chatgptIntake = await load('portfolio/chatgptIntake.js');
 const benchmarks = await load('portfolio/benchmarks.js');
+const researchBundle = await load('portfolio/researchBundle.js');
+const evidenceStore = await load('portfolio/evidence.js');
+const researchEval = await load('portfolio/researchEval.js');
 const { weekdays, seedMarket: seedStockMarket } = await import('./ashare-fixture.mjs');
 
 // ---------------------------------------------------------------- 时间与行情基线（与 golden 同口径）
@@ -1456,4 +1459,88 @@ test('10.4-9 基准版本变化：版本显式、可复现，历史规则不按�
       assert.ok(review.benchmarks.note.includes('基准'), '基准口径必须带说明');
     } finally { db.close(); }
   } finally { market.close(); }
+});
+
+// ================================================================ §11.2 数据迁移与兼容（交付要求）
+
+test('11.2-1 旧库无新表：入口零失败、写路径幂等懒迁移、升级前研究日志逐字节不变', () => {
+  // 升级首日的旧库形态：openPortfolioDb 只有核心表；research_evidence / research_thesis
+  // 是本分支新增表（写路径 CREATE TABLE IF NOT EXISTS 懒建），升级前尚不存在。
+  // 本用例在任务书入口对象上断言：bundle / 评价入口对缺表零失败，且迁移不触碰不可变日志。
+  seedMarket('mig');
+  const acc = seedAccount('mig');
+  const marketFile = join(dir, 'market-mig.sqlite');
+  const market = openAshareDb(marketFile);
+  const db = openPortfolioDb(acc.file, { marketPath: marketFile });
+  const exists = (name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+  try {
+    assert.equal(exists('research_evidence'), false, '旧库不应预先存在 research_evidence');
+    assert.equal(exists('research_thesis'), false, '旧库不应预先存在 research_thesis');
+
+    // 升级前就有的一条历史研究日志（research_journal 同为写路径懒建），作为不可变基准。
+    const journal = atClock(D9_MS, () => researchRecord.recordVpsResearchSnapshot({
+      portfolioDb: db, accountId: acc.id,
+      bundle: { report_id: 'BUNDLE-112-1', as_of_trade_date: D9, status: 'READY',
+        generated_at: `${D9.slice(0, 4)}-${D9.slice(4, 6)}-${D9.slice(6, 8)}T18:00:00+08:00` },
+    }));
+    assert.equal(journal.created, true);
+    const journalBefore = JSON.stringify(db.prepare('SELECT * FROM research_journal ORDER BY record_id').all());
+    assert.ok(journalBefore.length > 0, '不可变基准需要既有日志行');
+
+    const runBundle = () => researchBundle.buildInvestmentResearchBundle({
+      portfolioDb: db, marketDb: market, accountId: acc.id,
+      asOfTradeDate: LAST, now: new Date('2026-10-16T21:55:00+08:00'),
+    });
+
+    // 1) 旧库入口零失败：证据表缺失 → 空登记（sqlite_master 守卫提前返回），
+    //    不抛 no such table，也不登记成 evidence_model 缺口——缺表是升级前的合法状态。
+    const before = runBundle();
+    assert.deepEqual(before.evidence_register.entries, []);
+    assert.equal((before.evidence_gaps ?? []).filter(g => g.module === 'evidence_model').length, 0,
+      '缺表不是数据质量缺陷，不应进 gaps');
+
+    // 2) 评价入口：thesis 表缺失 → 空列表 + 结构化结果，不崩溃。
+    assert.deepEqual(researchEval.listResearchThesis(db, { accountId: acc.id }), []);
+    const evalBefore = researchEval.buildResearchEval({
+      portfolioDb: db, marketDb: market, accountId: acc.id, asOf: '20261023', horizon: 5,
+      feeEstimator: () => ({ total_cents: 10, estimated: true, version: 'synthetic-v1' }),
+    });
+    assert.ok(evalBefore && evalBefore.records, '评价入口在缺表时仍返回结构化结果');
+    assert.doesNotMatch(JSON.stringify(evalBefore), /no such table/);
+
+    // 3) 写路径懒迁移：首次写证据即建表；ensureEvidenceSchema 重复调用幂等。
+    evidenceStore.recordResearchEvidence(db, {
+      evidence_id: 'EV-112-1', kind: 'ROTATION', buy_code: '510300.SH', sell_code: '159558.SZ',
+      strategy_id: 'goal1026-migration', as_of: LAST, valid_until: null, status: 'VERIFIED',
+      recorded_by: 'migration-test', note: '§11.2 迁移用例', recorded_at: '2026-10-16T12:00:00.000Z',
+    }, { confirm: true });
+    assert.equal(exists('research_evidence'), true, '首次写入应懒建证据表');
+    evidenceStore.ensureEvidenceSchema(db);
+    evidenceStore.ensureEvidenceSchema(db); // 幂等：重复建表不抛错、不产生重复数据
+
+    const afterEvidence = runBundle();
+    assert.equal(afterEvidence.evidence_register.entries.length, 1,
+      '迁移后既有证据行应经 fromResearchEvidenceProvenance 进入统一登记');
+    assert.equal(afterEvidence.evidence_register.entries[0].claim, 'EV-112-1');
+    assert.equal((afterEvidence.evidence_gaps ?? []).filter(g => g.module === 'evidence_model').length, 0);
+
+    // 4) 判断单元同理懒建；同键同内容幂等，父记录分类由服务端推导。
+    const thesisArgs = {
+      parent_record_id: journal.record.record_id, target: '159558.SZ', direction: 'neutral',
+      horizon: 'swing', baseline_assessment: '迁移验证：不形成方向性判断。', thesis_id: 'THESIS-112-1',
+    };
+    const t1 = researchEval.appendResearchThesis(db, acc.id, thesisArgs, D9_MS + 60000);
+    assert.equal(t1.created, true);
+    assert.equal(exists('research_thesis'), true, '首次追加判断应懒建判断表');
+    assert.equal(t1.parent_evidence_class, 'TRUE_FORWARD');
+    const t2 = researchEval.appendResearchThesis(db, acc.id, thesisArgs, D9_MS + 120000);
+    assert.equal(t2.created, false, '同键同内容幂等（迁移不产生第二行）');
+
+    // 5) 升级前研究日志逐字节不变：以上全部迁移/写入不触碰不可变日志。
+    const journalAfter = JSON.stringify(db.prepare('SELECT * FROM research_journal ORDER BY record_id').all());
+    assert.equal(journalAfter, journalBefore, 'schema 迁移与新表写入不得改动既有研究日志');
+  } finally {
+    db.close();
+    market.close();
+  }
 });
