@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import {
-  canonicalJson, evaluateResearchJournal, listResearchJournal, readResearchJournal,
+  canonicalJson, evaluateResearchJournal, evaluateDirectionalWindow, listResearchJournal, readResearchJournal,
   JOURNAL_VERSION, type JournalEvaluation, type JournalFeeEstimator, type JournalRecord,
 } from './researchJournal.js';
 import {
@@ -363,6 +363,14 @@ interface UnitView {
   bucketClass: EvidenceClass;
   window: RecordWindow | null;
   pendingReason: string | null;
+  /** goal-1027 P0-2：父记录没有观测窗口时，用判断单元自身的结构化方向声明
+   * （target=ts_code + direction=bullish/bearish + benchmark）派生的可评价窗口。
+   * 与父窗口二选一：有父窗口时优先父窗口，不重复计数。 */
+  thesisWindow?: {
+    status: 'PENDING' | 'EVALUATED' | 'UNAVAILABLE';
+    reason: string | null;
+    window: RecordWindow | null;
+  };
 }
 
 function bump(map: Record<string, number>, key: string) { map[key] = (map[key] ?? 0) + 1; }
@@ -470,11 +478,42 @@ export function buildResearchEval(input: {
     const parent = recordsById.get(unit.parent_record_id) ?? readResearchJournal(input.portfolioDb, unit.parent_record_id);
     const layer = ((parent?.source ?? 'combined') as EvalLayer);
     const stat = parent ? windowOf.get(parent.record_id) : undefined;
-    unitViews.push({
+    const view: UnitView = {
       unit, layer, bucketClass: unit.parent_evidence_class,
       window: stat?.window ?? null,
       pendingReason: stat ? (stat.pendingReason ?? (stat.window ? null : 'parent_window_unavailable')) : 'parent_record_unavailable',
-    });
+    };
+    // P0-2：父窗口缺失时（ChatGPT/Combined 记录 observations 恒空），从判断单元的
+    // 结构化方向声明派生窗口。只对 bullish/bearish + 合法 ts_code target 尝试；
+    // 中性/条件性/证据不足不进入方向统计（它们不是方向预测）。资格仍由
+    // parent_evidence_class 决定——补录父记录的判断单元永远进不了前瞻统计。
+    if (!view.window && parent
+      && (unit.direction === 'bullish' || unit.direction === 'bearish')
+      && /^\d{6}\.(SH|SZ|BJ)$/.test(unit.target)) {
+      const computed = evaluateDirectionalWindow({
+        marketDb: input.marketDb, asOf: parent.as_of_trade_date,
+        evalCutoff: asOf,
+        tsCode: unit.target, benchmarkCode: unit.benchmark ?? undefined,
+        horizon, feeEstimator: input.feeEstimator,
+      });
+      view.thesisWindow = {
+        status: computed.status, reason: computed.reason,
+        window: computed.status === 'EVALUATED' ? {
+          record: parent, maturity: computed.maturity_date!,
+          net: computed.net_return_pct!, maxDrawdown: computed.max_drawdown_pct ?? 0,
+          excess: { csi300_etf_buy_hold: computed.excess_return_pct, frozen_multi_asset_basket: null, initial_five_etf_basket: null },
+          benchVol: null, benchMdd: null,
+          triggerDefined: 0, triggerMet: 0, invalidationDefined: 0, invalidationBreached: 0,
+        } : null,
+      };
+      if (view.thesisWindow.window) {
+        view.window = view.thesisWindow.window;
+        view.pendingReason = null;
+      } else if (view.pendingReason === 'parent_window_unavailable') {
+        view.pendingReason = `thesis_window_${computed.status.toLowerCase()}:${computed.reason ?? 'unspecified'}`;
+      }
+    }
+    unitViews.push(view);
   }
 
   const recordStats = recordStats0.map(({ record, cls }) => ({ record, cls, stat: windowOf.get(record.record_id)! }));
@@ -514,13 +553,16 @@ function classCountInit(): Record<EvidenceClass, number> {
 
 interface RecStat { record: JournalRecord; cls: EvidenceClass; stat: { window: RecordWindow | null; pendingReason: string | null; unavailableReason: string | null } }
 
-/** 一个层的六指标。统计值只来自 TRUE_FORWARD 成熟窗口；补录/历史按 by_class 单独计数（excluded），绝不并入。 */
+/** 一个层的六指标。统计值只来自 TRUE_FORWARD 成熟窗口；补录/历史按 by_class 单独计数（excluded），绝不并入。
+ * 窗口来源两类：记录级（VPS observations）与判断单元级（P0-2 结构化方向窗口，父窗口缺失时）。
+ * 同一父记录已有记录级窗口时，其判断单元不再叠加方向窗口，避免重复计数。 */
 function computeLayerMetrics(recStats: RecStat[], views: UnitView[], horizon: number): { metrics: LayerMetrics; conclusion: string } {
   const byClass = classCountInit();
   const pendingReasons: Record<string, number> = {};
   const unavailableReasons: Record<string, number> = {};
   let tfCount = 0, tfPending = 0, tfUnavailable = 0;
   const matured: RecordWindow[] = [];
+  const recordWindowParents = new Set(recStats.filter(r => r.stat.window).map(r => r.record.record_id));
   for (const { cls, stat } of recStats) {
     byClass[cls]++;
     if (cls !== 'TRUE_FORWARD') {
@@ -533,6 +575,20 @@ function computeLayerMetrics(recStats: RecStat[], views: UnitView[], horizon: nu
     else if (stat.pendingReason) { tfPending++; bump(pendingReasons, stat.pendingReason); }
     else if (stat.unavailableReason) { tfUnavailable++; bump(unavailableReasons, stat.unavailableReason); }
     else { tfPending++; bump(pendingReasons, 'evaluation_missing'); }
+  }
+  // P0-2：判断单元级方向窗口。仅 TRUE_FORWARD 资格、且父记录没有记录级窗口时计入；
+  // 中性/条件性/证据不足没有方向窗口（不计 pending，它们不是方向预测）。
+  for (const view of views) {
+    if (view.bucketClass !== 'TRUE_FORWARD') continue;
+    if (recordWindowParents.has(view.unit.parent_record_id)) continue;
+    if (view.thesisWindow?.window) {
+      matured.push(view.thesisWindow.window);
+      tfCount++;
+    } else if (view.thesisWindow && !view.window) {
+      tfCount++;
+      if (view.thesisWindow.status === 'PENDING') { tfPending++; bump(pendingReasons, view.thesisWindow.reason ?? 'thesis_window_pending'); }
+      else { tfUnavailable++; bump(unavailableReasons, view.thesisWindow.reason ?? 'thesis_window_unavailable'); }
+    }
   }
   const classBlock = (): MetricBucket['by_class'] => ({
     TRUE_FORWARD: { sample_size: matured.length, excluded: 0, pending: tfPending, pending_reasons: pendingReasons },
