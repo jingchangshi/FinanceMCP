@@ -295,6 +295,99 @@ export function evaluateResearchJournal(input: { portfolioDb: DatabaseSync; mark
   }));
 }
 
+/**
+ * 结构化判断单元的方向评价窗口（goal-1027 P0-2）。
+ *
+ * 背景：chatgptIntake 写入的记录 observations 恒为空（数量属于账户语义，外部研究不写
+ * observations），因此 evaluateResearchJournal 对 chatgpt 记录恒返回 no_observations，
+ * ChatGPT 层的判断单元永远拿不到成熟窗口。这里提供一条**结构化、可审计**的绑定：
+ * 判断单元自身声明了 target（必须是真实 ts_code）与 direction（bullish/bearish），
+ * 以其父记录 as_of 为起点、指定 horizon 个完整交易日为窗口，计算 target 相对
+ * benchmark（缺省 510300.SH）的费用后净收益差。中性/证据不足/条件性判断不进入
+ * 方向统计（它们本来就不是方向预测）。
+ *
+ * 绝不从自然语言推断标的或方向，绝不虚构观测：target 不是合法代码或行情/日历缺失时
+ * 返回 UNAVAILABLE + 原因，评价器如实计入 pending/unavailable，不填数。
+ */
+export function evaluateDirectionalWindow(input: {
+  marketDb: DatabaseSync | null | undefined;
+  /** 研究日（窗口起点，必须在交易日历中开放）。 */
+  asOf: string;
+  /** 评价截止日：成熟日不晚于它才算成熟（与 evaluateResearchJournal 的 asOf 同语义）。
+   * 二者必须分开——拿研究日自己当截止会让窗口永远 PENDING。 */
+  evalCutoff: string;
+  tsCode: string;
+  benchmarkCode?: string;
+  horizon: number;
+  feeEstimator?: JournalFeeEstimator;
+}): {
+  status: 'PENDING' | 'EVALUATED' | 'UNAVAILABLE';
+  reason: string | null;
+  maturity_date: string | null;
+  net_return_pct: number | null;
+  benchmark_net_return_pct: number | null;
+  excess_return_pct: number | null;
+  fees_cents: number | null;
+  max_drawdown_pct: number | null;
+} {
+  const base = { maturity_date: null as string | null, net_return_pct: null as number | null,
+    benchmark_net_return_pct: null as number | null, excess_return_pct: null as number | null,
+    fees_cents: null as number | null, max_drawdown_pct: null as number | null };
+  const db = input.marketDb;
+  if (!db || !table(db, 'trade_cal')) return { status: 'UNAVAILABLE', reason: 'trade_calendar_unavailable', ...base };
+  if (!/^\d{6}\.(SH|SZ|BJ)$/.test(input.tsCode)) return { status: 'UNAVAILABLE', reason: 'target_not_a_ts_code', ...base };
+  const startOpen = db.prepare('SELECT is_open FROM trade_cal WHERE cal_date=?').get(input.asOf) as any;
+  if (startOpen?.is_open !== 1) return { status: 'UNAVAILABLE', reason: 'research_date_not_open_in_calendar', ...base };
+  const dates = (db.prepare('SELECT cal_date FROM trade_cal WHERE is_open=1 AND cal_date>? ORDER BY cal_date LIMIT ?').all(input.asOf, input.horizon) as any[]).map(row => String(row.cal_date));
+  const maturity = dates.length === input.horizon ? dates.at(-1)! : null;
+  if (!maturity) return { status: 'PENDING', reason: 'future_calendar_insufficient', ...base };
+  if (maturity > input.evalCutoff) return { status: 'PENDING', reason: 'observation_window_not_mature', ...base, maturity_date: maturity };
+  const benchmarkCode = input.benchmarkCode ?? '510300.SH';
+  const allDates = [input.asOf, ...dates];
+  const series = allDates.map(date => price(db, input.tsCode, date));
+  const bench = allDates.map(date => price(db, benchmarkCode, date));
+  if (series.some(row => !row) || bench.some(row => !row)) return { status: 'UNAVAILABLE', reason: 'missing_exact_window_price', ...base, maturity_date: maturity };
+  const rows = series as Price[];
+  const benchRows = bench as Price[];
+  if (rows.some(row => row.factor === null) || benchRows.some(row => row.factor === null)) return { status: 'UNAVAILABLE', reason: 'adjustment_factor_missing', ...base, maturity_date: maturity };
+  const start = rows[0], end = rows.at(-1)!;
+  let peak = start.raw, dd = 0;
+  for (const row of rows) { peak = Math.max(peak, row.raw); dd = Math.min(dd, row.raw / peak - 1); }
+  let feesTotal: number | null = null;
+  let net = round((end.raw / start.raw - 1) * 100);
+  if (input.feeEstimator) {
+    const quantity = 100;
+    const buy = input.feeEstimator({ ts_code: input.tsCode, side: 'BUY', quantity, price_milli: Math.round(start.raw * 1000), trade_date: input.asOf });
+    const sell = input.feeEstimator({ ts_code: input.tsCode, side: 'SELL', quantity, price_milli: Math.round(end.raw * 1000), trade_date: maturity });
+    if (buy && sell && Number.isSafeInteger(buy.total_cents) && Number.isSafeInteger(sell.total_cents)) {
+      feesTotal = buy.total_cents + sell.total_cents;
+      const invested = Math.round(quantity * start.raw * 100) + buy.total_cents;
+      const proceeds = Math.round(quantity * end.raw * 100) - sell.total_cents;
+      net = round((proceeds / invested - 1) * 100);
+    }
+  }
+  // 基准同初始资金预算（与记录级评价同口径）。
+  const initialBudget = Math.round(100 * start.raw * 100) + (feesTotal !== null ? Math.round(feesTotal / 2) : 0);
+  let benchQuantity = Math.floor(initialBudget / (benchRows[0].raw * 10000)) * 100;
+  let benchNet = round((benchRows.at(-1)!.raw / benchRows[0].raw - 1) * 100);
+  if (benchQuantity <= 0) return { status: 'UNAVAILABLE', reason: 'benchmark_budget_below_one_lot', ...base, maturity_date: maturity };
+  if (input.feeEstimator) {
+    const buy = input.feeEstimator({ ts_code: benchmarkCode, side: 'BUY', quantity: benchQuantity, price_milli: Math.round(benchRows[0].raw * 1000), trade_date: input.asOf });
+    const sell = input.feeEstimator({ ts_code: benchmarkCode, side: 'SELL', quantity: benchQuantity, price_milli: Math.round(benchRows.at(-1)!.raw * 1000), trade_date: maturity });
+    if (!buy || !sell) return { status: 'UNAVAILABLE', reason: 'benchmark_fee_rules_unavailable', ...base, maturity_date: maturity };
+    const invested = Math.round(benchQuantity * benchRows[0].raw * 100) + buy.total_cents;
+    const proceeds = Math.round(benchQuantity * benchRows.at(-1)!.raw * 100) - sell.total_cents;
+    const residual = initialBudget - invested;
+    benchNet = round(((proceeds + residual) / initialBudget - 1) * 100);
+  }
+  return {
+    status: 'EVALUATED', reason: null, maturity_date: maturity,
+    net_return_pct: net, benchmark_net_return_pct: benchNet,
+    excess_return_pct: round(net - benchNet), fees_cents: feesTotal,
+    max_drawdown_pct: round(dd * 100),
+  };
+}
+
 export function recordJournalEvaluations(db: DatabaseSync, results: JournalEvaluation[]) {
   db.exec(SCHEMA);
   let created = 0;
