@@ -28,6 +28,8 @@ const ACCOUNT_TOOLS = [
   'ashare_investment_research_bundle', 'ashare_chatgpt_research_record_append',
   // goal-1026 §7：结构化研究判断单元追加（append-only 写工具）与三层研究评价（只读）。
   'ashare_research_thesis_append', 'ashare_research_eval',
+  // goal-1027 P0-1/P0-3：持久化快照只读获取与 Combined 联合判断冻结（append-only 写工具）。
+  'ashare_research_snapshot_get', 'ashare_research_combined_append',
 ];
 
 // 合成账户库（演示快照，不是用户真实账户）。

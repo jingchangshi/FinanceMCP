@@ -255,13 +255,14 @@ test('S10 工具声明与服务端门控一致：声明追加 scope 的工具，
   const { portfolioToolDefinitions, WRITE_SCOPE_TOOL_NAMES } = await import('../build/ashare/definitions.js');
   const { CHATGPT_INTAKE_TOOL } = await import('../build/portfolio/chatgptIntake.js');
   const { THESIS_APPEND_TOOL } = await import('../build/portfolio/researchEval.js');
+  const { COMBINED_APPEND_TOOL } = await import('../build/portfolio/combinedResearch.js');
   const { OAUTH_SCOPE, OAUTH_WRITE_SCOPE } = await import('../build/oauth/config.js');
   const appendDeclared = portfolioToolDefinitions
     .filter(t => t.securitySchemes.some(s => s.scopes.includes(OAUTH_WRITE_SCOPE)))
     .map(t => t.name);
-  // goal-1026 §7.2 追加研究判断单元工具：声明 research:append 的工具集与门控口径
-  // （definitions.ts WRITE_SCOPE_TOOL_NAMES）保持一致，按定义顺序。
-  assert.deepEqual(appendDeclared, [CHATGPT_INTAKE_TOOL, THESIS_APPEND_TOOL]);
+  // goal-1026 §7.2 研究判断单元 + goal-1027 P0-3 Combined 联合判断：声明 research:append
+  // 的工具集与门控口径（definitions.ts WRITE_SCOPE_TOOL_NAMES）保持一致，按定义顺序。
+  assert.deepEqual(appendDeclared, [CHATGPT_INTAKE_TOOL, THESIS_APPEND_TOOL, COMBINED_APPEND_TOOL]);
   // 声明推导出的清单必须与服务端写门控使用的导出集合逐项一致（同一口径的两面）。
   assert.deepEqual([...appendDeclared].sort(), [...WRITE_SCOPE_TOOL_NAMES].sort(),
     'securitySchemes 推导的写工具清单与 WRITE_SCOPE_TOOL_NAMES 不一致');

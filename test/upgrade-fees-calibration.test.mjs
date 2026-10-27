@@ -127,9 +127,11 @@ test('priority: code rule > broker category rule > category rule > default', () 
 
 test('fee administration is a local confirmed CLI; no public or private MCP tool can write it', () => {
   for (const tool of [...portfolioToolDefinitions, ...ashareToolDefinitions]) {
-    // 允许的例外是两个 append-only 研究写工具：ChatGPT 研究记录写回（research_journal）
-    // 与研究判断单元追加（research_thesis）。两者都不得写费用/账本相关表。
-    if (tool.name === 'ashare_chatgpt_research_record_append' || tool.name === 'ashare_research_thesis_append') {
+    // 允许的例外是三个 append-only 研究写工具：ChatGPT 研究记录写回（研究日志表）、
+    // 研究判断单元追加（research_thesis）、Combined 联合判断冻结（goal-1027 P0-3，
+    // 只写研究日志的 source='combined' 行）。三者都不得写费用/账本相关表。
+    if (tool.name === 'ashare_chatgpt_research_record_append' || tool.name === 'ashare_research_thesis_append'
+      || tool.name === 'ashare_research_combined_append') {
       assert.equal(tool.annotations.readOnlyHint, false); continue;
     }
     assert.doesNotMatch(tool.name, /fee|ledger|import|record|completeness|confirm|profile/, tool.name);
