@@ -324,9 +324,9 @@ test('工具端点：写工具可写、读工具只读、公网清单永不包�
     const priv = getPrivateToolList().map(t => t.name);
     assert.ok(priv.includes(THESIS_APPEND_TOOL));
     assert.ok(priv.includes(THESIS_EVAL_TOOL));
-    // 私有清单上的写工具恰好是两个追加类工具（intake + thesis）。
+    // 私有清单上的写工具恰好是三个追加类工具（intake + thesis + combined）。
     const writers = getPrivateToolList().filter(t => t.annotations.readOnlyHint !== true).map(t => t.name).sort();
-    assert.deepEqual(writers, ['ashare_chatgpt_research_record_append', THESIS_APPEND_TOOL].sort());
+    assert.deepEqual(writers, ['ashare_chatgpt_research_record_append', 'ashare_research_combined_append', THESIS_APPEND_TOOL].sort());
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);

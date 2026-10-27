@@ -134,13 +134,15 @@ test('ChatGPT records stay a separate source and need real provenance; no MCP to
     assert.deepEqual(Object.keys(r.by_source), ['chatgpt']);
     assert.equal(r.records.by_source.vps, undefined);
   } finally { p.close(); m.close(); }
-  // Exactly one MCP-reachable journal writer exists (chatgptIntake.ts); the tool dispatcher only imports it.
+  // MCP-reachable journal writers live in their own modules (chatgptIntake.ts for the ChatGPT
+  // intake, combinedResearch.ts for the Combined freeze — goal-1027 P0-3); the tool dispatcher
+  // only imports those writers and never calls the journal write itself.
   for (const file of ['src/portfolio/researchTools.ts', 'src/portfolio/tools.ts', 'src/oauth/router.ts', 'src/privateServer.ts', 'src/httpServer.ts', 'src/dispatch.ts']) {
     assert.doesNotMatch(readFileSync(file, 'utf8'), /recordResearchJournal|research_journal/, `${file} must not call a journal write directly`);
   }
   assert.match(readFileSync('src/portfolio/researchTools.ts', 'utf8'), /appendChatgptResearchRecord/);
   const writers = execFileSync('grep', ['-rlE', 'recordResearchJournal|recordJournalEvaluations', 'src'], { encoding: 'utf8' }).trim().split('\n').sort();
-  assert.deepEqual(writers, ['src/portfolio/bundleRecordCli.ts', 'src/portfolio/chatgptIntake.ts', 'src/portfolio/journalCli.ts', 'src/portfolio/researchJournal.ts', 'src/portfolio/researchRecord.ts']);
+  assert.deepEqual(writers, ['src/portfolio/bundleRecordCli.ts', 'src/portfolio/chatgptIntake.ts', 'src/portfolio/combinedResearch.ts', 'src/portfolio/journalCli.ts', 'src/portfolio/researchJournal.ts', 'src/portfolio/researchRecord.ts']);
 });
 
 test('the scheduled account service records, reviews and reports failure of either step', () => {

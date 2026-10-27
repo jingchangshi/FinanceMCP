@@ -113,16 +113,18 @@ test('V1-P1 the private endpoint advertises the three V1.0 research tools', asyn
     assert.equal(list.status, 200);
     const names = list.body.result.tools.map(t => t.name);
     for (const name of V1_TOOLS) assert.ok(names.includes(name), `缺少 ${name}`);
-    // Every private tool is read-only, except exactly the two append-only tools:
-    // the ChatGPT intake (research_journal) and the thesis unit append (research_thesis).
+    // Every private tool is read-only, except exactly the three append-only tools:
+    // the ChatGPT intake (研究日志), the thesis unit append (research_thesis) and the
+    // Combined freeze (goal-1027 P0-3, 只写研究日志 source='combined' 行).
     for (const tool of list.body.result.tools) {
-      if (tool.name === 'ashare_chatgpt_research_record_append' || tool.name === 'ashare_research_thesis_append') {
+      if (tool.name === 'ashare_chatgpt_research_record_append' || tool.name === 'ashare_research_thesis_append'
+        || tool.name === 'ashare_research_combined_append') {
         assert.deepEqual(tool.annotations, { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: true });
         continue;
       }
       assert.equal(tool.annotations?.readOnlyHint, true, `${tool.name} 必须是只读`);
     }
-    assert.equal(list.body.result.tools.filter(t => t.annotations?.readOnlyHint !== true).length, 2, 'exactly two non-read-only private tools');
+    assert.equal(list.body.result.tools.filter(t => t.annotations?.readOnlyHint !== true).length, 3, 'exactly three non-read-only private tools');
   } finally { await server.stop(); }
 });
 

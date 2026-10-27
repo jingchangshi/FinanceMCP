@@ -196,9 +196,10 @@ test('daily cap applies to new records only', () => {
 test('schema lists the append-only tools privately and nothing publicly', () => {
   const priv = getPrivateToolList();
   const writers = priv.filter(t => t.annotations.readOnlyHint !== true);
-  // goal-1026 §7.2 追加了研究判断单元工具：私有端点现在有两个 append-only 写工具，
-  // 其余（含 ashare_research_eval）仍必须只读。
-  assert.deepEqual(writers.map(t => t.name), [TOOL, 'ashare_research_thesis_append']);
+  // goal-1026 §7.2 追加了研究判断单元工具、goal-1027 P0-3 追加了 Combined 联合判断冻结：
+  // 私有端点现在有三个 append-only 写工具，其余（含 ashare_research_eval、
+  // ashare_research_snapshot_get）仍必须只读。
+  assert.deepEqual(writers.map(t => t.name), [TOOL, 'ashare_research_thesis_append', 'ashare_research_combined_append']);
   const intake = writers.find(t => t.name === TOOL);
   const schema = intake.inputSchema;
   assert.equal(schema.additionalProperties, false);
@@ -207,6 +208,8 @@ test('schema lists the append-only tools privately and nothing publicly', () => 
   assert.equal(intake.annotations.destructiveHint, false);
   assert.ok(!getAvailableToolList().some(t => t.name === TOOL));
   assert.ok(!getAvailableToolList().some(t => t.name === 'ashare_research_thesis_append'));
+  assert.ok(!getAvailableToolList().some(t => t.name === 'ashare_research_combined_append'));
+  assert.ok(!getAvailableToolList().some(t => t.name === 'ashare_research_snapshot_get'));
 });
 
 // ------------------------------------------------------------- HTTP: auth, public isolation, end to end
