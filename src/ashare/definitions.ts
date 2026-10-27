@@ -408,6 +408,37 @@ export const portfolioToolDefinitions: { name: string; description: string; inpu
     annotations: READ_ONLY,
     securitySchemes: PRIVATE_READ_SCHEMES,
   },
+  {
+    name: 'ashare_research_snapshot_get',
+    description: '只读：按真实身份获取持久化 VPS 研究快照（goal-1027 P0-1）。严格区分三个概念：Live Bundle（当前数据+代码生成的实时研究包）、Persisted VPS Snapshot（记录时刻冻结的不可变事实，本工具读取的对象）、ChatGPT Research Record（独立判断记录）。支持三种调用：(1) record_id 精确读取一个快照；(2) as_of_trade_date 列出该交易日全部持久化版本（同日多个 Bundle 各自独立，不隐式合并）并附最新版本的完整内容；(3) 两者都省略时列出账户全部快照元数据。返回原始 report_id（bundle_id）、记录时间 recorded_at、数据截止时间、规则版本、内容哈希（读取时服务端重算校验）；冻结原始内容（frozen_payload）与查询时元数据（query）严格分字段。payload 缺失的历史记录如实报告 PAYLOAD_MISSING 与不可恢复，绝不以 Live Bundle 回填、绝不按日期把内容不同的 Live Bundle 关联到旧快照。纯只读：不建表、不写行、不创建快照。仅在受认证的 /private/mcp 提供。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
+        record_id: { type: 'string', maxLength: 200, description: 'VPS 快照记录 ID（如 VPS-BUNDLE-20261026-…）；优先于 as_of_trade_date' },
+        as_of_trade_date: { type: 'string', description: 'YYYYMMDD；与 record_id 同时给出时做一致性校验，单独给出时列出该日全部版本并附最新完整快照' },
+      },
+    },
+    annotations: READ_ONLY,
+    securitySchemes: PRIVATE_READ_SCHEMES,
+  },
+  {
+    name: 'ashare_research_combined_append',
+    description: '只追加：按事先冻结的联合规则（rule_version 可追溯）生成并持久化一条 Combined 联合研究判断（goal-1027 P0-3）。Combined 表达的是：同一研究时点，以一条真实 VPS 研究记录和一条真实 ChatGPT 研究记录为父输入，按版本化规则形成的一份联合研究决策——不是把两套历史收益平均。任一父记录缺失即拒绝（combined_inputs_incomplete），不虚构联合判断。方向语义只取自 ChatGPT 侧的结构化判断单元（research_thesis），不从自由文本推断；无结构化方向时沿用 VPS 原判断并披露。冲突（ChatGPT 结构化方向含行动性主张而 VPS 判定无动作）按规则沿用 VPS 并保留分歧，不凭 ChatGPT 置信度覆盖。NO_ACTION 是合法联合决策。record_id 由父记录身份+规则版本派生：同输入幂等，不重复组合；记录不可变，结果已知后追加自动降为补录并被评价器排除在前瞻之外。只做研究判断合并，不产生换仓执行、不写账本。时间戳与 ID 由服务端生成。仅在受认证的 /private/mcp 提供。',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
+        as_of_trade_date: { type: 'string', description: 'YYYYMMDD 联合研究时点；必须与两条父记录一致' },
+        vps_record_id: { type: 'string', maxLength: 200, description: '可选：显式 VPS 父记录 ID；缺省取该日最新 VPS 记录' },
+        chatgpt_record_id: { type: 'string', maxLength: 200, description: '可选：显式 ChatGPT 父记录 ID；缺省取该日最新 ChatGPT 记录' },
+      },
+      required: ['as_of_trade_date'],
+    },
+    annotations: APPEND_ONLY,
+    securitySchemes: PRIVATE_APPEND_SCHEMES,
+  },
 ];
 
 export const PORTFOLIO_TOOL_NAMES = new Set(portfolioToolDefinitions.map(t => t.name));

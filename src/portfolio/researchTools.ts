@@ -15,6 +15,8 @@ import {
   THESIS_APPEND_TOOL, THESIS_EVAL_TOOL, RESEARCH_EVAL_SCHEMA,
   appendResearchThesis, buildResearchEval,
 } from './researchEval.js';
+import { SNAPSHOT_GET_TOOL, getResearchSnapshot, listResearchSnapshots } from './researchSnapshot.js';
+import { COMBINED_APPEND_TOOL, appendCombinedResearch } from './combinedResearch.js';
 
 /**
  * 私有账户端点的"研究/日报"工具实现（V1.0 C2/C6/D1）。
@@ -207,6 +209,47 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
       } finally { db.close(); }
     }
 
+    case SNAPSHOT_GET_TOOL: {
+      // 持久化 VPS 快照只读获取（goal-1027 P0-1）。纯只读：不建表、不写行、不创建快照。
+      const db = readDb();
+      try {
+        const account = resolveAccountId(db, args.account_id);
+        const recordId = args.record_id === undefined || args.record_id === null || args.record_id === '' ? undefined : String(args.record_id);
+        const asOf = ymd(args.as_of_trade_date, 'as_of_trade_date');
+        if (!recordId && !asOf) {
+          // record_id 与 as_of_trade_date 都缺省时列出全部（不隐式挑选快照）。
+          return json(listResearchSnapshots(db, { accountId: account.account_id }));
+        }
+        if (!recordId && asOf) {
+          // 只给交易日：优先列清单；调用方再按 record_id 精确读取。同时返回缺省最新命中的完整快照。
+          const list = listResearchSnapshots(db, { accountId: account.account_id, asOf });
+          if (!list.snapshots.length) return json({ ...list, note: '该交易日没有持久化 VPS 快照；只读查询不会创建快照。' });
+          const full = getResearchSnapshot(db, { accountId: account.account_id, asOf });
+          return json({ ...list, latest: full });
+        }
+        return json(getResearchSnapshot(db, { accountId: account.account_id, recordId, asOf }));
+      } finally { db.close(); }
+    }
+
+    case COMBINED_APPEND_TOOL: {
+      // Combined 联合判断生成与冻结（goal-1027 P0-3）。与 intake/thesis 同一边界：唯一以
+      // 可写方式打开的路径，且只调用只追加函数（研究日志表触发器禁止 UPDATE/DELETE）。
+      if (!portfolioEnabled()) throw new Error(DISABLED.message);
+      const path = portfolioDbPath();
+      if (!existsSync(path)) throw new Error(`账户数据库不存在（${path}），请先运行 finance-ashare portfolio-import`);
+      const db = openPortfolioDb(path, { writable: true });
+      try {
+        const account = resolveAccountId(db, (args ?? {}).account_id);
+        const asOf = ymd((args ?? {}).as_of_trade_date, 'as_of_trade_date');
+        if (!asOf) throw new Error('as_of_trade_date 需要 YYYYMMDD');
+        return json(appendCombinedResearch(db, {
+          accountId: account.account_id, asOf,
+          vpsRecordId: args.vps_record_id ? String(args.vps_record_id) : undefined,
+          chatgptRecordId: args.chatgpt_record_id ? String(args.chatgpt_record_id) : undefined,
+        }));
+      } finally { db.close(); }
+    }
+
     default:
       throw new Error(`Unknown research tool: ${name}`);
   }
@@ -221,4 +264,6 @@ export const RESEARCH_PRIVATE_TOOLS = new Set([
   CHATGPT_INTAKE_TOOL,
   THESIS_APPEND_TOOL,
   THESIS_EVAL_TOOL,
+  SNAPSHOT_GET_TOOL,
+  COMBINED_APPEND_TOOL,
 ]);
