@@ -101,6 +101,45 @@ Architecture work completed:
 - kept new coverage inside existing aggregate tools instead of adding endpoint-shaped public tools
 - refreshed the local `reports/tushare-mcp` coverage artifacts through `scripts/generate_tushare_coverage_report.js`
 
+### Goal-1028（2026-10-28，研究层消费，非公开工具面扩张）
+
+本轮热点行业 × 多策略研究系统（AShareInvestor `hotspot-sync`）在**服务端研究层**
+消费了下列接口。这些接口**未**加入公开聚合工具面（`Current Public Tool Surface`
+与 Snapshot 覆盖数字**不变**——覆盖数只计公开暴露的接口），但数据能力与
+PIT（点时）语义已实测，如实记录如下。
+
+**真实联网同步实测（2026-10-28，goal-1028 `hotspot-sync`）**：
+
+| 接口 | 实测行数 | 说明 |
+|---|---|---|
+| `sw_classify` | 511 | 申万 2021 L1/L2/L3 分类目录 |
+| `sw_member` | 5,922 | 全市场成分，`index_member_all` 一次取全 |
+| `sw_index_daily` | 8,091 | 申万指数日线 |
+| `ths_index` | 2,159 | 同花顺概念/行业/事件/风格目录 |
+| `ths_member` | 41,845 | 同花顺成分（无时点，见下） |
+| `ths_index_daily` | 6,816 | 同花顺指数日线 |
+
+以上为**真实拉取数据**，非估算。ETF 权重采集同步实测：9 只行业主题 ETF →
+`etf_weight_snapshot` **480 行**（1 只来自 `index_weight` + 8 只来自
+`fund_portfolio`），真实写入。
+
+**接口 PIT / 可得性发现**：
+
+| 接口 | 角色 | PIT / 可得性 | 发现 |
+|---|---|---|---|
+| `index_member_all` | 申万全量成分一次取全 | **PARTIAL PIT** | 上游 `out_date` 全为 NULL、`is_new` 恒为 `'Y'`——只有"在册"成分，无调出历史。列照存，等上游填；不伪造调出日期 |
+| `ths_member` | 同花顺成分 | **NO_POINT_IN_TIME** | 上游**无任何时间字段**。禁止用它回填历史（回填只会伪造时点）；仅当日主题标注可用。`hotspotPool` 仅在 `collected_at <= as_of` 守卫下使用——同步当日可用，历史回放诚实降级为"无 THS 龙头可选" |
+| `ths_daily` | 同花顺指数日线 | 正常日线，**缺 amount** | 字段列表**无 `amount`**（实测字段：`ts_code,trade_date,open,high,low,close,pre_close,avg_price,change,pct_change,vol,turnover_rate`）→ `amount_trend` 因子对 THS 来源板块**诚实不可得**：`SELECT NULL AS amount`，权重在可用因子上重归一化。对比 `sw_daily` **有** amount |
+| `fund_portfolio` | 基金季度/半年持仓 | 可得性 = `ann_date` | 天然滞后报告期末；`ann_date` 为 null 的行在写入时被**拒绝**（不伪造时点）。披露滞后是上游事实，非采集失败 |
+| `index_weight` | 指数月度权重 | 可得性 = `trade_date`（权重日） | 权重日即发布可得日；用于行业 ETF（如中证指数月度权重） |
+| `etf_sh_cons` / `etf_sz_cons` | ETF 申赎篮子 | 不适用 | 申赎篮子 `qty` **≠** 投资权重，**永不**进入 `etf_weight_snapshot`；`basketNotWeightGuard` 无条件拦截 |
+| `index_classify` | 指数分类目录 | **PENDING / 待验证** | L3 覆盖度需真实同步确认 L3 行数——goal-1028 **未**实测该接口，不宣称覆盖 |
+
+Architecture work completed:
+
+- 新增服务端研究层同步入口 `hotspot-sync`（申万 + 同花顺目录/成分/日线），**不**接入 daily 管道、**不**计入公开工具面
+- `ths_member` / `index_member_all` / `ths_daily` 的 PIT 限制在 `data-contracts.md` 与 `tushare-interface-coverage.md` 同步如实登记
+
 ## Highest-Priority Remaining Families
 
 These are the best next expansion areas under the current architecture style:
