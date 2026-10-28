@@ -411,18 +411,23 @@ test('8. MCP tools are callable and an unknown code yields a clear per-code entr
 
 // ---------------------------------------------------------------- H. regression
 
-test('9. the 9 pre-existing tools plus factor_snapshot are unchanged; ETF tools are appended', () => {
+test('9. the 9 pre-existing tools plus factor_snapshot are unchanged; ETF and hotspot tools are appended', () => {
   const names = ashareToolDefinitions.map(t => t.name);
   const BEFORE = [
     'ashare_data_status', 'ashare_daily_report', 'ashare_watchlist', 'ashare_stock_analysis', 'ashare_sector_rank',
     'ashare_factor_snapshot', 'ashare_stock_history', 'ashare_financial_data', 'ashare_market_data', 'ashare_stock_basic',
   ];
   assert.deepEqual(names.slice(0, BEFORE.length), BEFORE, '既有 10 个工具的顺序与名称未变');
-  assert.deepEqual(names.slice(BEFORE.length), ['ashare_etf_quotes', 'ashare_etf_status']);
+  assert.deepEqual(names.slice(BEFORE.length), [
+    'ashare_etf_quotes', 'ashare_etf_status',
+    'ashare_hotspot_sectors', 'ashare_hotspot_opportunities',
+  ]);
   const byName = new Map(ashareToolDefinitions.map(t => [t.name, t]));
   for (const n of BEFORE) assert.equal(byName.get(n).annotations.readOnlyHint, true, n);
   assert.equal(byName.get('ashare_etf_quotes').annotations.readOnlyHint, true);
   assert.equal(byName.get('ashare_etf_status').annotations.readOnlyHint, true);
+  assert.equal(byName.get('ashare_hotspot_sectors').annotations.readOnlyHint, true);
+  assert.equal(byName.get('ashare_hotspot_opportunities').annotations.readOnlyHint, true);
   assert.match(byName.get('ashare_etf_quotes').description, /vol=手/);
   assert.match(byName.get('ashare_etf_quotes').description, /amount=千元/);
   assert.match(byName.get('ashare_etf_quotes').description, /不是资金净流入/);
