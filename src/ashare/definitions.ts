@@ -163,7 +163,7 @@ ashareToolDefinitions.push(
 ashareToolDefinitions.push(
   {
     name: 'ashare_etf_quotes',
-    description: `ETF 行情快照（只读本地 fund_* 缓存）：基础信息、最新行情与明确单位换算、复权价格、份额时点值与质量标记。字段单位：价格=元/份，vol=手（1 手 = 100 份，volume_shares=份），amount=千元（amount_cny=元）。fund_share 是份额时点存量，份额变化不是资金净流入，也不等于成交额；仅在两个可比份额日期与价格代理都存在时才给出 net_creation_estimate（净申购规模估计）。行情缺失返回 NOT_READY 且价格字段为 null；行情落后于预期交易日时仍返回真实行情日期并标记 STALE/DEGRADED，不伪造、不用旧数据冒充当日。${DATA_NOTE}`,
+    description: `ETF 行情快照（只读本地 fund_* 缓存）：基础信息、基金费率（fee 块：management_rate_pct/custody_rate_pct/total_rate_pct，年费率百分比，来源 tushare.fund_basic，fee.as_of 为刷新时间；场内买卖无申购赎回费，交易成本仅为券商佣金）、最新行情与明确单位换算、复权价格、份额时点值与质量标记。字段单位：价格=元/份，vol=手（1 手 = 100 份，volume_shares=份），amount=千元（amount_cny=元）。fund_share 是份额时点存量，份额变化不是资金净流入，也不等于成交额；仅在两个可比份额日期与价格代理都存在时才给出 net_creation_estimate（净申购规模估计）。行情缺失返回 NOT_READY 且价格字段为 null；行情落后于预期交易日时仍返回真实行情日期并标记 STALE/DEGRADED，不伪造、不用旧数据冒充当日。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -177,7 +177,7 @@ ashareToolDefinitions.push(
   },
   {
     name: 'ashare_etf_status',
-    description: `ETF 数据状态：缓存最新 ETF 日线日期、预期最近交易日、五只 ETF 的基础信息/行情/份额覆盖、逐只就绪度（READY/DEGRADED/NOT_READY）与最近同步记录。空缓存返回 NOT_READY 与原因，不抛异常。${DATA_NOTE}`,
+    description: `ETF 数据状态：缓存最新 ETF 日线日期、预期最近交易日、五只 ETF 的基础信息（含 fee 费率块：管理/托管年费率百分比与 as_of 刷新时间）/行情/份额覆盖、逐只就绪度（READY/DEGRADED/NOT_READY）与最近同步记录。空缓存返回 NOT_READY 与原因，不抛异常。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: { date: dateProp },

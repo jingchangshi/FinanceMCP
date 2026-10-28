@@ -21,7 +21,7 @@ const { openAshareDb, upsertRows, closeAshareDb, migrateAshareDb } = await impor
 const etf = await import('../build/ashare/etf.js');
 const {
   ETF_UNIVERSE, ETF_LOT_SIZE, ETF_TRADE_UNIT, ETF_STALE_MAX_AGE_DAYS, ETF_LIQUIDITY_WINDOW,
-  FLOW_LABEL_RULE, ETF_NOT_INITIALIZED, classifyFlow, etfQuotes, etfStatus, etfSchemaReady,
+  FLOW_LABEL_RULE, ETF_NOT_INITIALIZED, ETF_FEE_NOTE, classifyFlow, etfQuotes, etfStatus, etfSchemaReady,
   syncFundBasic, syncFundDaily, syncFundAdj, syncFundShare,
 } = etf;
 const { ashareToolDefinitions } = await import('../build/ashare/definitions.js');
@@ -108,6 +108,35 @@ test('1. five ETF basic records map code → name → market → list_date', () 
     assert.equal(x.source, 'tushare.fund_daily');
     assert.equal(ETF_LOT_SIZE, 100);
     assert.deepEqual(ETF_TRADE_UNIT, x.trade_unit);
+    // fee 块：年费率百分比口径，来自 fund_basic 的 m_fee/c_fee。
+    assert.equal(x.fee.management_rate_pct, b.m_fee);
+    assert.equal(x.fee.custody_rate_pct, b.c_fee);
+    assert.equal(x.fee.total_rate_pct, b.m_fee + b.c_fee);
+    assert.equal(x.fee.unit, 'percent_per_year');
+    assert.equal(x.fee.source, 'tushare.fund_basic');
+    assert.equal(x.fee.note, ETF_FEE_NOTE);
+  }
+});
+
+test('1b. fee block survives missing fund_basic with explicit nulls (no fabrication)', () => {
+  const q = etfQuotes(db, ['999999.SZ'], { start: DATES[0], end: LAST });
+  const fee = q.quotes[0].fee;
+  assert.deepEqual(fee, {
+    management_rate_pct: null,
+    custody_rate_pct: null,
+    total_rate_pct: null,
+    unit: 'percent_per_year',
+    source: 'tushare.fund_basic',
+    as_of: null,
+    note: ETF_FEE_NOTE,
+  }, 'fund_basic 缺失时费率显式为 null，块仍在，不编造数字');
+  // etfStatus 逐只也带 fee 块（宇宙内代码有真实费率）。
+  const s = etfStatus(db, { date: LAST });
+  for (const c of s.codes) {
+    assert.equal(c.fee.management_rate_pct, 0.5);
+    assert.equal(c.fee.custody_rate_pct, 0.1);
+    assert.equal(c.fee.total_rate_pct, 0.6);
+    assert.equal(c.fee.unit, 'percent_per_year');
   }
 });
 
@@ -398,6 +427,8 @@ test('9. the 9 pre-existing tools plus factor_snapshot are unchanged; ETF tools 
   assert.match(byName.get('ashare_etf_quotes').description, /amount=千元/);
   assert.match(byName.get('ashare_etf_quotes').description, /不是资金净流入/);
   assert.match(byName.get('ashare_etf_quotes').description, /stale|STALE|滞后/);
+  assert.match(byName.get('ashare_etf_quotes').description, /management_rate_pct/);
+  assert.match(byName.get('ashare_etf_status').description, /fee/);
 });
 
 // ---------------------------------------------------------------- I. schema and sync shape
