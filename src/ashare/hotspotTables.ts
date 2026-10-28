@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS hotspot_candidate (
   primary_sector TEXT, sectors TEXT,
   etf_sources TEXT, multi_etf INTEGER,
   leaderships TEXT, signals TEXT,
+  risk_events TEXT,
   trade_permission TEXT, trade_permission_reason TEXT,
   pool TEXT, inclusion_reason TEXT, exclusion_reason TEXT,
   priority INTEGER, priority_reason TEXT,
@@ -97,6 +98,14 @@ export const HOTSPOT_TABLES = [
 /** Idempotent: safe to call at the top of every sync and every read path. */
 export function ensureHotspotSchema(db: DatabaseSync): void {
   db.exec(HOTSPOT_SCHEMA);
+  // Own-table column migration (goal-1028's own tables only — pre-existing
+  // production tables are never touched): tables created before risk_events
+  // existed get the column added once, guarded by table_info so the call
+  // stays idempotent. CREATE IF NOT EXISTS cannot add columns to a table
+  // that already exists.
+  const hasRisk = (db.prepare('PRAGMA table_info(hotspot_candidate)').all() as Array<{ name: string }>)
+    .some(c => c.name === 'risk_events');
+  if (!hasRisk) db.exec('ALTER TABLE hotspot_candidate ADD COLUMN risk_events TEXT');
 }
 
 export function hotspotTableExists(db: DatabaseSync, name: string): boolean {
