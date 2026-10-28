@@ -26,7 +26,9 @@
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import { ashareDataDir } from './db.js';
+import { writeWeightSnapshot, type EtfWeightRow } from './etfWeightStore.js';
 
 export const WEIGHT_CAPTURE_VERSION = 'etf-weight-cache-20261026-v1';
 
@@ -61,6 +63,8 @@ export interface WeightCaptureResult {
   weight_sum_pct: number | null;
   path: string | null;
   error: string | null;
+  /** fund_portfolio rows dropped from the PIT store for a missing ann_date. */
+  snapshot_skipped_no_ann_date?: number;
 }
 
 const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
@@ -117,7 +121,7 @@ export function makeTushareApi(token: string, throttleMs = 350): TushareApi {
   };
 }
 
-async function captureOne(api: TushareApi, code: string, asOf: string): Promise<WeightCaptureResult> {
+async function captureOne(api: TushareApi, code: string, asOf: string, db?: DatabaseSync): Promise<WeightCaptureResult> {
   const spec = INDEX_WEIGHT_SPECS[code];
   let weightRows: WeightCacheRow[] = [];
   let weightDate: string | null = null;
@@ -125,6 +129,10 @@ async function captureOne(api: TushareApi, code: string, asOf: string): Promise<
   let publicationDate: string | null = null;
   let indexCode: string | null = null;
   let sourceNote: string;
+  // fund_portfolio rows carry their own ann_date (per-report disclosure);
+  // index_weight rows take weightDate as the single publication date.
+  let fundRows: Array<{ ts_code: string; weight: number; ann_date: string | null }> = [];
+  let skippedNoAnnDate = 0;
 
   if (spec) {
     const res = await api('index_weight', {
@@ -158,10 +166,17 @@ async function captureOne(api: TushareApi, code: string, asOf: string): Promise<
       return { code, status: 'FAILED', weight_date: null, weight_source: 'fund_portfolio', publication_date: null, index_code: null, n: 0, weight_sum_pct: null, path: null, error: 'fund_portfolio: no report period on/before as_of' };
     }
     const periodRows = res.rows.filter(r => String(r.end_date) === weightDate);
-    weightRows = periodRows
-      .map(r => ({ ts_code: String(r.symbol), weight: Number(r.stk_mkv_ratio) }))
+    // Keep each row's own ann_date for the PIT store: a fund_portfolio row is
+    // only visible from its disclosure date, and rows lacking one are dropped.
+    fundRows = periodRows
+      .map(r => ({
+        ts_code: String(r.symbol), weight: Number(r.stk_mkv_ratio),
+        ann_date: /^\d{8}$/.test(String(r.ann_date ?? '')) ? String(r.ann_date) : null,
+      }))
       .filter(r => /^\d{6}\.(SH|SZ|BJ)$/.test(r.ts_code) && Number.isFinite(r.weight) && r.weight > 0);
-    publicationDate = periodRows.map(r => String(r.ann_date ?? '')).filter(d => /^\d{8}$/.test(d)).sort().at(-1) ?? null;
+    weightRows = fundRows.map(({ ts_code, weight }) => ({ ts_code, weight }));
+    skippedNoAnnDate = fundRows.filter(r => r.ann_date === null).length;
+    publicationDate = fundRows.map(r => r.ann_date ?? '').filter(d => d !== '').sort().at(-1) ?? null;
     weightSource = 'fund_portfolio';
     sourceNote = PORTFOLIO_NOTE;
   }
@@ -170,6 +185,7 @@ async function captureOne(api: TushareApi, code: string, asOf: string): Promise<
     return { code, status: 'FAILED', weight_date: weightDate, weight_source: weightSource, publication_date: publicationDate, index_code: indexCode, n: 0, weight_sum_pct: null, path: null, error: 'no constituent rows parsed' };
   }
 
+  const capturedAt = new Date().toISOString();
   const doc = {
     schema: WEIGHT_CAPTURE_VERSION,
     as_of: asOf,
@@ -178,7 +194,7 @@ async function captureOne(api: TushareApi, code: string, asOf: string): Promise<
     publication_date: publicationDate,
     index_code: indexCode,
     weightRows,
-    captured_at: new Date().toISOString(),
+    captured_at: capturedAt,
     source_note: sourceNote,
   };
   const dir = weightCacheDir();
@@ -187,11 +203,39 @@ async function captureOne(api: TushareApi, code: string, asOf: string): Promise<
   const tmpPath = `${finalPath}.tmp-${process.pid}`;
   writeFileSync(tmpPath, JSON.stringify(doc, null, 2));
   renameSync(tmpPath, finalPath); // 原子替换：失败保留旧文件
+  // Mirror into the PIT store the hotspot pool reads. available_from is the
+  // disclosure date an analyst could actually have known the weight: the
+  // rebalance day for index_weight, the row's own ann_date for fund_portfolio.
+  // Rows without a usable date are counted, never guessed.
+  if (db) {
+    const storeRows: EtfWeightRow[] = [];
+    if (weightSource === 'index_weight') {
+      for (const r of weightRows) {
+        storeRows.push({
+          etf_code: code, index_code: indexCode, stock_code: r.ts_code, weight: r.weight,
+          source: 'index_weight', effective_date: weightDate!, published_at: weightDate!,
+          available_from: weightDate!, collected_at: capturedAt, quality_status: 'OK',
+        });
+      }
+    } else {
+      for (const r of fundRows) {
+        if (!r.ann_date) continue; // 披露日缺失 → 不入 PIT 库，不伪造时点
+        storeRows.push({
+          etf_code: code, index_code: null, stock_code: r.ts_code, weight: r.weight,
+          source: 'fund_portfolio', effective_date: weightDate!, published_at: r.ann_date,
+          available_from: r.ann_date, collected_at: capturedAt, quality_status: 'OK',
+        });
+      }
+    }
+    if (storeRows.length) writeWeightSnapshot(db, storeRows);
+  }
   const sum = weightRows.reduce((s, r) => s + r.weight, 0);
   return {
     code, status: 'WRITTEN', weight_date: weightDate, weight_source: weightSource,
     publication_date: publicationDate, index_code: indexCode,
     n: weightRows.length, weight_sum_pct: Math.round(sum * 100) / 100, path: finalPath, error: null,
+    ...(weightSource === 'fund_portfolio' && skippedNoAnnDate > 0
+      ? { snapshot_skipped_no_ann_date: skippedNoAnnDate } : {}),
   };
 }
 
@@ -200,6 +244,14 @@ export interface WeightCaptureOptions {
   codes?: string[];
   out?: string;
   throttle_ms?: number;
+  /**
+   * When a live DB handle is passed, each successfully captured weight set is
+   * also mirrored into `etf_weight_snapshot` (the PIT store the hotspot pool
+   * reads). The JSON file cache stays authoritative for the daily report; the
+   * DB store is additive and only written on success — a FAILED capture never
+   * touches it.
+   */
+  db?: DatabaseSync;
 }
 
 export async function runWeightCapture(
@@ -218,7 +270,7 @@ export async function runWeightCapture(
   const results: WeightCaptureResult[] = [];
   for (const code of codes) {
     process.stderr.write(`[weight-capture] ${code} ...\n`);
-    const result = await captureOne(api, code, asOf);
+    const result = await captureOne(api, code, asOf, opts.db);
     results.push(result);
     process.stderr.write(`[weight-capture] ${code} ${result.status}${result.error ? ` (${result.error})` : ''}\n`);
   }
@@ -243,18 +295,26 @@ if (isMain) {
     const i = argv.indexOf(`--${name}`);
     return i >= 0 ? argv[i + 1] : undefined;
   };
+  // --db PATH: also mirror weights into that SQLite file's etf_weight_snapshot
+  // (the PIT store the hotspot pool reads). Optional — without it the JSON
+  // file cache contract is unchanged (goal-1026 readers keep working).
+  const dbPath = argOf('db');
+  const db = dbPath ? new DatabaseSync(dbPath) : undefined;
   runWeightCapture({
     as_of: argOf('as-of'),
     codes: argOf('codes')?.split(',').map(c => c.trim()).filter(Boolean),
     out: argOf('out'),
     throttle_ms: argOf('throttle-ms') ? Number(argOf('throttle-ms')) : undefined,
+    db,
   })
     .then(summary => {
       process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
+      db?.close();
       process.exit(summary.status === 'FAILED' ? 1 : summary.status === 'PARTIAL' ? 1 : 0);
     })
     .catch((error: unknown) => {
       process.stderr.write(`[weight-capture] ${(error as Error)?.stack || String(error)}\n`);
+      db?.close();
       process.exit(2);
     });
 }
