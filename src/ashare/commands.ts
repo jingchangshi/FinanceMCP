@@ -9,6 +9,8 @@ import { ashareResearchDbPath, openResearchDb } from './db.js';
 import { acceptance } from './acceptance.js';
 import { syncEtfForDaily, type EtfDailySyncSummary } from './etf.js';
 import { auditCache, fillGaps, saveAudit } from './audit.js';
+// 热点行业同步只在 `hotspot-sync` 显式命令里调用；import 本身不触网。
+import { syncSwClassify, syncSwMembers, syncSwIndexDaily, syncThsIndex, syncThsMembers, syncThsIndexDaily } from './industrySync.js';
 
 export interface CliHelpers {
   arg(name: string): string | undefined;
@@ -232,6 +234,48 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
     case 'status': {
       const result = await runAshareTool('ashare_data_status', { date: h.arg('date') });
       process.stdout.write(result.content[0].text + '\n');
+      return true;
+    }
+    case 'hotspot-sync': {
+      // 显式联网同步：申万 L1/L2/L3 + 成分 + 指数日线，同花顺概念/行业目录、成分与指数日线。
+      // 绝不接入 `daily` 定时路径；THS 成分无时点字段，表内恒为 NO_POINT_IN_TIME。
+      const start = h.arg('start') ? h.ymd(h.arg('start'), '--start') : addDays(shanghaiToday(), -400);
+      const end = h.arg('end') ? h.ymd(h.arg('end'), '--end') : shanghaiToday();
+      const thsCodes = h.arg('ths-codes')?.split(',').map(c => c.trim()).filter(Boolean)
+        ?? (db.prepare("SELECT ts_code FROM ths_index WHERE idx_type IN ('N','I') ORDER BY count DESC LIMIT 30").all() as Array<{ ts_code: string }>).map(r => r.ts_code);
+      const results: unknown[] = [];
+      results.push(await syncSwClassify(db));
+      results.push(await syncSwMembers(db));
+      results.push(await syncSwIndexDaily(db, { start, end }));
+      results.push(await syncThsIndex(db));
+      if (thsCodes.length) {
+        results.push(await syncThsMembers(db, { codes: thsCodes }));
+        results.push(await syncThsIndexDaily(db, { start, end, codes: thsCodes }));
+      }
+      h.print({ command: 'hotspot-sync', start, end, ths_codes: thsCodes.length, results });
+      return true;
+    }
+    case 'hotspot-snapshot': {
+      // 生成当日热点行业快照 + 候选池 + 多策略信号，写入 hotspot_* 表。
+      // 只写新建的热点研究表；不动 watchlist、研究日志或正式研究快照。
+      const { runHotspotPipeline } = await import('./hotspotPipeline.js');
+      const latestAsOf = (d: DatabaseSync): string =>
+        lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
+      const asOf = h.arg('date') ? h.ymd(h.arg('date'), '--date') : latestAsOf(db);
+      h.print(runHotspotPipeline(db, asOf, { persist: !h.flag('dry-run') }));
+      return true;
+    }
+    case 'hotspot-cc': {
+      // 冠军-挑战者走查比较：只读市场库，输出研究报告；不授权任何下单或生产变更。
+      const { runChampionChallenger } = await import('./hotspotExperiments.js');
+      const latestAsOf = (d: DatabaseSync): string =>
+        lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
+      h.print(runChampionChallenger(db, {
+        start: h.ymd(h.arg('start'), '--start'),
+        end: h.arg('end') ? h.ymd(h.arg('end'), '--end') : latestAsOf(db),
+        observation_end: h.arg('observation-end') ? h.ymd(h.arg('observation-end'), '--observation-end') : latestAsOf(db),
+        step_days: h.arg('step') ? Number(h.arg('step')) : 1,
+      }));
       return true;
     }
     default:

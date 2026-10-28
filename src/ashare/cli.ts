@@ -29,6 +29,10 @@ const USAGE = `用法: finance-ashare <command> [options]
                                                                  只读研究数据冻结快照导出（生产库只读，as-of 之后的数据拒绝导出）
   investment-research-bundle [--account ID] [--date YYYYMMDD] [--db PATH] [--market-db PATH]
                                                                  私有统一研究事实包；默认最近已收盘日，读取路径不写库
+  hotspot-sync [--start YYYYMMDD] [--end YYYYMMDD] [--ths-codes a,b]  显式联网同步热点行业数据（申万L1/L2/L3+成分+指数日线、同花顺目录/成分/指数日线；绝不接入 daily；THS 成分恒为 NO_POINT_IN_TIME）
+  hotspot-snapshot [--date YYYYMMDD] [--dry-run]                 生成热点行业快照 + 多策略候选池，写入 hotspot_* 研究表（只写新表）
+  hotspot-cc --start YYYYMMDD [--end YYYYMMDD] [--observation-end YYYYMMDD] [--step N]
+                                                                 冠军-挑战者走查比较（只读，输出研究报告；不授权下单或生产变更）
   migrate                                                        将旧版缓存主键布局迁移为按股票连续存储
 
   账户子命令（独立 portfolio.sqlite，只读演示账户，默认不在 MCP 暴露）：

@@ -186,6 +186,34 @@ ashareToolDefinitions.push(
   },
 );
 
+// 热点行业 × 多策略研究层（goal-1028）。只读 hotspot_snapshot / hotspot_candidate
+// 快照表（由 finance-ashare hotspot-snapshot CLI 写入）；表缺失或当日未生成时返回
+// NOT_READY 与原因，不实时计算、不触发同步。快照是研究观察，不是交易授权。
+ashareToolDefinitions.push(
+  {
+    name: 'ashare_hotspot_sectors',
+    description: `热点行业/主题快照：按预注册因子集(hotspot-config-1.0.0)对申万L1与同花顺概念的排名、状态机(EMERGING/LEADING/WEAKENING/NEUTRAL/UNKNOWN)、入选理由、反证与数据质量。行业键按来源命名空间隔离(SW2021:/THS:)，不按名称合并。快照缺失时返回 NOT_READY 与原因。${DATA_NOTE}`,
+    inputSchema: {
+      type: 'object',
+      properties: { date: dateProp },
+    },
+    annotations: READ_ONLY,
+  },
+  {
+    name: 'ashare_hotspot_opportunities',
+    description: `热点候选机会快照：动态候选池(FOCUS/RAW)个股与ETF、领导身份(产业/行情龙头)与证据、多策略信号(confirmed_on 确认日,绝不回填形态形成日)、交易权限(非主板=RESEARCH_ONLY)、入池/排除原因与优先级。研究观察,不构成交易授权;候选池与 wl-1.0.0 正式观察池相互独立。快照缺失时返回 NOT_READY 与原因。${DATA_NOTE}`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: dateProp,
+        pool: { type: 'string', enum: ['FOCUS', 'RAW'], description: '仅返回该池成员;缺省返回全部候选' },
+        ts_code: { type: 'string', description: '只看单只候选(个股或ETF)' },
+      },
+    },
+    annotations: READ_ONLY,
+  },
+);
+
 export const ASHARE_TOOL_NAMES = new Set(ashareToolDefinitions.map(t => t.name));
 
 /**
