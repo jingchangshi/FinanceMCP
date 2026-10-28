@@ -30,8 +30,19 @@ ChatGPT + Oracle VPS 夜报长期出现"ETF 费率不明"。排查结论（2026-
 ## 四、部署记录
 
 - 授权：用户 2026-10-28 明确授权（"按照方案A进行，授权你直接部署"）。
-- 回滚：见 `~/.local/share/ashare-v1/backups/rollback-*.env`（upgrade.sh 先打 rollback 标签再 build；rollback.sh --dry-run 通过）。
-- 具体时间/标签/live 验证结果在部署后补记于此。
+- 提交：`feat/etf-fee-exposure` 分支，commit `5112fab`（`5112fab0ad220a51cbd38baac5bfcbae7b292c18`，基线 `af863f4`）。
+- 测试：部署前 `npm test`（build + 全套单进程）：949 pass / 0 fail / 1 skipped。
+- 升级：`upgrade.sh --revision 5112fab0ad220a51cbd38baac5bfcbae7b292c18 --branch feat/etf-fee-exposure`，记录 `rollback-20261028T063715Z`（20261028T063715Z）。
+  - 回滚镜像标签在 build 前打：`finance-mcp-ashare:rollback-20261028T063715Z`（可寻址，旧镜像未被 build 覆盖）。
+  - 部署前数据库备份：`ashare.20261028T063715Z.sqlite`（VACUUM INTO + 完整性/恢复校验通过）。
+  - 升级后 `/health` 健康；容器 OCI revision 标签 = `5112fab0ad220a51cbd38baac5bfcbae7b292c18`（与目标一致）。
+- 回滚演练：`rollback.sh <record.env> --dry-run` PASS（目标 revision 与备份 sha256 均核验通过）。
+- 生产只读 live 验证（公开端点 `https://share.shijingchang.cn/ashare/mcp`）：`ALL_GOAL1028_LIVE_CHECKS_PASS`
+  - `ashare_etf_quotes`：5 只持仓逐只返回真实费率——159241/159278/159558.SZ = 管理 0.5% / 托管 0.1% / 合计 0.6%；516080/560390.SH = 0.15% / 0.05% / 0.2%；`unit=percent_per_year`；`as_of=2026-10-22T05:32:02.978Z`。
+  - `units.fee` 存在；工具描述含 `management_rate_pct` / `fee` 字样（ChatGPT 可从描述发现费率能力）。
+  - `ashare_etf_status`：codes[] 5 只 fee 块逐只匹配。
+  - 回归：`ashare_daily_report {date:"20261027"}` http=200（此前误用不存在的工具名 `ashare_daily` 得到空 body 400，属脚本笔误，非产品回归；已更正验证脚本）。
+- 私有库零写入核验：`portfolio.sqlite` research_journal 部署前后均为 7 行（本改动无写入路径）。
 
 ## 五、口径备忘
 
