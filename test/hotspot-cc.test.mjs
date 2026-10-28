@@ -145,7 +145,13 @@ test('challenger registration is spec-before-results and forbids in-place edits'
   const again = registerChallenger(registry, manifest);
   assert.equal(again.created, false, '同一 manifest 幂等重登记');
   assert.equal(again.identity_hash, first.identity_hash);
-  assert.equal(challengerSpecHash(manifest), first.identity_hash, 'spec 哈希与身份哈希一致');
+  // 身份哈希只覆盖 IDENTITY_FIELDS；spec 哈希覆盖更大面（再叠加评估窗口、
+  // 成本、判据），两者按设计不相等。真实契约是：登记后按 manifest 复核
+  // 身份得到同一哈希；recordResult 的 spec 校验面 = 登记 manifest 的
+  // experimentSpecHash（本测试末尾的 recordChallengerRun 即走该检查）。
+  assert.match(first.identity_hash, /^[0-9a-f]{64}$/, '身份哈希为 64 位十六进制');
+  assert.equal(registry.verifyIdentity(manifest), first.identity_hash, '登记后复核身份一致');
+  assert.match(challengerSpecHash(manifest), /^[0-9a-f]{64}$/, 'spec 哈希为 64 位十六进制');
 
   // 原地改动已登记 manifest → 必须被拒绝（改协议 = 新 candidate_version）。
   const mutated = { ...manifest, signal_definition: { ...manifest.signal_definition, engine: 'tampered-1.0.0' } };
