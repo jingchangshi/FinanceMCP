@@ -262,13 +262,19 @@ export function buildHotspotPool(
     else { pool = 'RAW'; inclusion = [...s.leaderships].join('+') || 'etf_constituent'; }
     if (pool === 'EXCLUDED' && !exclusion) exclusion = 'unknown';
 
-    // Priority: score percentile + rps + signals, all recorded.
+    // Priority: score percentile + rps + signals − risk-overlay penalty, all
+    // recorded. Each risk event weighs the same as each signal (±5, both
+    // capped at 15): a conflicted name is demoted, never silently kept beside
+    // an equally-scored clean one (strategies.ts: pool ranking penalizes
+    // conflicted names). Floor at 0 — a heavy risk load ranks at the bottom,
+    // not below "unknown priority".
     const score = row?.score ?? null;
     const rps120 = rps ? (rps.rows.get(s.ts_code)?.rps[120] ?? null) : null;
     const sigCount = scanSignals?.events.filter(e => e.status === 'active').length ?? 0;
+    const riskCount = (scanSignals?.risk_events ?? []).length;
     const priority = score !== null || rps120 !== null
-      ? Math.round(((score !== null ? Math.max(0, Math.min(100, (score ?? 0) * 100)) : 50) * 0.5
-        + (rps120 ?? 50) * 0.35 + Math.min(15, sigCount * 5)) * 100) / 100
+      ? Math.max(0, Math.round(((score !== null ? Math.max(0, Math.min(100, (score ?? 0) * 100)) : 50) * 0.5
+        + (rps120 ?? 50) * 0.35 + Math.min(15, sigCount * 5) - Math.min(15, riskCount * 5)) * 100) / 100)
       : null;
 
     candidates.push({
@@ -289,13 +295,14 @@ export function buildHotspotPool(
         invalidation: e.invalidation ? `${e.invalidation.on}:${e.invalidation.reason}` : e.invalidation_conditions,
         status: e.status,
       })),
+      risk_events: (scanSignals?.risk_events ?? []).map(r => ({ id: r.id, on: r.on })),
       trade_permission: perm,
       trade_permission_reason: reason,
       pool,
       inclusion_reason: inclusion,
       exclusion_reason: exclusion,
       priority,
-      priority_reason: `score(${score ?? 'n/a'})*0.5 + rps120(${rps120 ?? 'n/a'})*0.35 + signals(${sigCount})*5`,
+      priority_reason: `score(${score ?? 'n/a'})*0.5 + rps120(${rps120 ?? 'n/a'})*0.35 + signals(${sigCount})*5 - risk(${riskCount})*5`,
       data_quality: pool === 'EXCLUDED' ? 'DEGRADED' : 'OK',
     });
     void f; // fundamentals reserved for INDUSTRY_LEADER evidence enrichment in v2
@@ -307,7 +314,7 @@ export function buildHotspotPool(
     candidates.push({
       as_of: asOf, ts_code: etfCode, name, instrument_type: 'ETF',
       primary_sector: null, sectors: [], etf_sources: [], multi_etf: false,
-      leaderships: [], leader_evidence: [], signals: [],
+      leaderships: [], leader_evidence: [], signals: [], risk_events: [],
       trade_permission: 'EXECUTABLE', trade_permission_reason: 'ETF_UNIVERSAL',
       pool: 'RAW', inclusion_reason: 'relevant_etf',
       priority: null, priority_reason: 'etf vehicle; no stock ranking applies',

@@ -69,13 +69,13 @@ export function saveHotspotSnapshot(db: DatabaseSync, snapshot: HotspotSnapshot)
     db.prepare('DELETE FROM hotspot_candidate WHERE as_of = ?').run(snapshot.as_of);
     const ins = db.prepare(`INSERT INTO hotspot_candidate
       (as_of, ts_code, name, instrument_type, primary_sector, sectors, etf_sources, multi_etf,
-       leaderships, signals, trade_permission, trade_permission_reason, pool,
+       leaderships, signals, risk_events, trade_permission, trade_permission_reason, pool,
        inclusion_reason, exclusion_reason, priority, priority_reason, data_quality, config_version)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const c of snapshot.candidates) {
       ins.run(c.as_of, c.ts_code, c.name, c.instrument_type, c.primary_sector,
         stableJson(c.sectors), stableJson(c.etf_sources), c.multi_etf ? 1 : 0,
-        stableJson(c.leaderships), stableJson(c.signals),
+        stableJson(c.leaderships), stableJson(c.signals), stableJson(c.risk_events ?? []),
         c.trade_permission, c.trade_permission_reason, c.pool,
         c.inclusion_reason, c.exclusion_reason ?? null, c.priority, c.priority_reason,
         c.data_quality, snapshot.config_version);

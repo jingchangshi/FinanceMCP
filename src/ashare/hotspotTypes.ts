@@ -189,6 +189,14 @@ export interface HotspotCandidate {
   /** Score / rank evidence when the name was selected as a leader. */
   leader_evidence: Array<{ kind: LeadershipType; metric: string; value: number | null; note?: string }>;
   signals: CandidateSignalSummary[];
+  /**
+   * Risk-overlay annotations (trend_breakdown / macd_bear_divergence /
+   * overheated) observed for this name. Never entry candidates, never counted
+   * in `signals` or `with_signals`; surfaced so a bull event racing a bear
+   * risk signal stays visible (strategy-spec §2 "只作为候选的风险标注") and so
+   * pool ranking can penalize conflicted names (strategies.ts header).
+   */
+  risk_events: Array<{ id: string; on: string }>;
   trade_permission: TradePermission;
   /** e.g. 'MAINBOARD_OK', 'CHINEXT_RESEARCH_ONLY', 'STAR_RESEARCH_ONLY'. */
   trade_permission_reason: string;
