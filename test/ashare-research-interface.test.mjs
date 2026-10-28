@@ -28,6 +28,8 @@ const EXPECTED_TOOLS = [
   'ashare_factor_snapshot', 'ashare_stock_history', 'ashare_financial_data', 'ashare_market_data', 'ashare_stock_basic',
   // R0 ETF 纵切：追加在既有工具之后，不改变上面十个的名称、顺序与描述。
   'ashare_etf_quotes', 'ashare_etf_status',
+  // goal-1028 热点行业 × 多策略：同样追加在末尾，只读研究面。
+  'ashare_hotspot_sectors', 'ashare_hotspot_opportunities',
 ];
 // The nine tools that already existed before this phase; ashare_factor_snapshot is the addition.
 const EXISTING_TOOLS = EXPECTED_TOOLS.slice(0, 10).filter(name => name !== 'ashare_factor_snapshot');
