@@ -12,6 +12,7 @@ import { financialHistory, marketData, resolveCode, stockBasic, stockHistory } f
 import { factorSnapshot } from './engine.js';
 import { etfQuotes, etfStatus } from './etf.js';
 import { resolveResearchDate } from './researchDate.js';
+import { loadHotspotSnapshot } from './hotspotSnapshots.js';
 
 export { ashareToolDefinitions, ASHARE_TOOL_NAMES } from './definitions.js';
 
@@ -335,6 +336,55 @@ function etfStatusTool(args: Record<string, any>): ToolResult {
   return json(etfStatus(market, { date: args.date ?? resolveDate(market, undefined).date }));
 }
 
+function hotspotSectorsTool(args: Record<string, any>): ToolResult {
+  const d = db();
+  const { date, note } = resolveDate(d, args.date);
+  const snap = loadHotspotSnapshot(d, date);
+  if (!snap) {
+    return text(notReadyText(date, ['热点行业快照尚未生成(运行 finance-ashare hotspot-snapshot)'], note ? `\n> ${note}` : ''));
+  }
+  return json({
+    as_of: snap.as_of,
+    config_version: snap.config_version,
+    content_hash: snap.content_hash,
+    generated_at: snap.generated_at,
+    research_only: snap.research_only,
+    selected: snap.sectors.selected,
+    sectors: snap.sectors.sectors.map(s => ({
+      key: s.key, name: s.name, kind: s.kind, source: s.source,
+      state: s.state, rank: s.rank, rank_5d_ago: s.rank_5d_ago, rank_20d_ago: s.rank_20d_ago,
+      strength: s.strength,
+      factors: s.factors,
+      entry_reason: s.entry_reason, counter_evidence: s.counter_evidence,
+      data_quality: s.data_quality, quality_notes: s.quality_notes,
+    })),
+    coverage: snap.coverage,
+    note: note ?? undefined,
+  });
+}
+
+function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
+  const d = db();
+  const { date, note } = resolveDate(d, args.date);
+  const snap = loadHotspotSnapshot(d, date);
+  if (!snap) {
+    return text(notReadyText(date, ['热点候选快照尚未生成(运行 finance-ashare hotspot-snapshot)'], note ? `\n> ${note}` : ''));
+  }
+  let cands = snap.candidates;
+  if (args.pool) cands = cands.filter(c => c.pool === args.pool);
+  if (args.ts_code) cands = cands.filter(c => c.ts_code === String(args.ts_code));
+  return json({
+    as_of: snap.as_of,
+    strategy_set_version: snap.strategy_set_version,
+    content_hash: snap.content_hash,
+    research_only: snap.research_only,
+    counts: snap.counts,
+    pool_filter: args.pool ?? null,
+    candidates: cands,
+    note: note ?? undefined,
+  });
+}
+
 export async function runAshareTool(name: string, args: Record<string, any>): Promise<ToolResult> {
   switch (name) {
     case 'ashare_data_status': return dataStatus(args);
@@ -349,6 +399,8 @@ export async function runAshareTool(name: string, args: Record<string, any>): Pr
     case 'ashare_stock_basic': return json(stockBasic(db(), args));
     case 'ashare_etf_quotes': return etfQuotesTool(args);
     case 'ashare_etf_status': return etfStatusTool(args);
+    case 'ashare_hotspot_sectors': return hotspotSectorsTool(args);
+    case 'ashare_hotspot_opportunities': return hotspotOpportunitiesTool(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }

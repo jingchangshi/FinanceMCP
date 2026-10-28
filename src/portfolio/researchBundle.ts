@@ -8,6 +8,7 @@ import { screenEtfCandidates, ETF_UNIVERSE_VERSION } from '../ashare/etfUniverse
 import {
   collectEtfPenetrationInputs, buildEtfPenetrationSummary, type EtfPenetrationSummary,
 } from '../ashare/etfPenetration.js';
+import { loadHotspotSnapshot } from '../ashare/hotspotSnapshots.js';
 import { buildBenchmarkComparison, BENCHMARK_DEFINITION_VERSION } from './benchmarks.js';
 import { buildDailyReport } from './dailyReport.js';
 import { resolveAccountId, resolveAccountSnapshot } from './accounts.js';
@@ -506,6 +507,9 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     holdings: (portfolio?.holdings ?? snapshot.snapshot.positions).map((holding: any) => holding.ts_code),
   });
 
+  // ---- §4b 热点研究层摘要（goal-1028）：只读快照，facts 之外，不入 report_id。
+  const hotspotResearch = buildHotspotState({ db: market, asOf });
+
   const facts = {
     schema: RESEARCH_BUNDLE_SCHEMA, as_of_trade_date: asOf, account_id: account.account_id,
     market_report_id: targetReport?.report_id ?? null, market: targetReport,
@@ -601,6 +605,8 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     } : null,
     // §4 ETF穿透摘要接线（只读本地缓存；成分权重无入库缓存时逐只 UNAVAILABLE，不伪造）。
     etf_penetration: etfPenetration,
+    // §4b 热点行业 × 多策略研究层（goal-1028）：只读 CLI 快照；NOT_READY 不伪造。
+    hotspot_research: hotspotResearch,
     portfolio,
     transaction_fees: { as_of_trade_date: asOf, securities: feeSummary, accounting: 'actual booked fees remain immutable; slippage estimates are separate' },
     benchmarks,
@@ -791,4 +797,62 @@ export function buildEtfPenetrationState(input: {
     }
   }
   return { ...base, status: 'OK', reason: null, etfs, collected, unavailable, gaps };
+}
+
+// ---- §4b 热点行业 × 多策略研究层接线（goal-1028）。与 etf_penetration 同构：
+// 只读 hotspot_snapshot 快照表（CLI 写入），挂顶层 hotspot_research（facts 之外，
+// 不入 report_id 身份哈希）；块内 gaps 作用域在块内。快照缺失 = NOT_READY，
+// 不实时计算、不触发同步、不伪造。
+export interface HotspotResearchBundle {
+  schema: string;
+  as_of_trade_date: string | null;
+  status: 'OK' | 'NOT_READY' | 'UNAVAILABLE';
+  reason: string | null;
+  content_hash: string | null;
+  config_version: string | null;
+  strategy_set_version: string | null;
+  selected_sectors: string[];
+  counts: { raw_pool: number; focus_pool: number; excluded: number; etf_candidates: number; with_signals: number } | null;
+  focus_candidates: Array<{ ts_code: string; name: string; trade_permission: string; signals: number }>;
+  research_only: true;
+  gaps: Array<{ module: string; reason: string; affected: string[] }>;
+}
+
+export const HOTSPOT_RESEARCH_BUNDLE_SCHEMA = 'ashare-hotspot-research/1.0';
+
+export function buildHotspotState(input: { db: DatabaseSync | null; asOf: string | null }): HotspotResearchBundle {
+  const base = { schema: HOTSPOT_RESEARCH_BUNDLE_SCHEMA, as_of_trade_date: input.asOf ?? null };
+  const gaps: HotspotResearchBundle['gaps'] = [];
+  if (!input.db || !input.asOf) {
+    const reason = input.db ? 'as_of_unavailable' : 'market_db_unavailable';
+    gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
+    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], research_only: true, gaps };
+  }
+  let snap: ReturnType<typeof loadHotspotSnapshot> = null;
+  try {
+    snap = loadHotspotSnapshot(input.db, input.asOf);
+  } catch (error: any) {
+    const reason = `snapshot_read_failed: ${String(error?.message ?? error)}`;
+    gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
+    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], research_only: true, gaps };
+  }
+  if (!snap) {
+    const reason = 'hotspot_snapshot_not_generated';
+    gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
+    return { ...base, status: 'NOT_READY', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], research_only: true, gaps };
+  }
+  return {
+    ...base,
+    status: 'OK', reason: null,
+    content_hash: snap.content_hash,
+    config_version: snap.config_version,
+    strategy_set_version: snap.strategy_set_version,
+    selected_sectors: snap.sectors.selected,
+    counts: snap.counts,
+    focus_candidates: snap.candidates.filter(c => c.pool === 'FOCUS').slice(0, 15).map(c => ({
+      ts_code: c.ts_code, name: c.name, trade_permission: c.trade_permission, signals: c.signals.length,
+    })),
+    research_only: true,
+    gaps,
+  };
 }
