@@ -387,6 +387,43 @@ export const ETF_CANDIDATE_HISTORY_DAYS = 120;
 /** fund_basic 的无条件刷新间隔（自然日）。基础信息变化很慢，每天全量重拉只会浪费额度。 */
 export const ETF_FUND_BASIC_REFRESH_DAYS = 7;
 
+/**
+ * 基金费率口径（fee 块）。tushare fund_basic 的 m_fee/c_fee 是年费率百分比
+ * （0.5 = 0.5%/年；2026-10-28 与东方财富公开数据对 5 只持仓 ETF 逐只一致）。
+ * 场内二级市场买卖没有申购赎回费，交易成本只有券商佣金——佣金率属于账户侧，
+ * 不在本库，不得与基金费率混为一谈，也不得据此声称“费率不明”。
+ */
+export const ETF_FEE_NOTE =
+  'm_fee/c_fee 为年费率百分比（0.5 = 0.5%/年），来源 tushare.fund_basic（fee.as_of 为该行刷新时间，'
+  + '基础信息按 ' + ETF_FUND_BASIC_REFRESH_DAYS + ' 个自然日间隔刷新）；场内二级市场买卖无申购赎回费，'
+  + '交易成本仅为券商佣金（佣金率属于账户侧数据，不在本库）；管理人/托管人或费率调整由 fund_basic 刷新覆盖。';
+
+/** 单只 ETF 的费率块：基础信息缺失时各率为 null，块本身始终存在（不伪造、不省略）。 */
+export interface EtfFee {
+  management_rate_pct: number | null;
+  custody_rate_pct: number | null;
+  /** 管理费 + 托管费年费率合计；任一缺失时为 null，不做部分求和。 */
+  total_rate_pct: number | null;
+  unit: 'percent_per_year';
+  source: string;
+  as_of: string | null;
+  note: string;
+}
+
+function buildFee(basic: any): EtfFee {
+  const m = basic?.m_fee == null || !Number.isFinite(Number(basic.m_fee)) ? null : Number(basic.m_fee);
+  const c = basic?.c_fee == null || !Number.isFinite(Number(basic.c_fee)) ? null : Number(basic.c_fee);
+  return {
+    management_rate_pct: m,
+    custody_rate_pct: c,
+    total_rate_pct: m != null && c != null ? Math.round((m + c) * 10000) / 10000 : null,
+    unit: 'percent_per_year',
+    source: 'tushare.fund_basic',
+    as_of: basic?.updated_at ?? null,
+    note: ETF_FEE_NOTE,
+  };
+}
+
 const FUND_DAILY_BAR_COLS = FUND_DAILY_FIELDS.split(',');
 const FUND_ADJ_COLS = FUND_ADJ_FIELDS.split(',');
 const FUND_SHARE_COLS = FUND_SHARE_FIELDS.split(',');
@@ -791,6 +828,8 @@ export interface EtfQuote {
   delist_date: string | null;
   status: string | null;
   benchmark: string | null;
+  /** 基金年费率（管理/托管，百分比）。fund_basic 缺失时各率为 null，块始终存在。 */
+  fee: EtfFee;
   trade_unit: typeof ETF_TRADE_UNIT;
   as_of_trade_date: string;
   latest_bar: {
@@ -871,7 +910,7 @@ export function etfQuotes(db: DatabaseSync, codes: unknown, q: EtfQuotesQuery = 
     query: { start_date: start, end_date: end, adjust },
     as_of_trade_date: end,
     expected_trade_date: expected,
-    units: { price: '元/份', vol: '手（1 手 = 100 份）', amount: '千元', fd_share: '万份', amount_cny: '元', volume_shares: '份' },
+    units: { price: '元/份', vol: '手（1 手 = 100 份）', amount: '千元', fd_share: '万份', amount_cny: '元', volume_shares: '份', fee: '年费率百分比（management_rate_pct/custody_rate_pct/total_rate_pct）' },
     quotes,
     warnings,
     source: ETF_SOURCE,
@@ -1105,6 +1144,7 @@ function quoteOne(db: DatabaseSync, code: string, start: string, end: string, ad
     delist_date: basic?.delist_date || null,
     status: basic?.status ?? null,
     benchmark: basic?.benchmark ?? null,
+    fee: buildFee(basic),
     trade_unit: ETF_TRADE_UNIT,
     as_of_trade_date: end,
     latest_bar: last ? {
@@ -1176,7 +1216,7 @@ export interface EtfStatusResult {
   /** permission_denied：最近一次 fund_basic 同步因权限/积分受限，缺失不是“代码不存在”。 */
   fund_basic: { codes_present: string[]; missing: string[]; permission_denied: boolean };
   fund_share: { available: boolean; codes_with_share: number; latest_date: string | null };
-  codes: { ts_code: string; name: string | null; status: EtfQualityStatus; reasons: string[]; latest_bar_date: string | null; stale: boolean; share_available: boolean }[];
+  codes: { ts_code: string; name: string | null; status: EtfQualityStatus; reasons: string[]; latest_bar_date: string | null; stale: boolean; share_available: boolean; fee: EtfFee }[];
   quality: { status: EtfQualityStatus; reasons: string[] };
   last_sync: { dataset: string; key: string; rows: number; status: string; synced_at: string }[];
   source: string;
@@ -1233,6 +1273,7 @@ export function etfStatus(db: DatabaseSync, q: { date?: unknown } = {}): EtfStat
     latest_bar_date: x.latest_bar?.trade_date ?? null,
     stale: x.stale,
     share_available: x.share.fd_share_wan != null,
+    fee: x.fee,
   }));
   base.coverage.codes_with_bar_on_latest = base.codes.filter(c => c.latest_bar_date === date).length;
   const latest = base.latest_fund_daily_date;

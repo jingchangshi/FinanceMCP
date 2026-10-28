@@ -14,7 +14,7 @@ const USAGE = `用法: finance-ashare <command> [options]
   status [--date YYYYMMDD]                                       数据完整性状态
   etf-sync --start YYYYMMDD [--end YYYYMMDD] [--refresh]         同步五只 ETF 的基础信息/日线/复权/份额（独立 fund_* 表）
   etf-status [--date YYYYMMDD]                                   ETF 数据状态（最新日线、逐只就绪度、份额可得性）
-  etf-quotes [--codes a,b] [--start YYYYMMDD] [--end YYYYMMDD] [--adjust none|qfq|hfq]
+  etf-quotes [--codes a,b] [--start YYYYMMDD] [--end YYYYMMDD] [--adjust none|qfq|hfq]   ETF 行情快照（含 fee 基金费率块）
                                                                  ETF 行情快照（含单位换算、复权、份额与质量标记）
   acceptance [--days 3] [--end YYYYMMDD] [--allow-degraded]      连续真实交易日验收（两次定时运行、当日复查行情、最终 READY、MCP 一致、股票池连续）
   quality --date YYYYMMDD                                        重新执行数据质量检查
