@@ -264,3 +264,21 @@ test('industrySync exposes the six sync entry points (import smoke, no network)'
     assert.equal(typeof industrySync[name], 'function', name);
   }
 });
+
+test('hotspot-sync 首跑安全：discoverThsCodes 空库建表返回 []，不抛 no such table', t => {
+  const db = openAshareDb(':memory:');
+  t.after(() => db.close());
+  // 生产首次运行曾在此崩溃：命令处理器在 ensureHotspotSchema 之前查询
+  // ths_index（"no such table: ths_index"）。发现函数必须自建 schema，
+  // 且只在 THS 目录同步之后调用（首跑才有目录可排序）。
+  assert.deepEqual(industrySync.discoverThsCodes(db), [], '空库返回空列表而非抛错');
+  assert.ok(hotspotTableExists(db, 'ths_index'), '发现函数自身完成建表');
+  upsertRows(db, 'ths_index',
+    ['ts_code', 'name', 'idx_type', 'count', 'exchange', 'list_date', 'collected_at'], [
+      { ts_code: '885431.TI', name: 'CPO概念', idx_type: 'N', count: 120, exchange: '', list_date: '20200101', collected_at: '2026-10-29T00:00:00.000Z' },
+      { ts_code: '881105.TI', name: '半导体', idx_type: 'I', count: 200, exchange: '', list_date: '20200101', collected_at: '2026-10-29T00:00:00.000Z' },
+      { ts_code: '883300.TI', name: '事件型', idx_type: 'S', count: 999, exchange: '', list_date: '20200101', collected_at: '2026-10-29T00:00:00.000Z' },
+    ]);
+  assert.deepEqual(industrySync.discoverThsCodes(db), ['881105.TI', '885431.TI'],
+    '只取概念/行业类型并按成分数降序，事件型排除');
+});

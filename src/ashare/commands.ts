@@ -10,7 +10,7 @@ import { acceptance } from './acceptance.js';
 import { syncEtfForDaily, type EtfDailySyncSummary } from './etf.js';
 import { auditCache, fillGaps, saveAudit } from './audit.js';
 // 热点行业同步只在 `hotspot-sync` 显式命令里调用；import 本身不触网。
-import { syncSwClassify, syncSwMembers, syncSwIndexDaily, syncThsIndex, syncThsMembers, syncThsIndexDaily } from './industrySync.js';
+import { syncSwClassify, syncSwMembers, syncSwIndexDaily, syncThsIndex, syncThsMembers, syncThsIndexDaily, discoverThsCodes } from './industrySync.js';
 
 export interface CliHelpers {
   arg(name: string): string | undefined;
@@ -241,13 +241,17 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       // 绝不接入 `daily` 定时路径；THS 成分无时点字段，表内恒为 NO_POINT_IN_TIME。
       const start = h.arg('start') ? h.ymd(h.arg('start'), '--start') : addDays(shanghaiToday(), -400);
       const end = h.arg('end') ? h.ymd(h.arg('end'), '--end') : shanghaiToday();
-      const thsCodes = h.arg('ths-codes')?.split(',').map(c => c.trim()).filter(Boolean)
-        ?? (db.prepare("SELECT ts_code FROM ths_index WHERE idx_type IN ('N','I') ORDER BY count DESC LIMIT 30").all() as Array<{ ts_code: string }>).map(r => r.ts_code);
+      const explicitThsCodes = h.arg('ths-codes')?.split(',').map(c => c.trim()).filter(Boolean);
       const results: unknown[] = [];
       results.push(await syncSwClassify(db));
       results.push(await syncSwMembers(db));
       results.push(await syncSwIndexDaily(db, { start, end }));
       results.push(await syncThsIndex(db));
+      // Discover AFTER the catalog sync: on a fresh database ths_index was
+      // just populated above, and discovery ensures the schema first.
+      // (Previously this ran before any table existed — first production run
+      // of this command died with "no such table: ths_index".)
+      const thsCodes = explicitThsCodes ?? discoverThsCodes(db);
       if (thsCodes.length) {
         results.push(await syncThsMembers(db, { codes: thsCodes }));
         results.push(await syncThsIndexDaily(db, { start, end, codes: thsCodes }));

@@ -165,6 +165,20 @@ export async function syncThsIndex(
   return ok('ths_index', n);
 }
 
+/**
+ * Top THS concept/industry codes by member count — the default set for
+ * members + index-daily sync. Ensures the hotspot schema first so a fresh
+ * database answers [] instead of throwing "no such table: ths_index"
+ * (first production run of goal-1028 died exactly there). Call it AFTER
+ * syncThsIndex so a first run has the freshly synced catalog to rank.
+ */
+export function discoverThsCodes(db: DatabaseSync, limit = 30): string[] {
+  ensureHotspotSchema(db);
+  return (db.prepare(
+    "SELECT ts_code FROM ths_index WHERE idx_type IN ('N','I') ORDER BY count DESC LIMIT ?",
+  ).all(limit) as Array<{ ts_code: string }>).map(r => r.ts_code);
+}
+
 const THS_MEMBER_FIELDS = 'ts_code,con_code,con_name';
 const THS_MEMBER_COLUMNS = ['ts_code', 'con_code', 'con_name', 'quality_status', 'collected_at'];
 
