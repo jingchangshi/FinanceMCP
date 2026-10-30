@@ -13,8 +13,9 @@ import {
   evaluateInvalidation, hasInsufficientData, maxAgeOf, signalAgeTradeDays, signalIdOf,
   SIGNAL_LIFECYCLE_VERSION,
 } from './signalLifecycle.js';
+import { assessCandidateEntry } from './entryAssessment.js';
 import type {
-  StrategyDef, SignalEvent, SignalDirection, RiskEpisode, FormingSignal,
+  StrategyDef, SignalEvent, SignalDirection, RiskEpisode, FormingSignal, CandidateEntry,
 } from './hotspotTypes.js';
 import { HOTSPOT_STRATEGY_SET_VERSION } from './hotspotTypes.js';
 
@@ -161,6 +162,8 @@ export interface StockStrategyScan {
   risk_firings: Array<{ id: RiskId; on: string }>;
   /** Patterns forming but not confirmed — PREPARING evidence, never a signal. */
   forming: FormingSignal[];
+  /** Entry-timing assessment (goal-1030 WP2); research state, not an order. */
+  entry: CandidateEntry;
   bars: number;
 }
 
@@ -346,14 +349,20 @@ export function detectStrategyEvents(
   }
 
   const forming = detectForming(b, x, endIdx).filter(f => !open.has(f.strategy_id));
-  return {
+  const scan: StockStrategyScan = {
     ts_code: code,
     events: state.events,
     risk_events: risk,
     risk_firings: riskFirings,
     forming,
+    entry: {
+      entry_stage: null, entry_eligibility: false, entry_score: null,
+      rejection_reasons: [], entry_assessments: [], analysis_version: 'pending',
+    },
     bars: b.dates.length,
   };
+  scan.entry = assessCandidateEntry({ ts_code: code, scan, bars: b, x, asOf, asOfIndex: endIdx });
+  return scan;
 }
 
 /**

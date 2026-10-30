@@ -8,9 +8,9 @@ import { hotspotTableExists } from './hotspotTables.js';
 import type { PoolStrategyScan } from './strategies.js';
 import type {
   HotspotSectorSnapshot, HotspotCandidate, EtfSourceRef, LeadershipType,
-  TradePermission, DataQuality, SectorKey,
+  DataQuality, SectorKey,
 } from './hotspotTypes.js';
-import { HOTSPOT_CONFIG_VERSION, HOTSPOT_STRATEGY_SET_VERSION } from './hotspotTypes.js';
+import { HOTSPOT_CONFIG_VERSION, HOTSPOT_STRATEGY_SET_VERSION, tradePermissionOf } from './hotspotTypes.js';
 
 /**
  * Dynamic candidate pool generation (goal-1028 §P2.2, architecture.md §5.2).
@@ -25,7 +25,8 @@ import { HOTSPOT_CONFIG_VERSION, HOTSPOT_STRATEGY_SET_VERSION } from './hotspotT
  * (non-mainboard stocks stay RESEARCH_ONLY — consistent with simulateFunded).
  */
 
-export const MAINBOARD_RE = /^(60\d{4}\.SH|00\d{4}\.SZ)$/;
+/** Re-exported for callers that imported it from this module historically. */
+export { MAINBOARD_RE } from './hotspotTypes.js';
 
 export interface PoolEtfConstituent {
   etf_code: string;
@@ -81,12 +82,6 @@ interface CandidateSeed {
   leader_evidence: HotspotCandidate['leader_evidence'];
   sectors: Set<SectorKey>;
   etf_sources: EtfSourceRef[];
-}
-
-function tradePermissionOf(ts_code: string): { perm: TradePermission; reason: string } {
-  return MAINBOARD_RE.test(ts_code)
-    ? { perm: 'EXECUTABLE', reason: 'MAINBOARD_OK' }
-    : { perm: 'RESEARCH_ONLY', reason: ts_code.startsWith('688') ? 'STAR_RESEARCH_ONLY' : ts_code.startsWith('30') || ts_code.startsWith('301') ? 'CHINEXT_RESEARCH_ONLY' : 'NON_MAINBOARD_RESEARCH_ONLY' };
 }
 
 export function buildHotspotPool(
@@ -281,6 +276,17 @@ export function buildHotspotPool(
         + (rps120 ?? 50) * 0.35 + Math.min(15, sigCount * 5) - Math.min(15, riskCount * 5)) * 100) / 100)
       : null;
 
+    // Entry timing (goal-1030 WP2). The liquidity gate lives here because only
+    // the pool knows the 20-day amount; everything else is computed by the
+    // entry module from the same bars the strategies saw.
+    const entry = scanSignals?.entry ?? null;
+    const entryReasons = [...(entry?.rejection_reasons ?? [])];
+    let entryEligible = entry?.entry_eligibility ?? false;
+    if (entryEligible && !liquid) {
+      entryEligible = false;
+      entryReasons.push('BELOW_LIQUIDITY_FLOOR');
+    }
+
     candidates.push({
       as_of: asOf,
       ts_code: s.ts_code,
@@ -320,6 +326,11 @@ export function buildHotspotPool(
       risk_events: (scanSignals?.risk_events ?? []).map(r => ({
         id: r.id, on: r.on, last_on: r.last_on ?? r.on, bars: r.bars ?? 1,
       })),
+      entry_stage: entry?.entry_stage ?? null,
+      entry_eligibility: entryEligible,
+      entry_score: entry?.entry_score ?? null,
+      entry_assessments: entry?.entry_assessments ?? [],
+      entry_rejection_reasons: entryReasons,
       trade_permission: perm,
       trade_permission_reason: reason,
       pool,
@@ -327,6 +338,7 @@ export function buildHotspotPool(
       exclusion_reason: exclusion,
       priority,
       priority_reason: `score(${score ?? 'n/a'})*0.5 + rps120(${rps120 ?? 'n/a'})*0.35 + signals(${sigCount})*5 - risk(${riskCount})*5`,
+      research_score: score,
       data_quality: pool === 'EXCLUDED' ? 'DEGRADED' : 'OK',
     });
     void f; // fundamentals reserved for INDUSTRY_LEADER evidence enrichment in v2
@@ -341,9 +353,12 @@ export function buildHotspotPool(
       leaderships: [], leader_evidence: [], signals: [], risk_events: [],
       forming: [],
       signal_counts: { total: 0, confirmed: 0, active: 0, invalidated: 0, expired: 0, insufficient_data: 0 },
+      entry_stage: null, entry_eligibility: false, entry_score: null,
+      entry_assessments: [], entry_rejection_reasons: ['ETF_NO_ENTRY_MODEL'],
       trade_permission: 'EXECUTABLE', trade_permission_reason: 'ETF_UNIVERSAL',
       pool: 'RAW', inclusion_reason: 'relevant_etf',
       priority: null, priority_reason: 'etf vehicle; no stock ranking applies',
+      research_score: null,
       data_quality: 'OK',
     });
   }

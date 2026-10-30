@@ -143,6 +143,23 @@ export type InstrumentType = 'STOCK' | 'ETF';
 /** Account trading permission; non-mainboard stocks stay research-only. */
 export type TradePermission = 'EXECUTABLE' | 'RESEARCH_ONLY';
 
+/**
+ * Mainboard detection used by the real-account permission model. Pure and
+ * shared: the entry layer must reach the same verdict as the pool.
+ */
+export const MAINBOARD_RE = /^(60\d{4}\.SH|00\d{4}\.SZ)$/;
+
+export function tradePermissionOf(ts_code: string): { perm: TradePermission; reason: string } {
+  return MAINBOARD_RE.test(ts_code)
+    ? { perm: 'EXECUTABLE', reason: 'MAINBOARD_OK' }
+    : {
+      perm: 'RESEARCH_ONLY',
+      reason: ts_code.startsWith('688') ? 'STAR_RESEARCH_ONLY'
+        : ts_code.startsWith('30') || ts_code.startsWith('301') ? 'CHINEXT_RESEARCH_ONLY'
+          : 'NON_MAINBOARD_RESEARCH_ONLY',
+    };
+}
+
 export interface EtfSourceRef {
   etf_code: string;
   index_code: string | null;
@@ -207,6 +224,12 @@ export interface HotspotCandidate {
   forming?: FormingSignal[];
   /** Deterministic status tally over `signals` (audit trail, history included). */
   signal_counts?: Record<SignalStatus | 'total', number>;
+  /** goal-1030 WP2: current entry-timing research verdict (never a trade order). */
+  entry_stage?: EntryStage | null;
+  entry_eligibility?: boolean;
+  entry_score?: number | null;
+  entry_assessments?: EntryAssessment[];
+  entry_rejection_reasons?: string[];
   /**
    * Risk-overlay annotations (trend_breakdown / macd_bear_divergence /
    * overheated) observed for this name. Never entry candidates, never counted
@@ -225,6 +248,12 @@ export interface HotspotCandidate {
   /** Combined priority for research attention; ordering reason recorded. */
   priority: number | null;
   priority_reason: string;
+  /**
+   * goal-1030 WP3: the frozen analysis score (0..1) this name carried when the
+   * pool was built. Reported beside `priority` so the research ranking stays
+   * auditable; it never feeds the entry ranking.
+   */
+  research_score?: number | null;
   data_quality: DataQuality;
 }
 
@@ -244,6 +273,11 @@ export interface HotspotSnapshot {
     with_signals: number;
   };
   coverage: CoverageSummary[];
+  /**
+   * goal-1030 WP3: same-day comparison of the legacy research ranking against
+   * the independent entry ranking. Optional so old snapshots stay readable.
+   */
+  entry_view?: EntryView;
   /** Research-only marker: a snapshot is never a trade authorization. */
   research_only: true;
 }
@@ -334,6 +368,128 @@ export interface RiskEpisode {
   last_on: string;
   /** Number of firing bars inside the episode. */
   bars: number;
+}
+
+// ---------------------------------------------------------------- entry assessment (goal-1030 WP2)
+
+/**
+ * Research stages for an entry window. Deliberately NOT a trade signal: the
+ * vocabulary separates "worth studying now" from "worth owning".
+ */
+export type EntryStage =
+  | 'PREPARING'
+  | 'NEWLY_CONFIRMED'
+  | 'PULLBACK_READY'
+  | 'EXTENDED'
+  | 'RISK_BLOCKED'
+  | 'INVALIDATED'
+  | 'EXPIRED'
+  | 'INSUFFICIENT_DATA';
+
+export type EntryFamily = 'REVERSAL' | 'BREAKOUT' | 'TREND_CONTINUATION';
+
+/**
+ * One deterministic arithmetic term behind `entry_score`. `raw` is the
+ * untruncated input so the score is reproducible by hand.
+ */
+export interface ScoreContribution {
+  factor: string;
+  raw: number | null;
+  weight: number | null;
+  points: number;
+}
+
+export interface EntryTrigger {
+  /** Human-readable condition that would still need to be met. */
+  condition: string;
+  /** Entry reference price (null when the trigger is purely indicator-based). */
+  reference_price: number | null;
+  reference_kind: 'confirmation_close' | 'ma20' | 'prior_high' | 'upper_band' | 'neckline' | null;
+}
+
+export interface EntryDistance {
+  price: number | null;
+  pct: number | null;
+  atr: number | null;
+}
+
+/** Objective, pre-defined upside estimate — never an invented target price. */
+export interface RewardEstimate {
+  kind: 'measured_move' | 'prior_high' | 'resistance' | 'none';
+  price: number | null;
+  distance: number | null;
+  pct: number | null;
+  note: string;
+}
+
+export interface EntryAssessment {
+  strategy_family: EntryFamily;
+  entry_stage: EntryStage;
+  entry_eligibility: boolean;
+  /** Open signal identities for this family (active/confirmed). */
+  active_signal_ids: string[];
+  /** Other family members that confirmed but are not the representative. */
+  supporting_signal_ids: string[];
+  representative_signal_id: string | null;
+  confirmed_on: string | null;
+  last_validated_on: string | null;
+  invalidated_on: string | null;
+  signal_age_trade_days: number | null;
+  entry_trigger: EntryTrigger;
+  entry_distance: EntryDistance;
+  invalidation_condition: { code: string | null; level: number | null; description: string };
+  objective_risk_distance: EntryDistance;
+  risk_distance_reason: string | null;
+  reward_estimate: RewardEstimate;
+  /** reward.distance / risk.distance; null when either side is unknown. */
+  risk_reward: number | null;
+  risk_reward_uncertainty: 'LOW' | 'MEDIUM' | 'HIGH' | null;
+  hard_invalidations: string[];
+  soft_risk_warnings: string[];
+  entry_score: number | null;
+  ranking_contributions: ScoreContribution[];
+  rejection_reasons: string[];
+  data_quality: DataQuality;
+  as_of_trade_date: string;
+  analysis_version: string;
+}
+
+/** Candidate-level roll-up over the three families. */
+export interface CandidateEntry {
+  entry_stage: EntryStage | null;
+  entry_eligibility: boolean;
+  entry_score: number | null;
+  rejection_reasons: string[];
+  entry_assessments: EntryAssessment[];
+  analysis_version: string;
+}
+
+/** Research classes required by goal-1030 WP3. */
+export type CandidateClass =
+  | 'RESEARCH_ONLY'
+  | 'PREPARING'
+  | 'NEW_ENTRY'
+  | 'PULLBACK_WAIT'
+  | 'RISK_REJECTED'
+  | 'INSUFFICIENT_DATA';
+
+/** Same-day comparison of the legacy ranking against entry eligibility. */
+export interface EntryView {
+  as_of: string;
+  rules_version: string;
+  research_top10: Array<{ ts_code: string; name: string; priority: number | null; research_score: number | null }>;
+  entry_top10: Array<{
+    ts_code: string; name: string; candidate_class: CandidateClass;
+    entry_stage: EntryStage | null; entry_score: number | null;
+    confirmed_on: string | null; risk_reward: number | null; eligibility_reasons: string[];
+  }>;
+  preparing_top: Array<{ ts_code: string; name: string; entry_score: number | null }>;
+  rejected_high_rank: Array<{
+    ts_code: string; name: string; priority: number | null; research_score: number | null;
+    candidate_class: CandidateClass; entry_stage: EntryStage | null; rejection_reasons: string[];
+  }>;
+  counts: Record<CandidateClass, number>;
+  definition_note: string;
 }
 
 // ---------------------------------------------------------------- experiments

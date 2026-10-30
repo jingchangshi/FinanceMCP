@@ -134,6 +134,26 @@ test('pipeline snapshot is internally consistent and marked research-only', () =
   // 覆盖中的 ths_member 必须如实标注无时点。
   const ths = snapshot.coverage.find(c => c.dataset === 'ths_member');
   if (ths) assert.equal(ths.quality, 'NO_POINT_IN_TIME');
+
+  // WP3: 入场视图必须与候选自洽 —— 榜上的每只都必须 eligibility=true，
+  // 且被否决的高排名候选必须给出机器可读原因。
+  const view = snapshot.entry_view;
+  assert.ok(view, '快照必须携带 entry_view');
+  assert.equal(view.as_of, AS_OF);
+  const byCode = new Map(stocks.map(c => [c.ts_code, c]));
+  for (const e of view.entry_top10) {
+    const c = byCode.get(e.ts_code);
+    assert.ok(c, `入场榜代码必须来自候选池: ${e.ts_code}`);
+    assert.equal(c.entry_eligibility, true, `${e.ts_code} 未通过资格却进了入场榜`);
+    assert.equal(e.entry_score, c.entry_score);
+  }
+  for (const e of view.rejected_high_rank) {
+    assert.equal(byCode.get(e.ts_code)?.entry_eligibility, false, `${e.ts_code} 应在否决名单里`);
+    assert.ok(e.rejection_reasons.length > 0, `${e.ts_code} 被否决必须写原因`);
+  }
+  const classTotal = Object.values(view.counts).reduce((s, n) => s + n, 0);
+  assert.equal(classTotal, stocks.length, '每个股票候选恰好属于一个类别');
+  assert.ok(!view.entry_top10.some(e => byCode.get(e.ts_code)?.instrument_type === 'ETF'));
 });
 
 test('representative ETFs are evidence-based: only ETFs whose weighted constituent stamped the sector', () => {
