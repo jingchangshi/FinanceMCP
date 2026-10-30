@@ -78,7 +78,7 @@ function payload(candidates, over = {}) {
 
 // ---------------------------------------------------------------- 1
 
-test('entry_summary counts and ranks only what the snapshot's entry view says', () => {
+test('entry_summary counts and ranks only what the entry view in the snapshot says', () => {
   const candidates = [
     candidate({ ts_code: '600001.SH', entry_score: 94 }),
     candidate({ ts_code: '600002.SH', entry_score: 99 }),
