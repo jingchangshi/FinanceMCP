@@ -5,6 +5,7 @@ import { scanPoolStrategies } from './strategies.js';
 import { saveHotspotSnapshot, snapshotContentHash } from './hotspotSnapshots.js';
 import { topConstituents, weightCoverage } from './etfWeightStore.js';
 import { ETF_CANDIDATE_DECLARATIONS } from './etfDeclarations.js';
+import { buildEntryView } from './entryRanking.js';
 import {
   HOTSPOT_CONFIG_VERSION, HOTSPOT_STRATEGY_SET_VERSION,
   type HotspotSnapshot, type CoverageSummary,
@@ -195,6 +196,9 @@ export function runHotspotPipeline(
     sectors,
     candidates: pool.candidates,
     counts: pool.counts,
+    // Independent entry view (goal-1030 WP3): the legacy top-10 stays exactly
+    // what priority produced; the entry top-10 may legitimately be empty.
+    entry_view: buildEntryView(pool.candidates, asOf),
     coverage,
     research_only: true as const,
   };
