@@ -13,6 +13,7 @@ import { factorSnapshot } from './engine.js';
 import { etfQuotes, etfStatus } from './etf.js';
 import { resolveResearchDate } from './researchDate.js';
 import { loadHotspotSnapshot } from './hotspotSnapshots.js';
+import { classifyCandidate } from './entryRanking.js';
 
 export { ashareToolDefinitions, ASHARE_TOOL_NAMES } from './definitions.js';
 
@@ -373,6 +374,17 @@ function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
   let cands = snap.candidates;
   if (args.pool) cands = cands.filter(c => c.pool === args.pool);
   if (args.ts_code) cands = cands.filter(c => c.ts_code === String(args.ts_code));
+  // goal-1030 WP5.1: optional entry filters. Additive and compatible — the
+  // legacy `pool` filter and every existing field keep their meaning, and FOCUS
+  // is never redefined to mean "entered".
+  const eligibleFilter = args.entry_eligible === undefined ? null
+    : (args.entry_eligible === true || String(args.entry_eligible).toLowerCase() === 'true');
+  if (eligibleFilter !== null) {
+    cands = cands.filter(c => (classifyCandidate(c).entry_eligibility === true) === eligibleFilter);
+  }
+  if (args.candidate_class) {
+    cands = cands.filter(c => classifyCandidate(c).candidate_class === String(args.candidate_class));
+  }
   return json({
     as_of: snap.as_of,
     strategy_set_version: snap.strategy_set_version,
@@ -380,7 +392,21 @@ function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
     research_only: snap.research_only,
     counts: snap.counts,
     pool_filter: args.pool ?? null,
-    candidates: cands,
+    // Echoed so the caller can tell an empty result from an unfiltered one.
+    entry_filter: args.entry_eligible === undefined && args.candidate_class === undefined ? null : {
+      entry_eligible: eligibleFilter,
+      candidate_class: args.candidate_class ?? null,
+    },
+    // Same-day entry view (ranked eligible list, preparing, rejected, class
+    // counts). Server-computed only: ChatGPT must not recompute stages or scores.
+    entry_view: (snap as any).entry_view ?? null,
+    candidates: cands.map(c => ({
+      ...c,
+      // Single representative assessment (the eligible one when it exists), so a
+      // reader never has to choose among families to get the contract block.
+      entry_assessment: (c.entry_assessments ?? []).find(a => a.entry_eligibility)
+        ?? (c.entry_assessments ?? [])[0] ?? null,
+    })),
     note: note ?? undefined,
   });
 }

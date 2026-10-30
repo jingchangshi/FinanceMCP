@@ -9,6 +9,7 @@ import {
   collectEtfPenetrationInputs, buildEtfPenetrationSummary, type EtfPenetrationSummary,
 } from '../ashare/etfPenetration.js';
 import { loadHotspotSnapshot } from '../ashare/hotspotSnapshots.js';
+import { classifyCandidate } from '../ashare/entryRanking.js';
 import { buildBenchmarkComparison, BENCHMARK_DEFINITION_VERSION } from './benchmarks.js';
 import { buildDailyReport } from './dailyReport.js';
 import { resolveAccountId, resolveAccountSnapshot } from './accounts.js';
@@ -508,7 +509,12 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
   });
 
   // ---- §4b 热点研究层摘要（goal-1028）：只读快照，facts 之外，不入 report_id。
-  const hotspotResearch = buildHotspotState({ db: market, asOf });
+  const hotspotResearch = buildHotspotState({
+    db: market,
+    asOf,
+    holdings: (portfolio?.holdings ?? snapshot?.snapshot?.positions ?? [])
+      .map((h: any) => ({ ts_code: h.ts_code, name: h.name ?? null })),
+  });
 
   const facts = {
     schema: RESEARCH_BUNDLE_SCHEMA, as_of_trade_date: asOf, account_id: account.account_id,
@@ -814,19 +820,214 @@ export interface HotspotResearchBundle {
   selected_sectors: string[];
   counts: { raw_pool: number; focus_pool: number; excluded: number; etf_candidates: number; with_signals: number } | null;
   focus_candidates: Array<{ ts_code: string; name: string; trade_permission: string; signals: number }>;
+  /**
+   * goal-1030 WP5.2 entry view (research only). `null` when the snapshot exists
+   * but predates WP3 and therefore carries no entry_view — an old snapshot is
+   * not the same thing as "no entry candidates today".
+   */
+  entry_summary: HotspotEntrySummary | null;
   research_only: true;
   gaps: Array<{ module: string; reason: string; affected: string[] }>;
 }
 
+/** One candidate as ChatGPT needs it: facts only, no probability, no target price. */
+export interface HotspotEntryCandidate {
+  ts_code: string;
+  name: string;
+  candidate_class: string;
+  entry_stage: string | null;
+  entry_eligibility: boolean;
+  entry_score: number | null;
+  confirmed_on: string | null;
+  signal_age_trade_days: number | null;
+  entry_distance_atr: number | null;
+  objective_risk_pct: number | null;
+  reward_pct: number | null;
+  risk_reward: number | null;
+  risk_reward_uncertainty: string | null;
+  invalidation: string | null;
+  hard_invalidations: string[];
+  soft_risk_warnings: string[];
+  rejection_reasons: string[];
+  trade_permission: string;
+  primary_sector: string | null;
+}
+
+export interface HotspotEntrySummary {
+  rules_version: string | null;
+  /** How much of the account's book this view could actually be checked against. */
+  holdings_checked: number;
+  holdings_without_sector_mapping: string[];
+  counts: {
+    eligible: number;
+    new_confirmed: number;
+    pullback_wait: number;
+    preparing: number;
+    risk_rejected: number;
+    research_only: number;
+    insufficient_data: number;
+    /** Signals whose `invalidated_on` is this trade date (not the running total). */
+    invalidated_signals_today: number;
+  };
+  key_candidates: HotspotEntryCandidate[];
+  preparing_candidates: Array<{ ts_code: string; name: string; entry_score: number | null; primary_sector: string | null }>;
+  rejected_candidates: HotspotEntryCandidate[];
+  /** Non-null only when at least one holding could be mapped to a sector. */
+  overlap_with_holdings: Array<{ ts_code: string; name: string | null; sectors: string[]; candidates: string[] }> | null;
+  portfolio_risk_impact: {
+    /** New-entry candidates whose sector is already represented in the book. */
+    candidates_in_held_sectors: number;
+    candidates_in_other_sectors: number;
+    sectors_affected: string[];
+    note: string;
+  } | null;
+  data_gaps: string[];
+  maturity: 'ENTRY_VIEW_PRESENT' | 'SNAPSHOT_WITHOUT_ENTRY_VIEW';
+}
+
 export const HOTSPOT_RESEARCH_BUNDLE_SCHEMA = 'ashare-hotspot-research/1.0';
 
-export function buildHotspotState(input: { db: DatabaseSync | null; asOf: string | null }): HotspotResearchBundle {
+/**
+ * Entry view for the private research bundle (goal-1030 WP5.2).
+ *
+ * It reads only the stored snapshot and the account's own holdings. Nothing is
+ * recomputed here, no probability or target price is invented, and a holding
+ * whose sector cannot be evidenced is listed in `holdings_without_sector_mapping`
+ * instead of being assumed to overlap nothing.
+ */
+function buildEntrySummary(
+  snap: NonNullable<ReturnType<typeof loadHotspotSnapshot>>,
+  holdings: Array<{ ts_code: string; name?: string | null }>,
+): HotspotEntrySummary {
+  const view = (snap as any).entry_view;
+  const dataGaps: string[] = [];
+  const candidates = snap.candidates.map(c => ({ candidate: c, cls: classifyCandidate(c) }));
+
+  // Today's invalidations: read the lifecycle field, never a running total.
+  const invalidatedToday = snap.candidates.reduce((n, c) => n
+    + (c.signals ?? []).filter(s => s.status === 'invalidated' && s.invalidated_on === snap.as_of).length, 0);
+
+  const toCandidate = (entry: { candidate: any; cls: any }): HotspotEntryCandidate => {
+    const c = entry.candidate;
+    const assessments = c.entry_assessments ?? [];
+    const a = assessments.find((x: any) => x.entry_eligibility) ?? assessments[0] ?? null;
+    return {
+      ts_code: c.ts_code,
+      name: c.name,
+      candidate_class: entry.cls.candidate_class,
+      entry_stage: a?.entry_stage ?? c.entry_stage ?? null,
+      entry_eligibility: entry.cls.entry_eligibility ?? false,
+      entry_score: a?.entry_score ?? c.entry_score ?? null,
+      confirmed_on: a?.confirmed_on ?? null,
+      signal_age_trade_days: a?.signal_age_trade_days ?? null,
+      entry_distance_atr: a?.entry_distance?.atr ?? null,
+      objective_risk_pct: a?.objective_risk_distance?.pct ?? null,
+      reward_pct: a?.reward_estimate?.pct ?? null,
+      risk_reward: a?.risk_reward ?? null,
+      risk_reward_uncertainty: a?.risk_reward_uncertainty ?? null,
+      invalidation: a?.invalidation_condition?.description ?? null,
+      hard_invalidations: a?.hard_invalidations ?? [],
+      soft_risk_warnings: a?.soft_risk_warnings ?? [],
+      rejection_reasons: a?.rejection_reasons ?? c.entry_rejection_reasons ?? [],
+      trade_permission: c.trade_permission,
+      primary_sector: c.primary_sector ?? null,
+    };
+  };
+
+  const eligible = candidates
+    .filter(x => x.cls.entry_eligibility)
+    .sort((x, y) => (y.cls.entry_score ?? -1) - (x.cls.entry_score ?? -1));
+  const preparing = candidates.filter(x => x.cls.candidate_class === 'PREPARING');
+  const rejected = candidates.filter(x => x.cls.candidate_class === 'RISK_REJECTED');
+
+  // ---- holdings → sectors. ETF exposures come from the snapshot's own
+  // constituent-stamped representative ETF lists, stocks from their candidate row.
+  const holdingSectors = new Map<string, string[]>();
+  const unmapped: string[] = [];
+  const sectorList: any[] = (snap as any).sectors?.sectors ?? [];
+  for (const h of holdings) {
+    const direct = snap.candidates.find(c => c.ts_code === h.ts_code);
+    const viaEtf = sectorList
+      .filter(s => (s.representative_etfs ?? []).some((e: any) => e.etf_code === h.ts_code))
+      .map(s => s.key as string);
+    const sectors = [...new Set([...(direct ? (direct.sectors ?? []) : []), ...viaEtf])];
+    if (sectors.length) holdingSectors.set(h.ts_code, sectors);
+    else unmapped.push(h.ts_code);
+  }
+  if (unmapped.length) {
+    dataGaps.push(`HOLDING_SECTOR_UNMAPPED: 持仓 ${unmapped.join(', ')} 没有可证实的行业映射（既不在候选池，也不是任何行业的盖章代表 ETF）；其主题重叠未知，不按"无重叠"处理。`);
+  }
+  if (unmapped.length === holdings.length && holdings.length > 0) {
+    dataGaps.push('HOLDING_OVERLAP_UNCOMPUTABLE: 没有任何持仓可映射到行业，因此本次不输出组合重叠与风险影响。');
+  }
+
+  const overlap = holdingSectors.size === 0 ? null : [...holdingSectors].map(([code, sectors]) => ({
+    ts_code: code,
+    name: holdings.find(h => h.ts_code === code)?.name ?? null,
+    sectors,
+    candidates: eligible
+      .filter(x => x.candidate.primary_sector && sectors.includes(x.candidate.primary_sector))
+      .map(x => x.candidate.ts_code),
+  }));
+
+  let riskImpact: HotspotEntrySummary['portfolio_risk_impact'] = null;
+  if (overlap) {
+    const heldSectorSet = new Set([...holdingSectors.values()].flat());
+    const inHeld = eligible.filter(x => x.candidate.primary_sector && heldSectorSet.has(x.candidate.primary_sector));
+    const others = eligible.filter(x => !x.candidate.primary_sector || !heldSectorSet.has(x.candidate.primary_sector));
+    riskImpact = {
+      candidates_in_held_sectors: inHeld.length,
+      candidates_in_other_sectors: others.length,
+      sectors_affected: [...new Set(inHeld.map(x => x.candidate.primary_sector as string))].sort(),
+      note: '只统计行业重叠的候选数量；不计算仓位、相关性、VaR 或建议权重——账户层决策仍由用户在券商与私有研究包中完成。',
+    };
+  }
+  if (!view) {
+    dataGaps.push('SNAPSHOT_WITHOUT_ENTRY_VIEW: 该快照生成于 WP3 之前，没有入场视图；计数取自候选行，入场榜单与类别总量不可用。');
+  }
+
+  return {
+    rules_version: view?.rules_version ?? null,
+    holdings_checked: holdingSectors.size,
+    holdings_without_sector_mapping: unmapped,
+    counts: {
+      eligible: eligible.length,
+      new_confirmed: candidates.filter(x => x.cls.candidate_class === 'NEW_ENTRY').length,
+      pullback_wait: candidates.filter(x => x.cls.candidate_class === 'PULLBACK_WAIT').length,
+      preparing: preparing.length,
+      risk_rejected: rejected.length,
+      research_only: candidates.filter(x => x.cls.candidate_class === 'RESEARCH_ONLY').length,
+      insufficient_data: candidates.filter(x => x.cls.candidate_class === 'INSUFFICIENT_DATA').length,
+      invalidated_signals_today: invalidatedToday,
+    },
+    key_candidates: eligible.slice(0, 10).map(toCandidate),
+    preparing_candidates: preparing
+      .sort((x, y) => (y.cls.entry_score ?? -1) - (x.cls.entry_score ?? -1))
+      .slice(0, 10)
+      .map(x => ({
+        ts_code: x.candidate.ts_code, name: x.candidate.name,
+        entry_score: x.cls.entry_score ?? null, primary_sector: x.candidate.primary_sector ?? null,
+      })),
+    rejected_candidates: rejected.slice(0, 10).map(toCandidate),
+    overlap_with_holdings: overlap,
+    portfolio_risk_impact: riskImpact,
+    data_gaps: dataGaps,
+    maturity: view ? 'ENTRY_VIEW_PRESENT' : 'SNAPSHOT_WITHOUT_ENTRY_VIEW',
+  };
+}
+
+export function buildHotspotState(input: {
+  db: DatabaseSync | null;
+  asOf: string | null;
+  /** Account holdings, used only to disclose sector overlap — never to size anything. */
+  holdings?: Array<{ ts_code: string; name?: string | null }>;
+}): HotspotResearchBundle {
   const base = { schema: HOTSPOT_RESEARCH_BUNDLE_SCHEMA, as_of_trade_date: input.asOf ?? null };
   const gaps: HotspotResearchBundle['gaps'] = [];
   if (!input.db || !input.asOf) {
     const reason = input.db ? 'as_of_unavailable' : 'market_db_unavailable';
     gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
-    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], research_only: true, gaps };
+    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, research_only: true, gaps };
   }
   let snap: ReturnType<typeof loadHotspotSnapshot> = null;
   try {
@@ -834,12 +1035,12 @@ export function buildHotspotState(input: { db: DatabaseSync | null; asOf: string
   } catch (error: any) {
     const reason = `snapshot_read_failed: ${String(error?.message ?? error)}`;
     gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
-    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], research_only: true, gaps };
+    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, research_only: true, gaps };
   }
   if (!snap) {
     const reason = 'hotspot_snapshot_not_generated';
     gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
-    return { ...base, status: 'NOT_READY', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], research_only: true, gaps };
+    return { ...base, status: 'NOT_READY', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, research_only: true, gaps };
   }
   return {
     ...base,
@@ -852,6 +1053,7 @@ export function buildHotspotState(input: { db: DatabaseSync | null; asOf: string
     focus_candidates: snap.candidates.filter(c => c.pool === 'FOCUS').slice(0, 15).map(c => ({
       ts_code: c.ts_code, name: c.name, trade_permission: c.trade_permission, signals: c.signals.length,
     })),
+    entry_summary: buildEntrySummary(snap, input.holdings ?? []),
     research_only: true,
     gaps,
   };
