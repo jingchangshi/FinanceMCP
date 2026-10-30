@@ -30,7 +30,7 @@ import { regimeSeries, type Regime } from './market.js';
 import { detectStrategyEvents } from './strategies.js';
 import type { EntryAssessment, EntryFamily, EntryStage } from './hotspotTypes.js';
 import { HOTSPOT_EXPERIMENT_COSTS } from './hotspotTypes.js';
-import { ENTRY_RULES_VERSION } from './entryAssessment.js';
+import { ENTRY_RULES_VERSION, ENTRY_MAX_DISTANCE_ATR } from './entryAssessment.js';
 import {
   distribution, evaluateEvents, EVALUATION_VERSION,
   type EvaluationEvent, type EvaluationOutcome, type OutcomeStatus,
@@ -110,6 +110,16 @@ export interface EntryObservation {
   market_regime: Regime | null;
   /** Next-executable open vs the signal-day close, both unadjusted (descriptive). */
   entry_drift: number | null;
+  /**
+   * goal-1031 §2.2: the distance condition re-evaluated at the T+1 open, in
+   * ATR(T) units. The gate is decided at T's close; the fill happens at T+1's
+   * open, and until this field existed the study silently assumed the two were
+   * the same price. ATR(T) is the only volatility estimate knowable at
+   * decision time, so that is what the re-check uses.
+   */
+  entry_recheck_atr: number | null;
+  /** Whether that re-check still passes the 1.0-ATR entry window. */
+  entry_eligible_at_open: boolean | null;
   /** Trade days from the entry bar to invalidation; null = never invalidated. */
   invalidated_within: number | null;
   /** Forward bars actually available at the as-of date. */
@@ -141,10 +151,25 @@ export interface HorizonStat {
 }
 
 export interface GroupStat {
+  /** Event-days: one row per (signal, observation day). NOT independent trials. */
   n: number;
+  /** goal-1031 §2.4: distinct signal ids behind `n`. */
+  unique_signals: number;
   sufficient_sample: boolean;
+  /** The same 20-observation floor applied to unique signals, which is stricter. */
+  sufficient_unique_signals: boolean;
   horizons: Record<string, HorizonStat>;
+  /**
+   * One-vote-per-signal restatement of each horizon: mean inside a signal, then
+   * an unweighted mean across signals. A signal live D days contributes once,
+   * not D times. Published beside the event-day figure, never instead of it.
+   */
+  horizons_signal_equal: Record<string, { signals: number; mean_net: number | null; win_rate: number | null }>;
   mean_entry_drift: number | null;
+  /** The whole drift distribution: a mean cannot show a gate that failed in the tail. */
+  entry_drift_distribution: { n: number; min: number | null; p05: number | null; p50: number | null; p95: number | null; max: number | null };
+  /** goal-1031 §2.2: fills that would have failed the distance gate at the T+1 open. */
+  open_recheck: { n: number; failed: number; share: number | null };
   /** Share of observations whose 10-day window closed and invalidated in time. */
   invalidated_within_10: number | null;
   breakout_within_10: number | null;
@@ -214,10 +239,37 @@ interface Replay {
   soft_risk_count: number;
   market_regime: Regime | null;
   entry_drift: number | null;
+  entry_recheck_atr: number | null;
+  entry_eligible_at_open: boolean | null;
   invalidated_within: number | null;
   observed_bars_forward: number;
   breakdown_within_10: boolean | null;
   path: Record<string, { mfe: number | null; mae: number | null; mdd: number | null }>;
+}
+
+/**
+ * goal-1031 §2.2: re-apply the entry distance rule at the actual fill.
+ *
+ * The gate is decided at T's close; the fill happens at T+1's open. Until this
+ * field existed the study assumed the two prices were the same. The re-check
+ * uses the SAME rule (≤ 1.0 ATR above the reference price) and ATR(T), the only
+ * volatility estimate knowable at decision time. It is RECORDED, never used to
+ * re-filter the arm, so the existing event-day statistics stay comparable and
+ * the count of failed fills is visible instead of silently absorbed.
+ */
+function openRecheck(bars: Bars, x: IndicatorSet, a: EntryAssessment, i: number, eIdx: number):
+{ entry_recheck_atr: number | null; entry_eligible_at_open: boolean | null } {
+  if (a.entry_stage !== 'NEWLY_CONFIRMED' && a.entry_stage !== 'PULLBACK_READY') {
+    return { entry_recheck_atr: null, entry_eligible_at_open: null };
+  }
+  const ref = a.entry_trigger.reference_price;
+  const atr = x.atr14?.[i];
+  const fill = bars.rawOpen[eIdx];
+  if (ref === null || !Number.isFinite(ref) || !Number.isFinite(atr) || atr <= 0 || !(fill > 0)) {
+    return { entry_recheck_atr: null, entry_eligible_at_open: null };
+  }
+  const atrUnits = (fill - ref) / atr;
+  return { entry_recheck_atr: r4(atrUnits), entry_eligible_at_open: atrUnits <= ENTRY_MAX_DISTANCE_ATR };
 }
 
 /** Path statistics over the planned window [entry .. entry + h - 1]. */
@@ -297,6 +349,7 @@ function replay(db: DatabaseSync, opts: EntryStudyOptions, horizons: number[]): 
         market_regime: regimes.get(day) ?? null,
         entry_drift: bars.rawClose[i] > 0 && bars.rawOpen[eIdx] > 0
           ? r4(bars.rawOpen[eIdx] / bars.rawClose[i] - 1) : null,
+        ...openRecheck(bars, x, a, i, eIdx),
         invalidated_within: invalidatedWithin,
         observed_bars_forward: Math.min(bars.dates.length - 1, i + maxHorizon) - i,
         breakdown_within_10: tenDaysOut === undefined ? null
@@ -341,11 +394,45 @@ function groupStat(rows: EntryObservation[], horizons: number[]): GroupStat {
   }
   const mature = rows.filter(r => r.observed_bars_forward >= 10);
   const bd = rows.filter(r => r.breakdown_within_10 !== null);
+  const distinctSignals = new Set(rows.map(r => r.signal_id).filter((s): s is string => s !== null));
+  // One vote per signal: mean inside the signal, then average across signals.
+  const signalEqual: Record<string, { signals: number; mean_net: number | null; win_rate: number | null }> = {};
+  for (const h of horizons) {
+    const per = new Map<string, number[]>();
+    for (const r of rows) {
+      const m = r.horizons[`${h}`];
+      if (!m || m.status !== 'completed') continue;
+      const nr = m.net_return;
+      if (typeof nr !== 'number' || !Number.isFinite(nr)) continue;
+      const key = r.signal_id ?? `${r.ts_code}:${r.as_of}`;
+      per.set(key, [...(per.get(key) ?? []), nr]);
+    }
+    const means = [...per.values()].map(v => mean(v)).filter((v): v is number => v !== null);
+    signalEqual[`${h}`] = {
+      signals: means.length,
+      mean_net: r4(mean(means)),
+      win_rate: means.length ? r4(means.filter(v => v > 0).length / means.length) : null,
+    };
+  }
+  const recheck = rows.filter(r => r.entry_eligible_at_open !== null);
+  const drift = distribution(rows.map(r => r.entry_drift));
   return {
     n: rows.length,
+    unique_signals: distinctSignals.size,
     sufficient_sample: rows.length >= MIN_GROUP_SAMPLE,
+    sufficient_unique_signals: distinctSignals.size >= MIN_GROUP_SAMPLE,
     horizons: out,
+    horizons_signal_equal: signalEqual,
     mean_entry_drift: r4(mean(rows.map(r => r.entry_drift).filter((v): v is number => v !== null))),
+    entry_drift_distribution: {
+      n: drift.n, min: r4(drift.min), p05: r4(drift.p05),
+      p50: r4(drift.median), p95: r4(drift.p95), max: r4(drift.max),
+    },
+    open_recheck: {
+      n: recheck.length,
+      failed: recheck.filter(r => r.entry_eligible_at_open === false).length,
+      share: recheck.length ? r4(recheck.filter(r => r.entry_eligible_at_open === false).length / recheck.length) : null,
+    },
     invalidated_within_10: mature.length
       ? r4(mature.filter(r => r.invalidated_within !== null && r.invalidated_within <= 10).length / mature.length)
       : null,
@@ -440,6 +527,8 @@ export function runEntryStudy(db: DatabaseSync, opts: EntryStudyOptions): EntryS
       soft_risk_count: r.soft_risk_count,
       market_regime: r.market_regime,
       entry_drift: r.entry_drift,
+      entry_recheck_atr: r.entry_recheck_atr,
+      entry_eligible_at_open: r.entry_eligible_at_open,
       invalidated_within: r.invalidated_within,
       observed_bars_forward: r.observed_bars_forward,
       breakdown_within_10: r.breakdown_within_10,

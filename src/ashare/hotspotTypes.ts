@@ -324,6 +324,13 @@ export interface SignalEvent {
    */
   confirmation_lag: number;
   evidence: Record<string, number | string | boolean | null>;
+  /**
+   * goal-1031 §2.1-3: the strategy's own *entry* predicates, carried so the
+   * entry assessment can state what was met instead of reusing the exit text.
+   * Optional because hand-built fixtures predate the field.
+   */
+  trigger_conditions?: string;
+  confirmation_conditions?: string;
   invalidation_conditions: string;
   invalidation?: { on: string; reason: string } | null;
   /**
@@ -440,6 +447,15 @@ export interface EntryAssessment {
   invalidation_condition: { code: string | null; level: number | null; description: string };
   objective_risk_distance: EntryDistance;
   risk_distance_reason: string | null;
+  /**
+   * What `objective_risk_distance` actually measures (goal-1031 §2.1-2): the
+   * distance to the *invalidation trigger*, not a maximum loss. A gap through
+   * the level realises more than this number, so it must never be read as the
+   * worst case. Null when there is no level at all.
+   */
+  risk_basis: 'invalidation_trigger' | null;
+  /** One plain sentence saying how to read the risk distance. */
+  risk_note: string;
   reward_estimate: RewardEstimate;
   /** reward.distance / risk.distance; null when either side is unknown. */
   risk_reward: number | null;

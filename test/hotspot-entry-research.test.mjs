@@ -255,3 +255,52 @@ test('shadow: snapshots without an entry view are named as such, never counted a
   assert.equal(published.status, 'INSUFFICIENT_SAMPLE');
   assert.equal(published.stats, null, 'no statistic is fabricated from zero matured cases');
 });
+
+// goal-1031 §2.2: `entry_drift` was purely descriptive. The gate is decided at
+// T's close and the fill happens at T+1's open; until these fields existed the
+// study silently assumed the two prices were the same.
+test('research: the T+1 open re-check is a second gate, not a description of drift', () => {
+  const first = at(main, DATES[BREAK]);
+  assert.equal(first.entry_stage, 'NEWLY_CONFIRMED');
+  assert.ok(Number.isFinite(first.entry_recheck_atr), 'the re-check is measured, not assumed');
+  assert.equal(first.entry_eligible_at_open, true, 'a fill at 101 is below the 103 reference, so it passes');
+  assert.ok(first.entry_recheck_atr < 0, 'a fill below the reference is a negative distance');
+
+  for (const o of main.observations) {
+    if (o.entry_stage === 'NEWLY_CONFIRMED' || o.entry_stage === 'PULLBACK_READY') continue;
+    assert.equal(o.entry_recheck_atr, null, `${o.entry_stage} is not an entry stage: no distance exists`);
+    assert.equal(o.entry_eligible_at_open, null, 'not applicable must never be reported as false');
+  }
+
+  // Same decision day, a gap through the entry window at the open. The window is
+  // 1.0 ATR and ATR14 here is ~1.2, so +5 over the 103 reference cannot pass.
+  const d = DATES[BREAK + 1];
+  const before = db.prepare('SELECT open, high FROM daily WHERE ts_code = ? AND trade_date = ?').get(CODE, d);
+  db.prepare('UPDATE daily SET open = ?, high = ? WHERE ts_code = ? AND trade_date = ?').run(108, 108.5, CODE, d);
+  try {
+    const gapped = at(study(), DATES[BREAK]);
+    assert.equal(gapped.entry_stage, 'NEWLY_CONFIRMED', 'the decision-day verdict is unchanged by the gap');
+    assert.ok(gapped.entry_drift > 0, 'the gap is visible in drift too — but drift was never a gate');
+    assert.ok(gapped.entry_recheck_atr > 1, 'measured in the same ATR units as the entry window');
+    assert.equal(gapped.entry_eligible_at_open, false, 'the fill price is outside the 1.0-ATR window');
+  } finally {
+    db.prepare('UPDATE daily SET open = ?, high = ? WHERE ts_code = ? AND trade_date = ?')
+      .run(before.open, before.high, CODE, d);
+  }
+  assert.equal(at(study(), DATES[BREAK]).entry_eligible_at_open, true, 'restoring the open restores the verdict');
+});
+
+// goal-1031 §2.4: one event with four horizon windows is four rows, not four
+// independent trials, and the horizon rows of one signal are perfectly dependent.
+test('research: event-days and unique signals are published side by side', () => {
+  const o = main.summary.overall;
+  assert.ok(Number.isInteger(o.unique_signals), 'a signal count, not an event count');
+  assert.ok(o.unique_signals >= 1 && o.unique_signals <= o.n, 'signals can never exceed event-days');
+  const h3 = o.horizons_signal_equal['3'];
+  assert.ok(Number.isInteger(h3.signals) && h3.signals <= o.unique_signals);
+  assert.ok(Number.isFinite(o.open_recheck.failed));
+  assert.ok(o.open_recheck.failed <= o.open_recheck.n);
+  // A mean cannot show a gate that failed in the tail; the distribution can.
+  assert.ok(Object.hasOwn(o.entry_drift_distribution, 'p95'));
+  assert.ok(Object.hasOwn(o.entry_drift_distribution, 'max'));
+});

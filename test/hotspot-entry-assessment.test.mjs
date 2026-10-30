@@ -7,7 +7,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { detectStrategyEvents } from '../build/ashare/strategies.js';
-import { ENTRY_RULES_VERSION, ENTRY_MAX_DISTANCE_ATR } from '../build/ashare/entryAssessment.js';
+import {
+  ENTRY_RULES_VERSION, ENTRY_MAX_DISTANCE_ATR, assessCandidateEntry,
+} from '../build/ashare/entryAssessment.js';
 import { loadFixture, replayStock, candidateByCode } from './hotspot-20261029-fixture.mjs';
 
 const N = (n, v = Number.NaN) => new Array(n).fill(v);
@@ -70,6 +72,16 @@ test('entry: a fresh breakout is NEWLY_CONFIRMED with an objective risk and rewa
   assert.equal(bo.signal_age_trade_days, 4);
   assert.equal(bo.entry_trigger.reference_price, 103, 'reference = confirmation close');
   assert.equal(bo.entry_trigger.reference_kind, 'confirmation_close');
+  // goal-1031 §2.1-3: the trigger must state what the entry waits for. It used
+  // to copy the invalidation text, which said the opposite.
+  assert.ok(bo.entry_trigger.condition.length > 0);
+  assert.notEqual(bo.entry_trigger.condition, bo.invalidation_condition.description,
+    'entry trigger and invalidation condition must not be the same sentence');
+  // goal-1031 §2.1-3 (1.2.0): for a confirmed setup nothing is still pending, so
+  // the text must say the trigger is already met and quote the strategy's own
+  // trigger predicate rather than a generic sentence.
+  assert.match(bo.entry_trigger.condition, /^already met on \d{8}:/,
+    `trigger should state that it is met: ${bo.entry_trigger.condition}`);
   assert.equal(bo.invalidation_condition.code, 'close_below_prior_high');
   assert.equal(bo.invalidation_condition.level, 100.5);
   assert.equal(bo.objective_risk_distance.price, 100.5);
@@ -116,7 +128,67 @@ test('entry: a stop inside one bar of noise flags the ratio HIGH and earns no po
     'an unusable ratio earns no credit');
 });
 
-// ---------------------------------------------------------------- EXTENDED
+// ---------------------------------------------------------------- goal-1031 §2.1
+
+// A hand-built scan isolates the assessment from the strategy detector, so the
+// assertion is about the assessment rule and nothing else.
+function fakeScan(code, family, event) {
+  return {
+    ts_code: code, events: [{ ts_code: code, family, direction: 'bullish', status: 'active',
+      risk_flags: [], evidence: {}, invalidation_conditions: 'close below the level',
+      trigger_conditions: 'close above the level on volume', confirmation_conditions: 'same-bar',
+      ...event }],
+    risk_events: [], risk_firings: [], forming: [], bars: 0,
+  };
+}
+
+test('entry: a setup already beyond its own invalidation level is never eligible', () => {
+  // goal-1031 §2.1-2. 603119.SH was eligible on 2026-10-30 with a risk distance
+  // of −0.03 ATR: the close had already gone through the level that is supposed
+  // to be the failure condition. The close is at the reference (distance 0), so
+  // no other gate catches it.
+  const n = 100;
+  const d = dates(n);
+  const scan = fakeScan('603119.SH', 'BREAKOUT', {
+    strategy_id: 'bo_range', confirmed_on: d[99], signal_age_trade_days: 0,
+    evidence: { prior_high: 101, prior_low: 99 },
+  });
+  const entry = assessCandidateEntry({
+    ts_code: '603119.SH', scan, bars: mkBars(n, { dates: d, close: 100 }), x: mkX(n),
+    asOf: d[99], asOfIndex: 99,
+  });
+  const bo = family({ entry }, 'BREAKOUT');
+  assert.ok(bo.objective_risk_distance.atr < 0, `risk atr ${bo.objective_risk_distance.atr}`);
+  assert.equal(bo.entry_stage, 'NEWLY_CONFIRMED', 'the stage machine itself is unchanged');
+  assert.equal(bo.entry_eligibility, false);
+  assert.ok(bo.rejection_reasons.includes('INVALIDATION_ALREADY_BREACHED'));
+  assert.equal(entry.entry_eligibility, false);
+  // The disclosure says what the risk distance is, so it cannot be read as a
+  // maximum loss.
+  assert.equal(bo.risk_basis, 'invalidation_trigger');
+  assert.match(bo.risk_note, /not a maximum loss/);
+});
+
+test('entry: "prior" swing high excludes the as-of bar', () => {
+  // goal-1031 §2.1-4. A stock that spikes today must not raise its own target
+  // by that spike: the trend reward uses the high of the bars BEFORE today.
+  const n = 100;
+  const d = dates(n);
+  const high = N(n, 101);
+  high[99] = 106;                       // today's own spike
+  const scan = fakeScan('600001.SH', 'TREND_CONTINUATION', {
+    strategy_id: 'tc_ma_trend', confirmed_on: d[90], signal_age_trade_days: 3,
+  });
+  const entry = assessCandidateEntry({
+    ts_code: '600001.SH', scan, bars: mkBars(n, { dates: d, close: 100, high }), x: mkX(n),
+    asOf: d[99], asOfIndex: 99,
+  });
+  const trend = family({ entry }, 'TREND_CONTINUATION');
+  assert.equal(trend.reward_estimate.kind, 'prior_high');
+  assert.equal(trend.reward_estimate.price, 101, 'the pre-as-of high, never today\'s 106');
+});
+
+
 
 test('entry: price more than 1 ATR past the entry reference is EXTENDED, not eligible', () => {
   const n = 100;
