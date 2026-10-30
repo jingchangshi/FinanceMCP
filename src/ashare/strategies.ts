@@ -4,12 +4,18 @@ import { computeIndicators, type Bars, type IndicatorSet } from './indicators.js
 import { detectSignals, SIGNAL_VERSION } from './signals.js';
 import { percentileRank, RPS_VERSION } from './rps.js';
 import {
-  detectWBottom, detectRangeBreakout, detectPullbackResume, detectRpsHold,
+  detectWBottom, detectRangeBreakout, detectPullbackResume, detectRpsHold, confirmedLocalLows,
   DEFAULT_MACD_W_OPTS, DEFAULT_RSI_W_OPTS, DEFAULT_RANGE_BREAKOUT_OPTS,
   DEFAULT_PULLBACK_OPTS, DEFAULT_RPS_HOLD_OPTS, PATTERN_VERSION,
 } from './patterns.js';
 import { recentTradeDays } from './ingest.js';
-import type { StrategyDef, SignalEvent, SignalDirection } from './hotspotTypes.js';
+import {
+  evaluateInvalidation, hasInsufficientData, maxAgeOf, signalAgeTradeDays, signalIdOf,
+  SIGNAL_LIFECYCLE_VERSION,
+} from './signalLifecycle.js';
+import type {
+  StrategyDef, SignalEvent, SignalDirection, RiskEpisode, FormingSignal,
+} from './hotspotTypes.js';
 import { HOTSPOT_STRATEGY_SET_VERSION } from './hotspotTypes.js';
 
 /**
@@ -145,13 +151,27 @@ export const RISK_OVERLAY_IDS: readonly RiskId[] =
 export interface StockStrategyScan {
   ts_code: string;
   events: SignalEvent[];
-  risk_events: Array<{ id: RiskId; on: string }>;
+  /** Risk overlay collapsed into episodes (goal-1030 WC-1). */
+  risk_events: RiskEpisode[];
+  /**
+   * Raw per-bar firings. Kept so the legacy `priority` formula (which used
+   * `risk_events.length`) stays byte-compatible for the constrained rollout;
+   * it is not exposed on the wire.
+   */
+  risk_firings: Array<{ id: RiskId; on: string }>;
+  /** Patterns forming but not confirmed — PREPARING evidence, never a signal. */
+  forming: FormingSignal[];
   bars: number;
 }
 
 interface ScanState {
-  emitted: Set<string>; // strategy_id
   events: SignalEvent[];
+}
+
+interface OpenSignal {
+  event: SignalEvent;
+  confirmIdx: number;
+  counters: Record<string, number>;
 }
 
 function dateAt(bars: Bars, i: number): string { return bars.dates[i]; }
@@ -174,65 +194,114 @@ function baseEvent(
     invalidation: null,
     status: 'active',
     risk_flags: [...strat.risk_flags],
+    signal_id: signalIdOf(code, strat.strategy_id, dateAt(bars, i)),
+    last_validated_on: dateAt(bars, i),
+    invalidated_on: null,
+    invalidation_reason: null,
+    signal_age_trade_days: 0,
+    conflicting_risks: [],
+    max_age_trade_days: maxAgeOf(strat.strategy_id),
   };
 }
 
 /**
- * Scan ONE stock over its full loaded window up to `endIdx` (inclusive).
- * Each strategy emits at most once (first confirmation within the window).
- * W-bottom is re-evaluated every bar so a later invalidation is captured;
- * the other new detectors are first-cross by construction.
+ * Scan ONE stock over its loaded window up to `endIdx` (inclusive).
+ *
+ * Lifecycle (goal-1030 WP1): each strategy keeps at most one OPEN signal. Every
+ * later bar re-evaluates that signal's declared invalidation predicate and its
+ * frozen observation window. An invalidated/expired strategy may confirm again
+ * and the new event carries a new `signal_id`; an old identity never revives.
+ * Risk overlay firings are collapsed into episodes. `forming` lists patterns
+ * that are still unconfirmed so entry assessment can show PREPARING names.
  */
 export function detectStrategyEvents(
   code: string, b: Bars, x: IndicatorSet, rpsByDate: Map<string, number | null>, endIdx: number,
 ): StockStrategyScan {
-  const state: ScanState = { emitted: new Set(), events: [] };
-  const risk: Array<{ id: RiskId; on: string }> = [];
+  const state: ScanState = { events: [] };
+  const open = new Map<string, OpenSignal>();
+  const risk: RiskEpisode[] = [];
+  const riskFirings: Array<{ id: RiskId; on: string }> = [];
   const riskSeen = new Set<string>();
+  const lastRiskIdx = new Map<RiskId, number>();
   // Per-bar RPS120 aligned to this stock's date axis (never an end-date
   // snapshot reused for earlier bars).
   const rpsArr: Array<number | null> = b.dates.map(d => rpsByDate.get(d) ?? null);
-
-  // W-bottom bookkeeping: emitted event + matched pattern for invalidation.
-  let wEvent: SignalEvent | null = null;
-  let wPattern: { j1: number; j2: number } | null = null;
+  const asOf = dateAt(b, endIdx);
 
   const first = (strat: HotspotStrategy, i: number, formed: number | null, evidence: SignalEvent['evidence']): void => {
-    if (state.emitted.has(strat.strategy_id)) return;
-    state.emitted.add(strat.strategy_id);
-    state.events.push(baseEvent(code, strat, b, i, formed, evidence));
+    if (open.has(strat.strategy_id)) return; // still valid ⇒ no duplicate identity
+    const event = baseEvent(code, strat, b, i, formed, evidence);
+    state.events.push(event);
+    open.set(strat.strategy_id, { event, confirmIdx: i, counters: {} });
   };
 
   for (let i = 0; i <= endIdx; i++) {
+    // ---- 1. validate open signals (data ≤ i only; confirmation bar excluded)
+    for (const [sid, signal] of [...open]) {
+      if (i <= signal.confirmIdx) continue;
+      const verdict = evaluateInvalidation({
+        strategyId: sid, event: signal.event, bars: b, x, i, rps: rpsArr[i] ?? null,
+        counters: signal.counters,
+      });
+      if (verdict) {
+        signal.event.status = 'invalidated';
+        signal.event.invalidated_on = verdict.on;
+        signal.event.invalidation_reason = verdict.code;
+        signal.event.invalidation = { on: verdict.on, reason: verdict.detail };
+        signal.event.last_validated_on = dateAt(b, i);
+        open.delete(sid);
+        continue;
+      }
+      const maxAge = maxAgeOf(sid);
+      if (maxAge !== null && signalAgeTradeDays(signal.confirmIdx, i) > maxAge) {
+        signal.event.status = 'expired';
+        signal.event.expired_on = dateAt(b, i);
+        signal.event.invalidation_reason = 'max_age_exceeded';
+        signal.event.last_validated_on = dateAt(b, i);
+        open.delete(sid);
+      }
+    }
+
     if (i >= 61) {
       const ids = detectSignals(b, x, i);
       for (const id of ids) {
         if (id === 'trend_breakdown' || id === 'macd_bear_divergence' || id === 'overheated') {
           const key = `${id}@${i}`;
-          if (!riskSeen.has(key)) { riskSeen.add(key); risk.push({ id: id as RiskId, on: dateAt(b, i) }); }
+          if (!riskSeen.has(key)) {
+            riskSeen.add(key);
+            riskFirings.push({ id: id as RiskId, on: dateAt(b, i) });
+            const prev = risk[risk.length - 1];
+            if (prev && prev.id === id && lastRiskIdx.get(id as RiskId) === i - 1) {
+              prev.last_on = dateAt(b, i);
+              prev.bars += 1;
+            } else {
+              risk.push({ id: id as RiskId, on: dateAt(b, i), last_on: dateAt(b, i), bars: 1 });
+            }
+            lastRiskIdx.set(id as RiskId, i);
+          }
           continue;
         }
         const strat = HOTSPOT_STRATEGIES.find(s => s.existingSignalId === id);
-        if (strat) first(strat, i, null, { source_signal: id, signal_version: SIGNAL_VERSION });
+        if (strat) first(strat, i, null, existingSignalEvidence(id, b, x, i));
       }
     }
 
     // new detectors
-    if (!state.emitted.has('tc_pullback_resume')) {
+    if (!open.has('tc_pullback_resume')) {
       const p = detectPullbackResume(b.close, b.low, x.ma20, x.ma60, i, DEFAULT_PULLBACK_OPTS);
       if (p) first(STRATEGY_BY_ID.get('tc_pullback_resume')!, i, p.touchIndex, {
         touch_index: dateAt(b, p.touchIndex), ma20: round4(p.ma20),
       });
     }
 
-    if (!state.emitted.has('bo_range')) {
+    if (!open.has('bo_range')) {
       const r = detectRangeBreakout(b.high, b.low, b.close, b.vol, x.volMa20, i, DEFAULT_RANGE_BREAKOUT_OPTS);
       if (r) first(STRATEGY_BY_ID.get('bo_range')!, i, null, {
         prior_high: round4(r.priorHigh), prior_low: round4(r.priorLow), vol_ratio: round2(r.volRatio),
       });
     }
 
-    if (!state.emitted.has('tc_rps_hold')) {
+    if (!open.has('tc_rps_hold')) {
       const h = detectRpsHold(b.close, x.ma20, rpsArr, i, DEFAULT_RPS_HOLD_OPTS);
       if (h) first(STRATEGY_BY_ID.get('tc_rps_hold')!, i, null, {
         rps120: round2(h.rps), rps_version: RPS_VERSION,
@@ -240,28 +309,163 @@ export function detectStrategyEvents(
     }
 
     // W-bottom: evaluate DIF and RSI14; DIF takes precedence when both fire same bar.
-    const wDif = detectWBottom(x.dif, i, DEFAULT_MACD_W_OPTS);
-    const wRsi = !wDif && !state.emitted.has('rv_macd_w_bottom')
-      ? detectWBottom(x.rsi14, i, DEFAULT_RSI_W_OPTS) : null;
-    const w = wDif ?? wRsi;
-    if (w && !state.emitted.has('rv_macd_w_bottom') && i === w.confirmIndex) {
-      const strat = STRATEGY_BY_ID.get('rv_macd_w_bottom')!;
-      first(strat, i, w.j2, {
-        series: wDif ? 'dif' : 'rsi14',
-        first_low: round4(w.firstLow), second_low: round4(w.secondLow),
-        neckline: round4(w.neckline), j1_date: dateAt(b, w.j1), j2_date: dateAt(b, w.j2),
-        pattern_version: PATTERN_VERSION,
-      });
-      wEvent = state.events[state.events.length - 1];
-      wPattern = { j1: w.j1, j2: w.j2 };
-    } else if (w && wPattern && w.j1 === wPattern.j1 && w.j2 === wPattern.j2
-      && w.invalidateIndex !== null && w.invalidateIndex === i && wEvent && wEvent.status === 'active') {
-      wEvent.status = 'invalidated';
-      wEvent.invalidation = { on: dateAt(b, i), reason: `series fell below ${round4(w.invalidateBelow)} (both lows)` };
+    if (!open.has('rv_macd_w_bottom')) {
+      const wDif = detectWBottom(x.dif, i, DEFAULT_MACD_W_OPTS);
+      const wRsi = !wDif ? detectWBottom(x.rsi14, i, DEFAULT_RSI_W_OPTS) : null;
+      const w = wDif ?? wRsi;
+      if (w && i === w.confirmIndex) {
+        first(STRATEGY_BY_ID.get('rv_macd_w_bottom')!, i, w.j2, {
+          series: wDif ? 'dif' : 'rsi14',
+          first_low: round4(w.firstLow), second_low: round4(w.secondLow),
+          neckline: round4(w.neckline), j1_date: dateAt(b, w.j1), j2_date: dateAt(b, w.j2),
+          pattern_version: PATTERN_VERSION,
+        });
+      }
     }
   }
 
-  return { ts_code: code, events: state.events, risk_events: risk, bars: b.dates.length };
+  // ---- finalize lifecycle fields at the as-of bar
+  for (const ev of state.events) {
+    const confirmIdx = b.dates.indexOf(ev.confirmed_on);
+    ev.source_data_as_of = asOf;
+    ev.signal_id = signalIdOf(code, ev.strategy_id, ev.confirmed_on);
+    if (ev.status === 'active') {
+      if (hasInsufficientData(ev.strategy_id, x, endIdx)) ev.status = 'insufficient_data';
+      else if (ev.confirmed_on === asOf) ev.status = 'confirmed';
+    }
+    // A terminal signal's `last_validated_on` is the bar it was closed on, not
+    // the as-of bar: that date must stay meaningful for the audit trail.
+    const stillOpen = ev.status === 'active' || ev.status === 'confirmed' || ev.status === 'insufficient_data';
+    if (stillOpen) ev.last_validated_on = asOf;
+    const lastIdx = stillOpen ? endIdx : b.dates.indexOf(ev.last_validated_on ?? asOf);
+    ev.signal_age_trade_days = confirmIdx >= 0 && lastIdx >= confirmIdx ? lastIdx - confirmIdx : 0;
+    // Risks overlapping the post-confirmation window, not only those starting after it.
+    ev.conflicting_risks = risk
+      .filter(r => r.last_on >= ev.confirmed_on && !(r.on === ev.confirmed_on && r.last_on === ev.confirmed_on))
+      .map(r => `${r.id}@${r.on}`);
+  }
+
+  const forming = detectForming(b, x, endIdx).filter(f => !open.has(f.strategy_id));
+  return {
+    ts_code: code,
+    events: state.events,
+    risk_events: risk,
+    risk_firings: riskFirings,
+    forming,
+    bars: b.dates.length,
+  };
+}
+
+/**
+ * Evidence carried by the six frozen `detectSignals` ids. The extra fields are
+ * exactly what their lifecycle predicates need later (breakout level, the price
+ * low behind a divergence, the oversold RSI trough); they are read from bars
+ * ≤ i at confirmation time, never backfilled.
+ */
+function existingSignalEvidence(
+  id: string, b: Bars, x: IndicatorSet, i: number,
+): SignalEvent['evidence'] {
+  const base = { source_signal: id, signal_version: SIGNAL_VERSION };
+  switch (id) {
+    case 'breakout_20d':
+      return { ...base, breakout_level: round4(x.high20[i - 1]) };
+    case 'macd_bull_divergence': {
+      let low = Infinity;
+      for (let k = Math.max(0, i - 9); k <= i; k++) low = Math.min(low, b.low[k]);
+      return { ...base, divergence_low: round4(low) };
+    }
+    case 'rsi_oversold_rebound': {
+      let trough = Infinity;
+      for (let k = Math.max(0, i - 10); k <= i; k++) trough = Math.min(trough, x.rsi14[k]);
+      return { ...base, rsi_trough: round4(trough) };
+    }
+    default:
+      return base;
+  }
+}
+
+/** Unconfirmed patterns at the as-of bar — PREPARING evidence for WP2. */
+function detectForming(b: Bars, x: IndicatorSet, i: number): FormingSignal[] {
+  if (i < 61) return [];
+  const out: FormingSignal[] = [];
+  const close = b.close[i];
+  const fresh = (strategyId: string, sinceIdx: number): boolean => {
+    const maxAge = maxAgeOf(strategyId) ?? 20;
+    return i - sinceIdx <= maxAge;
+  };
+
+  // W-bottom: two confirmed DIF lows passed the pair tests, neckline not crossed.
+  const lows = confirmedLocalLows(x.dif, i, DEFAULT_MACD_W_OPTS, i - DEFAULT_MACD_W_OPTS.lookback - DEFAULT_MACD_W_OPTS.L);
+  outer:
+  for (let n = 0; n < lows.length - 1; n++) {
+    const j2 = lows[n].index;
+    for (let m = n + 1; m < lows.length; m++) {
+      const j1 = lows[m].index;
+      const gap = j2 - j1;
+      if (gap < DEFAULT_MACD_W_OPTS.minGap) continue;
+      if (gap > DEFAULT_MACD_W_OPTS.maxGap) break;
+      const v1 = x.dif[j1], v2 = x.dif[j2];
+      if (!Number.isFinite(v1) || !Number.isFinite(v2)) continue;
+      if (v1 > DEFAULT_MACD_W_OPTS.lowCeiling || v2 > DEFAULT_MACD_W_OPTS.lowCeiling) continue;
+      const scale = Math.max(Math.abs(v1), Math.abs(v2));
+      if (!(Math.abs(v2 - v1) <= DEFAULT_MACD_W_OPTS.relTol * scale)) continue;
+      let neckline = -Infinity;
+      for (let k = j1 + 1; k < j2; k++) neckline = Math.max(neckline, x.dif[k]);
+      if (!(neckline > v1 && neckline > v2)) continue;
+      if (close <= 0) continue;
+      if (x.dif[i] <= neckline && fresh('rv_macd_w_bottom', j2)) {
+        out.push({
+          strategy_id: 'rv_macd_w_bottom', family: 'REVERSAL', since: dateAt(b, j2),
+          evidence: { first_low: round4(v1), second_low: round4(v2), neckline: round4(neckline), needs: 'DIF close above neckline' },
+        });
+      }
+      break outer;
+    }
+  }
+
+  // Squeeze: width in the bottom 20% of 120 bars, no upper-band cross yet.
+  if (i >= 125) {
+    const window = x.bollWidth.slice(i - 120, i).filter(Number.isFinite).sort((a, c) => a - c);
+    const level = window[Math.floor(window.length * 0.2)];
+    const squeezedIdx = [1, 2, 3, 4, 5].filter(k => x.bollWidth[i - k] <= level).map(k => i - k).sort((a, c) => a - c)[0];
+    if (window.length >= 100 && Number.isFinite(level) && squeezedIdx !== undefined
+      && Number.isFinite(x.bollUp[i]) && close <= x.bollUp[i] && fresh('bo_squeeze', squeezedIdx)) {
+      out.push({
+        strategy_id: 'bo_squeeze', family: 'BREAKOUT', since: dateAt(b, squeezedIdx),
+        evidence: { boll_width: round4(x.bollWidth[i]), squeeze_level: round4(level), needs: 'close above upper band' },
+      });
+    }
+  }
+
+  // Pullback: healthy uptrend, recent MA20 touch, not yet resumed.
+  if (i >= 5 && Number.isFinite(x.ma20[i]) && Number.isFinite(x.ma60[i]) && Number.isFinite(x.ma20[i - 5])
+    && close > x.ma20[i] && x.ma20[i] > x.ma60[i] && x.ma20[i] > x.ma20[i - 5]) {
+    let touched: number | null = null;
+    for (let k = 1; k <= 5; k++) {
+      if (Number.isFinite(x.ma20[i - k]) && b.low[i - k] <= x.ma20[i - k] * 1.01) { touched = i - k; break; }
+    }
+    const resumed = b.close[i] > b.open[i] && close > x.ma20[i];
+    if (touched !== null && !resumed && fresh('tc_pullback_resume', touched)) {
+      out.push({
+        strategy_id: 'tc_pullback_resume', family: 'TREND_CONTINUATION', since: dateAt(b, touched),
+        evidence: { touch_index: dateAt(b, touched), ma20: round4(x.ma20[i]), needs: 'up close above MA20' },
+      });
+    }
+  }
+
+  // Range: pressing the 60-day prior high without a volume-qualified break.
+  if (i >= 61) {
+    let priorHigh = -Infinity;
+    for (let k = i - 60; k < i; k++) priorHigh = Math.max(priorHigh, b.high[k]);
+    if (Number.isFinite(priorHigh) && close > priorHigh * 0.97 && close <= priorHigh) {
+      out.push({
+        strategy_id: 'bo_range', family: 'BREAKOUT', since: dateAt(b, i),
+        evidence: { prior_high: round4(priorHigh), distance: round4(priorHigh / close - 1), needs: 'close above prior high on volume' },
+      });
+    }
+  }
+
+  return out;
 }
 
 const round4 = (v: number): number => Math.round(v * 1e4) / 1e4;

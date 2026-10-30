@@ -12,7 +12,7 @@
 
 export const HOTSPOT_SCHEMA_VERSION = 'hotspot-schema-1.0.0';
 export const HOTSPOT_CONFIG_VERSION = 'hotspot-config-1.0.0';
-export const HOTSPOT_STRATEGY_SET_VERSION = 'strategies-hs-1.0.0';
+export const HOTSPOT_STRATEGY_SET_VERSION = 'strategies-hs-1.1.0';
 
 // ---------------------------------------------------------------- taxonomy
 
@@ -169,7 +169,18 @@ export interface CandidateSignalSummary {
    */
   confirmation_lag?: number;
   invalidation: string;
-  status: 'active' | 'invalidated' | 'matured';
+  status: 'confirmed' | 'active' | 'invalidated' | 'expired' | 'insufficient_data' | 'matured';
+  /** goal-1030 WP1 lifecycle fields (all deterministic at as_of). */
+  signal_id?: string;
+  strategy_version?: string;
+  last_validated_on?: string;
+  invalidated_on?: string | null;
+  expired_on?: string | null;
+  invalidation_reason?: string | null;
+  signal_age_trade_days?: number | null;
+  max_age_trade_days?: number | null;
+  conflicting_risks?: string[];
+  source_data_as_of?: string;
 }
 
 export interface HotspotCandidate {
@@ -190,13 +201,20 @@ export interface HotspotCandidate {
   leader_evidence: Array<{ kind: LeadershipType; metric: string; value: number | null; note?: string }>;
   signals: CandidateSignalSummary[];
   /**
+   * Unconfirmed patterns visible at as_of (goal-1030 WP2 PREPARING). Never
+   * entry evidence on their own and never counted in `signals`.
+   */
+  forming?: FormingSignal[];
+  /** Deterministic status tally over `signals` (audit trail, history included). */
+  signal_counts?: Record<SignalStatus | 'total', number>;
+  /**
    * Risk-overlay annotations (trend_breakdown / macd_bear_divergence /
    * overheated) observed for this name. Never entry candidates, never counted
    * in `signals` or `with_signals`; surfaced so a bull event racing a bear
    * risk signal stays visible (strategy-spec §2 "只作为候选的风险标注") and so
    * pool ranking can penalize conflicted names (strategies.ts header).
    */
-  risk_events: Array<{ id: string; on: string }>;
+  risk_events: Array<{ id: string; on: string; last_on?: string; bars?: number }>;
   trade_permission: TradePermission;
   /** e.g. 'MAINBOARD_OK', 'CHINEXT_RESEARCH_ONLY', 'STAR_RESEARCH_ONLY'. */
   trade_permission_reason: string;
@@ -254,6 +272,8 @@ export interface StrategyDef {
   risk_flags: string[];
 }
 
+export type SignalStatus = 'confirmed' | 'active' | 'invalidated' | 'expired' | 'insufficient_data';
+
 export interface SignalEvent {
   ts_code: string;
   strategy_id: string;
@@ -272,8 +292,48 @@ export interface SignalEvent {
   evidence: Record<string, number | string | boolean | null>;
   invalidation_conditions: string;
   invalidation?: { on: string; reason: string } | null;
-  status: 'active' | 'invalidated';
+  /**
+   * Lifecycle state (goal-1030 WP1). `confirmed` = confirmed on the as-of bar;
+   * `active` = confirmed earlier and the contract still holds.
+   */
+  status: SignalStatus;
   risk_flags: string[];
+  /** Deterministic identity: `${ts_code}:${strategy_id}:${confirmed_on}`. */
+  signal_id?: string;
+  /** Last bar at which the contract was evaluated (equals as-of after a scan). */
+  last_validated_on?: string;
+  invalidated_on?: string | null;
+  /** Bar at which the frozen observation window elapsed (status `expired`). */
+  expired_on?: string | null;
+  /** Machine-readable rule id that fired, e.g. `trend_breakdown`. */
+  invalidation_reason?: string | null;
+  /** Trade days between confirmed_on and the as-of bar. */
+  signal_age_trade_days?: number | null;
+  /** Risk episodes (id@first_on) observed after confirmation — soft evidence. */
+  conflicting_risks?: string[];
+  /** Last market bar visible to the engine. */
+  source_data_as_of?: string;
+  /** Strategy observation window in trade days (frozen per lifecycle version). */
+  max_age_trade_days?: number | null;
+}
+
+/** A pattern that is forming but has not confirmed — never counts as evidence. */
+export interface FormingSignal {
+  strategy_id: string;
+  family: StrategyFamily;
+  /** First bar at which the forming state was observable. */
+  since: string;
+  evidence: Record<string, number | string | boolean | null>;
+}
+
+/** A risk overlay episode: consecutive firing bars collapsed into one event. */
+export interface RiskEpisode {
+  id: 'trend_breakdown' | 'macd_bear_divergence' | 'overheated';
+  /** First firing day (kept as `on` for backward compatibility). */
+  on: string;
+  last_on: string;
+  /** Number of firing bars inside the episode. */
+  bars: number;
 }
 
 // ---------------------------------------------------------------- experiments

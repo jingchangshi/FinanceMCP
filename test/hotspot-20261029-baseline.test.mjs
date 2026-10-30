@@ -37,22 +37,114 @@ test('WP0: no signal was confirmed on the as-of day itself', () => {
   assert.equal(todays.length, 0);
 });
 
-test('WP0: replaying the production window reproduces every stored signal and risk event', async () => {
+test('WP0: replaying the production window reproduces every stored confirmation and risk firing', async () => {
+  // The stored snapshot was produced by the pre-WP1 engine: one emission per
+  // strategy per window, one risk entry per firing bar. The lifecycle engine
+  // re-emits after invalidation/expiry, so it may confirm MORE often — but it
+  // must never lose a confirmation the production engine made, and the raw
+  // risk firings must stay identical (that is the audit trail both share).
   for (const c of focus) {
     const { scan } = await replayStock(c.ts_code, fixture);
     // tc_rps_hold needs the full-market RPS120 cross-section, which is not in
     // the offline fixture; it is asserted structurally elsewhere.
     const stored = c.signals.filter(s => s.strategy_id !== 'tc_rps_hold')
-      .map(s => `${s.strategy_id}@${s.confirmed_on}#${s.status}`);
-    const replayed = scan.events.filter(e => e.strategy_id !== 'tc_rps_hold')
-      .map(e => `${e.strategy_id}@${e.confirmed_on}#${e.status}`);
-    assert.deepEqual(replayed, stored, `${c.name} signals`);
-    assert.deepEqual(scan.risk_events.map(r => `${r.id}@${r.on}`),
-      c.risk_events.map(r => `${r.id}@${r.on}`), `${c.name} risk events`);
+      .map(s => `${s.strategy_id}@${s.confirmed_on}`);
+    const replayed = new Set(scan.events.filter(e => e.strategy_id !== 'tc_rps_hold')
+      .map(e => `${e.strategy_id}@${e.confirmed_on}`));
+    for (const id of stored) assert.ok(replayed.has(id), `${c.name}: ${id} lost by the replay`);
+    assert.deepEqual(scan.risk_firings.map(r => `${r.id}@${r.on}`),
+      c.risk_events.map(r => `${r.id}@${r.on}`), `${c.name} risk firings`);
   }
 });
 
-// ---------------------------------------------------------------- DEFECT-01
+// ------------------------------------------------------- WP1 AFTER contract
+// Same frozen data, lifecycle engine. The snapshot above is the "before";
+// these are the guarantees the corrected engine must hold on it.
+test('WP1: no signal outlives its frozen observation window', async () => {
+  const { SIGNAL_MAX_AGE_TRADE_DAYS } = await import('../build/ashare/signalLifecycle.js');
+  for (const c of focus) {
+    const { scan } = await replayStock(c.ts_code, fixture);
+    const openByStrategy = new Map();
+    for (const e of scan.events) {
+      assert.ok(e.signal_id, `${c.name} ${e.strategy_id}@${e.confirmed_on} has no identity`);
+      assert.equal(e.signal_id, `${e.ts_code}:${e.strategy_id}:${e.confirmed_on}`);
+      assert.equal(e.max_age_trade_days, SIGNAL_MAX_AGE_TRADE_DAYS[e.strategy_id]);
+      if (e.status === 'active' || e.status === 'confirmed') {
+        assert.ok(e.signal_age_trade_days <= e.max_age_trade_days,
+          `${c.name} ${e.strategy_id}@${e.confirmed_on} open at age ${e.signal_age_trade_days} > ${e.max_age_trade_days}`);
+        assert.equal(openByStrategy.has(e.strategy_id), false,
+          `${c.name} has two open ${e.strategy_id} signals`);
+        openByStrategy.set(e.strategy_id, e);
+      }
+      if (e.status === 'invalidated') {
+        assert.ok(e.invalidated_on, 'invalidated signal must carry invalidated_on');
+        assert.ok(e.invalidation_reason, 'invalidated signal must carry a machine-readable reason');
+        assert.ok(e.invalidated_on > e.confirmed_on, 'invalidation cannot precede confirmation');
+      }
+      if (e.status === 'expired') {
+        assert.ok(e.expired_on, 'expired signal must carry expired_on');
+        assert.equal(e.invalidated_on, null, 'expiry is not invalidation');
+      }
+    }
+  }
+});
+
+test('WP1: 平安银行 trend signal state matches its breakdown events', async () => {
+  const { scan } = await replayStock('000001.SZ', fixture);
+  const trends = scan.events.filter(e => e.strategy_id === 'tc_ma_trend');
+  // The pre-WP1 signal (20251114) is now expired, not eternally active.
+  const old = trends.find(e => e.confirmed_on === '20251114');
+  assert.ok(old, 'the 20251114 identity is still in the audit trail');
+  // It did not survive to the 2026-10-29 snapshot: its 20-trade-day window
+  // elapsed at age 21, so the 20260108 breakdown never met it.
+  assert.equal(old.status, 'expired');
+  assert.equal(old.signal_age_trade_days, 21);
+  assert.ok(old.expired_on > '20251114' && old.expired_on < '20260108');
+  // The signal confirmed on 20261013 is invalidated by the 20261022 breakdown.
+  const recent = trends.find(e => e.confirmed_on === '20261013');
+  assert.ok(recent, 'a re-confirmed trend signal exists after the old one closed');
+  assert.equal(recent.status, 'invalidated');
+  assert.equal(recent.invalidated_on, '20261022');
+  assert.equal(recent.invalidation_reason, 'trend_breakdown');
+  // No trend signal is currently open, because the last breakdown was 20261028.
+  assert.equal(trends.some(e => e.status === 'active' || e.status === 'confirmed'), false);
+});
+
+test('WP1: 艾艾精工 invalidated W-bottom no longer counts as current evidence', async () => {
+  const { scan } = await replayStock('603580.SH', fixture);
+  const w = scan.events.find(e => e.strategy_id === 'rv_macd_w_bottom' && e.confirmed_on === '20251031');
+  assert.ok(w, 'the invalidated W-bottom stays in the audit trail');
+  assert.equal(w.status, 'invalidated');
+  assert.equal(w.invalidated_on, '20251216');
+  assert.equal(w.invalidation_reason, 'dif_below_w_lows');
+  const open = scan.events.filter(e => e.status === 'active' || e.status === 'confirmed');
+  assert.deepEqual(open, [], '艾艾精工 has no current entry evidence on 2026-10-29');
+});
+
+test('WP1: risk firings collapse into episodes without losing any bar', async () => {
+  for (const c of focus) {
+    const { scan } = await replayStock(c.ts_code, fixture);
+    const firingBars = scan.risk_firings.length;
+    const covered = scan.risk_events.reduce((n, r) => n + r.bars, 0);
+    assert.equal(covered, firingBars, `${c.name}: episodes must cover every firing bar`);
+    assert.ok(scan.risk_events.length <= firingBars || firingBars === 0);
+    for (const r of scan.risk_events) {
+      assert.ok(r.last_on >= r.on);
+      assert.ok(r.bars >= 1);
+    }
+  }
+});
+
+test('WP1: soft risk is linked to the signal, not turned into invalidation', async () => {
+  const { scan } = await replayStock('301234.SZ', fixture);
+  const pullback = scan.events.find(e => e.strategy_id === 'tc_pullback_resume' && e.status === 'active');
+  assert.ok(pullback, '五洲医疗 still has an open pullback signal');
+  assert.ok(pullback.conflicting_risks.some(r => r.startsWith('macd_bear_divergence@20261029')),
+    'the 2026-10-29 bear divergence is attached as risk evidence');
+  assert.equal(pullback.status, 'active', 'a bearish divergence is not an automatic invalidation');
+});
+
+
 // Historical signals are never re-evaluated. 325 of 335 signals are 'active';
 // the only state transition ever produced is the W-bottom invalidation.
 test('DEFECT-01: signal statuses are frozen at confirmation (325 active / 10 invalidated)', () => {
