@@ -201,13 +201,15 @@ ashareToolDefinitions.push(
   },
   {
     name: 'ashare_hotspot_opportunities',
-    description: `热点候选机会快照：动态候选池(FOCUS/RAW)个股与ETF、领导身份(产业/行情龙头)与证据、多策略信号(confirmed_on 确认日,绝不回填形态形成日)、交易权限(非主板=RESEARCH_ONLY)、入池/排除原因与优先级。研究观察,不构成交易授权;候选池与 wl-1.0.0 正式观察池相互独立。快照缺失时返回 NOT_READY 与原因。${DATA_NOTE}`,
+    description: `热点候选机会快照：动态候选池(FOCUS/RAW)个股与ETF、领导身份(产业/行情龙头)与证据、多策略信号(confirmed_on 确认日,绝不回填形态形成日)、交易权限(非主板=RESEARCH_ONLY)、入池/排除原因与优先级。另有入场评估 entry_assessment(阶段/资格/分数/触发/风险收益比/否决原因)与当日 entry_view 榜单。研究观察,不构成交易授权;候选池与 wl-1.0.0 正式观察池相互独立,入场资格也不改变 FOCUS 的定义。快照缺失时返回 NOT_READY 与原因。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: {
         date: dateProp,
         pool: { type: 'string', enum: ['FOCUS', 'RAW'], description: '仅返回该池成员;缺省返回全部候选' },
         ts_code: { type: 'string', description: '只看单只候选(个股或ETF)' },
+        entry_eligible: { type: 'boolean', description: '仅返回通过入场资格门槛的候选(true)或仅返回未通过的候选(false);缺省不过滤' },
+        candidate_class: { type: 'string', enum: ['NEW_ENTRY', 'PULLBACK_WAIT', 'PREPARING', 'RISK_REJECTED', 'RESEARCH_ONLY', 'INSUFFICIENT_DATA'], description: '按入场类别过滤;类别由服务端规则确定' },
       },
     },
     annotations: READ_ONLY,
