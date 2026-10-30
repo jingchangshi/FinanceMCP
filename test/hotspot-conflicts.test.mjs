@@ -101,7 +101,7 @@ test('MACD 底背离：确认根首触 97、前缀不提前暴露、对照序列
   assert.ok(div, '97 起事件可见');
   assert.equal(div.confirmed_on, dates[97], '确认日 = 首触根，不回填形成低点');
   assert.equal(div.evidence.source_signal, 'macd_bull_divergence', '与既有检测器同源');
-  assert.equal(div.status, 'active');
+  assert.equal(div.status, 'confirmed', '在 as-of 根上确认 ⇒ confirmed（WP1 生命周期）');
   assert.equal(div.direction, 'bullish');
 
   // 前缀不变性：截断序列在同一根上给出完全相同的判定（无未来函数）。
@@ -120,7 +120,7 @@ test('MACD 底背离：确认根首触 97、前缀不提前暴露、对照序列
 
 // --------------------------------------------- 2. 多策略触发 + RSI 超卖反弹
 
-test('同一股票多个策略触发：趋势延续 + MACD 背离 + RSI 超卖反弹并存，每策略至多一次', () => {
+test('同一股票多个策略触发：趋势延续 + MACD 背离 + RSI 超卖反弹并存，每策略同一时刻至多一个开仓信号', () => {
   const { b, x, dates } = s1();
   const scan = detectStrategyEvents('600000.SH', b, x, new Map(), b.dates.length - 1);
   const ids = scan.events.map(e => e.strategy_id);
@@ -128,8 +128,14 @@ test('同一股票多个策略触发：趋势延续 + MACD 背离 + RSI 超卖�
     assert.ok(ids.includes(want), `${want} 应在同一股票上触发（实际: ${ids.join(',')}）`);
   }
   assert.ok(new Set(ids).size >= 2, '同一股票多个策略触发');
+  // WP1：失效/到期后允许重新确认，但同一策略不得同时存在两个开仓信号，
+  // 且重复确认必须落在不同日期（signal_id 由 confirmed_on 决定）。
   for (const id of new Set(ids)) {
-    assert.equal(ids.filter(v => v === id).length, 1, `${id} 每策略至多发射一次（emit-once）`);
+    const evs = scan.events.filter(e => e.strategy_id === id);
+    const keys = evs.map(e => e.confirmed_on);
+    assert.equal(new Set(keys).size, keys.length, `${id} 的重复确认必须落在不同日期`);
+    assert.ok(evs.filter(e => e.status === 'active' || e.status === 'confirmed').length <= 1,
+      `${id} 同一时刻至多一个开仓信号`);
   }
   const oversold = scan.events.find(e => e.strategy_id === 'rv_rsi_oversold');
   assert.equal(oversold.confirmed_on, dates[100], 'RSI 超卖反弹首触于 100');
@@ -211,7 +217,7 @@ test('多策略冲突：风险叠加与多头事件并存互不吞没，池排�
   assert.equal(cY.priority, rY.priority, '未注入风险的代码优先级不变');
 
   // 风险标注如实投影；惩罚只降权，绝不由风险直接改写池资格。
-  assert.deepEqual(rX.risk_events, [{ id: 'trend_breakdown', on: '20250910' }]);
+  assert.deepEqual(rX.risk_events, [{ id: 'trend_breakdown', on: '20250910', last_on: '20250910', bars: 1 }]);
   assert.deepEqual(cX.risk_events, []);
   if (rX.pool !== cX.pool) {
     // 降级只允许经既有截止口径移出 FOCUS，绝不能以风险本身为排除理由。
@@ -272,7 +278,8 @@ test('信号失效条件：W 底确认事件破位后翻转 invalidated，破位
   assert.equal(ev119.status, 'invalidated');
   assert.ok(ev119.invalidation, '失效记录存在');
   assert.equal(ev119.invalidation.on, dates[100], '失效日 = 破位根');
-  assert.match(ev119.invalidation.reason, /fell below/, '失效原因可读');
+  assert.equal(ev119.invalidation_reason, 'dif_below_w_lows', '机器可读的失效规则 id');
+  assert.match(ev119.invalidation.reason, /DIF/, '失效原因可读');
 });
 
 // --------------------------------------------------- 5. 候选数量不足

@@ -270,8 +270,12 @@ export function buildHotspotPool(
     // not below "unknown priority".
     const score = row?.score ?? null;
     const rps120 = rps ? (rps.rows.get(s.ts_code)?.rps[120] ?? null) : null;
-    const sigCount = scanSignals?.events.filter(e => e.status === 'active').length ?? 0;
-    const riskCount = (scanSignals?.risk_events ?? []).length;
+    // Lifecycle (goal-1030 WP1): only signals whose contract still holds count.
+    // `confirmed` means confirmed on the as-of bar itself and counts too.
+    const sigCount = scanSignals?.events.filter(e => e.status === 'active' || e.status === 'confirmed').length ?? 0;
+    // The legacy priority formula consumed one entry per risk *firing*; the wire
+    // now carries episodes, so keep the raw count for a byte-compatible rollout.
+    const riskCount = (scanSignals?.risk_firings ?? scanSignals?.risk_events ?? []).length;
     const priority = score !== null || rps120 !== null
       ? Math.max(0, Math.round(((score !== null ? Math.max(0, Math.min(100, (score ?? 0) * 100)) : 50) * 0.5
         + (rps120 ?? 50) * 0.35 + Math.min(15, sigCount * 5) - Math.min(15, riskCount * 5)) * 100) / 100)
@@ -294,8 +298,28 @@ export function buildHotspotPool(
         confirmation_lag: e.confirmation_lag,
         invalidation: e.invalidation ? `${e.invalidation.on}:${e.invalidation.reason}` : e.invalidation_conditions,
         status: e.status,
+        signal_id: e.signal_id ?? `${e.ts_code}:${e.strategy_id}:${e.confirmed_on}`,
+        strategy_version: e.strategy_version,
+        last_validated_on: e.last_validated_on ?? asOf,
+        invalidated_on: e.invalidated_on ?? null,
+        expired_on: e.expired_on ?? null,
+        invalidation_reason: e.invalidation_reason ?? null,
+        signal_age_trade_days: e.signal_age_trade_days ?? null,
+        max_age_trade_days: e.max_age_trade_days ?? null,
+        conflicting_risks: e.conflicting_risks ?? [],
+        source_data_as_of: e.source_data_as_of ?? asOf,
       })),
-      risk_events: (scanSignals?.risk_events ?? []).map(r => ({ id: r.id, on: r.on })),
+      forming: scanSignals?.forming ?? [],
+      signal_counts: (() => {
+        const c: Record<string, number> = {
+          total: 0, confirmed: 0, active: 0, invalidated: 0, expired: 0, insufficient_data: 0,
+        };
+        for (const e of scanSignals?.events ?? []) { c[e.status] += 1; c.total += 1; }
+        return c as HotspotCandidate['signal_counts'];
+      })(),
+      risk_events: (scanSignals?.risk_events ?? []).map(r => ({
+        id: r.id, on: r.on, last_on: r.last_on ?? r.on, bars: r.bars ?? 1,
+      })),
       trade_permission: perm,
       trade_permission_reason: reason,
       pool,
@@ -315,6 +339,8 @@ export function buildHotspotPool(
       as_of: asOf, ts_code: etfCode, name, instrument_type: 'ETF',
       primary_sector: null, sectors: [], etf_sources: [], multi_etf: false,
       leaderships: [], leader_evidence: [], signals: [], risk_events: [],
+      forming: [],
+      signal_counts: { total: 0, confirmed: 0, active: 0, invalidated: 0, expired: 0, insufficient_data: 0 },
       trade_permission: 'EXECUTABLE', trade_permission_reason: 'ETF_UNIVERSAL',
       pool: 'RAW', inclusion_reason: 'relevant_etf',
       priority: null, priority_reason: 'etf vehicle; no stock ranking applies',
