@@ -43,8 +43,15 @@ const { weekdays } = await import('./ashare-fixture.mjs');
 // 今天（上海）随真实时钟变化；前瞻记录要求 recorded_at（服务端现在时）<= as_of。
 const shanghaiToday = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10).replace(/-/g, '');
 const R = shanghaiToday;                       // 前瞻研究日 = 今天（上海）
-const DAYS = weekdays('20261005', 30);         // 合成日历 20261005 起 30 个工作日
-assert.ok(DAYS.includes(R) || R > DAYS.at(-1), `fixture 日历需覆盖研究日 ${R}：${DAYS.at(-1)}`);
+// 合成日历：weekdays() 只产生工作日。整份用例要求研究日 = 上海今天——as_of 必须
+// >= 服务端现在时才能是 TRUE_FORWARD，而 intake 又禁止 as_of > 今天。因此今天若
+// 落在周末/节假日，就把今天作为"合成交易日"加进日历，而不是把研究日挪到未来。
+// （20261031 是周六；旧写法 `assert.ok(DAYS.includes(R) || ...)` 会让整份文件在
+// 每个周末必然失败，与用例自身的回退逻辑相矛盾。）
+const DAYS = (() => {
+  const base = weekdays('20261005', 30);       // 合成日历 20261005 起 30 个工作日
+  return base.includes(R) ? base : [...base, R].sort();
+})();
 // 研究日之后至少 horizon 个交易日（不足则把 R 往前挪到日历内且 >= TRUE_FORWARD_START）。
 const TRUE_FORWARD_START = '20261022';
 let researchDay = R;
@@ -53,6 +60,10 @@ if (!DAYS.includes(researchDay) || DAYS.filter(d => d > researchDay).length < 5)
   // 服务端 now 固定为真实今天：只有 as_of >= 今天才可能是 TRUE_FORWARD。
   researchDay = candidates.at(-1) ?? DAYS.at(-6);
 }
+// 回退到过去的研究日就不再是前瞻，M2/M4 的 TRUE_FORWARD 断言会失去意义：
+// 与其静默降级，不如明确失败并指出 fixture 需要延长到今天之后 5 个交易日。
+assert.equal(researchDay, R,
+  `fixture 日历需覆盖上海今天之后至少 5 个交易日：今天 ${R}，日历 ${DAYS[0]}..${DAYS.at(-1)}`);
 const AS_OF = researchDay;                     // 评价记录 as_of
 const EVAL_DATE = DAYS[DAYS.indexOf(AS_OF) + 5]; // 5 日窗口成熟后的评价截止日
 const CODE = '159241.SZ';

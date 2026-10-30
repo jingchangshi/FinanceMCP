@@ -76,10 +76,36 @@ test('ranking: entry top-10 is ordered by entry score, never by signal count', (
   assert.deepEqual(view.entry_top10.map(e => e.ts_code), ['600002.SH']);
   assert.equal(view.entry_top10[0].confirmed_on, '20261028');
   assert.equal(view.entry_top10[0].risk_reward, 2.1);
+  // goal-1031 §2.1-5: a fixture with no family reports null, never a guess.
+  assert.equal(view.entry_top10[0].strategy_family, null);
+  assert.deepEqual(view.entry_top10[0].families_considered, []);
   // The stale-signal name is research top-1 and rejected for entry, with reasons.
   assert.deepEqual(view.research_top10.map(e => e.ts_code), ['600001.SH', '600002.SH']);
   assert.deepEqual(view.rejected_high_rank.map(e => e.ts_code), ['600001.SH']);
   assert.deepEqual(view.rejected_high_rank[0].rejection_reasons, ['STAGE_EXTENDED']);
+});
+
+test('ranking: a second family that contradicts the representative is visible', () => {
+  // 600919.SH on 2026-10-30: BREAKOUT said risk/reward 8.62 and TREND said 0.01
+  // for the same name on the same day. The list shows the representative, but a
+  // reader must be able to see that another family rejected the same entry.
+  const conflict = cand({
+    ts_code: '600919.SH', name: '江苏银行',
+    entry_stage: 'NEWLY_CONFIRMED', entry_eligibility: true, entry_score: 100,
+    entry_assessments: [
+      { strategy_family: 'BREAKOUT', entry_stage: 'NEWLY_CONFIRMED', entry_eligibility: true, risk_reward: 8.62, confirmed_on: '20261030' },
+      { strategy_family: 'TREND_CONTINUATION', entry_stage: 'EXTENDED', entry_eligibility: false, risk_reward: 0.01 },
+    ],
+  });
+  const view = buildEntryView([conflict], '20261030');
+  const row = view.entry_top10[0];
+  assert.equal(row.strategy_family, 'BREAKOUT', 'the representative family is named');
+  assert.equal(row.families_considered.length, 2);
+  assert.ok(row.families_considered.some(f => f.strategy_family === 'TREND_CONTINUATION' && f.entry_eligibility === false),
+    'the rejecting family is disclosed');
+  // A saturated score must not read as "best".
+  assert.match(view.definition_note, /no penalty fired/);
+  assert.match(view.definition_note, /families_considered/);
 });
 
 test('ranking: entry ranking ties break by code, so the list is reproducible', () => {

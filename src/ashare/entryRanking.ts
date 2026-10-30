@@ -14,7 +14,11 @@
  */
 import type { HotspotCandidate, EntryStage, CandidateClass, EntryView } from './hotspotTypes.js';
 
-export const RANKING_RULES_VERSION = 'ranking-rules-1.0.0';
+// 1.1.0 (goal-1031 §2.1-5): `entry_top10` rows gain `strategy_family` and
+// `families_considered`. The ORDER is unchanged — same filter, same sort, same
+// tie-break — so a 1.0.0 list is the same list with less disclosed. The version
+// moves because the published payload gained fields, not because a rule moved.
+export const RANKING_RULES_VERSION = 'ranking-rules-1.1.0';
 
 export type { CandidateClass, EntryView } from './hotspotTypes.js';
 
@@ -132,11 +136,25 @@ export function buildEntryView(candidates: HotspotCandidate[], asOf: string): En
       ts_code: s.ts_code, name: s.name, priority: s.priority, research_score: s.research_score,
     })),
     entry_top10: entryTop.map(s => {
-      const a = entryAssessmentOf(candidates, s.ts_code);
+      const c = candidates.find(x => x.ts_code === s.ts_code);
+      const a = c?.entry_assessments?.[0] ?? null;
+      // goal-1031 §2.1-5: a name can carry two families that contradict each
+      // other (600919.SH on 2026-10-30: BREAKOUT risk/reward 8.62 vs TREND
+      // 0.01). The representative stays "best stage"; the disagreement is shown
+      // rather than hidden, because a reader who sees only one number cannot
+      // tell that the other family rejected the same entry.
+      const all = (c?.entry_assessments ?? []).filter(Boolean);
       return {
         ts_code: s.ts_code, name: s.name, candidate_class: s.candidate_class,
         entry_stage: s.entry_stage, entry_score: s.entry_score,
         confirmed_on: a?.confirmed_on ?? null, risk_reward: a?.risk_reward ?? null,
+        strategy_family: a?.strategy_family ?? null,
+        families_considered: all.length >= 2
+          ? all.map(o => ({
+            strategy_family: o.strategy_family, entry_stage: o.entry_stage,
+            entry_eligibility: o.entry_eligibility, risk_reward: o.risk_reward,
+          }))
+          : [],
         eligibility_reasons: s.eligibility_reasons,
       };
     }),
@@ -150,13 +168,11 @@ export function buildEntryView(candidates: HotspotCandidate[], asOf: string): En
     definition_note:
       'research_top10 = legacy priority order (FOCUS semantics unchanged); entry_top10 = entry-eligible '
       + 'candidates only, ordered by entry_score, then risk/reward, then proximity to the reference, then '
-      + 'code (zero is allowed); preparing_top = unconfirmed patterns ranked the same way; '
+      + 'code (zero is allowed). A fresh confirmation has nothing to subtract yet, so entry_score 100 means '
+      + '"no penalty fired", not "best", and the ranking inside such a tie is decided by risk/reward; '
+      + 'strategy_family names the representative family (rule: best stage) and families_considered lists the '
+      + 'other families assessed for the same name, so a family that rejected the same entry is visible; '
+      + 'preparing_top = unconfirmed patterns ranked the same way; '
       + 'rejected_high_rank = research top-10 failing the entry gates, with machine-readable reasons.',
   };
-}
-
-function entryAssessmentOf(candidates: HotspotCandidate[], tsCode: string) {
-  const c = candidates.find(x => x.ts_code === tsCode);
-  const primary = c?.entry_assessments?.[0] ?? null;
-  return primary;
 }

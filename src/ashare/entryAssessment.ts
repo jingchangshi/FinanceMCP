@@ -11,6 +11,26 @@
  * Rules are frozen under `entry-rules-1.0.0` BEFORE any 2026-10-29 entry
  * outcome was evaluated; changing a parameter requires a new version and the
  * out-of-sample re-validation in WP4.
+ *
+ * 1.1.0 (goal-1031 §2.1-3): `entry_trigger.condition` no longer copies the
+ * strategy's invalidation text. Only the wording of an existing field changed;
+ * no stage, distance, score, gate or threshold moved, so 1.0.0 results remain
+ * numerically comparable and are NOT recomputed with this version.
+ *
+ * 1.2.0 (goal-1031 §2.1): three substantive corrections, each with a test.
+ *   a. `entry_trigger.condition` now quotes the strategy's own trigger text
+ *      (`signal.trigger_conditions`) and states whether it is already met —
+ *      the 1.1.0 wording was generic and did not say what was actually true.
+ *   b. eligibility rejects a setup whose close is already beyond its own
+ *      invalidation level (`INVALIDATION_ALREADY_BREACHED`). Previously such a
+ *      row could be eligible (603119.SH, 2026-10-30: risk −0.03 ATR).
+ *   c. reward windows exclude the as-of bar. The trend `prior_high`, the
+ *      divergence `recentHigh`, the RSI resistance and the squeeze base are all
+ *      "prior" structure, and including today let a stock's own spike set its
+ *      own target. This lowers some reward estimates; it is not a re-tune.
+ * `risk_basis` / `risk_note` are disclosure only. No score weight, no ATR
+ * threshold and no stage boundary moved, so score comparability across 1.1.0
+ * holds; reward and eligibility do change, hence the version bump.
  */
 import type { Bars, IndicatorSet } from './indicators.js';
 import type {
@@ -21,7 +41,7 @@ import { tradePermissionOf } from './hotspotTypes.js';
 import type { StockStrategyScan } from './strategies.js';
 import { maxAgeOf } from './signalLifecycle.js';
 
-export const ENTRY_RULES_VERSION = 'entry-rules-1.0.0';
+export const ENTRY_RULES_VERSION = 'entry-rules-1.2.0';
 
 /** Trade days a confirmation still counts as "new" for entry timing. */
 export const NEWLY_CONFIRMED_MAX_AGE: Readonly<Record<EntryFamily, number>> = {
@@ -154,6 +174,8 @@ function assessFamily(
     invalidation_condition: { code: null, level: null, description: '' },
     objective_risk_distance: { price: null, pct: null, atr: null },
     risk_distance_reason: null,
+    risk_basis: null,
+    risk_note: 'no risk distance was computed for this state',
     reward_estimate: { kind: 'none', price: null, distance: null, pct: null, note: '' },
     risk_reward: null,
     risk_reward_uncertainty: null,
@@ -263,8 +285,16 @@ function assessFamily(
   out.invalidation_condition = inv;
   if (inv.level !== null) {
     out.objective_risk_distance = distanceTo(close, inv.level, atr);
+    // goal-1031 §2.1-2: name what the number is. It is the distance to the
+    // invalidation trigger; a gap through the level loses more than this, so
+    // it is an input to the ratio, not a maximum loss.
+    out.risk_basis = 'invalidation_trigger';
+    out.risk_note = 'distance to the invalidation trigger, not a maximum loss: '
+      + 'a gap through the level realises more than this distance';
   } else {
     out.risk_distance_reason = 'indicator_based_invalidation';
+    out.risk_basis = null;
+    out.risk_note = 'no price level; the invalidation is indicator-based, so no risk distance exists';
   }
 
   out.reward_estimate = rewardFor(open[0] ?? null, bars, x, i, close, indexOf);
@@ -304,11 +334,21 @@ function referenceFor(
   if (signal) {
     const sid = signal.strategy_id;
     const confIdx = indexOf.get(signal.confirmed_on);
+    // goal-1031 §2.1-3: the field is the strategy's own entry predicate, not its
+    // exit predicate. The invalidation text lives only in `invalidation_condition`.
+    const met = signal.trigger_conditions ?? 'the strategy confirmation rule';
     if (sid === 'tc_pullback_resume' || sid === 'tc_ma_trend' || sid === 'tc_rps_hold') {
       const ma20 = at(x.ma20, i);
       if (finite(ma20)) {
         return {
-          trigger: { condition: signal.invalidation_conditions, reference_price: r4(ma20), reference_kind: 'ma20' },
+          // For a trend setup the entry still waits for something: price coming
+          // back to MA20. That is a real trigger, and it is disjoint from the
+          // invalidation ("close below MA60"), which is the opposite claim.
+          trigger: {
+            condition: `pullback entry: price returns to MA20; the signal was confirmed on ${signal.confirmed_on} by: ${met}`,
+            reference_price: r4(ma20),
+            reference_kind: 'ma20',
+          },
           price: ma20,
         };
       }
@@ -320,7 +360,13 @@ function referenceFor(
     if (confIdx !== undefined) {
       const p = bars.close[confIdx];
       return {
-        trigger: { condition: signal.invalidation_conditions, reference_price: r4(p), reference_kind: 'confirmation_close' },
+        // Nothing is still "needed": the trigger is already met on the
+        // confirmation bar, and the text says so instead of describing failure.
+        trigger: {
+          condition: `already met on ${signal.confirmed_on}: ${met}`,
+          reference_price: r4(p),
+          reference_kind: 'confirmation_close',
+        },
         price: p,
       };
     }
@@ -432,14 +478,18 @@ function rewardFor(
   if (sid === 'rv_macd_divergence') {
     const low = evNumber(signal, 'divergence_low');
     if (low === null) return none('divergence low unavailable');
+    // goal-1031 §2.1-4: the reference high must predate the as-of bar. Including
+    // it let today's own spike enlarge today's reward estimate.
     let recentHigh = -Infinity;
-    for (let k = Math.max(0, i - 9); k <= i; k++) recentHigh = Math.max(recentHigh, bars.high[k]);
+    for (let k = Math.max(0, i - 9); k < i; k++) recentHigh = Math.max(recentHigh, bars.high[k]);
+    if (!Number.isFinite(recentHigh)) return none('no bar before the as-of bar to measure from');
     return mk('measured_move', close + (recentHigh - low), 'divergence height projected from entry');
   }
   if (sid === 'rv_rsi_oversold') {
     let resistance = -Infinity;
-    for (let k = Math.max(0, i - 20); k <= i; k++) resistance = Math.max(resistance, bars.high[k]);
-    return mk('resistance', resistance, '20-bar high as objective resistance');
+    for (let k = Math.max(0, i - 20); k < i; k++) resistance = Math.max(resistance, bars.high[k]);
+    if (!Number.isFinite(resistance)) return none('no bar before the as-of bar to measure from');
+    return mk('resistance', resistance, '20-bar high (pre-as-of) as objective resistance');
   }
   if (sid === 'bo_range' || sid === 'bo_volume_20d') {
     const priorHigh = evNumber(signal, 'prior_high') ?? evNumber(signal, 'breakout_level');
@@ -456,12 +506,15 @@ function rewardFor(
     const width = finite(at(x.bollUp, i)) && finite(at(x.bollMid, i)) ? (at(x.bollUp, i) - at(x.bollMid, i)) * 4 : null;
     if (width === null) return none('no band width');
     let base = Infinity;
-    for (let k = Math.max(0, i - 20); k <= i; k++) base = Math.min(base, bars.low[k]);
+    for (let k = Math.max(0, i - 20); k < i; k++) base = Math.min(base, bars.low[k]);
+    if (!Number.isFinite(base)) return none('no bar before the as-of bar to measure from');
     return mk('measured_move', close + (close - base) + width, 'squeeze range projected from entry');
   }
-  // Trend continuation: objective upside is the prior swing high.
+  // Trend continuation: objective upside is the prior swing high. "Prior" means
+  // the bars before the as-of bar: including it made today's own high the
+  // resistance and shrank the reward of exactly the strongest days.
   let priorHigh = -Infinity;
-  for (let k = Math.max(0, i - 60); k <= i; k++) priorHigh = Math.max(priorHigh, bars.high[k]);
+  for (let k = Math.max(0, i - 60); k < i; k++) priorHigh = Math.max(priorHigh, bars.high[k]);
   if (!finite(priorHigh) || priorHigh <= close) return none('price already at the prior swing high');
   return mk('prior_high', priorHigh, 'prior 60-bar swing high as objective resistance');
 }
@@ -529,6 +582,12 @@ function eligibility(a: EntryAssessment, perm: TradePermission): boolean {
   if (a.entry_stage === 'RISK_BLOCKED') reasons.push('RISK_BLOCKED');
   const atrDist = a.entry_distance.atr;
   if (atrDist !== null && atrDist > ENTRY_MAX_DISTANCE_ATR) reasons.push('ENTRY_TOO_FAR');
+  // goal-1031 §2.1-2: a close already beyond its own invalidation level is not
+  // an entry at all — the setup's failure condition is satisfied on the as-of
+  // bar. Before this check such a row could still be eligible (603119.SH on
+  // 2026-10-30: risk distance −0.03 ATR, no rejection reason).
+  const riskAtr = a.objective_risk_distance.atr;
+  if (riskAtr !== null && riskAtr < 0) reasons.push('INVALIDATION_ALREADY_BREACHED');
   a.rejection_reasons = [...new Set([...a.rejection_reasons, ...reasons])];
   return reasons.length === 0;
 }

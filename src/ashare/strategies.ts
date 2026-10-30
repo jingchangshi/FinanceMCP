@@ -193,6 +193,8 @@ function baseEvent(
     formed_on: formed !== null ? dateAt(bars, formed) : null,
     confirmation_lag: formed !== null ? i - formed : 0,
     evidence,
+    trigger_conditions: strat.trigger_conditions,
+    confirmation_conditions: strat.confirmation_conditions,
     invalidation_conditions: strat.invalidation_conditions,
     invalidation: null,
     status: 'active',

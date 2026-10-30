@@ -81,6 +81,14 @@ async function main() {
     print(await runValidationCommand(process.argv.slice(3)));
     return;
   }
+  // Entry-layer freeze (goal-1031 §2.1). Dispatched here, deliberately outside
+  // validationCli, so recording it cannot change the signal implementation_hash
+  // that guards the 21:10 forward observation.
+  if (command === 'research-entry') {
+    const { runEntryCommand } = await import('./entryFreezeCli.js');
+    print(await runEntryCommand(process.argv.slice(3)));
+    return;
+  }
   // Research commands open the live cache read-only themselves and must not
   // create or migrate a writable live connection.
   if (command === 'research-snapshot' || command === 'research-evaluate' || command === 'research-seed') {
