@@ -170,7 +170,8 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
       const db = openPortfolioDb(path, { writable: true });
       try {
         const account = resolveAccountId(db, (args ?? {}).account_id);
-        return json(appendChatgptResearchRecord(db, account.account_id, args ?? {}, Date.now(), Number.isInteger(limit) && limit > 0 ? limit : undefined));
+        return json(appendChatgptResearchRecord(db, account.account_id, args ?? {}, Date.now(), Number.isInteger(limit) && limit > 0 ? limit : undefined,
+          { market: readOnlyMarket() }));
       } finally { db.close(); }
     }
 
@@ -246,6 +247,7 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
           accountId: account.account_id, asOf,
           vpsRecordId: args.vps_record_id ? String(args.vps_record_id) : undefined,
           chatgptRecordId: args.chatgpt_record_id ? String(args.chatgpt_record_id) : undefined,
+          market: readOnlyMarket(),
         }));
       } finally { db.close(); }
     }
