@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { canonicalJson, JOURNAL_VERSION, readResearchJournal, recordResearchJournal } from './researchJournal.js';
+import { canonicalJson, JOURNAL_VERSION, readResearchJournal, recordResearchJournal, resolveHotspotBinding } from './researchJournal.js';
 import { classifyRecord, type EvidenceClass } from './forwardReview.js';
 import { inPortfolioTransaction } from './db.js';
 
@@ -142,15 +142,16 @@ function missingBundleReason(db: DatabaseSync, accountId: string, reportId: stri
  * Append one ChatGPT research record. `accountId` must already be resolved by the caller;
  * `nowMs` is the server clock (injectable for tests only, never from the client).
  */
-export function appendChatgptResearchRecord(db: DatabaseSync, accountId: string, args: Record<string, unknown>, nowMs = Date.now(), dailyLimit: number = INTAKE_LIMITS.dailyRecords): ChatgptIntakeResult {
+export function appendChatgptResearchRecord(db: DatabaseSync, accountId: string, args: Record<string, unknown>, nowMs = Date.now(), dailyLimit: number = INTAKE_LIMITS.dailyRecords,
+  options: { market?: DatabaseSync | null } = {}): ChatgptIntakeResult {
   const parsed = parseIntakeArgs(args, nowMs);
   // The existence check, the daily cap and the insert run in one write transaction. Without it, two writers of the
   // same idempotency key both pass the check and the loser hits the journal's no-replace trigger, which reports a
   // retry as an error. With it the loser waits for the lock and then replays the stored row (created:false).
-  return inPortfolioTransaction(db, () => appendParsedRecord(db, accountId, parsed, nowMs, dailyLimit));
+  return inPortfolioTransaction(db, () => appendParsedRecord(db, accountId, parsed, nowMs, dailyLimit, options.market ?? null));
 }
 
-function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnType<typeof parseIntakeArgs>, nowMs: number, dailyLimit: number): ChatgptIntakeResult {
+function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnType<typeof parseIntakeArgs>, nowMs: number, dailyLimit: number, market: DatabaseSync | null): ChatgptIntakeResult {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get()) throw new Error(`bundle_not_found: the research journal has no VPS snapshots yet`);
   const bundles = db.prepare("SELECT record_id FROM research_journal WHERE account_id=? AND source='vps' AND bundle_id=? AND as_of_trade_date=? ORDER BY record_id LIMIT 10")
     .all(accountId, parsed.reportId, parsed.asOf) as { record_id: string }[];
@@ -173,6 +174,10 @@ function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnT
   if (today >= dailyLimit) throw new Error(`rate_limited: at most ${dailyLimit} ChatGPT research records per day`);
   const received = new Date(nowMs).toISOString();
   const { content } = parsed;
+  // goal-1032 follow-up: the independent research record is bound to the same
+  // snapshot version it cites, exactly like the VPS bundle that anchors it.
+  // Unbound when no snapshot exists — never guessed.
+  const hotspot = resolveHotspotBinding(market, parsed.asOf);
   const result = recordResearchJournal(db, {
     record_id: recordId, account_id: accountId, source: 'chatgpt', as_of_trade_date: parsed.asOf,
     bundle_id: parsed.reportId, generated_at: received,
@@ -187,6 +192,6 @@ function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnT
     correction_of: parsed.correctsRecordId ?? null,
     provenance: { author: 'chatgpt', source_reference: `mcp:${CHATGPT_INTAKE_TOOL}:${parsed.reportId}`, obtained_at: received },
     payload: { kind: 'chatgpt-research-record/1', client_content_hash: clientHash, idempotency_key: parsed.idempotencyKey ?? null, report_id: parsed.reportId, ...content },
-  });
+  }, hotspot);
   return { created: result.created, record_id: recordId, content_hash: result.record.content_hash, evidence_class: classifyRecord(result.record) };
 }

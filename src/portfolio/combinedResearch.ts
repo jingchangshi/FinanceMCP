@@ -2,7 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import {
   canonicalJson, JOURNAL_VERSION, listResearchJournal, readResearchJournal,
-  recordResearchJournal, type JournalRecord,
+  recordResearchJournal, resolveHotspotBinding, type JournalRecord,
 } from './researchJournal.js';
 import { classifyRecord, type EvidenceClass } from './forwardReview.js';
 import { inPortfolioTransaction } from './db.js';
@@ -57,6 +57,8 @@ export interface CombinedAppendInput {
   vpsRecordId?: string;
   chatgptRecordId?: string;
   nowMs?: number;
+  /** 只读市场库，用于解析本记录要绑定的快照版本；缺失时不写绑定，不猜。 */
+  market?: DatabaseSync | null;
 }
 
 export interface CombinedAppendResult {
@@ -223,7 +225,7 @@ function appendCombinedParsed(db: DatabaseSync, input: CombinedAppendInput, nowM
       frozen_before_outcome: true,
       execution: 'none: research judgement merge only; no rebalancing, no order, no account write',
     },
-  });
+  }, resolveHotspotBinding(input.market, input.asOf));
   return {
     created: result.created, record_id: recordId, content_hash: result.record.content_hash,
     decision, vps_record_id: vps.record_id, chatgpt_record_id: chatgpt.record_id,

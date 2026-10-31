@@ -153,6 +153,37 @@ export interface HotspotBinding {
   basis: 'BUNDLE' | 'LEGACY_PAYLOAD' | 'LEGACY_UNBOUND';
 }
 
+/**
+ * Resolve the snapshot version a research record must be bound to.
+ *
+ * Selects the same row the readers select (`ORDER BY config_version DESC LIMIT
+ * 1`), so the binding names the version a report of that day would actually
+ * have read. Returns null when the market DB, the pointer table or the row is
+ * missing, and on any query error: an unbound record is honest (readers report
+ * "unknown"), while a guessed version is a lie.
+ *
+ * `basis` stays 'BUNDLE' for every writer. The value means "resolved from the
+ * live snapshot pointer at record time"; the column's CHECK has no separate
+ * code for other sources, and inventing one would require rebuilding an
+ * append-only table that already exists in production.
+ */
+export function resolveHotspotBinding(
+  market: DatabaseSync | null | undefined, asOfTradeDate: string,
+): HotspotBinding | null {
+  if (!market || !table(market, 'hotspot_snapshot')) return null;
+  try {
+    const row = market.prepare(`SELECT as_of, config_version, content_hash, version_no
+      FROM hotspot_snapshot WHERE as_of = ? ORDER BY config_version DESC LIMIT 1`)
+      .get(asOfTradeDate) as
+      { as_of: string; config_version: string; content_hash: string | null; version_no: number | null } | undefined;
+    return row ? {
+      hotspotAsOf: row.as_of, configVersion: row.config_version,
+      versionNo: row.version_no ?? null, contentHash: row.content_hash ?? null,
+      basis: 'BUNDLE' as const,
+    } : null;
+  } catch { return null; }
+}
+
 /** Append the record→snapshot-version binding. Same write path as the journal row. */
 export function bindResearchHotspot(db: DatabaseSync, binding: {
   recordId: string; accountId: string; asOfTradeDate: string;

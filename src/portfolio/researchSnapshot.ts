@@ -121,12 +121,19 @@ export interface SnapshotGetResult {
   snapshot: SnapshotMetadata | null;
   /** 原始冻结内容：持久化时刻的完整 bundle（payload），逐字节保留；缺失时为 null。 */
   frozen_payload: unknown;
-  /** frozen_payload 的重算哈希（服务端只读校验）；与落库 content_hash 一致才可信。 */
+  /**
+   * 冻结内容的两个哈希，口径不同，不相等是正常的：
+   * - `payload_sha256` 只覆盖 `frozen_payload`（服务端重算）；
+   * - `journal_content_hash` 是落库时整条 journal 记录（含 payload、record_id、
+   *   versions、judgement 等）的哈希。
+   * `status` 只回答"payload 在不在"，**不表示两个哈希已经比对过**。记录完整性由读取
+   * 时的重算校验保证：不一致会直接抛 `journal_integrity_error`，不会走到这里。
+   */
   payload_verification: {
-    recomputed_sha256: string | null;
-    /** journal.content_hash 覆盖整条记录（含 payload）；recomputed 覆盖 payload 子集，二者口径不同，均如实给出。 */
-    record_content_hash: string | null;
-    status: 'VERIFIED' | 'PAYLOAD_MISSING';
+    payload_sha256: string | null;
+    journal_content_hash: string | null;
+    status: 'PAYLOAD_PRESENT' | 'PAYLOAD_MISSING';
+    hash_basis: string;
   } | null;
   /** 同账户同交易日的其他快照身份（帮助选择；不构成自动关联）。 */
   same_date_snapshots: { record_id: string; bundle_id: string; recorded_at: string }[];
@@ -195,11 +202,16 @@ export function getResearchSnapshot(db: DatabaseSync, input: {
     frozen_payload: hasPayload ? payload : null,
     payload_verification: hasPayload
       ? {
-        recomputed_sha256: createHash('sha256').update(canonicalJson(payload)).digest('hex'),
-        record_content_hash: record.content_hash,
-        status: 'VERIFIED',
+        payload_sha256: createHash('sha256').update(canonicalJson(payload)).digest('hex'),
+        journal_content_hash: record.content_hash,
+        status: 'PAYLOAD_PRESENT',
+        hash_basis: 'payload_sha256 covers frozen_payload only; journal_content_hash is the stored hash of the whole journal record. Different bases: equality is neither expected nor checked.',
       }
-      : { recomputed_sha256: null, record_content_hash: record.content_hash, status: 'PAYLOAD_MISSING' },
+      : {
+        payload_sha256: null, journal_content_hash: record.content_hash,
+        status: 'PAYLOAD_MISSING',
+        hash_basis: 'The frozen payload is absent from this historical record; only the record hash is available.',
+      },
     same_date_snapshots: sameDate,
     note: hasPayload
       ? `已按真实身份读取冻结快照（journal 版本 ${JOURNAL_VERSION}）；frozen_payload 是记录时刻的完整原始内容，query 是本次查询元数据。该日共 ${sameDate.length} 个持久化版本。`

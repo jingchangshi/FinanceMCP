@@ -6,7 +6,7 @@ import type { CliHelpers } from '../ashare/commands.js';
 import { portfolioDbPath, openPortfolioDb } from './db.js';
 import { openMarketCache } from './quotes.js';
 import { buildInvestmentResearchBundle } from './researchBundle.js';
-import { recordResearchJournal, readResearchJournal, canonicalJson, JOURNAL_VERSION } from './researchJournal.js';
+import { recordResearchJournal, readResearchJournal, canonicalJson, JOURNAL_VERSION, resolveHotspotBinding } from './researchJournal.js';
 
 /** Explicit scheduled write path. Stores only authentic VPS output in the private account volume. */
 export function runBundleRecordCommand(h: CliHelpers): void {
@@ -29,19 +29,7 @@ export function runBundleRecordCommand(h: CliHelpers): void {
     // Only a snapshot that is actually in the table gets bound; when there is
     // none we write no binding at all and readers report "unbound" — we never
     // guess a version from whatever happens to be current.
-    const hotspot = (() => {
-      if (!market) return null;
-      try {
-        const row = market.prepare(`SELECT as_of, config_version, content_hash, version_no
-          FROM hotspot_snapshot WHERE as_of = ? LIMIT 1`).get(bundle.as_of_trade_date) as
-          { as_of: string; config_version: string; content_hash: string | null; version_no: number | null } | undefined;
-        return row ? {
-          hotspotAsOf: row.as_of, configVersion: row.config_version,
-          versionNo: row.version_no ?? null, contentHash: row.content_hash ?? null,
-          basis: 'BUNDLE' as const,
-        } : null;
-      } catch { return null; }
-    })();
+    const hotspot = resolveHotspotBinding(market, bundle.as_of_trade_date);
     const existing = readResearchJournal(portfolio, id);
     const record = existing ? { created: false, record: existing } : recordResearchJournal(portfolio, {
       record_id: id, account_id: bundle.account_id, source: 'vps', as_of_trade_date: bundle.as_of_trade_date,

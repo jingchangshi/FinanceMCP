@@ -132,7 +132,11 @@ test('S1: 10-26 式身份漂移复现——live ID 变化后旧快照仍可按�
     });
     assert.equal(got.snapshot?.bundle_id, `BUNDLE-${AS_OF}-oldcode`);
     assert.equal(got.frozen_payload?.report_id, `BUNDLE-${AS_OF}-oldcode`);
-    assert.equal(got.payload_verification?.status, 'VERIFIED');
+    assert.equal(got.payload_verification?.status, 'PAYLOAD_PRESENT');
+    // The two hashes measure different things; equality is neither expected nor claimed.
+    assert.match(got.payload_verification.payload_sha256, /^[0-9a-f]{64}$/);
+    assert.match(got.payload_verification.journal_content_hash, /^[0-9a-f]{64}$/);
+    assert.match(got.payload_verification.hash_basis, /different bases|Different bases/i);
   } finally { portfolio.close(); }
 });
 
