@@ -1,6 +1,11 @@
 [Unit]
 Description=FinanceMCP real-account close-of-day research report and forward record
-After=docker.service network-online.target finance-ashare-daily.service
+# goal-1032: hotspot runs after daily instead of at 19:40, so the ordering is
+# declared here too — the account research record binds itself to a snapshot
+# VERSION, and recording before that version exists would bind nothing.
+After=docker.service network-online.target finance-ashare-daily.service finance-ashare-hotspot.service
+# No Wants=: the daily unit already queues hotspot through OnSuccess/OnFailure.
+# Pulling it in here as well would run a second (network-bound) catalog sync.
 
 [Service]
 Type=oneshot

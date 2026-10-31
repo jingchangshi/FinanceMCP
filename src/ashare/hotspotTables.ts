@@ -81,6 +81,38 @@ CREATE TABLE IF NOT EXISTS hotspot_candidate (
   PRIMARY KEY (as_of, ts_code)
 );
 CREATE INDEX IF NOT EXISTS hotspot_candidate_ts ON hotspot_candidate(ts_code);
+-- goal-1032 §2.1: append-only history of every content that was ever published
+-- for a day. The hotspot_snapshot table above stays the CURRENT POINTER
+-- (unchanged primary key, unchanged readers); this table survives regeneration.
+CREATE TABLE IF NOT EXISTS hotspot_snapshot_version (
+  as_of TEXT NOT NULL,
+  config_version TEXT NOT NULL,
+  version_no INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  hash_basis TEXT NOT NULL DEFAULT 'v2',
+  strategy_set_version TEXT,
+  payload TEXT NOT NULL,
+  coverage TEXT,
+  generated_at TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('PUBLISHED','SUPERSEDED','CORRECTION')),
+  superseded_by INTEGER,
+  correction_of INTEGER,
+  readiness TEXT,
+  data_state TEXT,
+  first_cited_by TEXT,
+  first_cited_at TEXT,
+  PRIMARY KEY (as_of, config_version, version_no),
+  UNIQUE (as_of, config_version, content_hash)
+);
+CREATE INDEX IF NOT EXISTS hotspot_snapshot_version_hash ON hotspot_snapshot_version(content_hash);
+CREATE TRIGGER IF NOT EXISTS hotspot_snapshot_version_frozen BEFORE UPDATE ON hotspot_snapshot_version
+WHEN NEW.payload IS NOT OLD.payload OR NEW.content_hash IS NOT OLD.content_hash
+  OR NEW.as_of IS NOT OLD.as_of OR NEW.config_version IS NOT OLD.config_version
+  OR NEW.version_no IS NOT OLD.version_no
+BEGIN SELECT RAISE(ABORT,'hotspot_snapshot_version payload is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS hotspot_snapshot_version_no_delete BEFORE DELETE ON hotspot_snapshot_version
+BEGIN SELECT RAISE(ABORT,'hotspot_snapshot_version is append-only'); END;
 `;
 
 /** Every table HOTSPOT_SCHEMA creates, in doc order. */
@@ -93,6 +125,10 @@ export const HOTSPOT_TABLES = [
   'ths_index_daily',
   'hotspot_snapshot',
   'hotspot_candidate',
+  // NOTE: hotspot_snapshot_version is deliberately NOT listed here. This array
+  // is the SOURCE-dataset catalogue that hotspotCoverage reports on; the ledger
+  // is an output of the pipeline, not an input, and listing it would make the
+  // coverage block claim a data source that never existed.
 ] as const;
 
 /** Idempotent: safe to call at the top of every sync and every read path. */
@@ -106,6 +142,12 @@ export function ensureHotspotSchema(db: DatabaseSync): void {
   const hasRisk = (db.prepare('PRAGMA table_info(hotspot_candidate)').all() as Array<{ name: string }>)
     .some(c => c.name === 'risk_events');
   if (!hasRisk) db.exec('ALTER TABLE hotspot_candidate ADD COLUMN risk_events TEXT');
+  // goal-1032: the pointer row gains the ledger position it points at. Guarded
+  // exactly like risk_events — CREATE IF NOT EXISTS cannot add columns to an
+  // existing table, and production already has a hotspot_snapshot.
+  const snapCols = new Set((db.prepare('PRAGMA table_info(hotspot_snapshot)').all() as Array<{ name: string }>).map(c => c.name));
+  if (!snapCols.has('version_no')) db.exec('ALTER TABLE hotspot_snapshot ADD COLUMN version_no INTEGER');
+  if (!snapCols.has('state')) db.exec('ALTER TABLE hotspot_snapshot ADD COLUMN state TEXT');
 }
 
 export function hotspotTableExists(db: DatabaseSync, name: string): boolean {

@@ -348,6 +348,11 @@ function hotspotSectorsTool(args: Record<string, any>): ToolResult {
     as_of: snap.as_of,
     config_version: snap.config_version,
     content_hash: snap.content_hash,
+    // goal-1032: which ledger position this is, and the data it was computed
+    // from. Both are echoed verbatim — a reader that cannot see the data state
+    // has no way to tell "the market was thin today" from "the snapshot is old".
+    version_no: snap.version_no ?? null,
+    data_state: snap.data_state ?? null,
     generated_at: snap.generated_at,
     research_only: snap.research_only,
     selected: snap.sectors.selected,
@@ -389,6 +394,11 @@ function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
     as_of: snap.as_of,
     strategy_set_version: snap.strategy_set_version,
     content_hash: snap.content_hash,
+    // goal-1032: ledger position + the data the ranking was computed from.
+    // `data_state.readiness` is DEGRADED on a real but thin day, NOT_READY only
+    // on days a snapshot is not published at all.
+    version_no: snap.version_no ?? null,
+    data_state: snap.data_state ?? null,
     research_only: snap.research_only,
     counts: snap.counts,
     pool_filter: args.pool ?? null,

@@ -1,12 +1,16 @@
 #!/bin/sh
-# Trading-day hotspot pipeline entry point used by finance-ashare-hotspot.timer:
-# industry sync (SW/THS members + index daily) -> hotspot snapshot.
+# Trading-day hotspot pipeline entry point.
+#
+# goal-1032: there is NO hotspot timer any more. This script is triggered by
+# finance-ashare-daily.service (OnSuccess= and OnFailure=), i.e. after the
+# market pipeline finished and the data is (or is not) ready — the readiness
+# gate below then decides whether a snapshot may be published at all. The daily
+# unit runs twice (18:40, 21:10), so this runs twice and the version ledger
+# records both data states instead of one overwriting the other.
 #
 # Kept separate from run-daily.sh on purpose: run-daily.sh's contract is the
 # market/report pipeline (see operations.md §1.2), and hotspot-sync is a
 # network-bound full-catalog refresh that must not stretch that unit's runtime.
-# The timer fires after the 18:40 daily run so the snapshot sees the same
-# trading day's close.
 set -eu
 # A systemd user manager started before the account joined the docker group
 # lacks that group; re-exec under it so `docker exec` can reach the socket.
@@ -59,6 +63,16 @@ if ! docker exec "$CONTAINER" node build/ashare/cli.js hotspot-snapshot >"$SNAP_
 fi
 # Report the persisted identity, not just "ok": the hash is what the MCP tools
 # and the research bundle must agree on.
-jq -r '"finance-ashare hotspot ok: as_of=\(.snapshot.as_of) hash=\(.snapshot.content_hash // .content_hash) "
-  + "counts=\(.counts // .snapshot.counts // {} | tojson)"' "$SNAP_OUT" 2>/dev/null \
+jq -r '"finance-ashare hotspot ok: as_of=\(.snapshot.as_of) readiness=\(.readiness.status // "?") "
+  + "hash=\(.saved.content_hash // .snapshot.content_hash) version=\(.saved.version_no // "-") "
+  + "state=\(.saved.state // "DRY_RUN") counts=\(.snapshot.counts // {} | tojson)"' "$SNAP_OUT" 2>/dev/null \
   || echo "finance-ashare hotspot ok: $SNAP_OUT"
+
+# goal-1032 publish gate. NOT_READY means the pipeline ran, computed, and
+# deliberately wrote nothing: there is no honest snapshot for a day whose bars
+# or quality gate fails. Exit 78 so the unit is visibly failed instead of
+# silently "ok with no new snapshot"; the next daily run retries.
+if jq -e '.readiness.status == "NOT_READY"' "$SNAP_OUT" >/dev/null 2>&1; then
+  echo "finance-ashare hotspot NOT PUBLISHED: data not ready — $(jq -r '.readiness.reason // "unknown"' "$SNAP_OUT")" >&2
+  exit 78
+fi
