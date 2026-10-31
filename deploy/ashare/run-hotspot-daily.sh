@@ -4,9 +4,22 @@
 # goal-1032: there is NO hotspot timer any more. This script is triggered by
 # finance-ashare-daily.service (OnSuccess= and OnFailure=), i.e. after the
 # market pipeline finished and the data is (or is not) ready — the readiness
-# gate below then decides whether a snapshot may be published at all. The daily
-# unit runs twice (18:40, 21:10), so this runs twice and the version ledger
-# records both data states instead of one overwriting the other.
+# gate below then decides whether a snapshot may be published at all.
+#
+# The daily unit fires twice (18:40 and 21:10 CST), but only the 18:40 pass is
+# a *publishing* pass. The late pass exists as a repair: it covers a 18:40 run
+# that died or that found the data not yet published. On a normal day there is
+# nothing to repair, and the guard below exits before syncing, so a day has ONE
+# published version instead of two versions of the same data.
+#
+# Evidence for that (2026-10-19..10-30, 40 dataset-day pairs across daily /
+# daily_basic / adj_factor / stk_limit): the second sync never changed a single
+# row, and no day ever needed repair. Re-running anyway was not harmless — it
+# put a second, unexplained version number on the same day, which is exactly
+# what a report then has to disambiguate.
+#
+# ASHARE_HOTSPOT_FORCE=1 overrides the guard (manual re-publish, e.g. after
+# changing the engine and wanting a fresh snapshot for the same day).
 #
 # Kept separate from run-daily.sh on purpose: run-daily.sh's contract is the
 # market/report pipeline (see operations.md §1.2), and hotspot-sync is a
@@ -22,6 +35,26 @@ LOG_DIR="$DATA_DIR/logs"
 mkdir -p "$LOG_DIR"
 STAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
 CONTAINER="${ASHARE_CONTAINER:-finance-mcp-ashare}"
+
+# Late-pass repair guard (see the header). Deliberately BEFORE the container
+# wait: when there is nothing to repair, this should cost milliseconds and must
+# not depend on docker being up. Any failure to answer the question falls
+# through to the normal pipeline — a guard that cannot run must not stop work.
+if [ "${ASHARE_HOTSPOT_FORCE:-0}" != "1" ] \
+  && [ "${ASHARE_HOTSPOT_NOW_HHMM:-$(TZ=Asia/Shanghai date +%H%M)}" -ge 2030 ] \
+  && command -v sqlite3 >/dev/null 2>&1 \
+  && [ -f "$DATA_DIR/ashare.sqlite" ]; then
+  latest_bar="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" 'SELECT MAX(trade_date) FROM daily;' 2>/dev/null || true)"
+  if [ -n "$latest_bar" ]; then
+    already="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" \
+      "SELECT 1 FROM hotspot_snapshot WHERE as_of='$latest_bar' AND state IN ('PUBLISHED','CORRECTION') AND json_extract(payload,'\$.data_state.readiness')='READY' LIMIT 1;" \
+      2>/dev/null || true)"
+    if [ -n "$already" ]; then
+      echo "finance-ashare hotspot SKIPPED (late repair pass): as_of=$latest_bar already has a READY published snapshot; nothing to repair. Set ASHARE_HOTSPOT_FORCE=1 to re-publish."
+      exit 0
+    fi
+  fi
+fi
 
 # After a reboot the timer (Persistent=true) can fire before the container is up;
 # wait a bounded time, then fail loudly so the unit is marked failed in journald.
