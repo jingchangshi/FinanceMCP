@@ -25,6 +25,23 @@ export function runBundleRecordCommand(h: CliHelpers): void {
     // Only acquisition time is excluded; prices, facts and all rule versions participate in identity.
     // The bundle ID binds semantic facts and versions, excluding acquisition clocks and prior history.
     const id = `VPS-${bundle.report_id}`;
+    // goal-1032: pin the record to the exact hotspot snapshot version it read.
+    // Only a snapshot that is actually in the table gets bound; when there is
+    // none we write no binding at all and readers report "unbound" — we never
+    // guess a version from whatever happens to be current.
+    const hotspot = (() => {
+      if (!market) return null;
+      try {
+        const row = market.prepare(`SELECT as_of, config_version, content_hash, version_no
+          FROM hotspot_snapshot WHERE as_of = ? LIMIT 1`).get(bundle.as_of_trade_date) as
+          { as_of: string; config_version: string; content_hash: string | null; version_no: number | null } | undefined;
+        return row ? {
+          hotspotAsOf: row.as_of, configVersion: row.config_version,
+          versionNo: row.version_no ?? null, contentHash: row.content_hash ?? null,
+          basis: 'BUNDLE' as const,
+        } : null;
+      } catch { return null; }
+    })();
     const existing = readResearchJournal(portfolio, id);
     const record = existing ? { created: false, record: existing } : recordResearchJournal(portfolio, {
       record_id: id, account_id: bundle.account_id, source: 'vps', as_of_trade_date: bundle.as_of_trade_date,
@@ -36,7 +53,7 @@ export function runBundleRecordCommand(h: CliHelpers): void {
       observations: (bundle.portfolio?.holdings ?? []).filter((holding: any) => holding.bar_quality === 'READY')
         .map((holding: any) => ({ ts_code: holding.ts_code, quantity: holding.quantity, direction: 'observe' as const, benchmark_code: '510300.SH' })),
       payload: bundle,
-    });
+    }, hotspot);
     const folder = h.arg('output-dir') ?? join(dirname(path), 'research-bundles');
     mkdirSync(folder, { recursive: true, mode: 0o700 });
     chmodSync(folder, 0o700);

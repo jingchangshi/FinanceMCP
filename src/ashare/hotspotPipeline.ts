@@ -3,6 +3,7 @@ import { evaluateHotspotSectors } from './hotspot.js';
 import { buildHotspotPool, type PoolEtfConstituent, type PoolOptions } from './hotspotPool.js';
 import { scanPoolStrategies } from './strategies.js';
 import { saveHotspotSnapshot, snapshotContentHash } from './hotspotSnapshots.js';
+import { dataState } from './dataReadiness.js';
 import { topConstituents, weightCoverage } from './etfWeightStore.js';
 import { ETF_CANDIDATE_DECLARATIONS } from './etfDeclarations.js';
 import { buildEntryView } from './entryRanking.js';
@@ -41,12 +42,29 @@ export interface HotspotPipelineOptions {
   pool?: Partial<Omit<PoolOptions, 'etfConstituents' | 'etfCodes' | 'signalScanProvider'>>;
   /** Set false for a dry run: compute everything, persist nothing. */
   persist?: boolean;
+  /**
+   * Entry implementation identity, supplied by the CLI (hashing the entry
+   * modules is async and this orchestrator is sync). Carried into
+   * `data_state.entry_identity` so a snapshot records which entry code
+   * produced its `entry_view`.
+   */
+  entryHash?: string;
+  entryScheme?: string;
 }
 
 export interface HotspotPipelineResult {
   snapshot: HotspotSnapshot;
-  saved: { content_hash: string; candidates_written: number; replaced: boolean } | null;
+  saved: {
+    content_hash: string; candidates_written: number; replaced: boolean;
+    version_no: number; state: string; superseded_version: number | null; hash_basis: string;
+  } | null;
   seconds: number;
+  /**
+   * goal-1032 publish gate. NOT_READY means the pipeline computed but refused to
+   * persist: there is no honest snapshot for a day whose bars/quality gate fails.
+   * DEGRADED publishes, and the mark travels inside `data_state.readiness`.
+   */
+  readiness: { status: 'READY' | 'DEGRADED' | 'NOT_READY'; reason: string | null };
   /**
    * Phase timings for acceptance E11 (performance record). Diagnostic only —
    * deliberately OUTSIDE the snapshot body so it never perturbs content_hash.
@@ -189,6 +207,13 @@ export function runHotspotPipeline(
   // Keep the nested sectors payload in lockstep with the top-level coverage so
   // both hash inputs agree (sectors.coverage is itself part of the hash body).
   sectors.coverage = sectorCoverage;
+  // goal-1032: the fingerprint of the data this run actually read. Computed
+  // before the body so that it is part of `content_hash` (basis v2), and read
+  // as a publish gate so a NOT_READY day is never written.
+  // (Both DBs are read here; nothing is written.)
+  const state = dataState(db, asOf, {
+    entryIdentity: opts.entryHash ? { scheme: opts.entryScheme ?? 'entry-modules-v1', entry_hash: opts.entryHash } : null,
+  });
   const body = {
     as_of: asOf,
     config_version: HOTSPOT_CONFIG_VERSION,
@@ -200,6 +225,7 @@ export function runHotspotPipeline(
     // what priority produced; the entry top-10 may legitimately be empty.
     entry_view: buildEntryView(pool.candidates, asOf),
     coverage,
+    data_state: state,
     research_only: true as const,
   };
   const snapshot: HotspotSnapshot = {
@@ -208,10 +234,13 @@ export function runHotspotPipeline(
     generated_at: new Date().toISOString(),
   };
   const t2 = Date.now();
-  const saved = opts.persist === false
+  const saved = opts.persist === false || state.readiness === 'NOT_READY'
     ? null
     : saveHotspotSnapshot(db, snapshot);
   timings.write = (Date.now() - t2) / 1000;
   timings.total = (Date.now() - startedAt) / 1000;
-  return { snapshot, saved, seconds: timings.total, timings };
+  return {
+    snapshot, saved, seconds: timings.total, timings,
+    readiness: { status: state.readiness, reason: state.readiness_reason },
+  };
 }

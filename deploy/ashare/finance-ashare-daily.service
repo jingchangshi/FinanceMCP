@@ -1,6 +1,17 @@
 [Unit]
 Description=FinanceMCP A-share daily sync, analysis and report snapshot
 After=docker.service network-online.target
+# goal-1032: the hotspot snapshot is TRIGGERED BY the daily run, not by a clock.
+# Previously 19:40 fixed time — 2.5 h before the second daily run, so the
+# snapshot was structurally built on whatever data existed at 19:40.
+# Both OnSuccess and OnFailure, deliberately: the hotspot has its own publish
+# gate (DATA_NOT_READY) and must not be suppressed by an unrelated failure such
+# as the research-observation exit 79. The daily pipeline runs twice (18:40 and
+# 21:10), so the snapshot is republished — and versioned — after each run.
+# OnSuccess/OnFailure are [Unit] options, not [Service]: `systemd-analyze verify`
+# on this host (systemd 249) rejects them in [Service] as unknown keys.
+OnSuccess=finance-ashare-hotspot.service
+OnFailure=finance-ashare-hotspot.service
 
 [Service]
 Type=oneshot

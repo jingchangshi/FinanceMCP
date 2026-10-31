@@ -278,6 +278,21 @@ export interface HotspotSnapshot {
    * the independent entry ranking. Optional so old snapshots stay readable.
    */
   entry_view?: EntryView;
+  /**
+   * goal-1032: what data this snapshot actually read. Hashed into `content_hash`
+   * under basis v2, so a changed data state is visible as a changed hash instead
+   * of being indistinguishable from a code change. Optional so every snapshot
+   * written before this release still type-checks and still hashes under v1.
+   */
+  data_state?: import('./dataReadiness.js').DataState;
+  /** Version-ledger position of this snapshot (absent = written before the ledger existed). */
+  version_no?: number;
+  /**
+   * PUBLISHED = current pointer; SUPERSEDED = kept in the ledger, no longer the
+   * pointer; CORRECTION = a later version that explicitly corrects an earlier
+   * one (same three values as the ledger's CHECK constraint).
+   */
+  state?: 'PUBLISHED' | 'SUPERSEDED' | 'CORRECTION';
   /** Research-only marker: a snapshot is never a trade authorization. */
   research_only: true;
 }

@@ -54,6 +54,24 @@ CREATE TRIGGER IF NOT EXISTS research_journal_evaluation_no_replace BEFORE INSER
  BEGIN SELECT RAISE(ABORT,'research_journal_evaluation is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS research_journal_evaluation_no_update BEFORE UPDATE ON research_journal_evaluation BEGIN SELECT RAISE(ABORT,'research_journal_evaluation is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS research_journal_evaluation_no_delete BEFORE DELETE ON research_journal_evaluation BEGIN SELECT RAISE(ABORT,'research_journal_evaluation is immutable'); END;
+-- goal-1032 §2.1: which hotspot snapshot version each research record actually read.
+-- Sidetable, never a column on research_journal: that table is immutable and its
+-- records are already hashed, so binding identity must ride alongside them.
+CREATE TABLE IF NOT EXISTS research_hotspot_binding (
+ record_id TEXT PRIMARY KEY,
+ account_id TEXT NOT NULL,
+ as_of_trade_date TEXT NOT NULL,
+ hotspot_as_of TEXT NOT NULL,
+ config_version TEXT NOT NULL,
+ version_no INTEGER,
+ content_hash TEXT,
+ binding_basis TEXT NOT NULL CHECK (binding_basis IN ('BUNDLE','LEGACY_PAYLOAD','LEGACY_UNBOUND')),
+ bound_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS research_hotspot_binding_no_update BEFORE UPDATE ON research_hotspot_binding
+ BEGIN SELECT RAISE(ABORT,'research_hotspot_binding is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS research_hotspot_binding_no_delete BEFORE DELETE ON research_hotspot_binding
+ BEGIN SELECT RAISE(ABORT,'research_hotspot_binding is immutable'); END;
 `;
 function table(db: DatabaseSync | null | undefined, name: string): boolean {
   return !!db?.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
@@ -121,7 +139,46 @@ export function readResearchJournal(db: DatabaseSync, id: string): JournalRecord
   const row = db.prepare('SELECT * FROM research_journal WHERE record_id=?').get(id) as any;
   return row ? checkedJournalRow(row) : null;
 }
-export function recordResearchJournal(db: DatabaseSync, input: ResearchJournalInput) {
+export interface HotspotBinding {
+  /** Snapshot day actually read (the snapshot pointer's as_of, not necessarily the trade date). */
+  hotspotAsOf: string;
+  configVersion: string;
+  versionNo: number | null;
+  contentHash: string | null;
+  /**
+   * BUNDLE        — resolved from the live snapshot pointer at record time.
+   * LEGACY_PAYLOAD— frozen payload itself carried the hash (pre-ledger record).
+   * LEGACY_UNBOUND— unknown; never guessed from the current table.
+   */
+  basis: 'BUNDLE' | 'LEGACY_PAYLOAD' | 'LEGACY_UNBOUND';
+}
+
+/** Append the record→snapshot-version binding. Same write path as the journal row. */
+export function bindResearchHotspot(db: DatabaseSync, binding: {
+  recordId: string; accountId: string; asOfTradeDate: string;
+} & HotspotBinding): void {
+  db.prepare(`INSERT INTO research_hotspot_binding
+    (record_id, account_id, as_of_trade_date, hotspot_as_of, config_version, version_no, content_hash, binding_basis, bound_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(binding.recordId, binding.accountId, binding.asOfTradeDate, binding.hotspotAsOf, binding.configVersion,
+      binding.versionNo, binding.contentHash, binding.basis, new Date().toISOString());
+}
+
+export function readResearchHotspotBinding(db: DatabaseSync, recordId: string) {
+  if (!table(db, 'research_hotspot_binding')) return null;
+  return (db.prepare('SELECT * FROM research_hotspot_binding WHERE record_id=?').get(recordId) ?? null) as
+    { record_id: string; account_id: string; as_of_trade_date: string; hotspot_as_of: string;
+      config_version: string; version_no: number | null; content_hash: string | null;
+      binding_basis: string; bound_at: string } | null;
+}
+
+/**
+ * Record a research journal entry and, in the same transaction, the hotspot
+ * snapshot version it read. The binding is optional: callers that have no
+ * market DB (tests, external intake) simply write no binding rather than a
+ * guessed one.
+ */
+export function recordResearchJournal(db: DatabaseSync, input: ResearchJournalInput, hotspot?: HotspotBinding | null) {
   const record = normalized(input), digest = hash(record);
   // Explicit write entrypoint also installs additive protections on earlier journal tables.
   db.exec(SCHEMA);
@@ -140,7 +197,24 @@ export function recordResearchJournal(db: DatabaseSync, input: ResearchJournalIn
     if (!sources.has('vps') || !sources.has('chatgpt')) throw new Error('Combined research requires actual VPS and ChatGPT parent records');
   }
   const recordedAt = new Date().toISOString();
-  db.prepare('INSERT INTO research_journal VALUES (?,?,?,?,?,?,?,?)').run(record.record_id, record.account_id, record.source, record.as_of_trade_date, record.bundle_id, digest, canonicalJson(record), recordedAt);
+  // Journal row + binding must land together: a record that claims a snapshot
+  // version we failed to write is worse than no record at all. A SAVEPOINT (not
+  // BEGIN) so this nests inside callers that already opened a transaction.
+  db.exec('SAVEPOINT journal_bind');
+  try {
+    db.prepare('INSERT INTO research_journal VALUES (?,?,?,?,?,?,?,?)').run(record.record_id, record.account_id, record.source, record.as_of_trade_date, record.bundle_id, digest, canonicalJson(record), recordedAt);
+    if (hotspot) {
+      bindResearchHotspot(db, {
+        recordId: record.record_id, accountId: record.account_id,
+        asOfTradeDate: record.as_of_trade_date, ...hotspot,
+      });
+    }
+    db.exec('RELEASE journal_bind');
+  } catch (e) {
+    db.exec('ROLLBACK TO journal_bind');
+    db.exec('RELEASE journal_bind');
+    throw e;
+  }
   return { created: true, record: { ...record, content_hash: digest, recorded_at: recordedAt } };
 }
 export function listResearchJournal(db: DatabaseSync, input: { accountId: string; asOf?: string; limit?: number }): JournalRecord[] {

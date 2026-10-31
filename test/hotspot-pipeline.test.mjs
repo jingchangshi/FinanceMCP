@@ -187,11 +187,22 @@ test('E10: MCP hotspot tools read the written snapshot; a date without one is NO
   assert.equal(sectors.as_of, AS_OF);
   assert.ok(sectors.content_hash.startsWith('sha256:'));
   assert.ok(Array.isArray(sectors.selected));
+  // goal-1032: the reader must be able to see WHICH version this is and what
+  // data produced it. Echoed verbatim from the snapshot, never recomputed here.
+  assert.ok(Number.isInteger(sectors.version_no) && sectors.version_no >= 1,
+    'the tool must name the ledger version it read');
+  assert.equal(sectors.data_state.as_of, AS_OF);
+  assert.ok(['READY', 'DEGRADED'].includes(sectors.data_state.readiness));
+  assert.ok(sectors.data_state.fingerprint.bars.daily > 0, 'the fingerprint must count the bars it ranked from');
+  assert.ok(sectors.data_state.fingerprint_hash.startsWith('sha256:'));
 
   const opps = parse(await runAshareTool('ashare_hotspot_opportunities', { date: AS_OF, pool: 'FOCUS' }));
   assert.equal(opps.pool_filter, 'FOCUS');
   assert.ok(opps.candidates.every(c => c.pool === 'FOCUS'));
   assert.equal(opps.candidates.length, opps.counts.focus_pool);
+  assert.equal(opps.version_no, sectors.version_no);
+  assert.equal(opps.data_state.fingerprint_hash, sectors.data_state.fingerprint_hash,
+    'both tools read the same snapshot, so the fingerprint must be identical');
 
   const singleCode = opps.candidates[0]?.ts_code;
   if (singleCode) {
@@ -329,6 +340,11 @@ test('researchBundle hotspot_research: reads the snapshot, degrades honestly, st
   assert.equal(ok.status, 'OK');
   assert.equal(ok.research_only, true);
   assert.match(ok.content_hash ?? '', /^sha256:/);
+  // goal-1032: the private bundle discloses the ledger position and the data
+  // state exactly as the public tools do — one snapshot, one story.
+  assert.ok(Number.isInteger(ok.version_no) && ok.version_no >= 1, 'the bundle must name the ledger version');
+  assert.equal(ok.data_state?.as_of, AS_OF);
+  assert.ok(ok.data_state?.fingerprint_hash.startsWith('sha256:'));
   assert.deepEqual(ok.selected_sectors,
     JSON.parse(db.prepare('SELECT payload FROM hotspot_snapshot WHERE as_of = ?').get(AS_OF).payload).sectors.selected);
   assert.ok(ok.focus_candidates.length > 0 && ok.focus_candidates.length <= 15);

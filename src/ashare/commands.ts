@@ -263,10 +263,26 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       // 生成当日热点行业快照 + 候选池 + 多策略信号，写入 hotspot_* 表。
       // 只写新建的热点研究表；不动 watchlist、研究日志或正式研究快照。
       const { runHotspotPipeline } = await import('./hotspotPipeline.js');
+      // goal-1032: the snapshot records WHICH entry implementation produced its
+      // entry_view, so "which code wrote this ranking" is a read fact.
+      const { entryImplementationHash, ENTRY_IMPLEMENTATION_SCHEME } = await import('./entryIdentity.js');
       const latestAsOf = (d: DatabaseSync): string =>
         lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
       const asOf = h.arg('date') ? h.ymd(h.arg('date'), '--date') : latestAsOf(db);
-      h.print(runHotspotPipeline(db, asOf, { persist: !h.flag('dry-run') }));
+      h.print(runHotspotPipeline(db, asOf, {
+        persist: !h.flag('dry-run'),
+        entryHash: entryImplementationHash(),
+        entryScheme: ENTRY_IMPLEMENTATION_SCHEME,
+      }));
+      return true;
+    }
+    case 'hotspot-versions': {
+      // 快照版本账本（append-only）：某日曾经发布过的每一份内容及其状态。
+      const { listHotspotVersions } = await import('./hotspotSnapshots.js');
+      const latestAsOf = (d: DatabaseSync): string =>
+        lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
+      const asOf = h.arg('date') ? h.ymd(h.arg('date'), '--date') : latestAsOf(db);
+      h.print({ command: 'hotspot-versions', as_of: asOf, versions: listHotspotVersions(db, asOf) });
       return true;
     }
     case 'hotspot-cc': {

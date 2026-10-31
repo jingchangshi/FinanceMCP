@@ -9,6 +9,7 @@ import {
   collectEtfPenetrationInputs, buildEtfPenetrationSummary, type EtfPenetrationSummary,
 } from '../ashare/etfPenetration.js';
 import { loadHotspotSnapshot } from '../ashare/hotspotSnapshots.js';
+import type { DataState } from '../ashare/dataReadiness.js';
 import { classifyCandidate } from '../ashare/entryRanking.js';
 import { buildBenchmarkComparison, BENCHMARK_DEFINITION_VERSION } from './benchmarks.js';
 import { buildDailyReport } from './dailyReport.js';
@@ -817,6 +818,13 @@ export interface HotspotResearchBundle {
   content_hash: string | null;
   config_version: string | null;
   strategy_set_version: string | null;
+  /**
+   * goal-1032: ledger position of this snapshot, and the data it was computed
+   * from. Absent on a snapshot written before the ledger existed — absence is
+   * reported as absence, never back-filled from the current pointer.
+   */
+  version_no?: number | null;
+  data_state?: DataState | null;
   selected_sectors: string[];
   counts: { raw_pool: number; focus_pool: number; excluded: number; etf_candidates: number; with_signals: number } | null;
   focus_candidates: Array<{ ts_code: string; name: string; trade_permission: string; signals: number }>;
@@ -885,7 +893,10 @@ export interface HotspotEntrySummary {
   maturity: 'ENTRY_VIEW_PRESENT' | 'SNAPSHOT_WITHOUT_ENTRY_VIEW';
 }
 
-export const HOTSPOT_RESEARCH_BUNDLE_SCHEMA = 'ashare-hotspot-research/1.0';
+// 1.1 (goal-1032): additive version_no / data_state on the block. Nothing was
+// removed or redefined, so 1.0 readers keep working; the bump only tells them
+// the position and the input data are now disclosed.
+export const HOTSPOT_RESEARCH_BUNDLE_SCHEMA = 'ashare-hotspot-research/1.1';
 
 /**
  * Entry view for the private research bundle (goal-1030 WP5.2).
@@ -1048,6 +1059,8 @@ export function buildHotspotState(input: {
     content_hash: snap.content_hash,
     config_version: snap.config_version,
     strategy_set_version: snap.strategy_set_version,
+    version_no: snap.version_no ?? null,
+    data_state: snap.data_state ?? null,
     selected_sectors: snap.sectors.selected,
     counts: snap.counts,
     focus_candidates: snap.candidates.filter(c => c.pool === 'FOCUS').slice(0, 15).map(c => ({
