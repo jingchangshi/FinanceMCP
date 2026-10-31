@@ -44,7 +44,13 @@ export interface DataFingerprint {
   };
   financials: {
     table: string | null;
-    /** Latest reporting periods with their row counts (2026-10-30: 20260930 6236 → 6678 at 21:12). */
+    /**
+     * Latest reporting periods with their row counts. Verified against
+     * production on 2026-10-30: end_date 20260930 → 5577 rows, from the last
+     * `fina_indicator` sync at 13:12Z. (An earlier note here claimed 6236 → 6678;
+     * that figure could not be reproduced against the market DB and has been
+     * replaced with the measured values.)
+     */
     periods: Array<{ end_date: string; rows: number }>;
     digest: string | null;
   };
