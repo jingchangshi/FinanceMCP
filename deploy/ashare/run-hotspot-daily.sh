@@ -6,11 +6,16 @@
 # market pipeline finished and the data is (or is not) ready — the readiness
 # gate below then decides whether a snapshot may be published at all.
 #
-# The daily unit fires twice (18:40 and 21:10 CST), but only the 18:40 pass is
-# a *publishing* pass. The late pass exists as a repair: it covers a 18:40 run
-# that died or that found the data not yet published. On a normal day there is
-# nothing to repair, and the guard below exits before syncing, so a day has ONE
-# published version instead of two versions of the same data.
+# The daily unit fires twice (18:40 and 21:10 CST), but only the first pass of a
+# day is a *publishing* pass. The later pass exists as a repair: it covers a
+# first run that died or that found the data not yet published. On a normal day
+# there is nothing to repair, and the guard below exits before syncing, so a day
+# has ONE published version instead of two versions of the same data.
+#
+# The guard keys on "today's bars already have a READY published snapshot", not
+# on the clock: a weekend or after-hours run is keyed to an OLDER bar date, so it
+# always proceeds and can re-publish with a changed engine (add FORCE=1 only to
+# re-publish *the same* day).
 #
 # Evidence for that (2026-10-19..10-30, 40 dataset-day pairs across daily /
 # daily_basic / adj_factor / stk_limit): the second sync never changed a single
@@ -18,8 +23,7 @@
 # put a second, unexplained version number on the same day, which is exactly
 # what a report then has to disambiguate.
 #
-# ASHARE_HOTSPOT_FORCE=1 overrides the guard (manual re-publish, e.g. after
-# changing the engine and wanting a fresh snapshot for the same day).
+# ASHARE_HOTSPOT_FORCE=1 overrides the guard (manual re-publish of the same day).
 #
 # Kept separate from run-daily.sh on purpose: run-daily.sh's contract is the
 # market/report pipeline (see operations.md §1.2), and hotspot-sync is a
@@ -41,16 +45,15 @@ CONTAINER="${ASHARE_CONTAINER:-finance-mcp-ashare}"
 # not depend on docker being up. Any failure to answer the question falls
 # through to the normal pipeline — a guard that cannot run must not stop work.
 if [ "${ASHARE_HOTSPOT_FORCE:-0}" != "1" ] \
-  && [ "${ASHARE_HOTSPOT_NOW_HHMM:-$(TZ=Asia/Shanghai date +%H%M)}" -ge 2030 ] \
   && command -v sqlite3 >/dev/null 2>&1 \
   && [ -f "$DATA_DIR/ashare.sqlite" ]; then
   latest_bar="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" 'SELECT MAX(trade_date) FROM daily;' 2>/dev/null || true)"
-  if [ -n "$latest_bar" ]; then
+  if [ -n "$latest_bar" ] && [ "$latest_bar" = "$(TZ=Asia/Shanghai date +%Y%m%d)" ]; then
     already="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" \
       "SELECT 1 FROM hotspot_snapshot WHERE as_of='$latest_bar' AND state IN ('PUBLISHED','CORRECTION') AND json_extract(payload,'\$.data_state.readiness')='READY' LIMIT 1;" \
       2>/dev/null || true)"
     if [ -n "$already" ]; then
-      echo "finance-ashare hotspot SKIPPED (late repair pass): as_of=$latest_bar already has a READY published snapshot; nothing to repair. Set ASHARE_HOTSPOT_FORCE=1 to re-publish."
+      echo "finance-ashare hotspot SKIPPED (already published): as_of=$latest_bar has a READY snapshot; nothing to repair. Set ASHARE_HOTSPOT_FORCE=1 to re-publish the same day."
       exit 0
     fi
   fi
