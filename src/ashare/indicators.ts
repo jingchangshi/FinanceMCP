@@ -87,6 +87,10 @@ export interface Bars {
   /** Raw (unadjusted) prices, for display and limit-price checks. */
   rawOpen: number[];
   rawClose: number[];
+  /** Raw high/low and the daily down limit (optional so hand-built test bars stay valid). */
+  rawHigh?: number[];
+  rawLow?: number[];
+  downLimit?: number[];
   upLimit: number[];
   /** Bars without an adjustment factor; their prices are not on the same basis as the rest. */
   adjMissing?: number;
