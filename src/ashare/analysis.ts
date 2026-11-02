@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { forEachStockBars } from './bars.js';
-import { computeIndicators } from './indicators.js';
+import { computeIndicators, type Bars, type IndicatorSet } from './indicators.js';
 import { detectSignals, technicalState, TechnicalState } from './signals.js';
 import { recentTradeDays, addDays } from './ingest.js';
 import { Fundamentals, fundamentalRisk, fundamentalsAsOf } from './fundamentals.js';
@@ -125,7 +125,17 @@ function percentileRanks(values: number[]): number[] {
 
 const isSt = (name: string) => /ST|退/.test(name ?? '');
 
-export function scanMarket(db: DatabaseSync, date: string): MarketScan {
+/**
+ * Optional observer for the single full-market pass. The V2 prescreen uses
+ * this instead of loading every stock's bars a second time. The callback must
+ * only READ bars/indicators and copy numbers out — the arrays are reused for
+ * the next stock. It cannot change scan results.
+ */
+export interface MarketScanHooks {
+  onStock?: (code: string, bars: Bars, x: IndicatorSet, i: number, row: StockRow) => void;
+}
+
+export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHooks = {}): MarketScan {
   const days = recentTradeDays(db, date, 260);
   const start = days[0];
   const basic = new Map((db.prepare('SELECT ts_code, name, industry, list_date FROM stock_basic').all() as any[]).map(r => [r.ts_code, r]));
@@ -188,6 +198,7 @@ export function scanMarket(db: DatabaseSync, date: string): MarketScan {
       : risk.exclude ? '最近已披露财报亏损'
       : undefined;
     if (reason) { row.eligible = false; row.ineligible_reason = reason; }
+    hooks.onStock?.(code, bars, x, i, row);
     rows.push(row);
   });
 
