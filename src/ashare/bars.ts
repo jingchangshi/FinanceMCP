@@ -16,7 +16,7 @@ export function forEachStockBars(
 ): number {
   // One indexed range query per stock: efficient for both a 260-day window and full history.
   const stmt = db.prepare(`
-    SELECT d.ts_code, d.trade_date, d.open, d.high, d.low, d.close, d.vol, d.amount, a.adj_factor, l.up_limit
+    SELECT d.ts_code, d.trade_date, d.open, d.high, d.low, d.close, d.vol, d.amount, a.adj_factor, l.up_limit, l.down_limit
     FROM daily d
     LEFT JOIN adj_factor a ON a.trade_date = d.trade_date AND a.ts_code = d.ts_code
     LEFT JOIN stk_limit l ON l.trade_date = d.trade_date AND l.ts_code = d.ts_code
@@ -38,7 +38,7 @@ export function forEachStockBars(
     // A missing factor is carried forward from the previous bar so the series can still be
     // displayed, but `adjMissing` marks it: callers must not derive signals or scores from it.
     let carry = Number.isFinite(lastFactor) ? lastFactor : 1;
-    const bars: Bars = { dates: [], open: [], high: [], low: [], close: [], vol: [], amount: [], rawOpen: [], rawClose: [], upLimit: [], adjMissing: 0 };
+    const bars: Bars = { dates: [], open: [], high: [], low: [], close: [], vol: [], amount: [], rawOpen: [], rawClose: [], rawHigh: [], rawLow: [], upLimit: [], downLimit: [], adjMissing: 0 };
     for (const r of rows) {
       if (Number.isFinite(r.adj_factor)) carry = r.adj_factor;
       else bars.adjMissing!++;
@@ -53,7 +53,10 @@ export function forEachStockBars(
       bars.amount.push(r.amount ?? 0);
       bars.rawOpen.push(r.open);
       bars.rawClose.push(r.close);
+      bars.rawHigh!.push(r.high);
+      bars.rawLow!.push(r.low);
       bars.upLimit.push(r.up_limit ?? NaN);
+      bars.downLimit!.push(r.down_limit ?? NaN);
     }
     stocks++;
     cb(current, bars);
