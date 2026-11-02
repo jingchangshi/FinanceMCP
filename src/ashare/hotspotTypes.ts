@@ -279,6 +279,14 @@ export interface HotspotSnapshot {
    */
   entry_view?: EntryView;
   /**
+   * goal-1102: the independent five-family technical view. Optional so every
+   * snapshot written before V2 still type-checks and still hashes identically.
+   * It carries its OWN framework version and implementation fingerprint and
+   * never reuses `entry_hash`. When present it is part of the content identity
+   * of newly written snapshots only.
+   */
+  technical_view_v2?: import('./technicalFrameworkV2.js').TechnicalViewV2;
+  /**
    * goal-1032: what data this snapshot actually read. Hashed into `content_hash`
    * under basis v2, so a changed data state is visible as a changed hash instead
    * of being indistinguishable from a code change. Optional so every snapshot

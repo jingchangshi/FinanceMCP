@@ -7,6 +7,10 @@ import { dataState } from './dataReadiness.js';
 import { topConstituents, weightCoverage } from './etfWeightStore.js';
 import { ETF_CANDIDATE_DECLARATIONS } from './etfDeclarations.js';
 import { buildEntryView } from './entryRanking.js';
+import { scanMarket } from './analysis.js';
+import {
+  analyzeTechnicalV2, createTechnicalPrescreen, forcedResearchCodes, unavailableTechnicalView,
+} from './technicalCandidatesV2.js';
 import {
   HOTSPOT_CONFIG_VERSION, HOTSPOT_STRATEGY_SET_VERSION,
   type HotspotSnapshot, type CoverageSummary,
@@ -71,7 +75,7 @@ export interface HotspotPipelineResult {
    * `pool` includes `scan` (the lazy strategy-scan provider runs inside the
    * pool build); `scan` is the provider's own span within `pool`.
    */
-  timings: { sectors: number; pool: number; scan: number; write: number; total: number };
+  timings: { sectors: number; pool: number; scan: number; technical: number; write: number; total: number };
 }
 
 /** Industry/theme ETFs the pool considers relevant by declaration. */
@@ -121,7 +125,7 @@ export function runHotspotPipeline(
   opts: HotspotPipelineOptions = {},
 ): HotspotPipelineResult {
   const startedAt = Date.now();
-  const timings = { sectors: 0, pool: 0, scan: 0, write: 0, total: 0 };
+  const timings = { sectors: 0, pool: 0, scan: 0, technical: 0, write: 0, total: 0 };
   const config = opts.config;
   const etfTopN = opts.pool?.etfTopN ?? 10;
 
@@ -135,11 +139,20 @@ export function runHotspotPipeline(
   const etfNames = opts.etfNames ?? etfDisplayNames(db, etfCodes);
   const constituents = opts.etfConstituents ?? storeBackedConstituents(db, asOf, etfTopN + 10);
 
+  // The prescreen rides on the SAME full-market scan the pool pays for: V2
+  // observes every stock once, then only the union of its family lists is
+  // loaded again for the detailed pass.
+  const technicalPrescreen = createTechnicalPrescreen();
+  const sharedScan = scanMarket(db, asOf, {
+    onStock: (code, bars, x, i, row) => technicalPrescreen.observe(code, bars, x, i, row),
+  });
+
   // 3+4. Pool build with an injected lazy strategy scan: buildHotspotPool
   // collects the seed codes, then hands them to exactly one scanPoolStrategies
   // pass before assembling candidates — the market scan / RPS work is paid once.
   const poolOpts: PoolOptions = {
     ...opts.pool,
+    marketScan: sharedScan,
     etfConstituents: constituents,
     etfCodes,
     etfNames,
@@ -154,6 +167,22 @@ export function runHotspotPipeline(
   const t1 = Date.now();
   const pool = buildHotspotPool(db, asOf, sectors, null, poolOpts);
   timings.pool = (Date.now() - t1) / 1000;
+
+  // 4b. Technical methodology V2 (goal-1102). Deliberately isolated: a V2
+  // failure yields an UNAVAILABLE view and the legacy snapshot still publishes.
+  const t3 = Date.now();
+  let technicalView;
+  try {
+    technicalView = analyzeTechnicalV2(db, {
+      asOf,
+      prescreen: technicalPrescreen.finish(),
+      rps: pool.rps ?? null,
+      forcedCodes: forcedResearchCodes(db, asOf),
+    });
+  } catch (e) {
+    technicalView = unavailableTechnicalView(asOf, e instanceof Error ? e.message : String(e));
+  }
+  timings.technical = (Date.now() - t3) / 1000;
 
   // Representative ETFs per sector (goal P5.1): an ETF represents a sector
   // only when one of its PIT-resolved constituents stamped that sector in the
@@ -224,6 +253,7 @@ export function runHotspotPipeline(
     // Independent entry view (goal-1030 WP3): the legacy top-10 stays exactly
     // what priority produced; the entry top-10 may legitimately be empty.
     entry_view: buildEntryView(pool.candidates, asOf),
+    technical_view_v2: technicalView,
     coverage,
     data_state: state,
     research_only: true as const,

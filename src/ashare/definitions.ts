@@ -201,7 +201,7 @@ ashareToolDefinitions.push(
   },
   {
     name: 'ashare_hotspot_opportunities',
-    description: `热点候选机会快照：动态候选池(FOCUS/RAW)个股与ETF、领导身份(产业/行情龙头)与证据、多策略信号(confirmed_on 确认日,绝不回填形态形成日)、交易权限(非主板=RESEARCH_ONLY)、入池/排除原因与优先级。另有入场评估 entry_assessment(阶段/资格/分数/触发/风险收益比/否决原因)与当日 entry_view 榜单。研究观察,不构成交易授权;候选池与 wl-1.0.0 正式观察池相互独立,入场资格也不改变 FOCUS 的定义。快照缺失时返回 NOT_READY 与原因。${DATA_NOTE}`,
+    description: `热点候选机会快照：动态候选池(FOCUS/RAW)个股与ETF、领导身份(产业/行情龙头)与证据、多策略信号(confirmed_on 确认日,绝不回填形态形成日)、交易权限(非主板=RESEARCH_ONLY)、入池/排除原因与优先级。另有入场评估 entry_assessment(阶段/资格/分数/触发/风险收益比/否决原因)与当日 entry_view 榜单。technical_view_v2 为独立的五类技术方法视图(趋势延续/平台突破/底部反转/波动率扩张/均值回归)：各家族单独列候选与阶段(FORMING/CONFIRMED/FOLLOW_THROUGH/FAILED/EXPIRED)，不合并跨家族分数；停牌、无K线、一字跌停的股票不会进入正常 research_ready 清单。研究观察,不构成交易授权;候选池与 wl-1.0.0 正式观察池相互独立,入场资格也不改变 FOCUS 的定义。快照缺失时返回 NOT_READY 与原因。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: {
