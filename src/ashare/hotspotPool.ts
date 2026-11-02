@@ -1,8 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { scanMarket, scoreRows, SCORE_VERSION, type StockRow } from './analysis.js';
+import { scanMarket, scoreRows, SCORE_VERSION, type StockRow, type MarketScan } from './analysis.js';
 import { fundamentalsAsOf } from './fundamentals.js';
 import { recentTradeDays } from './ingest.js';
-import { computeRps } from './rps.js';
+import { computeRps, type RpsResult } from './rps.js';
 import { swMemberIndex, activeSwMembers } from './industryClassification.js';
 import { hotspotTableExists } from './hotspotTables.js';
 import type { PoolStrategyScan } from './strategies.js';
@@ -52,6 +52,12 @@ export interface PoolOptions {
    * Ignored when `signalScan` is supplied directly (tests, replays).
    */
   signalScanProvider?: (codes: string[]) => PoolStrategyScan | null;
+  /**
+   * A full-market scan already computed for this as-of day. Passed by the
+   * pipeline so V2 can observe the same pass instead of loading every stock's
+   * bars twice. Ignored by callers that do not have one.
+   */
+  marketScan?: MarketScan;
   focusMin?: number;
   focusMax?: number;
   rawMax?: number;
@@ -64,6 +70,8 @@ export interface PoolOptions {
 export interface PoolResult {
   candidates: HotspotCandidate[];
   counts: { raw_pool: number; focus_pool: number; excluded: number; etf_candidates: number; with_signals: number };
+  /** The as-of RPS cross-section, reused by V2 as background (never a V2 gate). */
+  rps?: RpsResult | null;
   coverage: Array<{ dataset: string; rows: number; quality: DataQuality; reason?: string }>;
 }
 
@@ -92,7 +100,7 @@ export function buildHotspotPool(
   opts: PoolOptions,
 ): PoolResult {
   const cfg = { ...DEFAULTS, ...opts };
-  const scan = scanMarket(db, asOf);
+  const scan = opts.marketScan ?? scanMarket(db, asOf);
   const rowsByCode = new Map(scan.rows.map(r => [r.ts_code, r]));
   // scoreRows writes score/rank/components onto the row objects (same
   // once-only convention as experimentA.selectPool) — pass scan.rows itself
@@ -405,7 +413,7 @@ export function buildHotspotPool(
     { dataset: 'rps_cross_section', rows: rps?.universe ?? 0, quality: (rps?.universe ?? 0) > 0 ? 'OK' as DataQuality : 'UNAVAILABLE' as DataQuality, ...(rps?.universe ? {} : { reason: 'insufficient_history' }) },
     { dataset: 'strategy_scan', rows: strategyScan?.coverage.scanned ?? 0, quality: strategyScan ? 'OK' as DataQuality : 'UNAVAILABLE' as DataQuality, ...(strategyScan ? {} : { reason: 'not_run' }) },
   ];
-  return { candidates, counts, coverage };
+  return { candidates, counts, coverage, rps };
 }
 
 export const POOL_CONFIG_VERSION = HOTSPOT_CONFIG_VERSION;
