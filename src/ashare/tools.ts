@@ -410,6 +410,9 @@ function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
     // Same-day entry view (ranked eligible list, preparing, rejected, class
     // counts). Server-computed only: ChatGPT must not recompute stages or scores.
     entry_view: (snap as any).entry_view ?? null,
+    // goal-1102: independent five-family technical view. Null on snapshots
+    // written before V2; never recomputed by the tool (server-side only).
+    technical_view_v2: (snap as any).technical_view_v2 ?? null,
     candidates: cands.map(c => ({
       ...c,
       // Single representative assessment (the eligible one when it exists), so a

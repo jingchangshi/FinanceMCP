@@ -58,6 +58,10 @@ export function snapshotContentHash(
   };
   if (basis === 'v2') {
     body.entry_view = snapshot.entry_view ?? null;
+    // goal-1102: V2 has its own content identity. Add the key ONLY when the
+    // body carries it, so every pre-V2 body re-hashes to exactly the value it
+    // was published under (the legacy v1/v2 formulas are untouched).
+    if (snapshot.technical_view_v2 !== undefined) body.technical_view_v2 = snapshot.technical_view_v2;
     const ds = snapshot.data_state;
     body.data_state = ds
       ? { version: ds.version, as_of: ds.as_of, fingerprint: ds.fingerprint, entry_identity: ds.entry_identity }
