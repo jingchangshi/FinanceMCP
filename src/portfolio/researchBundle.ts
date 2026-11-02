@@ -9,6 +9,7 @@ import {
   collectEtfPenetrationInputs, buildEtfPenetrationSummary, type EtfPenetrationSummary,
 } from '../ashare/etfPenetration.js';
 import { loadHotspotSnapshot } from '../ashare/hotspotSnapshots.js';
+import type { TechnicalViewV2 } from '../ashare/technicalFrameworkV2.js';
 import type { DataState } from '../ashare/dataReadiness.js';
 import { classifyCandidate } from '../ashare/entryRanking.js';
 import { buildBenchmarkComparison, BENCHMARK_DEFINITION_VERSION } from './benchmarks.js';
@@ -834,6 +835,12 @@ export interface HotspotResearchBundle {
    * not the same thing as "no entry candidates today".
    */
   entry_summary: HotspotEntrySummary | null;
+  /**
+   * goal-1102: the independent five-family technical view published with the
+   * same snapshot. `null` on snapshots written before V2 — absence is disclosed
+   * as absence and never recomputed by the bundle.
+   */
+  technical_view_v2?: TechnicalViewV2 | null;
   research_only: true;
   gaps: Array<{ module: string; reason: string; affected: string[] }>;
 }
@@ -896,7 +903,9 @@ export interface HotspotEntrySummary {
 // 1.1 (goal-1032): additive version_no / data_state on the block. Nothing was
 // removed or redefined, so 1.0 readers keep working; the bump only tells them
 // the position and the input data are now disclosed.
-export const HOTSPOT_RESEARCH_BUNDLE_SCHEMA = 'ashare-hotspot-research/1.1';
+// 1.2 (goal-1102): additive technical_view_v2. Old snapshots carry null, so
+// readers can tell "pre-V2 snapshot" from "no candidates".
+export const HOTSPOT_RESEARCH_BUNDLE_SCHEMA = 'ashare-hotspot-research/1.2';
 
 /**
  * Entry view for the private research bundle (goal-1030 WP5.2).
@@ -1038,7 +1047,7 @@ export function buildHotspotState(input: {
   if (!input.db || !input.asOf) {
     const reason = input.db ? 'as_of_unavailable' : 'market_db_unavailable';
     gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
-    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, research_only: true, gaps };
+    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, technical_view_v2: null, research_only: true, gaps };
   }
   let snap: ReturnType<typeof loadHotspotSnapshot> = null;
   try {
@@ -1046,12 +1055,12 @@ export function buildHotspotState(input: {
   } catch (error: any) {
     const reason = `snapshot_read_failed: ${String(error?.message ?? error)}`;
     gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
-    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, research_only: true, gaps };
+    return { ...base, status: 'UNAVAILABLE', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, technical_view_v2: null, research_only: true, gaps };
   }
   if (!snap) {
     const reason = 'hotspot_snapshot_not_generated';
     gaps.push({ module: 'hotspot_research', reason, affected: ['hotspot_research'] });
-    return { ...base, status: 'NOT_READY', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, research_only: true, gaps };
+    return { ...base, status: 'NOT_READY', reason, content_hash: null, config_version: null, strategy_set_version: null, selected_sectors: [], counts: null, focus_candidates: [], entry_summary: null, technical_view_v2: null, research_only: true, gaps };
   }
   return {
     ...base,
@@ -1067,6 +1076,7 @@ export function buildHotspotState(input: {
       ts_code: c.ts_code, name: c.name, trade_permission: c.trade_permission, signals: c.signals.length,
     })),
     entry_summary: buildEntrySummary(snap, input.holdings ?? []),
+    technical_view_v2: snap.technical_view_v2 ?? null,
     research_only: true,
     gaps,
   };

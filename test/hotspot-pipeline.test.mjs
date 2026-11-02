@@ -339,6 +339,9 @@ test('researchBundle hotspot_research: reads the snapshot, degrades honestly, st
   const ok = buildHotspotState({ db, asOf: AS_OF });
   assert.equal(ok.status, 'OK');
   assert.equal(ok.research_only, true);
+  // goal-1102 follow-up: a pre-V2 snapshot has no view; absence is null, not
+  // an empty candidate set.
+  assert.equal(ok.technical_view_v2, null);
   assert.match(ok.content_hash ?? '', /^sha256:/);
   // goal-1032: the private bundle discloses the ledger position and the data
   // state exactly as the public tools do — one snapshot, one story.
