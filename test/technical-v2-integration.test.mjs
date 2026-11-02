@@ -20,6 +20,7 @@ const { openAshareDb, upsertRows } = await import('../build/ashare/db.js');
 const { weekdays, seedReferenceUniverse } = await import('./ashare-fixture.mjs');
 const { analyzeTechnicalDay, renderTechnicalViewMarkdown } = await import('../build/ashare/technicalCandidatesV2.js');
 const { runHotspotPipeline } = await import('../build/ashare/hotspotPipeline.js');
+const { buildHotspotState } = await import('../build/portfolio/researchBundle.js');
 
 const DATES = weekdays('20250101', 160);
 const AS_OF = DATES.at(-1);
@@ -113,4 +114,19 @@ test('markdown preview states stages and shared context once', () => {
   assert.match(md, /共享量价与交易状态/);
   assert.match(md, /UNVERIFIED/);
   assert.match(md, /不存在跨家族 100 分/);
+});
+
+test('private research bundle carries the same V2 view as the snapshot', () => {
+  const result = runHotspotPipeline(db, AS_OF, { persist: true, etfCodes: [] });
+  assert.ok(result.saved, `snapshot must be persisted (readiness=${result.readiness.status})`);
+  const block = buildHotspotState({ db, asOf: AS_OF });
+  assert.equal(block.status, 'OK');
+  assert.equal(block.version_no, result.saved.version_no);
+  assert.ok(block.technical_view_v2, 'bundle must carry technical_view_v2');
+  // The persisted payload goes through JSON, which normalises -0 to 0; compare
+  // the serialised form so the assertion is about content, not float identity.
+  assert.deepEqual(JSON.parse(JSON.stringify(block.technical_view_v2.families)),
+    JSON.parse(JSON.stringify(result.snapshot.technical_view_v2.families)));
+  assert.equal(block.technical_view_v2.implementation_fingerprint,
+    result.snapshot.technical_view_v2.implementation_fingerprint);
 });
