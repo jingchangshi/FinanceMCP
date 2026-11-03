@@ -91,7 +91,7 @@ function lastWhere(from: number, to: number, pred: (k: number) => boolean): numb
 
 export const PATTERN_DEFINITIONS_V2: Record<TechnicalFamily, string> = {
   TREND_CONTINUATION:
-    '中期多头趋势首次成立，或趋势内回踩 MA20 后重新收上 MA20；失效为收盘跌破 MA60。',
+    '趋势内回踩 MA20 后重新收上 MA20；均线多头排列只是背景，不单独构成信号；失效为收盘跌破 MA60。',
   PLATFORM_BREAKOUT:
     '30 日窄幅平台（振幅 ≤15%、后半段波动收缩、非急涨）被放量收盘突破；无平台的急涨新高不算平台突破。',
   REVERSAL:
@@ -107,6 +107,12 @@ export const PATTERN_DEFINITIONS_V2: Record<TechnicalFamily, string> = {
 interface ObservationParts {
   stage: TechnicalStage;
   stage_detail: string;
+  /** Price-event date (the bar the pattern is about). Defaults to the earliest dated stage fact. */
+  pattern_event_date?: string | null;
+  /** First bar at which the pattern is provable from data ≤ that bar. */
+  first_observed_date?: string | null;
+  invalidated_at?: string | null;
+  expires_at?: string | null;
   formed_on?: string | null;
   confirmed_on?: string | null;
   formation_basis?: string[];
@@ -115,16 +121,23 @@ interface ObservationParts {
   invalidation?: { on: string; reason: string } | null;
   key_levels?: Record<string, number | null>;
   evidence?: Record<string, number | string | boolean | null>;
+  counter_evidence?: string[];
 }
 
 function makeObservation(
   input: PatternInput, strategy_id: string, family: TechnicalFamily, parts: ObservationParts,
 ): PatternObservation {
+  const eventDate = parts.pattern_event_date ?? parts.confirmed_on ?? parts.formed_on ?? null;
   return {
     strategy_id,
     family,
     stage: parts.stage,
     stage_detail: parts.stage_detail,
+    pattern_event_date: eventDate,
+    first_observed_date: parts.first_observed_date ?? parts.confirmed_on ?? parts.formed_on
+      ?? input.bars.dates[input.endIdx],
+    invalidated_at: parts.invalidated_at ?? (parts.stage === 'FAILED' ? parts.invalidation?.on ?? null : null),
+    expires_at: parts.expires_at ?? (parts.stage === 'EXPIRED' ? input.bars.dates[input.endIdx] : null),
     formed_on: parts.formed_on ?? null,
     confirmed_on: parts.confirmed_on ?? null,
     last_evaluated_on: input.bars.dates[input.endIdx],
@@ -134,6 +147,8 @@ function makeObservation(
     invalidation: parts.invalidation ?? null,
     key_levels: parts.key_levels ?? {},
     evidence: parts.evidence ?? {},
+    counter_evidence: parts.counter_evidence
+      ?? (parts.stage === 'FORMING' ? ['尚无可观察的确认价格行为'] : []),
   };
 }
 
@@ -154,11 +169,15 @@ function rpsValue(input: PatternInput): number | null {
 // ---------------------------------------------------------------- A. trend continuation
 
 /**
- * TREND_CONTINUATION — a trend state and a pullback-to-MA20 resume.
+ * TREND_CONTINUATION — a pullback-to-MA20 resume inside an established trend.
  *
  * Thresholds: MA20 above its value 5 bars ago; pullback touch tolerance 1%
- * (shared with `DEFAULT_PULLBACK_OPTS`); evaluation windows 20 bars for the
- * established trend and 10 bars for the pullback resume.
+ * (shared with `DEFAULT_PULLBACK_OPTS`); evaluation window 10 bars for the
+ * pullback resume.
+ *
+ * A bullish MA20 > MA60 alignment is background context, never a standalone
+ * event: the family only dates a pullback into MA20 and its later resume.
+ * That is why there is no `trend_established` confirmation here (A01 / D13).
  */
 export function detectTrendContinuation(input: PatternInput): PatternObservation[] {
   const { bars: b, x, endIdx: i } = input;
@@ -168,68 +187,6 @@ export function detectTrendContinuation(input: PatternInput): PatternObservation
   const ma60 = x.ma60;
   const toRaw = rawScaler(input);
   const out: PatternObservation[] = [];
-
-  // ---- tc_v2_trend_established
-  const trendCond = (k: number): boolean => k >= 60
-    && isFin(close[k]) && isFin(ma20[k]) && isFin(ma60[k]) && isFin(ma20[k - 5])
-    && close[k] > ma20[k] && ma20[k] > ma60[k] && ma20[k] > ma20[k - 5];
-
-  let established = -1;
-  for (let k = 60; k <= i; k++) {
-    if (trendCond(k) && !(k - 1 >= 60 && trendCond(k - 1))) established = k;
-  }
-  if (established >= 0) {
-    const age = i - established;
-    if (age <= 20) {
-      // First close below MA60 after confirmation voids the episode; its date
-      // is the confirmation date, never the run's low.
-      const fail = firstWhere(established, i, k => isFin(close[k]) && isFin(ma60[k]) && close[k] < ma60[k]);
-      const base = {
-        formation_basis: ['收盘 > MA20 > MA60 且 MA20 高于 5 个交易日前（首次成立）'],
-        confirmation_conditions: ['收盘 > MA20 > MA60，且 MA20 > 5 日前 MA20'],
-        invalidation_conditions: ['收盘跌破 MA60'],
-        key_levels: { ma20: toRaw(ma20[established]), ma60: toRaw(ma60[established]), close: toRaw(close[established]) },
-        evidence: {
-          confirmation_lag: 0,
-          bars_since_confirmation: age,
-          ma20: round4(ma20[established]),
-          ma60: round4(ma60[established]),
-          ma20_5_bars_ago: round4(ma20[established - 5]),
-        },
-      };
-      if (fail >= 0) {
-        out.push(makeObservation(input, 'tc_v2_trend_established', 'TREND_CONTINUATION', {
-          ...base,
-          stage: 'FAILED', stage_detail: 'TREND_ESTABLISHED',
-          formed_on: null, confirmed_on: b.dates[established],
-          invalidation: { on: b.dates[fail], reason: 'close_below_ma60' },
-          evidence: { ...base.evidence, invalidation_close: round4(close[fail]) },
-        }));
-      } else if (established === i) {
-        out.push(makeObservation(input, 'tc_v2_trend_established', 'TREND_CONTINUATION', {
-          ...base,
-          stage: 'CONFIRMED', stage_detail: 'TREND_ESTABLISHED',
-          formed_on: null, confirmed_on: b.dates[established],
-        }));
-      } else {
-        out.push(makeObservation(input, 'tc_v2_trend_established', 'TREND_CONTINUATION', {
-          ...base,
-          stage: 'FOLLOW_THROUGH', stage_detail: 'TREND_ESTABLISHED',
-          formed_on: null, confirmed_on: b.dates[established],
-        }));
-      }
-    } else {
-      out.push(makeObservation(input, 'tc_v2_trend_established', 'TREND_CONTINUATION', {
-        stage: 'EXPIRED', stage_detail: 'TREND_ESTABLISHED',
-        formed_on: null, confirmed_on: b.dates[established],
-        formation_basis: ['收盘 > MA20 > MA60 且 MA20 高于 5 个交易日前（首次成立）'],
-        confirmation_conditions: ['收盘 > MA20 > MA60，且 MA20 > 5 日前 MA20'],
-        invalidation_conditions: ['收盘跌破 MA60'],
-        key_levels: { ma20: toRaw(ma20[established]), ma60: toRaw(ma60[established]) },
-        evidence: { confirmation_lag: 0, bars_since_confirmation: age, expired: true },
-      }));
-    }
-  }
 
   // ---- tc_v2_pullback_resume
   const pullbackAt = (k: number) => detectPullbackResume(close, b.low, ma20, ma60, k, DEFAULT_PULLBACK_OPTS);
@@ -246,6 +203,7 @@ export function detectTrendContinuation(input: PatternInput): PatternObservation
   if (current) {
     out.push(makeObservation(input, 'tc_v2_pullback_resume', 'TREND_CONTINUATION', {
       stage: 'CONFIRMED', stage_detail: 'PULLBACK_RESUME',
+      pattern_event_date: b.dates[current.touchIndex], first_observed_date: b.dates[i],
       formed_on: b.dates[current.touchIndex], confirmed_on: b.dates[i],
       formation_basis: ['上升趋势中回踩 MA20（low ≤ MA20 × 1.01）'],
       confirmation_conditions: ['收盘重新站上 MA20 且高于前一日收盘，MA20 > MA60'],
@@ -260,7 +218,10 @@ export function detectTrendContinuation(input: PatternInput): PatternObservation
     }));
   } else if (latest >= 0) {
     const fail = firstWhere(latest, i, k => isFin(close[k]) && isFin(ma60[k]) && close[k] < ma60[k]);
+    const priorTouch = pullbackAt(latest)?.touchIndex ?? latest;
     const common = {
+      pattern_event_date: b.dates[priorTouch],
+      first_observed_date: b.dates[latest],
       formed_on: null as string | null,
       confirmed_on: b.dates[latest],
       formation_basis: ['上升趋势中回踩 MA20（low ≤ MA20 × 1.01）'],
@@ -381,6 +342,8 @@ export function detectPlatformBreakout(input: PatternInput): PatternObservation[
   ): PatternObservation => makeObservation(input, 'pb_v2_platform_breakout', 'PLATFORM_BREAKOUT', {
     stage,
     stage_detail,
+    pattern_event_date: stage === 'FORMING' ? b.dates[i] : b.dates[confirmedIdx],
+    first_observed_date: stage === 'FORMING' ? b.dates[i] : b.dates[confirmedIdx],
     formed_on: b.dates[formedIdx],
     confirmed_on: b.dates[confirmedIdx],
     formation_basis: ['30 日平台振幅 ≤15%，近 10 日波动 ≤ 前 20 日的 0.8 倍，且非急涨'],
@@ -491,6 +454,8 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
       const fail = firstWhere(formationIdx, i, k => isFin(close[k]) && close[k] < divergenceLow);
       const confirm = firstWhere(formationIdx, i, k => isFin(close[k]) && close[k] > neckline);
       const base = {
+        pattern_event_date: b.dates[j2],
+        first_observed_date: b.dates[formationIdx],
         formed_on: b.dates[formationIdx],
         formation_basis: [
           `价格低点 ${b.dates[j2]} < ${b.dates[j1]}，但 DIF 低点抬高`,
@@ -555,9 +520,15 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
   // ---- rv_v2_macd_w_bottom
   const w = detectWBottom(dif, i, DEFAULT_MACD_W_OPTS);
   if (w) {
+    // The second low is only a *confirmed* swing low `L` bars to its right, so
+    // the pair is unknowable before then even if the neckline cross came
+    // earlier. Both the visibility date and the confirmation date respect that.
+    const firstObsIdx = Math.max(w.confirmIndex, w.j2 + DEFAULT_MACD_W_OPTS.L);
     const base = {
-      formed_on: b.dates[w.j2],
-      confirmed_on: b.dates[w.confirmIndex],
+      pattern_event_date: b.dates[w.j2],
+      first_observed_date: b.dates[firstObsIdx],
+      formed_on: b.dates[firstObsIdx],
+      confirmed_on: b.dates[firstObsIdx],
       formation_basis: [`DIF 双底 ${b.dates[w.j1]} / ${b.dates[w.j2]}，颈线 ${round4(w.neckline)}`],
       confirmation_conditions: ['DIF 上穿两低点之间的颈线'],
       invalidation_conditions: ['DIF 跌破两个低点'],
@@ -574,25 +545,26 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
         neckline: round4(w.neckline),
       },
     };
-    if (i === w.confirmIndex) {
+    if (i === firstObsIdx) {
       out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
         ...base, stage: 'CONFIRMED', stage_detail: 'DIF_W_CONFIRMED',
       }));
     } else if (w.invalidateIndex !== null) {
       out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
         ...base, stage: 'FAILED', stage_detail: 'DIF_W_INVALIDATED',
-        invalidation: { on: b.dates[w.invalidateIndex], reason: 'dif_w_invalidated' },
+        invalidated_at: b.dates[Math.max(w.invalidateIndex, firstObsIdx)],
+        invalidation: { on: b.dates[Math.max(w.invalidateIndex, firstObsIdx)], reason: 'dif_w_invalidated' },
         evidence: { ...base.evidence, invalidate_below: round4(w.invalidateBelow) },
       }));
-    } else if (i - w.confirmIndex > 40) {
+    } else if (i - firstObsIdx > 40) {
       out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
         ...base, stage: 'EXPIRED', stage_detail: 'DIF_W_CONFIRMED',
-        evidence: { ...base.evidence, bars_since_confirmation: i - w.confirmIndex, expired: true },
+        evidence: { ...base.evidence, bars_since_confirmation: i - firstObsIdx, expired: true },
       }));
     } else {
       out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
         ...base, stage: 'FOLLOW_THROUGH', stage_detail: 'DIF_W_CONFIRMED',
-        evidence: { ...base.evidence, bars_since_confirmation: i - w.confirmIndex },
+        evidence: { ...base.evidence, bars_since_confirmation: i - firstObsIdx },
       }));
     }
   } else {
@@ -619,7 +591,9 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
         if (isFin(dif[i]) && dif[i] <= neckline) {
           out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
             stage: 'FORMING', stage_detail: 'DIF_W_FORMING',
-            formed_on: b.dates[j2], confirmed_on: null,
+            pattern_event_date: b.dates[j2],
+            first_observed_date: b.dates[j2 + opts.L],
+            formed_on: b.dates[j2 + opts.L], confirmed_on: null,
             formation_basis: [`DIF 双底 ${b.dates[j1]} / ${b.dates[j2]}，尚未越过颈线`],
             confirmation_conditions: ['DIF 上穿两低点之间的颈线'],
             invalidation_conditions: ['DIF 跌破两个低点'],
@@ -691,6 +665,7 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
     const sq = recentSqueeze(i - 5, i - 1);
     out.push(makeObservation(input, 've_v2_boll_squeeze_breakout', 'VOLATILITY_EXPANSION', {
       stage: 'CONFIRMED', stage_detail: 'SQUEEZE_BREAKOUT',
+      pattern_event_date: b.dates[i], first_observed_date: b.dates[i],
       formed_on: b.dates[sq], confirmed_on: b.dates[i],
       formation_basis: ['布林带宽处于近 120 日 20% 分位（收口）'],
       confirmation_conditions: ['收盘上穿上轨，且前一日收盘不高于上轨'],
@@ -714,6 +689,7 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
       const fail = firstWhere(confirmed, i, k => isFin(close[k]) && isFin(x.bollMid[k]) && close[k] < x.bollMid[k]);
       const tail = (extra: ObservationParts): PatternObservation => makeObservation(input, 've_v2_boll_squeeze_breakout', 'VOLATILITY_EXPANSION', {
         stage: extra.stage, stage_detail: extra.stage_detail ?? 'EXPANSION_FOLLOW_THROUGH',
+        pattern_event_date: b.dates[confirmed], first_observed_date: b.dates[confirmed],
         formed_on: b.dates[sq], confirmed_on: b.dates[confirmed],
         formation_basis: ['布林带宽处于近 120 日 20% 分位（收口）'],
         confirmation_conditions: ['收盘上穿上轨'],
@@ -747,6 +723,7 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
       && close[i] <= x.bollUp[i] && close[i] > x.bollMid[i]) {
       out.push(makeObservation(input, 've_v2_boll_squeeze_breakout', 'VOLATILITY_EXPANSION', {
         stage: 'FORMING', stage_detail: 'SQUEEZE_FORMING',
+        pattern_event_date: b.dates[currentSqueeze], first_observed_date: b.dates[currentSqueeze],
         formed_on: b.dates[currentSqueeze], confirmed_on: null,
         formation_basis: ['布林带宽处于近 120 日 20% 分位（收口）'],
         confirmation_conditions: ['收盘上穿上轨，且前一日收盘不高于上轨'],
@@ -794,6 +771,8 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
   if (latestRide >= 0 && background(i)) {
     const fail = firstWhere(latestRide, i, k => isFin(close[k]) && isFin(x.bollMid[k]) && close[k] < x.bollMid[k]);
     const base = {
+      pattern_event_date: b.dates[latestRide],
+      first_observed_date: b.dates[latestRide],
       formed_on: b.dates[latestRide],
       confirmed_on: b.dates[latestRide],
       formation_basis: ['上升趋势中，近 5 日至少 3 日收盘触及/站上布林上轨，且带宽高于 120 日中位数'],
@@ -868,6 +847,7 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
     return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
       stage: 'FORMING', stage_detail: 'OVERSOLD_IN_DOWNTREND',
       formed_on: b.dates[latestObs], confirmed_on: null,
+      counter_evidence: ['下跌趋势仍在：超卖只作逆势观察，不构成低风险机会'],
       formation_basis: ['下跌趋势中出现超卖（收盘 ≤ 布林下轨 ×1.01 或 RSI14 < 30）'],
       confirmation_conditions: [],
       invalidation_conditions: ['收盘跌破超卖区低点', '超卖不等于低风险机会'],
@@ -893,6 +873,7 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
   if (latestObs >= 0 && confirmObsAt(i) >= 0) {
     return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
       stage: 'CONFIRMED', stage_detail: 'BAND_REENTRY_CONFIRMED',
+      pattern_event_date: b.dates[latestObs], first_observed_date: b.dates[i],
       formed_on: b.dates[latestObs], confirmed_on: b.dates[i],
       formation_basis: ['震荡环境中出现超卖观察（布林下轨附近或 RSI14 < 30）'],
       confirmation_conditions: ['收盘高于下轨、高于前一日收盘，且 RSI14 不低于前一日'],
@@ -920,6 +901,8 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
     const observationLow = minFinite(b.low, confirmedObs, i);
     const failed = isFin(observationLow) && isFin(close[i]) && close[i] < observationLow;
     const base = {
+      pattern_event_date: b.dates[confirmedObs],
+      first_observed_date: b.dates[confirmed],
       formed_on: b.dates[confirmedObs], confirmed_on: b.dates[confirmed],
       formation_basis: ['震荡环境中出现超卖观察（布林下轨附近或 RSI14 < 30）'],
       confirmation_conditions: ['收盘高于下轨、高于前一日收盘，且 RSI14 不低于前一日'],

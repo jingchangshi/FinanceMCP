@@ -16,6 +16,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { scanMarket } from './analysis.js';
 import { forEachStockBars } from './bars.js';
+import { tradeDayGate } from './dataReadiness.js';
 import { computeIndicators, type Bars, type IndicatorSet } from './indicators.js';
 import { recentTradeDays } from './ingest.js';
 import { regimeSeries, type Regime } from './market.js';
@@ -29,6 +30,7 @@ import {
   type TechnicalStage, type TechnicalViewV2,
 } from './technicalFrameworkV2.js';
 import { detectAllPatterns, PATTERN_DEFINITIONS_V2 } from './technicalPatternsV2.js';
+import { buildResearchUniverse } from './technicalResearchStateV2.js';
 
 /** Capacity is a cost control, not a tuned parameter (goal-1102 §四). */
 export const TECHNICAL_CAPACITY = {
@@ -230,6 +232,31 @@ function suspendedOn(db: DatabaseSync, asOf: string): Set<string> {
     .map(r => r.ts_code));
 }
 
+/**
+ * SW2021 L1 membership as of `asOf`, for report readability and holding-overlap
+ * disclosure only. It is never a discovery seed, a gate or a ranking input —
+ * a stock with no mapped industry still gets its signals and its state.
+ */
+function sectorMembership(db: DatabaseSync, asOf: string, codes: string[]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sw_member'").get();
+  if (!exists || codes.length === 0) return out;
+  const rows = db.prepare('SELECT ts_code, l1_code, in_date, out_date FROM sw_member').all() as Array<{
+    ts_code: string; l1_code: string; in_date: string | null; out_date: string | null;
+  }>;
+  const wanted = new Set(codes);
+  for (const r of rows) {
+    if (!wanted.has(r.ts_code)) continue;
+    if (r.in_date && r.in_date > asOf) continue;
+    if (r.out_date && r.out_date <= asOf) continue;
+    const list = out.get(r.ts_code);
+    if (list) { if (!list.includes(`SW2021:${r.l1_code}`)) list.push(`SW2021:${r.l1_code}`); }
+    else out.set(r.ts_code, [`SW2021:${r.l1_code}`]);
+  }
+  for (const list of out.values()) list.sort();
+  return out;
+}
+
 function calendarIndex(days: string[]): Map<string, number> {
   return new Map(days.map((d, i) => [d, i]));
 }
@@ -247,6 +274,16 @@ function barsBehind(lastBar: string, asOf: string, index: Map<string, number>): 
  */
 export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOptions): TechnicalViewV2 {
   const asOf = opts.asOf;
+  // A known closed day has no same-day research view. Refusing here (not only
+  // in the publish gate) keeps every caller — pipeline, CLI preview, tests —
+  // from reading Friday's bars under a Saturday as-of label (C13).
+  const calendar = tradeDayGate(db, asOf);
+  if (calendar.known && !calendar.open) {
+    return unavailableTechnicalView(
+      asOf,
+      `${asOf} 非交易日：最近已完成交易日 ${calendar.previous ?? '未知'}，请以该交易日运行`,
+    );
+  }
   const barCount = opts.barCount ?? 330;
   const days = recentTradeDays(db, asOf, barCount); // ascending, ends at asOf
   const dayIndex = calendarIndex(days);
@@ -350,6 +387,8 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
       counts,
     };
   });
+  const contextList = [...contexts.values()].sort((a, b) => a.ts_code.localeCompare(b.ts_code));
+  const sectorByCode = sectorMembership(db, asOf, contextList.map(c => c.ts_code));
 
   return {
     status: 'OK',
@@ -359,8 +398,9 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
     as_of: asOf,
     market_regime: regime,
     methodology_note: METHODOLOGY_NOTE,
-    contexts: [...contexts.values()].sort((a, b) => a.ts_code.localeCompare(b.ts_code)),
+    contexts: contextList,
     families,
+    research_universe: buildResearchUniverse({ as_of: asOf, contexts: contextList, families }, sectorByCode),
     coverage,
     evidence_level: 'UNVERIFIED',
     research_only: true,
@@ -385,6 +425,12 @@ export function unavailableTechnicalView(asOf: string, reason: string): Technica
       candidates: [],
       counts: emptyStageCounts(),
     })),
+    research_universe: {
+      as_of: asOf,
+      counts: { FOCUS: 0, WATCH: 0, EXTENDED: 0, DETERIORATING: 0, BLOCKED: 0, INVALIDATED: 0, total: 0 },
+      stocks: [],
+      daily_highlights: [],
+    },
     coverage: {
       universe: 0, preselected: 0, analyzed: 0,
       skipped_adj_missing: 0, skipped_insufficient: 0, capacity_limited: 0,

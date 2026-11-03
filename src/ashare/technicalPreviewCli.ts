@@ -11,6 +11,8 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { ashareDbPath } from './db.js';
 import { analyzeTechnicalDay, renderTechnicalViewMarkdown } from './technicalCandidatesV2.js';
+import { recentTradeDays } from './ingest.js';
+import { computeRps } from './rps.js';
 
 export interface TechnicalPreviewOptions {
   date: string;
@@ -37,7 +39,11 @@ export function runTechnicalPreview(opts: TechnicalPreviewOptions): TechnicalPre
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
     db.exec(PRAGMAS);
-    const view = analyzeTechnicalDay(db, opts.date);
+    // Same RPS window as the daily pipeline, so a preview's shared context
+    // matches the published snapshot instead of showing rps120 = null.
+    const days = recentTradeDays(db, opts.date, 260);
+    const rps = days.length > 1 ? computeRps(db, days[0], opts.date) : null;
+    const view = analyzeTechnicalDay(db, opts.date, rps);
     const markdown = renderTechnicalViewMarkdown(view);
     const written: string[] = [];
     if (opts.outDir) {

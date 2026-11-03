@@ -190,6 +190,17 @@ test('trend continuation: MA20 pullback resumes on the confirmation bar (no back
   assert.equal(resume.evidence.rps_background_only, true, 'RPS is background only');
 });
 
+test('trend continuation: bullish alignment alone is background, never a confirmation', () => {
+  // 120 bars of steady rise: close > MA20 > MA60 the whole way, but the low
+  // never touches MA20, so there is no pullback and no resume to confirm.
+  const bars = makeBars(Array.from({ length: 120 }, (_, i) => 10 + 0.05 * i));
+  const obs = detectTrendContinuation(patternInput(bars, 119));
+  assert.equal(obs.some(o => o.stage === 'CONFIRMED' || o.stage === 'FOLLOW_THROUGH'), false,
+    'MA20 > MA60 is context; confirmation needs the pullback resume');
+  assert.equal(obs.some(o => o.strategy_id === 'tc_v2_trend_established'), false,
+    'there is no standalone trend-established signal');
+});
+
 // ---------------------------------------------------------------- B. platform
 
 test('platform breakout: tight base confirms on the volume breakout; a run-up never does', () => {
@@ -217,6 +228,20 @@ test('platform breakout: tight base confirms on the volume breakout; a run-up ne
   const runup = detectPlatformBreakout(patternInput(runupBars(), 130));
   assert.equal(runup.some(o => o.strategy_id === 'pb_v2_platform_breakout' && o.stage === 'CONFIRMED'), false,
     'a new high after a fast run-up is not a platform breakout');
+});
+
+test('platform breakout: falling back through the breakout level fails the episode, date kept', () => {
+  // Same platform and breakout at 130, then two bars back down through
+  // platform_high × 0.97 with a sharp drop.
+  const closes = platformBars().close.concat([18.2, 17.5]);
+  const bars = makeBars(closes, { vol: closes.map((_, i) => (i === 130 ? 250 : 100)) });
+  const failed = detectPlatformBreakout(patternInput(bars, 132));
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].stage, 'FAILED');
+  assert.equal(failed[0].stage_detail, 'PLATFORM_BREAKOUT_FAILED');
+  assert.equal(failed[0].confirmed_on, bars.dates[130], 'the historical breakout date is kept');
+  assert.equal(failed[0].invalidated_at, bars.dates[132]);
+  assert.equal(failed[0].evidence.invalidation_close, 17.5);
 });
 
 // ---------------------------------------------------------------- C. reversal

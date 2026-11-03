@@ -66,21 +66,11 @@ CREATE TABLE IF NOT EXISTS hotspot_snapshot (
   coverage TEXT,
   PRIMARY KEY (as_of, config_version)
 );
-CREATE TABLE IF NOT EXISTS hotspot_candidate (
-  as_of TEXT NOT NULL,
-  ts_code TEXT NOT NULL,
-  name TEXT, instrument_type TEXT,
-  primary_sector TEXT, sectors TEXT,
-  etf_sources TEXT, multi_etf INTEGER,
-  leaderships TEXT, signals TEXT,
-  risk_events TEXT,
-  trade_permission TEXT, trade_permission_reason TEXT,
-  pool TEXT, inclusion_reason TEXT, exclusion_reason TEXT,
-  priority INTEGER, priority_reason TEXT,
-  data_quality TEXT, config_version TEXT,
-  PRIMARY KEY (as_of, ts_code)
-);
-CREATE INDEX IF NOT EXISTS hotspot_candidate_ts ON hotspot_candidate(ts_code);
+-- The V1 'hotspot_candidate' mirror (priority / pool / inclusion_reason) is gone
+-- from the active schema: V2 keeps one record per stock inside
+-- technical_view.research_universe and never writes per-candidate rows. Existing
+-- production tables still hold their V1 rows; they are left untouched as archive
+-- and are no longer created, written, or reported as a data source.
 -- goal-1032 §2.1: append-only history of every content that was ever published
 -- for a day. The hotspot_snapshot table above stays the CURRENT POINTER
 -- (unchanged primary key, unchanged readers); this table survives regeneration.
@@ -124,7 +114,6 @@ export const HOTSPOT_TABLES = [
   'ths_member',
   'ths_index_daily',
   'hotspot_snapshot',
-  'hotspot_candidate',
   // NOTE: hotspot_snapshot_version is deliberately NOT listed here. This array
   // is the SOURCE-dataset catalogue that hotspotCoverage reports on; the ledger
   // is an output of the pipeline, not an input, and listing it would make the
@@ -134,17 +123,9 @@ export const HOTSPOT_TABLES = [
 /** Idempotent: safe to call at the top of every sync and every read path. */
 export function ensureHotspotSchema(db: DatabaseSync): void {
   db.exec(HOTSPOT_SCHEMA);
-  // Own-table column migration (goal-1028's own tables only — pre-existing
-  // production tables are never touched): tables created before risk_events
-  // existed get the column added once, guarded by table_info so the call
-  // stays idempotent. CREATE IF NOT EXISTS cannot add columns to a table
-  // that already exists.
-  const hasRisk = (db.prepare('PRAGMA table_info(hotspot_candidate)').all() as Array<{ name: string }>)
-    .some(c => c.name === 'risk_events');
-  if (!hasRisk) db.exec('ALTER TABLE hotspot_candidate ADD COLUMN risk_events TEXT');
   // goal-1032: the pointer row gains the ledger position it points at. Guarded
-  // exactly like risk_events — CREATE IF NOT EXISTS cannot add columns to an
-  // existing table, and production already has a hotspot_snapshot.
+  // by table_info — CREATE IF NOT EXISTS cannot add columns to an existing
+  // table, and production already has a hotspot_snapshot.
   const snapCols = new Set((db.prepare('PRAGMA table_info(hotspot_snapshot)').all() as Array<{ name: string }>).map(c => c.name));
   if (!snapCols.has('version_no')) db.exec('ALTER TABLE hotspot_snapshot ADD COLUMN version_no INTEGER');
   if (!snapCols.has('state')) db.exec('ALTER TABLE hotspot_snapshot ADD COLUMN state TEXT');

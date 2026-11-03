@@ -10,6 +10,7 @@ process.env.ASHARE_DB_PATH = join(dir, 'market.sqlite');
 const { openAshareDb, upsertRows } = await import('../build/ashare/db.js');
 const { seedMarket, weekdays } = await import('./ashare-fixture.mjs');
 const { openPortfolioDb } = await import('../build/portfolio/db.js');
+const { saveHotspotSnapshot } = await import('../build/ashare/hotspotSnapshots.js');
 const { DEMO_SNAPSHOT, importSnapshot, markSnapshotCurrent } = await import('../build/portfolio/account.js');
 const { initBaseline, confirmRealAccount } = await import('../build/portfolio/ledger.js');
 const {
@@ -89,6 +90,70 @@ test('identity hash input is byte-stable: same fixture, same report_id across in
   try {
     const ids = new Set([build(f).report_id, build(f).report_id, build(f).report_id]);
     assert.equal(ids.size, 1);
+  } finally { f.market.close?.(); f.p.close?.(); }
+});
+
+// ---------------------------------------------------------------- §6.2 same-day versions
+//
+// goal-1102 §6.2: a report must pin the technical snapshot it read. Two V2
+// versions of the same trade date are two different research records, so the
+// bundle identity must differ — otherwise S1 and S2 would be indistinguishable
+// and a report could mix half of one with half of the other.
+
+function hotspotBody(code) {
+  return {
+    as_of: '20261020',
+    framework: 'V2_ONLY',
+    framework_version: 'technical-v2.0.0',
+    implementation_fingerprint: 'sha256:impl-feat',
+    config_version: 'hotspot-config-1.0.0',
+    content_hash: '',
+    data_quality: 'READY',
+    market_data_as_of: '20261020',
+    generated_at: '2026-10-21T01:00:00Z',
+    sectors: { as_of: '20261020', config_version: 'hotspot-config-1.0.0', sectors: [], selected: [], coverage: [] },
+    technical_view: {
+      status: 'OK', as_of: '20261020', framework_version: 'technical-v2.0.0',
+      implementation_fingerprint: 'sha256:impl-feat', market_regime: 'range',
+      families: [], contexts: [], coverage: {}, evidence_level: 'UNVERIFIED', research_only: true,
+      research_universe: {
+        as_of: '20261020', counts: { FOCUS: 1, WATCH: 0, EXTENDED: 0, DETERIORATING: 0, BLOCKED: 0, INVALIDATED: 0, total: 1 },
+        stocks: [{ ts_code: code, name: code, research_state: 'FOCUS', signals: [] }],
+        daily_highlights: [code],
+      },
+    },
+    coverage: [],
+    data_state: {
+      version: 'data-readiness-1.0.0', as_of: '20261020', fingerprint: { bars: { daily: 1 } }, readiness: 'READY',
+    },
+    research_only: true,
+  };
+}
+
+test('a report pins its research snapshot: S1 and S2 of one day get different report_ids', () => {
+  const f = fixture();
+  try {
+    const absent = build(f);
+    assert.equal(absent.hotspot_research.status, 'NOT_READY');
+    assert.equal(absent.hotspot_research.reason, 'hotspot_snapshot_not_generated');
+    assert.equal(absent.hotspot_research.snapshot, null);
+
+    const v1 = saveHotspotSnapshot(f.market, hotspotBody('600001.SH'));
+    const s1 = build(f);
+    assert.equal(s1.hotspot_research.status, 'OK');
+    assert.equal(s1.hotspot_research.snapshot.version_no, v1.version_no);
+    assert.equal(s1.hotspot_research.snapshot.content_hash, v1.content_hash);
+
+    const v2 = saveHotspotSnapshot(f.market, hotspotBody('600002.SH'));
+    const s2 = build(f);
+    assert.equal(v2.version_no, v1.version_no + 1);
+    assert.notEqual(v2.content_hash, v1.content_hash);
+
+    const ids = new Set([absent.report_id, s1.report_id, s2.report_id]);
+    assert.equal(ids.size, 3, 'no snapshot, S1 and S2 must all be distinct research records');
+    assert.equal(s2.hotspot_research.snapshot.version_no, v2.version_no);
+    // Re-reading the same current version is stable: the identity is the version, not the wall clock.
+    assert.equal(build(f).report_id, s2.report_id);
   } finally { f.market.close?.(); f.p.close?.(); }
 });
 

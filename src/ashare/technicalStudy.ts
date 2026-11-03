@@ -5,8 +5,7 @@
  * the V1 research path does: t+1 open entry, up-limit unbuyable, suspension /
  * down-limit exit deferral, fees + slippage, and fixed horizons.
  *
- * Three controls are kept beside the V2 cohort:
- *   - `V1_FOCUS`            — that day's legacy FOCUS pool (old methodology)
+ * Two controls are kept beside the V2 cohort:
  *   - `RPS_TOP20`           — RPS120 alone, no technical filtering
  *   - `UNFILTERED_CONFIRMED`— V2 confirmations with the trading-state gate OFF
  *
@@ -22,7 +21,6 @@ import { computeRps } from './rps.js';
 import { recentTradeDays } from './ingest.js';
 import { evaluateEvents, summarizeEvaluation, type EvaluationEvent } from './evaluation.js';
 import { HOTSPOT_EXPERIMENT_COSTS } from './hotspotTypes.js';
-import { loadHotspotSnapshot } from './hotspotSnapshots.js';
 import { analyzeTechnicalDay } from './technicalCandidatesV2.js';
 import {
   TECHNICAL_FRAMEWORK_VERSION, type TechnicalFamily, type TechnicalStage,
@@ -156,18 +154,7 @@ export function runTechnicalStudy(db: DatabaseSync, opts: TechnicalStudyOptions)
       if (s) controls.push(s);
     }
 
-    // Control 2: legacy V1 FOCUS pool from the stored snapshot (no rewrite).
-    const snap = loadHotspotSnapshot(db, date);
-    if (snap) {
-      const focus = uniq(snap.candidates.filter(c => c.pool === 'FOCUS' && c.instrument_type === 'STOCK')
-        .map(c => c.ts_code)).sort().slice(0, cap);
-      for (const horizon of horizons) {
-        const s = sample(db, 'V1_FOCUS', focus.map(ts_code => ({ date, ts_code })), asOf, horizon);
-        if (s) controls.push(s);
-      }
-    }
-
-    // Control 3: RPS120 alone (top 20), no technical or entry filtering.
+    // Control 2: RPS120 alone (top 20), no technical filtering.
     const scan = scanMarket(db, date);
     const days = recentTradeDays(db, date, 260);
     const rps = days.length > 1 ? computeRps(db, days[0], date) : null;
@@ -201,7 +188,7 @@ export function runTechnicalStudy(db: DatabaseSync, opts: TechnicalStudyOptions)
     notes: [
       '描述性观察：仅统计已完成的 T+h 收盘退出；未到期样本保持 pending，不视为收益。',
       '样本可能重叠、重复股票与同族多候选，不构成独立样本，也不做显著性结论。',
-      'V1_FOCUS / RPS_TOP20 / UNFILTERED_CONFIRMED 是对照，不是推荐组合。',
+      'RPS_TOP20 / UNFILTERED_CONFIRMED 是对照，不是推荐组合；V1 FOCUS 对照已随 V1 删除，不再保留活动实现。',
       '停牌、一字跌停与买入约束由 evaluation.ts 统一处理；其计数在各样本的 denominators 中。',
     ],
   };

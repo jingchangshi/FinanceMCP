@@ -1,12 +1,10 @@
-// goal-1030 WP6.3: the schema-compatibility promise, mechanised.
+// goal-1030 WP6.3 / goal-1102: the schema-compatibility promise, mechanised.
 //
-// `MCP_ENTRY_CONTRACT_V1.md` §1 promises that adding the entry layer does not
-// change what an older client must send. Before this file nothing asserted that:
-// an edit that added `required: ['entry_eligible']` would have passed every
-// other test while breaking every existing caller. The table below is the
-// frozen `inputSchema.required` of all 26 exposed tools (14 public + 12 private)
-// as of the 2026-10-29 baseline; changing an entry here is a breaking change
-// and must be reviewed as one.
+// Adding a research state must not change what a client already sends. Before
+// this file nothing asserted that: an edit that made `research_state` required
+// would have passed every other test while breaking every existing caller. The
+// table below is the frozen `inputSchema.required` of every exposed tool;
+// changing an entry here is a breaking change and must be reviewed as one.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -54,19 +52,21 @@ test('the required inputs of every exposed tool are frozen (additive changes onl
   }
 });
 
-test('the entry layer is optional on the wire', () => {
+test('the hotspot research filter is optional on the wire and keeps its V2 meaning', () => {
   const tool = ashareToolDefinitions.find(t => t.name === 'ashare_hotspot_opportunities');
   const props = tool.inputSchema.properties;
-  for (const name of ['entry_eligible', 'candidate_class']) {
+  for (const name of ['date', 'ts_code', 'research_state']) {
     assert.ok(name in props, `${name} must be advertised`);
     assert.ok(!(tool.inputSchema.required ?? []).includes(name),
-      `${name} must stay optional: it is an added filter, not a new obligation`);
+      `${name} must stay optional: it narrows a read, it is not a new obligation`);
   }
-  // The pre-existing filters keep their meaning and stay optional too.
-  for (const name of ['date', 'pool', 'ts_code']) assert.ok(name in props, name);
-  assert.deepEqual(props.pool.enum, ['FOCUS', 'RAW'], 'pool keeps the legacy two-value meaning');
-  assert.deepEqual(props.candidate_class.enum,
-    ['NEW_ENTRY', 'PULLBACK_WAIT', 'PREPARING', 'RISK_REJECTED', 'RESEARCH_ONLY', 'INSUFFICIENT_DATA']);
+  assert.deepEqual(props.research_state.enum,
+    ['FOCUS', 'WATCH', 'EXTENDED', 'DETERIORATING', 'BLOCKED', 'INVALIDATED'],
+    'the filter names the six research states; there is no pool or candidate_class vocabulary');
+  // The deleted V1 filters must not come back as a compatibility alias.
+  for (const gone of ['pool', 'entry_eligible', 'candidate_class']) {
+    assert.equal(gone in props, false, `${gone} belongs to the removed V1 entry layer`);
+  }
 });
 
 test('every public tool is still read-only and none of them touches the account database', () => {

@@ -1,34 +1,39 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { evaluateHotspotSectors } from './hotspot.js';
-import { buildHotspotPool, type PoolEtfConstituent, type PoolOptions } from './hotspotPool.js';
-import { scanPoolStrategies } from './strategies.js';
-import { saveHotspotSnapshot, snapshotContentHash } from './hotspotSnapshots.js';
+import { saveHotspotSnapshot, snapshotContentHash, SNAPSHOT_HASH_BASIS } from './hotspotSnapshots.js';
 import { dataState } from './dataReadiness.js';
 import { topConstituents, weightCoverage } from './etfWeightStore.js';
 import { ETF_CANDIDATE_DECLARATIONS } from './etfDeclarations.js';
-import { buildEntryView } from './entryRanking.js';
 import { scanMarket } from './analysis.js';
+import { recentTradeDays } from './ingest.js';
+import { computeRps } from './rps.js';
 import {
   analyzeTechnicalV2, createTechnicalPrescreen, forcedResearchCodes, unavailableTechnicalView,
 } from './technicalCandidatesV2.js';
 import {
-  HOTSPOT_CONFIG_VERSION, HOTSPOT_STRATEGY_SET_VERSION,
-  type HotspotSnapshot, type CoverageSummary,
+  HOTSPOT_CONFIG_VERSION, sectorLocalCode, type HotspotSnapshot, type CoverageSummary,
 } from './hotspotTypes.js';
 import type { HotspotConfig } from './hotspot.js';
 
 /**
- * Daily hotspot snapshot orchestrator (goal-1028 §P2.3 / architecture.md §5).
+ * Daily research snapshot orchestrator — V2 is the only production path.
  *
  * One entry point wires the whole research surface for a single as-of day:
  *
- *   1. sector identification  — evaluateHotspotSectors (SW L1 + THS themes)
- *   2. ETF universe           — industry_theme declarations, PIT weight lookup
- *                              via etfWeightStore (never basket quantities)
- *   3. candidate pool         — buildHotspotPool (leaders + RPS + ETF core)
- *   4. strategy scan          — scanPoolStrategies over the seeded pool codes
- *   5. persistence            — saveHotspotSnapshot (content-hash identical
- *                              regenerations replace, never fork history)
+ *   1. sector identification — evaluateHotspotSectors (SW L1 + THS themes)
+ *   2. representative ETFs  — PIT constituents whose stocks belong to the
+ *                             sector; calculated independently of any stock
+ *                             ranking (an ETF is evidence, not a seed)
+ *   3. full-market V2 scan  — ONE scanMarket pass feeds the per-family
+ *                             prescreen; only the union is loaded again
+ *   4. technical view       — five independent families + the single per-stock
+ *                             research state
+ *   5. persistence          — saveHotspotSnapshot (content-hash identical
+ *                             regenerations replace, never fork history)
+ *
+ * Removed in this rebuild: the V1 candidate pool, its priority ranking, the
+ * entry view and the per-candidate mirror. A stock's research record exists
+ * once, in `technical_view.research_universe`.
  *
  * The pipeline only ever writes the NEW hotspot tables; watchlist, research
  * logs and formal snapshots are untouched. ETF weight reads are point-in-time
@@ -41,25 +46,14 @@ export interface HotspotPipelineOptions {
   /** ETFs considered relevant this day; default = industry_theme declarations. */
   etfCodes?: string[];
   etfNames?: Record<string, string>;
-  /** Injected for tests; default reads etf_weight_snapshot (PIT-resolved). */
-  etfConstituents?: (etfCode: string) => PoolEtfConstituent[];
-  pool?: Partial<Omit<PoolOptions, 'etfConstituents' | 'etfCodes' | 'signalScanProvider'>>;
   /** Set false for a dry run: compute everything, persist nothing. */
   persist?: boolean;
-  /**
-   * Entry implementation identity, supplied by the CLI (hashing the entry
-   * modules is async and this orchestrator is sync). Carried into
-   * `data_state.entry_identity` so a snapshot records which entry code
-   * produced its `entry_view`.
-   */
-  entryHash?: string;
-  entryScheme?: string;
 }
 
 export interface HotspotPipelineResult {
   snapshot: HotspotSnapshot;
   saved: {
-    content_hash: string; candidates_written: number; replaced: boolean;
+    content_hash: string; replaced: boolean;
     version_no: number; state: string; superseded_version: number | null; hash_basis: string;
   } | null;
   seconds: number;
@@ -70,15 +64,13 @@ export interface HotspotPipelineResult {
    */
   readiness: { status: 'READY' | 'DEGRADED' | 'NOT_READY'; reason: string | null };
   /**
-   * Phase timings for acceptance E11 (performance record). Diagnostic only —
-   * deliberately OUTSIDE the snapshot body so it never perturbs content_hash.
-   * `pool` includes `scan` (the lazy strategy-scan provider runs inside the
-   * pool build); `scan` is the provider's own span within `pool`.
+   * Phase timings for the performance record. Diagnostic only — deliberately
+   * OUTSIDE the snapshot body so it never perturbs content_hash.
    */
-  timings: { sectors: number; pool: number; scan: number; technical: number; write: number; total: number };
+  timings: { sectors: number; rps: number; technical: number; write: number; total: number };
 }
 
-/** Industry/theme ETFs the pool considers relevant by declaration. */
+/** Industry/theme ETFs the research surface considers relevant by declaration. */
 export function defaultHotspotEtfCodes(): string[] {
   return ETF_CANDIDATE_DECLARATIONS
     .filter(d => d.category === 'industry_theme')
@@ -104,158 +96,162 @@ function etfDisplayNames(db: DatabaseSync, codes: string[]): Record<string, stri
   return names;
 }
 
-/** Default PIT constituent lookup backed by etf_weight_snapshot. */
-function storeBackedConstituents(db: DatabaseSync, asOf: string, topN: number) {
-  return (etfCode: string): PoolEtfConstituent[] =>
-    topConstituents(db, etfCode, asOf, topN).map(r => ({
-      etf_code: r.etf_code,
-      stock_code: r.stock_code,
-      weight: r.weight,
-      source: r.source,
-      effective_date: r.effective_date,
-      available_from: r.available_from,
-      quality: r.quality_status,
-    }));
+interface EtfRef { etf_code: string; name?: string; index_code?: string | null }
+
+/**
+ * Sector → representative ETFs, from PIT ETF constituents and sw_member.
+ *
+ * A sector is represented by an ETF only when one of that ETF's dated
+ * constituents actually belongs to the sector on `asOf`. There is no ranking
+ * input here at all: the mapping cannot tilt which stocks are researched, and
+ * it is deterministic (sorted by etf_code) so the snapshot hash is stable.
+ * THS themes have no member table in this database and therefore stay empty
+ * rather than being inferred from names.
+ */
+function representativeEtfsBySector(
+  db: DatabaseSync,
+  asOf: string,
+  sectors: Array<{ key: string; source: 'SW2021' | 'THS' }>,
+  etfCodes: string[],
+  etfNames: Record<string, string>,
+  topN: number,
+): Map<string, EtfRef[]> {
+  const out = new Map<string, EtfRef[]>();
+  const sw = sectors.filter(s => s.source === 'SW2021');
+  if (sw.length === 0 || etfCodes.length === 0) return out;
+
+  let memberRows: Array<{ ts_code: string; l1_code: string; in_date: string | null; out_date: string | null }> = [];
+  try {
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sw_member'").get();
+    if (exists) {
+      memberRows = db.prepare('SELECT ts_code, l1_code, in_date, out_date FROM sw_member').all() as any[];
+    }
+  } catch { memberRows = []; }
+  if (memberRows.length === 0) return out;
+
+  const active = memberRows.filter(m =>
+    (!m.in_date || m.in_date <= asOf) && (!m.out_date || m.out_date > asOf));
+  const l1ByStock = new Map<string, Set<string>>();
+  for (const m of active) {
+    let set = l1ByStock.get(m.ts_code);
+    if (!set) l1ByStock.set(m.ts_code, (set = new Set()));
+    set.add(m.l1_code);
+  }
+
+  const bySector = new Map<string, Map<string, EtfRef>>();
+  for (const sector of sw) bySector.set(sector.key, new Map());
+  for (const etfCode of [...etfCodes].sort()) {
+    let rows: Array<{ stock_code: string }> = [];
+    try {
+      rows = topConstituents(db, etfCode, asOf, topN);
+    } catch { rows = []; }
+    if (rows.length === 0) continue;
+    const hit = new Set<string>();
+    for (const r of rows) {
+      if (r.stock_code === etfCode) continue;
+      for (const l1 of l1ByStock.get(r.stock_code) ?? []) hit.add(l1);
+    }
+    if (hit.size === 0) continue;
+    for (const sector of sw) {
+      if (!hit.has(sectorLocalCode(sector.key))) continue;
+      bySector.get(sector.key)!.set(etfCode, {
+        etf_code: etfCode,
+        ...(etfNames[etfCode] ? { name: etfNames[etfCode] } : {}),
+        index_code: null,
+      });
+    }
+  }
+  for (const [key, m] of bySector) {
+    if (m.size) out.set(key, [...m.values()].sort((a, b) => a.etf_code.localeCompare(b.etf_code)));
+  }
+  return out;
 }
 
-/** Run the full hotspot research pipeline for one as-of day. */
+/** Run the full research pipeline for one as-of day. */
 export function runHotspotPipeline(
   db: DatabaseSync,
   asOf: string,
   opts: HotspotPipelineOptions = {},
 ): HotspotPipelineResult {
   const startedAt = Date.now();
-  const timings = { sectors: 0, pool: 0, scan: 0, technical: 0, write: 0, total: 0 };
+  const timings = { sectors: 0, rps: 0, technical: 0, write: 0, total: 0 };
   const config = opts.config;
-  const etfTopN = opts.pool?.etfTopN ?? 10;
 
   // 1. Sector identification (SW L1 + THS themes, ranked with state machine).
   const t0 = Date.now();
   const sectors = evaluateHotspotSectors(db, asOf, config);
   timings.sectors = (Date.now() - t0) / 1000;
 
-  // 2. ETF universe + PIT constituent lookup.
+  // 2. ETF universe + representative mapping (evidence only, never a seed).
   const etfCodes = opts.etfCodes ?? defaultHotspotEtfCodes();
   const etfNames = opts.etfNames ?? etfDisplayNames(db, etfCodes);
-  const constituents = opts.etfConstituents ?? storeBackedConstituents(db, asOf, etfTopN + 10);
+  const reps = representativeEtfsBySector(
+    db, asOf, sectors.sectors.map(s => ({ key: s.key, source: s.source })), etfCodes, etfNames, 20);
+  for (const s of sectors.sectors) {
+    const list = reps.get(s.key) ?? [];
+    if (list.length) s.representative_etfs = list;
+  }
 
-  // The prescreen rides on the SAME full-market scan the pool pays for: V2
-  // observes every stock once, then only the union of its family lists is
-  // loaded again for the detailed pass.
-  const technicalPrescreen = createTechnicalPrescreen();
-  const sharedScan = scanMarket(db, asOf, {
-    onStock: (code, bars, x, i, row) => technicalPrescreen.observe(code, bars, x, i, row),
+  // 3. One full-market pass feeds the per-family prescreen. RPS is a background
+  //    feature only — no family gates on it, so a low-RPS reversal still enters.
+  const prescreen = createTechnicalPrescreen();
+  scanMarket(db, asOf, {
+    onStock: (code, bars, x, i, row) => prescreen.observe(code, bars, x, i, row),
   });
-
-  // 3+4. Pool build with an injected lazy strategy scan: buildHotspotPool
-  // collects the seed codes, then hands them to exactly one scanPoolStrategies
-  // pass before assembling candidates — the market scan / RPS work is paid once.
-  const poolOpts: PoolOptions = {
-    ...opts.pool,
-    marketScan: sharedScan,
-    etfConstituents: constituents,
-    etfCodes,
-    etfNames,
-    signalScanProvider: (codes) => {
-      if (!codes.length) return null;
-      const t = Date.now();
-      const scanResult = scanPoolStrategies(db, codes, asOf);
-      timings.scan = (Date.now() - t) / 1000;
-      return scanResult;
-    },
-  };
   const t1 = Date.now();
-  const pool = buildHotspotPool(db, asOf, sectors, null, poolOpts);
-  timings.pool = (Date.now() - t1) / 1000;
+  const days = recentTradeDays(db, asOf, 260);
+  const rps = days.length > 1 ? computeRps(db, days[0], asOf) : null;
+  timings.rps = (Date.now() - t1) / 1000;
 
-  // 4b. Technical methodology V2 (goal-1102). Deliberately isolated: a V2
-  // failure yields an UNAVAILABLE view and the legacy snapshot still publishes.
-  const t3 = Date.now();
+  // 4. Technical methodology V2 (the only decision framework).
+  const t2 = Date.now();
   let technicalView;
   try {
     technicalView = analyzeTechnicalV2(db, {
       asOf,
-      prescreen: technicalPrescreen.finish(),
-      rps: pool.rps ?? null,
+      prescreen: prescreen.finish(),
+      rps,
       forcedCodes: forcedResearchCodes(db, asOf),
     });
   } catch (e) {
     technicalView = unavailableTechnicalView(asOf, e instanceof Error ? e.message : String(e));
   }
-  timings.technical = (Date.now() - t3) / 1000;
+  timings.technical = (Date.now() - t2) / 1000;
 
-  // Representative ETFs per sector (goal P5.1): an ETF represents a sector
-  // only when one of its PIT-resolved constituents stamped that sector in the
-  // pool — evidence-based, never inferred from name similarity or category
-  // declarations. Deterministic order (etf_code) so the snapshot hash stays
-  // reproducible.
-  const etfBySector = new Map<string, Map<string, { etf_code: string; name?: string; index_code?: string | null }>>();
-  for (const c of pool.candidates) {
-    if (c.instrument_type !== 'STOCK') continue;
-    for (const key of c.sectors) {
-      let m = etfBySector.get(key);
-      if (!m) etfBySector.set(key, (m = new Map()));
-      for (const e of c.etf_sources) {
-        if (!m.has(e.etf_code)) {
-          m.set(e.etf_code, {
-            etf_code: e.etf_code,
-            ...(etfNames[e.etf_code] ? { name: etfNames[e.etf_code] } : {}),
-            index_code: e.index_code,
-          });
-        }
-      }
-    }
-  }
-  for (const s of sectors.sectors) {
-    const m = etfBySector.get(s.key);
-    if (m) s.representative_etfs = [...m.values()].sort((a, b) => a.etf_code.localeCompare(b.etf_code));
-  }
-
-  // 5. Assemble + persist. Coverage merges sector, pool and ETF-weight layers;
-  // an absent weight store degrades coverage, never the candidate facts.
+  // 5. Assemble + persist.
   //
-  // Self-referential coverage fix (acceptance E9): the hotspot_snapshot /
-  // hotspot_candidate entries describe THIS run's own write, not the table
-  // state observed before it. Taken pre-write, the first write of a day hashes
-  // as 0 rows while every identical rerun hashes as N — content-hash
-  // reproducibility (data-contracts §4) would fail by construction. Both dry
-  // runs and real runs therefore report the write outcome they produce: 1
-  // snapshot row for (as_of, config_version) plus the candidate rows below.
+  // Self-referential coverage (acceptance E9): the hotspot_snapshot entry
+  // describes THIS run's own write, not the table state observed before it.
   const selfCoverage = new Map<string, CoverageSummary>([
     ['hotspot_snapshot', { dataset: 'hotspot_snapshot', rows: 1, quality: 'OK' }],
-    ['hotspot_candidate', { dataset: 'hotspot_candidate', rows: pool.candidates.length, quality: 'OK' }],
   ]);
   const applySelfCoverage = (list: CoverageSummary[]): CoverageSummary[] =>
     list.map(c => selfCoverage.get(c.dataset) ?? c);
   const sectorCoverage = applySelfCoverage(sectors.coverage);
   const coverage: CoverageSummary[] = applySelfCoverage([
     ...sectors.coverage,
-    ...pool.coverage,
     ...weightCoverage(db, etfCodes, asOf),
   ]);
   // Keep the nested sectors payload in lockstep with the top-level coverage so
   // both hash inputs agree (sectors.coverage is itself part of the hash body).
   sectors.coverage = sectorCoverage;
+
   // goal-1032: the fingerprint of the data this run actually read. Computed
-  // before the body so that it is part of `content_hash` (basis v2), and read
-  // as a publish gate so a NOT_READY day is never written.
-  // (Both DBs are read here; nothing is written.)
-  const state = dataState(db, asOf, {
-    entryIdentity: opts.entryHash ? { scheme: opts.entryScheme ?? 'entry-modules-v1', entry_hash: opts.entryHash } : null,
-  });
+  // before the body so that it is part of `content_hash`, and read as a publish
+  // gate so a NOT_READY day is never written.
+  const state = dataState(db, asOf);
   const body = {
     as_of: asOf,
+    framework: 'V2_ONLY' as const,
+    framework_version: technicalView.framework_version,
+    implementation_fingerprint: technicalView.implementation_fingerprint,
     config_version: HOTSPOT_CONFIG_VERSION,
-    strategy_set_version: HOTSPOT_STRATEGY_SET_VERSION,
     sectors,
-    candidates: pool.candidates,
-    counts: pool.counts,
-    // Independent entry view (goal-1030 WP3): the legacy top-10 stays exactly
-    // what priority produced; the entry top-10 may legitimately be empty.
-    entry_view: buildEntryView(pool.candidates, asOf),
-    technical_view_v2: technicalView,
+    technical_view: technicalView,
     coverage,
     data_state: state,
+    data_quality: state.readiness,
+    market_data_as_of: state.fingerprint.bars.daily > 0 ? asOf : null,
     research_only: true as const,
   };
   const snapshot: HotspotSnapshot = {
@@ -263,11 +259,11 @@ export function runHotspotPipeline(
     content_hash: snapshotContentHash(body),
     generated_at: new Date().toISOString(),
   };
-  const t2 = Date.now();
+  const t3 = Date.now();
   const saved = opts.persist === false || state.readiness === 'NOT_READY'
     ? null
     : saveHotspotSnapshot(db, snapshot);
-  timings.write = (Date.now() - t2) / 1000;
+  timings.write = (Date.now() - t3) / 1000;
   timings.total = (Date.now() - startedAt) / 1000;
   return {
     snapshot, saved, seconds: timings.total, timings,

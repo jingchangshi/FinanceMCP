@@ -260,20 +260,16 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       return true;
     }
     case 'hotspot-snapshot': {
-      // 生成当日热点行业快照 + 候选池 + 多策略信号，写入 hotspot_* 表。
+      // 生成当日热点行业 + V2 五族技术视图 + 股票唯一研究状态，写入 hotspot_* 表。
       // 只写新建的热点研究表；不动 watchlist、研究日志或正式研究快照。
+      // V2 is the only production path: the snapshot carries the framework
+      // version and the compiled-module fingerprint, so "which code wrote this
+      // view" is a read fact without a separate entry-identity hash.
       const { runHotspotPipeline } = await import('./hotspotPipeline.js');
-      // goal-1032: the snapshot records WHICH entry implementation produced its
-      // entry_view, so "which code wrote this ranking" is a read fact.
-      const { entryImplementationHash, ENTRY_IMPLEMENTATION_SCHEME } = await import('./entryIdentity.js');
       const latestAsOf = (d: DatabaseSync): string =>
         lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
       const asOf = h.arg('date') ? h.ymd(h.arg('date'), '--date') : latestAsOf(db);
-      h.print(runHotspotPipeline(db, asOf, {
-        persist: !h.flag('dry-run'),
-        entryHash: entryImplementationHash(),
-        entryScheme: ENTRY_IMPLEMENTATION_SCHEME,
-      }));
+      h.print(runHotspotPipeline(db, asOf, { persist: !h.flag('dry-run') }));
       return true;
     }
     case 'hotspot-versions': {
@@ -283,19 +279,6 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
         lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
       const asOf = h.arg('date') ? h.ymd(h.arg('date'), '--date') : latestAsOf(db);
       h.print({ command: 'hotspot-versions', as_of: asOf, versions: listHotspotVersions(db, asOf) });
-      return true;
-    }
-    case 'hotspot-cc': {
-      // 冠军-挑战者走查比较：只读市场库，输出研究报告；不授权任何下单或生产变更。
-      const { runChampionChallenger } = await import('./hotspotExperiments.js');
-      const latestAsOf = (d: DatabaseSync): string =>
-        lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
-      h.print(runChampionChallenger(db, {
-        start: h.ymd(h.arg('start'), '--start'),
-        end: h.arg('end') ? h.ymd(h.arg('end'), '--end') : latestAsOf(db),
-        observation_end: h.arg('observation-end') ? h.ymd(h.arg('observation-end'), '--observation-end') : latestAsOf(db),
-        step_days: h.arg('step') ? Number(h.arg('step')) : 1,
-      }));
       return true;
     }
     default:
