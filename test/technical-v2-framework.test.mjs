@@ -44,26 +44,40 @@ test('a stale bar is labeled but does not silently borrow the as-of date', () =>
   assert.ok(verdict.blockers.includes('NO_BAR_ON_AS_OF'));
 });
 
-test('technical_view_v2 joins the content identity only when present', () => {
+test('content identity covers the V2 view, the fingerprint and the data state, and excludes generated_at', () => {
   const body = {
     as_of: '20261102',
+    framework: 'V2_ONLY',
+    framework_version: fw.TECHNICAL_FRAMEWORK_VERSION,
+    implementation_fingerprint: 'sha256:impl',
     config_version: 'cfg',
-    strategy_set_version: 'strat',
-    sectors: [],
-    candidates: [],
-    counts: {},
+    sectors: { selected: [], sectors: [], coverage: [] },
+    technical_view: { status: 'OK', as_of: '20261102', families: [], research_universe: { counts: {}, stocks: [] } },
     coverage: [],
-    entry_view: null,
-    data_state: {
-      version: 'data-1', as_of: '20261102', fingerprint: 'fp',
-      entry_identity: null, checked_at: '2026-11-02T13:00:00Z',
-    },
+    data_state: { version: 'data-1', as_of: '20261102', fingerprint: 'fp', readiness: 'READY' },
   };
-  const without = snapshotContentHash(body, { basis: 'v2' });
-  const explicitUndefined = snapshotContentHash({ ...body, technical_view_v2: undefined }, { basis: 'v2' });
-  const withV2 = snapshotContentHash({ ...body, technical_view_v2: { status: 'OK', families: [] } }, { basis: 'v2' });
-  assert.equal(explicitUndefined, without, 'an absent/undefined V2 field must not change a legacy hash');
-  assert.notEqual(withV2, without, 'a real V2 payload must be part of the identity');
+  const base = snapshotContentHash(body);
+  assert.match(base, /^sha256:[0-9a-f]{64}$/);
+  // `generated_at` is not part of the payload the hash reads; adding it changes nothing.
+  assert.equal(snapshotContentHash({ ...body, generated_at: '2026-11-02T13:00:00Z' }), base);
+
+  const changedView = snapshotContentHash({ ...body, technical_view: { ...body.technical_view, families: [{ family: 'REVERSAL' }] } });
+  assert.notEqual(changedView, base, 'the technical view is part of the identity');
+
+  const changedImpl = snapshotContentHash({ ...body, implementation_fingerprint: 'sha256:other' });
+  assert.notEqual(changedImpl, base, 'the compiled-module fingerprint is part of the identity');
+
+  const changedData = snapshotContentHash({ ...body, data_state: { ...body.data_state, fingerprint: 'fp2' } });
+  assert.notEqual(changedData, base, 'the data fingerprint is part of the identity');
+
+  // Key order must never matter: the hash is stable JSON, not source order.
+  const reordered = snapshotContentHash({
+    data_state: body.data_state, coverage: body.coverage, technical_view: body.technical_view,
+    sectors: body.sectors, config_version: body.config_version,
+    implementation_fingerprint: body.implementation_fingerprint,
+    framework_version: body.framework_version, framework: body.framework, as_of: body.as_of,
+  });
+  assert.equal(reordered, base);
 });
 
 test('family list is fixed and ordered; no cross-family score exists', () => {

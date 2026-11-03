@@ -1,16 +1,26 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { ensureHotspotSchema, hotspotTableExists } from './hotspotTables.js';
-import type { HotspotSnapshot, HotspotCandidate } from './hotspotTypes.js';
+import type { HotspotSnapshot } from './hotspotTypes.js';
 
 /**
- * Daily hotspot snapshot persistence (goal-1028 §P2.3 / architecture.md §5.3).
- * Snapshots are reproducible research records: same inputs ⇒ same
- * `content_hash`. Rows are written per (as_of, config_version); a regeneration
- * of the SAME day with the SAME config replaces the row (crash-retry
- * idempotence), it never mutates a different day's snapshot. This table is
- * part of the NEW research surface — existing watchlist history and formal
- * research logs are never touched here.
+ * Daily research snapshot persistence (goal-1028 §P2.3, rebuilt for V2).
+ *
+ * A snapshot is the whole day's research identity:
+ *
+ *     as_of + version_no + content_hash + implementation_fingerprint
+ *
+ * Rules (unchanged, and what makes the identity checkable):
+ *   - the same inputs under the same compiled V2 modules produce the same
+ *     `content_hash`; `generated_at` and `checked_at` are excluded,
+ *   - a regeneration of the same day with the same content is UNCHANGED and
+ *     writes nothing,
+ *   - different content appends a NEW version to the append-only ledger and
+ *     supersedes the previous pointer; history is never rewritten.
+ *
+ * What this module no longer does: it does not write per-candidate rows. The
+ * per-stock record lives once inside `technical_view.research_universe`; the
+ * old `hotspot_candidate` mirror is left as read-only archive.
  */
 
 /** Stable JSON: object keys sorted recursively so hashes do not drift. */
@@ -27,67 +37,54 @@ export function stableJson(value: unknown): string {
   return JSON.stringify(walk(value));
 }
 
+export const SNAPSHOT_HASH_BASIS = 'v3' as const;
+
 /**
- * Content hash over the REPRODUCIBLE payload only: sectors + candidates +
- * counts + coverage + versions. `generated_at` is excluded deliberately —
- * two runs of the same day over the same data must hash identically.
+ * Content hash over the reproducible payload only.
  *
- * Two bases coexist (goal-1032):
- *   - `v1` — the original six-key formula. Kept byte-identical so every hash
- *            written before 2026-10-31 still verifies; it silently ignored
- *            `entry_view` and knew nothing about the input data.
- *   - `v2` — default whenever the body carries `data_state`. Adds the entry
- *            view and the data fingerprint, so a changed data state can no
- *            longer hide behind an unchanged hash.
- * `checked_at` inside `data_state` is excluded from the hashed subset (see
- * hashDataState): the fingerprint describes the data, not when we looked.
+ * Basis v3 (this rebuild) hashes: the as-of day, the framework identity
+ * (`V2_ONLY` + framework version + compiled-module fingerprint), the config
+ * version, the sector evaluation, the technical view (which contains the
+ * per-stock research states), the coverage and the hashed data fingerprint.
+ * `generated_at` / `checked_at` are excluded: two runs over the same data must
+ * agree, and a regeneration that only changed wall-clock time is not a new
+ * version.
  */
 export function snapshotContentHash(
   snapshot: Omit<HotspotSnapshot, 'content_hash' | 'generated_at'>,
-  opts: { basis?: 'v1' | 'v2' } = {},
 ): string {
-  const basis: 'v1' | 'v2' = opts.basis ?? (snapshot.data_state ? 'v2' : 'v1');
-  const body: Record<string, unknown> = {
+  const ds = snapshot.data_state;
+  const body = {
+    basis: SNAPSHOT_HASH_BASIS,
     as_of: snapshot.as_of,
+    framework: snapshot.framework,
+    framework_version: snapshot.framework_version,
+    implementation_fingerprint: snapshot.implementation_fingerprint,
     config_version: snapshot.config_version,
-    strategy_set_version: snapshot.strategy_set_version,
     sectors: snapshot.sectors,
-    candidates: snapshot.candidates,
-    counts: snapshot.counts,
+    technical_view: snapshot.technical_view,
     coverage: snapshot.coverage,
+    data_state: ds ? { version: ds.version, as_of: ds.as_of, fingerprint: ds.fingerprint } : null,
   };
-  if (basis === 'v2') {
-    body.entry_view = snapshot.entry_view ?? null;
-    // goal-1102: V2 has its own content identity. Add the key ONLY when the
-    // body carries it, so every pre-V2 body re-hashes to exactly the value it
-    // was published under (the legacy v1/v2 formulas are untouched).
-    if (snapshot.technical_view_v2 !== undefined) body.technical_view_v2 = snapshot.technical_view_v2;
-    const ds = snapshot.data_state;
-    body.data_state = ds
-      ? { version: ds.version, as_of: ds.as_of, fingerprint: ds.fingerprint, entry_identity: ds.entry_identity }
-      : null;
-  }
   return `sha256:${createHash('sha256').update(stableJson(body)).digest('hex')}`;
 }
 
 export interface SaveResult {
   content_hash: string;
-  candidates_written: number;
   replaced: boolean;
   /** Ledger position of the version this save produced (or matched). */
   version_no: number;
   state: 'INSERTED' | 'UNCHANGED' | 'PUBLISHED' | 'CORRECTION';
   superseded_version: number | null;
-  hash_basis: 'v1' | 'v2';
+  hash_basis: string;
 }
 
 export interface SaveOptions {
-  basis?: 'v1' | 'v2';
   /** Explicit correction of a previously published version number. */
   correctionOf?: number;
 }
 
-interface VersionRow { version_no: number; content_hash: string; hash_basis: 'v1' | 'v2' }
+interface VersionRow { version_no: number; content_hash: string; hash_basis: string }
 
 /**
  * Persist a snapshot and append it to the version ledger.
@@ -96,21 +93,13 @@ interface VersionRow { version_no: number; content_hash: string; hash_basis: 'v1
  * same readers). Every distinct content is ALSO appended to
  * `hotspot_snapshot_version`, which is append-only and trigger-protected — a
  * regeneration can no longer destroy the previous version (goal-1031 D1).
- *
- * Rules (spec §2.2):
- *   1. no ledger row yet + no pointer      → version 1, INSERTED
- *   2. same hash AND same basis as latest  → UNCHANGED, zero writes
- *   3. different content                   → append next version; the previous
- *                                            row becomes SUPERSEDED
  */
 export function saveHotspotSnapshot(db: DatabaseSync, snapshot: HotspotSnapshot, opts: SaveOptions = {}): SaveResult {
   ensureHotspotSchema(db);
-  const hash_basis: 'v1' | 'v2' = opts.basis ?? (snapshot.data_state ? 'v2' : 'v1');
+  const hash_basis = SNAPSHOT_HASH_BASIS;
   // The hash is a function of the content, never of what the caller passed in:
-  // recomputing here is what makes "same inputs ⇒ same hash" true by
-  // construction, and what stops a v2 body from being stored under a v1 hash.
-  // `content_hash` already on the object is overwritten on purpose.
-  const content_hash = snapshotContentHash(snapshot, { basis: hash_basis });
+  // recomputing here is what makes "same inputs ⇒ same hash" true by construction.
+  const content_hash = snapshotContentHash(snapshot);
   snapshot.content_hash = content_hash;
 
   const pointer = db.prepare('SELECT content_hash, version_no FROM hotspot_snapshot WHERE as_of = ? AND config_version = ?')
@@ -119,26 +108,21 @@ export function saveHotspotSnapshot(db: DatabaseSync, snapshot: HotspotSnapshot,
     WHERE as_of = ? AND config_version = ? ORDER BY version_no DESC LIMIT 1`)
     .get(snapshot.as_of, snapshot.config_version) as VersionRow | undefined;
 
-  if (!last && pointer && pointer.content_hash === content_hash && hash_basis === 'v1') {
-    // Pre-ledger row that still matches byte for byte: nothing to record.
-    return {
-      content_hash, candidates_written: snapshot.candidates.length, replaced: true,
-      version_no: pointer.version_no ?? 0, state: 'UNCHANGED', superseded_version: null, hash_basis,
-    };
-  }
   if (last && last.content_hash === content_hash && last.hash_basis === hash_basis) {
     return {
-      content_hash, candidates_written: snapshot.candidates.length, replaced: true,
+      content_hash, replaced: true,
       version_no: last.version_no, state: 'UNCHANGED', superseded_version: null, hash_basis,
+    };
+  }
+  if (!last && pointer && pointer.content_hash === content_hash) {
+    return {
+      content_hash, replaced: true,
+      version_no: pointer.version_no ?? 0, state: 'UNCHANGED', superseded_version: null, hash_basis,
     };
   }
 
   const version_no = (last?.version_no ?? 0) + 1;
-  const versioned: HotspotSnapshot = {
-    ...snapshot,
-    version_no,
-    state: 'PUBLISHED',
-  };
+  const versioned: HotspotSnapshot = { ...snapshot, version_no, state: 'PUBLISHED' };
   const existed = !!pointer;
   db.exec('BEGIN');
   try {
@@ -149,46 +133,32 @@ export function saveHotspotSnapshot(db: DatabaseSync, snapshot: HotspotSnapshot,
         WHERE as_of = ? AND config_version = ? AND version_no = ?`)
         .run(version_no, snapshot.as_of, snapshot.config_version, last.version_no);
     }
+    // `strategy_set_version` is a legacy column name kept for schema
+    // compatibility; it now carries the technical framework version that
+    // actually produced the view.
     db.prepare(`INSERT INTO hotspot_snapshot_version
       (as_of, config_version, version_no, content_hash, hash_basis, strategy_set_version, payload, coverage,
        generated_at, recorded_at, state, superseded_by, correction_of, readiness, data_state)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`)
       .run(snapshot.as_of, snapshot.config_version, version_no, content_hash, hash_basis,
-        snapshot.strategy_set_version, stableJson(versioned), stableJson(snapshot.coverage),
+        snapshot.framework_version, stableJson(versioned), stableJson(snapshot.coverage),
         snapshot.generated_at, new Date().toISOString(),
         opts.correctionOf ? 'CORRECTION' : 'PUBLISHED', opts.correctionOf ?? null,
-        snapshot.data_state?.readiness ?? null,
-        snapshot.data_state ? stableJson(snapshot.data_state) : null);
+        snapshot.data_state.readiness,
+        stableJson(snapshot.data_state));
     db.prepare(`INSERT OR REPLACE INTO hotspot_snapshot
       (as_of, config_version, strategy_set_version, payload, content_hash, generated_at, coverage, version_no, state)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PUBLISHED')`)
-      .run(snapshot.as_of, snapshot.config_version, snapshot.strategy_set_version,
+      .run(snapshot.as_of, snapshot.config_version, snapshot.framework_version,
         stableJson(versioned), content_hash, snapshot.generated_at,
         stableJson(snapshot.coverage), version_no);
-    // Candidates: replace this day's rows for THIS config only. Deleting by
-    // as_of alone would wipe a second config_version's mirror (goal-1031 D2).
-    db.prepare('DELETE FROM hotspot_candidate WHERE as_of = ? AND config_version = ?')
-      .run(snapshot.as_of, snapshot.config_version);
-    const ins = db.prepare(`INSERT INTO hotspot_candidate
-      (as_of, ts_code, name, instrument_type, primary_sector, sectors, etf_sources, multi_etf,
-       leaderships, signals, risk_events, trade_permission, trade_permission_reason, pool,
-       inclusion_reason, exclusion_reason, priority, priority_reason, data_quality, config_version)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-    for (const c of snapshot.candidates) {
-      ins.run(c.as_of, c.ts_code, c.name, c.instrument_type, c.primary_sector,
-        stableJson(c.sectors), stableJson(c.etf_sources), c.multi_etf ? 1 : 0,
-        stableJson(c.leaderships), stableJson(c.signals), stableJson(c.risk_events ?? []),
-        c.trade_permission, c.trade_permission_reason, c.pool,
-        c.inclusion_reason, c.exclusion_reason ?? null, c.priority, c.priority_reason,
-        c.data_quality, snapshot.config_version);
-    }
     db.exec('COMMIT');
   } catch (e) {
     db.exec('ROLLBACK');
     throw e;
   }
   return {
-    content_hash, candidates_written: snapshot.candidates.length, replaced: existed,
+    content_hash, replaced: existed,
     version_no,
     state: opts.correctionOf ? 'CORRECTION' : (existed ? 'PUBLISHED' : 'INSERTED'),
     superseded_version: last?.version_no ?? null, hash_basis,
@@ -223,6 +193,11 @@ export function listHotspotVersions(db: DatabaseSync, asOf: string): Array<{
     FROM hotspot_snapshot_version WHERE as_of = ? ORDER BY config_version, version_no DESC`).all(asOf) as any[];
 }
 
+/**
+ * The current pointer for a day. A pre-V2 row is still returned as parsed JSON
+ * — callers MUST check `framework === 'V2_ONLY'` and report an older row as
+ * archive rather than pretending it is a current research view.
+ */
 export function loadHotspotSnapshot(db: DatabaseSync, asOf: string, configVersion?: string): HotspotSnapshot | null {
   if (!hotspotTableExists(db, 'hotspot_snapshot')) return null;
   // The ledger columns arrive through ensureHotspotSchema's guarded ALTER. A
@@ -244,6 +219,16 @@ export function loadHotspotSnapshot(db: DatabaseSync, asOf: string, configVersio
 }
 
 /**
+ * True only for the V2 research shape this release writes and reads. The input
+ * is typed `unknown` on purpose: archived rows parse into this module without
+ * the V2 keys, so this is a runtime check, not a compile-time narrowing.
+ */
+export function isCurrentSnapshot(snapshot: unknown): boolean {
+  const s = snapshot as Partial<HotspotSnapshot> | null | undefined;
+  return !!s && s.framework === 'V2_ONLY' && !!s.technical_view;
+}
+
+/**
  * The payload never contains its own ledger position — the position lives in
  * the row that stores it. Readers get it stamped on, so "which version is this"
  * is answered by the table, not by whatever the writer happened to serialize.
@@ -254,12 +239,4 @@ function stampPosition(snapshot: HotspotSnapshot, versionNo: number | null, stat
   if (versionNo !== null && versionNo !== undefined) snapshot.version_no = versionNo;
   if (state) snapshot.state = state;
   return snapshot;
-}
-
-/** Candidate rows for one as-of day (flattened from the relational mirror). */
-export function loadHotspotCandidates(db: DatabaseSync, asOf: string, pool?: 'FOCUS' | 'RAW'): HotspotCandidate[] {
-  if (!hotspotTableExists(db, 'hotspot_candidate')) return [];
-  const snap = loadHotspotSnapshot(db, asOf);
-  if (!snap) return [];
-  return pool ? snap.candidates.filter(c => c.pool === pool) : snap.candidates;
 }

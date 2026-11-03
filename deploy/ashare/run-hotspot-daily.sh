@@ -83,15 +83,21 @@ SYNC_ERR="$LOG_DIR/hotspot-sync-$STAMP.log"
 SNAP_OUT="$LOG_DIR/hotspot-snapshot-$STAMP.json"
 SNAP_ERR="$LOG_DIR/hotspot-snapshot-$STAMP.log"
 
-if ! docker exec "$CONTAINER" node build/ashare/cli.js hotspot-sync >"$SYNC_OUT" 2>"$SYNC_ERR"; then
+if docker exec "$CONTAINER" node build/ashare/cli.js hotspot-sync >"$SYNC_OUT" 2>"$SYNC_ERR"; then
+  echo "finance-ashare hotspot-sync ok: $SYNC_OUT"
+else
+  # `$?` inside the `then` branch of `if ! cmd` is the status of `!`, which is
+  # always 0 when the command failed. Capture it in the `else` branch instead:
+  # the caller must see the real failure code.
   code=$?
   echo "finance-ashare hotspot-sync FAILED (exit $code), snapshot NOT regenerated; see $SYNC_ERR" >&2
   tail -20 "$SYNC_ERR" >&2
   exit "$code"
 fi
-echo "finance-ashare hotspot-sync ok: $SYNC_OUT"
 
-if ! docker exec "$CONTAINER" node build/ashare/cli.js hotspot-snapshot >"$SNAP_OUT" 2>"$SNAP_ERR"; then
+if docker exec "$CONTAINER" node build/ashare/cli.js hotspot-snapshot >"$SNAP_OUT" 2>"$SNAP_ERR"; then
+  :
+else
   code=$?
   echo "finance-ashare hotspot-snapshot FAILED (exit $code); see $SNAP_ERR" >&2
   tail -20 "$SNAP_ERR" >&2
@@ -101,7 +107,7 @@ fi
 # and the research bundle must agree on.
 jq -r '"finance-ashare hotspot ok: as_of=\(.snapshot.as_of) readiness=\(.readiness.status // "?") "
   + "hash=\(.saved.content_hash // .snapshot.content_hash) version=\(.saved.version_no // "-") "
-  + "state=\(.saved.state // "DRY_RUN") counts=\(.snapshot.counts // {} | tojson)"' "$SNAP_OUT" 2>/dev/null \
+  + "state=\(.saved.state // "DRY_RUN") states=\(.snapshot.technical_view.research_universe.counts // {} | tojson)"' "$SNAP_OUT" 2>/dev/null \
   || echo "finance-ashare hotspot ok: $SNAP_OUT"
 
 # goal-1032 publish gate. NOT_READY means the pipeline ran, computed, and

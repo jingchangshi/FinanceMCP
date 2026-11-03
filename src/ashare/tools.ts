@@ -12,8 +12,7 @@ import { financialHistory, marketData, resolveCode, stockBasic, stockHistory } f
 import { factorSnapshot } from './engine.js';
 import { etfQuotes, etfStatus } from './etf.js';
 import { resolveResearchDate } from './researchDate.js';
-import { loadHotspotSnapshot } from './hotspotSnapshots.js';
-import { classifyCandidate } from './entryRanking.js';
+import { isCurrentSnapshot, loadHotspotSnapshot } from './hotspotSnapshots.js';
 
 export { ashareToolDefinitions, ASHARE_TOOL_NAMES } from './definitions.js';
 
@@ -374,52 +373,50 @@ function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
   const { date, note } = resolveDate(d, args.date);
   const snap = loadHotspotSnapshot(d, date);
   if (!snap) {
-    return text(notReadyText(date, ['热点候选快照尚未生成(运行 finance-ashare hotspot-snapshot)'], note ? `\n> ${note}` : ''));
+    return text(notReadyText(date, ['研究快照尚未生成(运行 finance-ashare hotspot-snapshot)'], note ? `\n> ${note}` : ''));
   }
-  let cands = snap.candidates;
-  if (args.pool) cands = cands.filter(c => c.pool === args.pool);
-  if (args.ts_code) cands = cands.filter(c => c.ts_code === String(args.ts_code));
-  // goal-1030 WP5.1: optional entry filters. Additive and compatible — the
-  // legacy `pool` filter and every existing field keep their meaning, and FOCUS
-  // is never redefined to mean "entered".
-  const eligibleFilter = args.entry_eligible === undefined ? null
-    : (args.entry_eligible === true || String(args.entry_eligible).toLowerCase() === 'true');
-  if (eligibleFilter !== null) {
-    cands = cands.filter(c => (classifyCandidate(c).entry_eligibility === true) === eligibleFilter);
+  if (!isCurrentSnapshot(snap)) {
+    // A V1-era row stays readable in the archive, but it is not a current
+    // research view and must never be dressed up as one.
+    return text(notReadyText(date, [
+      `该日快照为 ${snap.framework_version ?? 'pre-V2'} 归档，不是当前 V2 研究视图；请在该交易日重新生成快照`,
+    ], note ? `\n> ${note}` : ''));
   }
-  if (args.candidate_class) {
-    cands = cands.filter(c => classifyCandidate(c).candidate_class === String(args.candidate_class));
-  }
+  const view = snap.technical_view;
+  const universe = view.research_universe;
+  let stocks = universe.stocks;
+  if (args.ts_code) stocks = stocks.filter(s => s.ts_code === String(args.ts_code));
+  if (args.research_state) stocks = stocks.filter(s => s.research_state === String(args.research_state));
+  const highlightSet = new Set(universe.daily_highlights);
+  const highlights = universe.daily_highlights
+    .map(code => universe.stocks.find(s => s.ts_code === code))
+    .filter((s): s is NonNullable<typeof s> => !!s);
+
   return json({
     as_of: snap.as_of,
-    strategy_set_version: snap.strategy_set_version,
-    content_hash: snap.content_hash,
-    // goal-1032: ledger position + the data the ranking was computed from.
-    // `data_state.readiness` is DEGRADED on a real but thin day, NOT_READY only
-    // on days a snapshot is not published at all.
-    version_no: snap.version_no ?? null,
-    data_state: snap.data_state ?? null,
-    research_only: snap.research_only,
-    counts: snap.counts,
-    pool_filter: args.pool ?? null,
-    // Echoed so the caller can tell an empty result from an unfiltered one.
-    entry_filter: args.entry_eligible === undefined && args.candidate_class === undefined ? null : {
-      entry_eligible: eligibleFilter,
-      candidate_class: args.candidate_class ?? null,
+    framework: snap.framework,
+    framework_version: snap.framework_version,
+    implementation_fingerprint: snap.implementation_fingerprint,
+    snapshot: {
+      version_no: snap.version_no ?? null,
+      content_hash: snap.content_hash,
+      data_quality: snap.data_quality,
+      market_data_as_of: snap.market_data_as_of,
+      generated_at: snap.generated_at,
     },
-    // Same-day entry view (ranked eligible list, preparing, rejected, class
-    // counts). Server-computed only: ChatGPT must not recompute stages or scores.
-    entry_view: (snap as any).entry_view ?? null,
-    // goal-1102: independent five-family technical view. Null on snapshots
-    // written before V2; never recomputed by the tool (server-side only).
-    technical_view_v2: (snap as any).technical_view_v2 ?? null,
-    candidates: cands.map(c => ({
-      ...c,
-      // Single representative assessment (the eligible one when it exists), so a
-      // reader never has to choose among families to get the contract block.
-      entry_assessment: (c.entry_assessments ?? []).find(a => a.entry_eligibility)
-        ?? (c.entry_assessments ?? [])[0] ?? null,
-    })),
+    // The data the view was computed from. `readiness` is DEGRADED on a real but
+    // thin day; NOT_READY days are never persisted at all.
+    data_state: snap.data_state,
+    market_regime: view.market_regime,
+    methodology_note: view.methodology_note,
+    evidence_level: view.evidence_level,
+    research_only: snap.research_only,
+    research_state_counts: universe.counts,
+    daily_highlights: highlights,
+    filter: args.ts_code || args.research_state
+      ? { ts_code: args.ts_code ?? null, research_state: args.research_state ?? null }
+      : null,
+    stocks,
     note: note ?? undefined,
   });
 }

@@ -31,13 +31,17 @@ export const TECHNICAL_FRAMEWORK_VERSION = 'technical-v2.0.0';
 export const TECHNICAL_IMPLEMENTATION_SCHEME = 'technical-modules-v1';
 /**
  * Compiled modules whose bytes decide what a V2 view contains. `indicators`
- * and `patterns` are included because both families reuse their arithmetic.
+ * and `patterns` are included because both families reuse their arithmetic;
+ * `technicalResearchStateV2` because it decides the single research state and
+ * the highlights; `analysis`/`bars`/`ingest`/`market` because they feed the
+ * prescreen, the bars and the regime; `rps` because RPS is part of the context.
  * The list deliberately excludes `hotspotPool`, `entry*` and `strategies`: V2
  * must be independent of the V1 entry/ranking implementation.
  */
 export const TECHNICAL_MODULES = [
   'technicalFrameworkV2', 'technicalPatternsV2', 'technicalCandidatesV2',
-  'indicators', 'patterns',
+  'technicalResearchStateV2', 'indicators', 'patterns',
+  'analysis', 'bars', 'ingest', 'market', 'rps',
 ] as const;
 
 export function technicalImplementationFingerprint(dirs: { ashare?: string } = {}): string {
@@ -320,11 +324,27 @@ export interface PatternInput {
   barsBehindAsOf: number;
 }
 
-export interface PatternObservation {  strategy_id: string;
+export interface PatternObservation {
+  strategy_id: string;
   family: TechnicalFamily;
   stage: TechnicalStage;
   /** Family-specific stage label, e.g. PLATFORM_FORMING / BREAKOUT_CONFIRMED. */
   stage_detail: string;
+  /**
+   * Price-event date: the bar the pattern is ABOUT (the second divergence low,
+   * the pullback touch, the breakout bar). May predate the day the event became
+   * observable, and must never be used as an entry date.
+   */
+  pattern_event_date: string | null;
+  /**
+   * First bar at which the pattern is provable from data ≤ that bar. For a
+   * right-side swing-low confirmation this is strictly after the event low.
+   */
+  first_observed_date: string;
+  /** Set when the observation is FAILED (the first invalidation bar). */
+  invalidated_at: string | null;
+  /** Set when the observation is EXPIRED (the bar at which the window elapsed). */
+  expires_at: string | null;
   formed_on: string | null;
   confirmed_on: string | null;
   last_evaluated_on: string;
@@ -334,6 +354,8 @@ export interface PatternObservation {  strategy_id: string;
   invalidation: { on: string; reason: string } | null;
   key_levels: Record<string, number | null>;
   evidence: Record<string, number | string | boolean | null>;
+  /** Facts that argue AGAINST the reading; never deleted when a stage passes. */
+  counter_evidence: string[];
 }
 
 export interface TechnicalCandidateV2 extends Omit<PatternObservation, 'family'> {
@@ -360,6 +382,96 @@ export interface TechnicalFamilyView {
   counts: Record<TechnicalStage, number> & { total: number; research_ready: number };
 }
 
+// ---------------------------------------------------------------- research state
+
+/**
+ * One research state per stock per as-of day. This is a RESEARCH ranking, not
+ * a trade instruction and not a position size. The six values are decided by
+ * the deterministic order in `technicalResearchStateV2.ts`:
+ *
+ *   1. BLOCKED       — the day's trading/data facts forbid a same-day reading
+ *                      (suspended, no bar, one-price limit-down, stale bar).
+ *   2. INVALIDATED   — every signal episode is dead (failed or window elapsed).
+ *   3. DETERIORATING — live signals and dead signals of other families coexist;
+ *                      the conflict is shown, never averaged away.
+ *   4. EXTENDED      — the setup holds but price has run too fast (RAPID_RUNUP).
+ *   5. FOCUS         — a live, research-ready confirmation with normal trading.
+ *   6. WATCH         — forming only, or a live setup the account cannot execute
+ *                      at normal prices (one-price limit-up / non-mainboard).
+ */
+export type ResearchState = 'FOCUS' | 'WATCH' | 'EXTENDED' | 'DETERIORATING' | 'BLOCKED' | 'INVALIDATED';
+
+/** Display order: actionable research first, dead/blocked last. */
+export const RESEARCH_STATE_ORDER: Record<ResearchState, number> = {
+  FOCUS: 0, WATCH: 1, EXTENDED: 2, DETERIORATING: 3, INVALIDATED: 4, BLOCKED: 5,
+};
+
+export const RESEARCH_STATE_LABELS: Record<ResearchState, string> = {
+  FOCUS: '重点关注',
+  WATCH: '观察',
+  EXTENDED: '已延伸',
+  DETERIORATING: '恶化中',
+  BLOCKED: '交易受限',
+  INVALIDATED: '已失效',
+};
+
+/** One signal as the stock-level view exposes it — facts and dates only. */
+export interface ResearchSignalView {
+  strategy_id: string;
+  family: TechnicalFamily;
+  family_label: string;
+  stage: TechnicalStage;
+  stage_detail: string;
+  pattern_event_date: string | null;
+  first_observed_date: string;
+  confirmed_on: string | null;
+  invalidated_at: string | null;
+  expires_at: string | null;
+  confirmation_conditions: string[];
+  invalidation_conditions: string[];
+  key_levels: Record<string, number | null>;
+  evidence: Record<string, number | string | boolean | null>;
+  counter_evidence: string[];
+}
+
+export interface ResearchStockView {
+  ts_code: string;
+  name: string;
+  as_of_trade_date: string;
+  /** Last bar used; may precede the as-of day (see `bars_behind_as_of`). */
+  trade_date: string;
+  bars_behind_as_of: number;
+  research_state: ResearchState;
+  research_state_label: string;
+  primary_family: TechnicalFamily | null;
+  primary_pattern: string | null;
+  signals: ResearchSignalView[];
+  decisive_reasons: string[];
+  conflicting_evidence: string[];
+  counter_evidence: string[];
+  watch_conditions: string[];
+  trading_constraints: string[];
+  trading_status: TradingStatus;
+  price_volume_tags: PriceVolumeTag[];
+  /** SW2021 L1 membership for readability/overlap only — never a gate. */
+  sectors: string[];
+  market_regime: Regime | 'UNKNOWN';
+  rps120: number | null;
+  research_ready: boolean;
+  evidence_level: EvidenceLevel;
+  trade_permission: 'EXECUTABLE' | 'RESEARCH_ONLY';
+  trade_permission_reason: string;
+}
+
+export interface ResearchUniverseV2 {
+  as_of: string;
+  counts: Record<ResearchState, number> & { total: number };
+  /** Every stock with at least one signal, in display order. */
+  stocks: ResearchStockView[];
+  /** 2–5 actionable research names; a highlight is not a buy recommendation. */
+  daily_highlights: string[];
+}
+
 export interface TechnicalViewV2 {
   status: 'OK' | 'UNAVAILABLE';
   reason: string | null;
@@ -371,6 +483,8 @@ export interface TechnicalViewV2 {
   /** One record per stock, however many families list it. */
   contexts: PriceVolumeContext[];
   families: TechnicalFamilyView[];
+  /** One record per stock: the single aggregation every reader must use. */
+  research_universe: ResearchUniverseV2;
   coverage: {
     universe: number;
     preselected: number;

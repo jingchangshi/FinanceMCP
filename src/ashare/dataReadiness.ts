@@ -11,8 +11,9 @@ import { checkQuality, previousTradeDay, type QualityStatus } from './ingest.js'
  *   - `checkDataReadiness` — may we publish a snapshot for this day at all?
  *   - `dataState`           — what data did the published snapshot actually
  *                             read? The answer is hashed into `content_hash`
- *                             (basis v2), so "the data changed" and "the
- *                             formula changed" can never be confused again.
+ *                             (basis v3, see hotspotSnapshots.ts), so "the data
+ *                             changed" and "the module changed" can never be
+ *                             confused again.
  *
  * Read-only: every statement here is a SELECT. The quality status is
  * RECOMPUTED from the stored bars, never read back from `quality_check` — that
@@ -69,8 +70,6 @@ export interface DataState {
   };
   fingerprint: DataFingerprint;
   fingerprint_hash: string;
-  /** Which entry implementation produced the entry view; null when the caller did not supply it. */
-  entry_identity: { scheme: string; entry_hash: string } | null;
   /** Wall-clock observation time. EXCLUDED from every hash — two runs over the same data must agree. */
   checked_at: string;
 }
@@ -138,6 +137,28 @@ export interface ReadinessResult {
 }
 
 /**
+ * Calendar gate for one as-of date.
+ *
+ * `known` is false when the calendar has no row (or no calendar at all); those
+ * dates keep the previous bar-based behaviour. A known closed day is refused
+ * before any bar-quality reasoning: a weekend has no same-day market, and the
+ * caller must be pointed at the last completed trading day instead of being
+ * handed Friday's prices under a Saturday label.
+ */
+export function tradeDayGate(
+  db: DatabaseSync, asOf: string,
+): { known: boolean; open: boolean; previous: string | null } {
+  try {
+    const row = db.prepare('SELECT is_open FROM trade_cal WHERE cal_date = ?').get(asOf) as
+      { is_open?: number } | undefined;
+    if (!row) return { known: false, open: false, previous: null };
+    return { known: true, open: !!row.is_open, previous: previousTradeDay(db, asOf) ?? null };
+  } catch {
+    return { known: false, open: false, previous: null };
+  }
+}
+
+/**
  * May a hotspot snapshot be published for this day?
  *
  * The gate blocks on the data the pipeline actually reads — the bar datasets
@@ -149,6 +170,14 @@ export interface ReadinessResult {
  * down in docs/goal-1032, not left implicit.
  */
 export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessResult {
+  const calendar = tradeDayGate(db, asOf);
+  if (calendar.known && !calendar.open) {
+    return {
+      status: 'NOT_READY',
+      checks: { bars_present: false, quality_ready: false, financials_synced_today: false },
+      reason: `${asOf} 非交易日；最近已完成交易日 ${calendar.previous ?? '未知'}，不生成该日快照`,
+    };
+  }
   const daily = countOn(db, 'daily', asOf);
   const bars_present = daily > 0;
   // Missing bars short-circuits: with no bars the quality check has nothing to
@@ -218,24 +247,18 @@ export function dataFingerprint(db: DatabaseSync, asOf: string): DataFingerprint
  * The hashed subset. `checked_at` is excluded on purpose: the fingerprint is a
  * statement about the data, not about when we looked at it.
  */
-export function hashDataState(state: Pick<DataState, 'as_of' | 'fingerprint' | 'entry_identity'>): string {
+export function hashDataState(state: Pick<DataState, 'as_of' | 'fingerprint'>): string {
   const body = JSON.stringify({
     scheme: FINGERPRINT_SCHEME,
     as_of: state.as_of,
     fingerprint: state.fingerprint,
-    entry_identity: state.entry_identity,
   });
   return `sha256:${createHash('sha256').update(body).digest('hex')}`;
 }
 
-export function dataState(
-  db: DatabaseSync,
-  asOf: string,
-  opts: { entryIdentity?: { scheme: string; entry_hash: string } | null } = {},
-): DataState {
+export function dataState(db: DatabaseSync, asOf: string): DataState {
   const readiness = checkDataReadiness(db, asOf);
   const fingerprint = dataFingerprint(db, asOf);
-  const entry_identity = opts.entryIdentity ?? null;
   return {
     version: READINESS_VERSION,
     as_of: asOf,
@@ -243,8 +266,7 @@ export function dataState(
     readiness_reason: readiness.reason,
     checks: readiness.checks,
     fingerprint,
-    fingerprint_hash: hashDataState({ as_of: asOf, fingerprint, entry_identity }),
-    entry_identity,
+    fingerprint_hash: hashDataState({ as_of: asOf, fingerprint }),
     checked_at: new Date().toISOString(),
   };
 }

@@ -154,86 +154,17 @@ test('hotspot_snapshot: composite PK (as_of, config_version) round-trip', t => {
   assert.equal(rows[0].generated_at, '2026-10-27T13:00:00.000Z');
 });
 
-// ---------------------------------------------------------------- 5. candidate round-trip
+// ---------------------------------------------------------------- 5. archive table
 
-test('hotspot_candidate: JSON columns and NULL priority round-trip', t => {
+test('the V1 hotspot_candidate mirror is not created and not reported as a source', t => {
   const db = openAshareDb(':memory:');
   t.after(() => db.close());
   ensureHotspotSchema(db);
-  const cols = ['as_of', 'ts_code', 'name', 'instrument_type', 'primary_sector', 'sectors', 'etf_sources',
-    'multi_etf', 'leaderships', 'signals', 'risk_events', 'trade_permission', 'trade_permission_reason',
-    'pool', 'inclusion_reason', 'exclusion_reason', 'priority', 'priority_reason',
-    'data_quality', 'config_version'];
-  upsertRows(db, 'hotspot_candidate', cols, [{
-    as_of: '20261027',
-    ts_code: '600519.SH',
-    name: '贵州茅台',
-    instrument_type: 'STOCK',
-    primary_sector: 'SW2021:801780.SI',
-    sectors: JSON.stringify(['SW2021:801780.SI', 'THS:885573.TI']),
-    etf_sources: JSON.stringify([{ etf_code: '512760.SH', index_code: '931743.CSI', weight: 8.5, source: 'index_weight', effective_date: '20260930', available_from: '20260930', quality: 'OK' }]),
-    multi_etf: 1,
-    leaderships: JSON.stringify(['INDUSTRY_LEADER', 'MARKET_LEADER']),
-    signals: JSON.stringify([{ strategy_id: 'rv_macd_w_bottom', family: 'REVERSAL', direction: 'bullish', confirmed_on: '20261027', invalidation: 'close < neck', status: 'active' }]),
-    risk_events: JSON.stringify([{ id: 'trend_breakdown', on: '20261020' }]),
-    trade_permission: 'EXECUTABLE',
-    trade_permission_reason: 'MAINBOARD_OK',
-    pool: 'FOCUS',
-    inclusion_reason: 'industry leader + ETF core constituent',
-    exclusion_reason: null,
-    priority: null,
-    priority_reason: 'deferred to next ranking pass',
-    data_quality: 'OK',
-    config_version: 'hotspot-config-1.0.0',
-  }]);
-  const row = db.prepare('SELECT * FROM hotspot_candidate WHERE as_of = ? AND ts_code = ?')
-    .get('20261027', '600519.SH');
-  assert.ok(row, 'row readable by composite PK');
-  assert.equal(row.priority, null, 'NULL priority survives the round-trip');
-  assert.equal(row.exclusion_reason, null);
-  assert.equal(row.multi_etf, 1);
-  assert.deepEqual(JSON.parse(row.sectors), ['SW2021:801780.SI', 'THS:885573.TI']);
-  assert.deepEqual(JSON.parse(row.leaderships), ['INDUSTRY_LEADER', 'MARKET_LEADER']);
-  assert.equal(JSON.parse(row.etf_sources)[0].etf_code, '512760.SH');
-  assert.equal(JSON.parse(row.signals)[0].strategy_id, 'rv_macd_w_bottom');
-  assert.deepEqual(JSON.parse(row.risk_events), [{ id: 'trend_breakdown', on: '20261020' }],
-    'risk_events JSON 列往返不丢');
-  // Upsert with a filled priority replaces the same PK, never duplicates.
-  upsertRows(db, 'hotspot_candidate', cols, [{
-    as_of: '20261027', ts_code: '600519.SH', name: '贵州茅台', instrument_type: 'STOCK',
-    primary_sector: 'SW2021:801780.SI', sectors: '[]', etf_sources: '[]', multi_etf: 0,
-    leaderships: '[]', signals: '[]', risk_events: '[]', trade_permission: 'RESEARCH_ONLY',
-    trade_permission_reason: 'MAINBOARD_OK', pool: 'RAW', inclusion_reason: 'r',
-    exclusion_reason: null, priority: 3, priority_reason: 'ranked', data_quality: 'OK',
-    config_version: 'hotspot-config-1.0.0',
-  }]);
-  const count = db.prepare('SELECT COUNT(*) n FROM hotspot_candidate WHERE as_of = ? AND ts_code = ?')
-    .get('20261027', '600519.SH');
-  assert.equal(count.n, 1, 'PK (as_of, ts_code) replaces, never duplicates');
-  assert.equal(db.prepare('SELECT priority FROM hotspot_candidate').get().priority, 3);
-});
-
-test('ensureHotspotSchema: pre-risk_events hotspot_candidate migrates once, idempotently', t => {
-  const db = openAshareDb(':memory:');
-  t.after(() => db.close());
-  // Shape of the table as it existed before risk_events was added: CREATE IF
-  // NOT EXISTS cannot add a column to an existing table, so the guarded ALTER
-  // in ensureHotspotSchema is the only migration path (goal-1028 own tables
-  // only — this test proves that path works on a pre-fix table).
-  db.exec(`CREATE TABLE hotspot_candidate (
-    as_of TEXT NOT NULL, ts_code TEXT NOT NULL, name TEXT, priority INTEGER,
-    PRIMARY KEY (as_of, ts_code))`);
-  ensureHotspotSchema(db);
-  ensureHotspotSchema(db); // second call must be a no-op (guarded by table_info)
-  const hasRisk = (db.prepare('PRAGMA table_info(hotspot_candidate)').all())
-    .some(c => c.name === 'risk_events');
-  assert.ok(hasRisk, 'pre-fix 表经守护式 ALTER 补上 risk_events 列');
-  // Migrated table accepts the current INSERT shape.
-  db.prepare(`INSERT INTO hotspot_candidate (as_of, ts_code, name, priority, risk_events)
-    VALUES (?, ?, ?, ?, ?)`).run('20261027', '600519.SH', '贵州茅台', 3,
-    JSON.stringify([{ id: 'trend_breakdown', on: '20261020' }]));
-  const row = db.prepare('SELECT risk_events FROM hotspot_candidate WHERE as_of = ?').get('20261027');
-  assert.deepEqual(JSON.parse(row.risk_events), [{ id: 'trend_breakdown', on: '20261020' }]);
+  assert.equal(hotspotTableExists(db, 'hotspot_candidate'), false,
+    'V2 never creates the per-candidate mirror');
+  assert.equal(HOTSPOT_TABLES.includes('hotspot_candidate'), false);
+  assert.equal(hotspotCoverage(db).some(c => c.dataset === 'hotspot_candidate'), false,
+    'an archive table is not a coverage dataset');
 });
 
 // ---------------------------------------------------------------- coverage

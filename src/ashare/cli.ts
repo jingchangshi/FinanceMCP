@@ -30,13 +30,11 @@ const USAGE = `用法: finance-ashare <command> [options]
   investment-research-bundle [--account ID] [--date YYYYMMDD] [--db PATH] [--market-db PATH]
                                                                  私有统一研究事实包；默认最近已收盘日，读取路径不写库
   hotspot-sync [--start YYYYMMDD] [--end YYYYMMDD] [--ths-codes a,b]  显式联网同步热点行业数据（申万L1/L2/L3+成分+指数日线、同花顺目录/成分/指数日线；绝不接入 daily；THS 成分恒为 NO_POINT_IN_TIME）
-  hotspot-snapshot [--date YYYYMMDD] [--dry-run]                 生成热点行业快照 + 多策略候选池，写入 hotspot_* 研究表（只写新表）
+  hotspot-snapshot [--date YYYYMMDD] [--dry-run]                 生成热点行业 + V2 五族技术视图 + 每股唯一研究状态，写入 hotspot_* 研究表（只写新表）
   technical-preview --date YYYYMMDD [--db PATH] [--json|--md] [--out DIR]
                                                                  只读技术方法 V2 预览：五类策略候选 + 共享量价上下文；默认不持久化
   technical-study --dates YYYYMMDD[,YYYYMMDD...] | --start/--end [--as-of YYYYMMDD] [--horizons 3,5,10,20]
                                                                  V2 候选的描述性前瞻观察（只读；复用 T+1/费用/3-20日评价与三组对照）
-  hotspot-cc --start YYYYMMDD [--end YYYYMMDD] [--observation-end YYYYMMDD] [--step N]
-                                                                 冠军-挑战者走查比较（只读，输出研究报告；不授权下单或生产变更）
   migrate                                                        将旧版缓存主键布局迁移为按股票连续存储
 
   账户子命令（独立 portfolio.sqlite，只读演示账户，默认不在 MCP 暴露）：
@@ -83,14 +81,6 @@ async function main() {
   if (command === 'research-validation') {
     const { runValidationCommand } = await import('./validationCli.js');
     print(await runValidationCommand(process.argv.slice(3)));
-    return;
-  }
-  // Entry-layer freeze (goal-1031 §2.1). Dispatched here, deliberately outside
-  // validationCli, so recording it cannot change the signal implementation_hash
-  // that guards the 21:10 forward observation.
-  if (command === 'research-entry') {
-    const { runEntryCommand } = await import('./entryFreezeCli.js');
-    print(await runEntryCommand(process.argv.slice(3)));
     return;
   }
   // Research commands open the live cache read-only themselves and must not

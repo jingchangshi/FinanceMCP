@@ -186,7 +186,7 @@ ashareToolDefinitions.push(
   },
 );
 
-// 热点行业 × 多策略研究层（goal-1028）。只读 hotspot_snapshot / hotspot_candidate
+// 热点行业 × 多策略研究层（goal-1028）。只读 hotspot_snapshot
 // 快照表（由 finance-ashare hotspot-snapshot CLI 写入）；表缺失或当日未生成时返回
 // NOT_READY 与原因，不实时计算、不触发同步。快照是研究观察，不是交易授权。
 ashareToolDefinitions.push(
@@ -201,15 +201,13 @@ ashareToolDefinitions.push(
   },
   {
     name: 'ashare_hotspot_opportunities',
-    description: `热点候选机会快照：动态候选池(FOCUS/RAW)个股与ETF、领导身份(产业/行情龙头)与证据、多策略信号(confirmed_on 确认日,绝不回填形态形成日)、交易权限(非主板=RESEARCH_ONLY)、入池/排除原因与优先级。另有入场评估 entry_assessment(阶段/资格/分数/触发/风险收益比/否决原因)与当日 entry_view 榜单。technical_view_v2 为独立的五类技术方法视图(趋势延续/平台突破/底部反转/波动率扩张/均值回归)：各家族单独列候选与阶段(FORMING/CONFIRMED/FOLLOW_THROUGH/FAILED/EXPIRED)，不合并跨家族分数；停牌、无K线、一字跌停的股票不会进入正常 research_ready 清单。研究观察,不构成交易授权;候选池与 wl-1.0.0 正式观察池相互独立,入场资格也不改变 FOCUS 的定义。快照缺失时返回 NOT_READY 与原因。${DATA_NOTE}`,
+    description: `交易日研究快照（V2 唯一路径）：每只股票一个 research_state（FOCUS/WATCH/EXTENDED/DETERIORATING/BLOCKED/INVALIDATED），由服务端确定性规则计算，非交易指令、非收益预测。五类技术族（趋势延续/平台突破/底部反转/波动率扩张/均值回归）独立列信号与阶段（FORMING/CONFIRMED/FOLLOW_THROUGH/FAILED/EXPIRED），不合并跨家族分数；每个信号带 pattern_event_date（价格事件日）与 first_observed_date（首次可证日），确认日绝不回填。停牌、当日无K线、一字跌停的股票为 BLOCKED，不进入正常研究重点。daily_highlights 是 2–5 只可读研究重点，不是买入推荐。返回 as-of、version_no、content_hash、implementation_fingerprint 与 data_state 供核对；快照缺失或为 V2 之前归档时返回 NOT_READY 与原因。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: {
         date: dateProp,
-        pool: { type: 'string', enum: ['FOCUS', 'RAW'], description: '仅返回该池成员;缺省返回全部候选' },
-        ts_code: { type: 'string', description: '只看单只候选(个股或ETF)' },
-        entry_eligible: { type: 'boolean', description: '仅返回通过入场资格门槛的候选(true)或仅返回未通过的候选(false);缺省不过滤' },
-        candidate_class: { type: 'string', enum: ['NEW_ENTRY', 'PULLBACK_WAIT', 'PREPARING', 'RISK_REJECTED', 'RESEARCH_ONLY', 'INSUFFICIENT_DATA'], description: '按入场类别过滤;类别由服务端规则确定' },
+        ts_code: { type: 'string', description: '只看单只股票' },
+        research_state: { type: 'string', enum: ['FOCUS', 'WATCH', 'EXTENDED', 'DETERIORATING', 'BLOCKED', 'INVALIDATED'], description: '按股票唯一研究状态过滤；缺省返回全部观察对象' },
       },
     },
     annotations: READ_ONLY,
