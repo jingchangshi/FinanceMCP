@@ -15,11 +15,12 @@
  *                       impossible (suspended, no as-of bar, stale bar,
  *                       one-price limit-down, unknown limit).
  *   2. INVALIDATED    — every signal episode is dead (FAILED / EXPIRED).
- *   3. DETERIORATING  — NEW negative evidence of the SAME family is dated
- *                       AFTER the latest live confirmation. A failure or an
- *                       expiry that predates the live setup is history: it
- *                       stays in `signals` for audit but never negates the
- *                       live reading. EXPIRED never triggers DETERIORATING.
+ *   3. DETERIORATING  — NEW negative evidence is dated AFTER the latest live
+ *                       confirmation. The state belongs to the stock, so a
+ *                       failure from any family counts; a failure or expiry
+ *                       that predates the live setup is history and never
+ *                       negates the live reading. EXPIRED never triggers
+ *                       DETERIORATING.
  *   4. EXTENDED       — the setup holds but price has run: RAPID_RUNUP or a
  *                       live signal's `price_extension` (close >= MA20 + 3 ATR14).
  *   5. FOCUS          — a live, research-ready confirmation and normal trading.
@@ -153,27 +154,26 @@ function decideState(
   }
 
   // 3. ONLY current negative evidence can contradict a live setup: a FAILED
-  //    instance of the SAME family dated strictly after the latest live
-  //    confirmation. Earlier failures are history (the live setup already
-  //    superseded them) and an EXPIRED window is observation-window end, not
-  //    current negative evidence. Both stay in `signals` for audit.
+  //    instance dated strictly after the latest live confirmation. The state
+  //    is the stock's, not the family's, so a failure in ANY family after the
+  //    live setup was confirmed is current evidence; the reverse (a failure
+  //    dated before it) is history that the live setup already superseded.
+  //    An EXPIRED window is observation-window end, never current negative
+  //    evidence. Everything dead stays in `signals` for audit; no score is
+  //    computed and no family's evidence is netted against another's.
   if (live.length > 0) {
-    // Compare inside the family: a REVERSAL failure is evidence about the
-    // REVERSAL setup, not about a later confirmation from another family.
-    const familyLiveConfirm = (family: string): string => live.reduce(
-      (m, s) => (s.family === family && s.confirmed_on && s.confirmed_on > m ? s.confirmed_on : m), '',
+    const latestLiveConfirm = live.reduce(
+      (m, s) => (s.confirmed_on && s.confirmed_on > m ? s.confirmed_on : m), '',
     );
-    const currentFailures = failed.filter((f) => {
-      const liveConfirm = familyLiveConfirm(f.family);
-      return f.invalidated_at !== null && liveConfirm !== '' && f.invalidated_at > liveConfirm;
-    });
+    const currentFailures = failed.filter((f) => f.invalidated_at !== null
+      && latestLiveConfirm !== '' && f.invalidated_at > latestLiveConfirm);
     if (currentFailures.length > 0) {
       for (const s of live) {
         decisive.push(`${signalLabel(s)}（${s.strategy_id}）于 ${s.confirmed_on ?? '未标注日期'} 确认`);
       }
       for (const f of currentFailures) {
         conflicting.push(`${signalLabel(f)}（${f.strategy_id}）于 ${f.invalidated_at} 失效，`
-          + `晚于同族当前有效形态确认日 ${familyLiveConfirm(f.family)}：`
+          + `晚于当前有效形态最新确认日 ${latestLiveConfirm}：`
           + `${f.invalidation?.reason ?? '触发失效条件'}`);
       }
       return { state: 'DETERIORATING', decisive, conflicting, constraints };

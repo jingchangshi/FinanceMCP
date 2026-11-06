@@ -185,26 +185,42 @@ test('expired-only episodes are INVALIDATED with the window-end date', () => {
   assert.match(s.decisive_reasons.join(''), /2026-10-27/);
 });
 
-test('a failed episode from another family and an expired window never veto a live setup', () => {
+test('an expired window never vetoes a live setup', () => {
   const live = signal({ family: 'TREND_CONTINUATION', strategy_id: 'tc_v2_pullback_resume' });
-  const deadOther = signal({
-    family: 'MEAN_REVERSION', strategy_id: 'mr_v2_oversold_reversion', stage: 'FAILED',
-    stage_detail: '失效', confirmed_on: '2026-10-20', invalidated_at: '2026-10-31',
-    invalidation: { on: '2026-10-31', reason: '反弹未站回中轨' }, research_ready: false,
-  });
   const expired = signal({
     family: 'REVERSAL', strategy_id: 'rv_v2_macd_dif_divergence', stage: 'EXPIRED',
     stage_detail: '过期', confirmed_on: null, expires_at: '2026-10-29', research_ready: false,
   });
-  const s = only(build([ctx()], [live, deadOther, expired]));
-  assert.equal(s.research_state, 'FOCUS', 'other-family failures and expiries are history, not current evidence');
+  const s = only(build([ctx()], [live, expired]));
+  assert.equal(s.research_state, 'FOCUS', 'an elapsed observation window is not negative evidence');
   assert.deepEqual(s.conflicting_evidence, []);
-  assert.equal(s.signals.length, 3, 'the dead episodes stay in signals for audit');
+  assert.equal(s.signals.length, 2, 'the expired episode stays in signals for audit');
 });
 
-test('a historical same-family failure before the live confirmation coexists with it', () => {
+test('a failure from another family after the live confirmation is current evidence ⇒ DETERIORATING', () => {
+  const live = signal({
+    family: 'TREND_CONTINUATION', strategy_id: 'tc_v2_pullback_resume',
+    confirmed_on: '2026-10-29', formed_on: '2026-10-26',
+  });
+  const deadOther = signal({
+    family: 'MEAN_REVERSION', strategy_id: 'mr_v2_oversold_reversion', stage: 'FAILED',
+    stage_detail: '失效', confirmed_on: '2026-10-20', invalidated_at: '2026-11-01',
+    invalidation: { on: '2026-11-01', reason: '反弹未站回中轨' }, research_ready: false,
+  });
+  const s = only(build([ctx()], [live, deadOther]));
+  assert.equal(s.research_state, 'DETERIORATING',
+    'the stock state is not family-scoped: a later failure in any family is current evidence');
+  assert.match(s.decisive_reasons.join(''), /tc_v2_pullback_resume/);
+  assert.match(s.decisive_reasons.join(''), /2026-10-29/);
+  assert.match(s.conflicting_evidence.join(''), /mr_v2_oversold_reversion/);
+  assert.match(s.conflicting_evidence.join(''), /2026-11-01/);
+  assert.equal(s.signals.length, 2, 'the failed episode stays in signals for audit');
+});
+
+test('a failure dated before the live confirmation is history, whatever its family', () => {
   const live = signal({ confirmed_on: '2026-11-01', formed_on: '2026-10-28' });
   const history = signal({
+    family: 'MEAN_REVERSION', strategy_id: 'mr_v2_oversold_reversion',
     stage: 'FAILED', stage_detail: '失效', confirmed_on: '2026-10-10',
     invalidated_at: '2026-10-20', invalidation: { on: '2026-10-20', reason: '跌破 MA60' },
     research_ready: false,
@@ -215,7 +231,7 @@ test('a historical same-family failure before the live confirmation coexists wit
   assert.equal(s.signals.filter(x => x.stage === 'FAILED').length, 1, 'history is preserved');
 });
 
-test('a same-family failure after the live confirmation is current evidence ⇒ DETERIORATING', () => {
+test('a failure after the live confirmation is current evidence ⇒ DETERIORATING', () => {
   const live = signal({
     family: 'REVERSAL', strategy_id: 'rv_v2_macd_w_bottom', stage: 'FOLLOW_THROUGH',
     confirmed_on: '2026-10-26', formed_on: '2026-10-19',
