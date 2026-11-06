@@ -59,7 +59,11 @@ test('full-market discovery produces all five families with no FOCUS seed', () =
   ]);
   assert.ok(view.coverage.universe > 1000, `universe=${view.coverage.universe}`);
   assert.ok(view.coverage.preselected > 0);
-  assert.ok(view.coverage.preselected <= 500);
+  // goal-1106 WP5: the eligible universe is analysed in full; the legacy
+  // 120/500 prescreen capacity no longer gates which stocks are detected.
+  assert.ok(view.coverage.preselected > 500, `preselected=${view.coverage.preselected}`);
+  assert.equal(view.coverage.analyzed, view.coverage.preselected,
+    'every eligible stock must reach the detailed detector pass');
   // One record per stock, and every record's state is one of the six.
   const codes = view.research_universe.stocks.map(s => s.ts_code);
   assert.equal(new Set(codes).size, codes.length, 'a stock must not appear twice');

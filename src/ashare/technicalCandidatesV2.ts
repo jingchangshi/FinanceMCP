@@ -4,10 +4,13 @@
  * Discovery is deliberately independent of the V1 entry machinery:
  *
  *   1. one full-market pass (the SAME `scanMarket` pass the legacy pool
- *      already pays for) records a cheap per-family prescreen vector;
- *   2. each family's prescreen list is capped deterministically;
- *   3. only the union of those lists is loaded again for the detailed
- *      five-family pattern analysis.
+ *      already pays for) records the stocks that pass the basic eligibility
+ *      gates and, as a diagnostic, a cheap per-family prescreen vector;
+ *   2. every eligible stock is loaded for the detailed five-family pattern
+ *      analysis. The per-family/union capacity caps are NOT applied to that
+ *      analysis: goal-1106 WP5 measured active patterns (CONFIRMED /
+ *      FOLLOW_THROUGH / FORMING) missing from the capped union on every
+ *      audited day, so the prescreen may only report, never gate.
  *
  * The prescreen never reads `FOCUS`, `priority`, `entry_score` or RPS as a
  * gate. A low-RPS name making a lower low with a higher DIF low is visible
@@ -32,7 +35,7 @@ import {
 import { detectAllPatterns, PATTERN_DEFINITIONS_V2 } from './technicalPatternsV2.js';
 import { buildResearchUniverse } from './technicalResearchStateV2.js';
 
-/** Capacity is a cost control, not a tuned parameter (goal-1102 §四). */
+/** Ranking capacity is a diagnostic, not a gate (goal-1106 WP5). */
 export const TECHNICAL_CAPACITY = {
   perFamily: 120,
   union: 500,
@@ -54,7 +57,16 @@ export interface PrescreenEntry {
 
 export interface PrescreenResult {
   universe: number;
+  /** Diagnostic only: what the legacy per-family ranking would have kept. */
   perFamily: Record<TechnicalFamily, PrescreenEntry[]>;
+  /**
+   * Every stock that passes the basic eligibility gates (no ST/delisting
+   * marker, no missing adjustment factor, ≥130 bars, 20-day turnover ≥0.5亿).
+   * This is the detailed-analysis universe; capacity caps never remove a name
+   * from it.
+   */
+  eligible: PrescreenEntry[];
+  /** Diagnostic only: entries the legacy ranking would have truncated. */
   capacity_limited: number;
 }
 
@@ -107,6 +119,7 @@ export function createTechnicalPrescreen(): TechnicalPrescreen {
   };
   let universe = 0;
   let capacityLimited = 0;
+  const eligible: Array<{ ts_code: string; name: string }> = [];
   const push = (family: TechnicalFamily, code: string, name: string, metric: number): void => {
     lists[family].push({ ts_code: code, name, metric });
   };
@@ -120,6 +133,7 @@ export function createTechnicalPrescreen(): TechnicalPrescreen {
       const c = b.close[i];
       const m20 = x.ma20[i], m60 = x.ma60[i], rsi = x.rsi14[i], bw = x.bollWidth[i];
       if (!finite(c)) return;
+      eligible.push({ ts_code: code, name: row.name });
       const name = row.name;
       // Each condition is deliberately LOOSER than the detector: the detailed
       // pass makes the real decision, the prescreen only protects recall.
@@ -194,7 +208,13 @@ export function createTechnicalPrescreen(): TechnicalPrescreen {
         capacityLimited += ranked[family].length - kept.length;
         perFamily[family] = kept.map((e, k) => ({ ...e, rank: k + 1 }));
       }
-      return { universe, perFamily, capacity_limited: capacityLimited };
+      return {
+        universe,
+        perFamily,
+        eligible: [...eligible].sort((a, b) => a.ts_code.localeCompare(b.ts_code))
+          .map(({ ts_code, name }) => ({ ts_code, name, rank: 0 })),
+        capacity_limited: capacityLimited,
+      };
     },
   };
 }
@@ -268,7 +288,8 @@ function barsBehind(lastBar: string, asOf: string, index: Map<string, number>): 
 }
 
 /**
- * Run the detailed V2 analysis for one as-of day over the prescreened union.
+ * Run the detailed V2 analysis for one as-of day over every eligible stock
+ * (plus suspended / one-price-limit names the prescreen cannot observe).
  * Only bars with `trade_date <= asOf` are read (forEachStockBars guarantees
  * it); a stock without an as-of bar keeps its last bar and is marked stale.
  */
@@ -294,7 +315,10 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
   const forced = new Map<string, string>();
   for (const f of opts.forcedCodes ?? []) forced.set(f.ts_code, f.name ?? f.ts_code);
   const codeSet = new Set<string>([...forced.keys()]);
-  for (const family of TECHNICAL_FAMILIES) for (const e of opts.prescreen.perFamily[family]) codeSet.add(e.ts_code);
+  // Every eligible name is analysed in full. The per-family prescreen lists are
+  // retained for diagnostics only; using them here would re-introduce the
+  // capacity truncation that WP5 measured as a recall loss.
+  for (const e of opts.prescreen.eligible) codeSet.add(e.ts_code);
   const codes = [...codeSet].sort();
   const names = nameMap(db, codes);
   for (const [code, fallback] of forced) if (!names.has(code)) names.set(code, fallback);
@@ -504,7 +528,7 @@ export function renderTechnicalViewMarkdown(view: TechnicalViewV2): string {
   out.push(`- framework_version: \`${view.framework_version}\``);
   out.push(`- implementation_fingerprint: \`${view.implementation_fingerprint.slice(0, 16)}…\``);
   out.push(`- 市场环境: ${view.market_regime}`);
-  out.push(`- 覆盖: 全市场 ${view.coverage.universe} 只，预选 ${view.coverage.preselected} 只，详析 ${view.coverage.analyzed} 只，容量截断 ${view.coverage.capacity_limited} 只`);
+  out.push(`- 覆盖: 全市场 ${view.coverage.universe} 只，合格 ${view.coverage.preselected} 只，详析 ${view.coverage.analyzed} 只，预筛排名截断（仅诊断，不参与选股）${view.coverage.capacity_limited} 条`);
   out.push(`- 证据等级: ${view.evidence_level}（仅研究观察，不构成交易指令）`);
   out.push('');
   for (const f of view.families) {
