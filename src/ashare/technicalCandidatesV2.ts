@@ -308,9 +308,17 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
   const barCount = opts.barCount ?? 330;
   const days = recentTradeDays(db, asOf, barCount); // ascending, ends at asOf
   const dayIndex = calendarIndex(days);
-  const start = days[0];
+  // Recursive indicators (EMA/RSI/ATR) are seeded at their first bar, so a
+  // rolling left edge re-seeds them on every as-of and can move a
+  // near-threshold event by a day. Read each stock from its first bar up to
+  // asOf instead: the seed then never depends on the as-of. The detectors still
+  // look back only inside their own declared windows; `days` remains the
+  // trading-day index for `barsBehindAsOf`.
+  const HISTORY_START = '19000101';
   const suspended = suspendedOn(db, asOf);
-  const regime = opts.regime ?? regimeSeries(db, asOf).get(asOf) ?? 'UNKNOWN';
+  const regimeMap = opts.regime ? null : regimeSeries(db, asOf);
+  const regime = opts.regime ?? regimeMap?.get(asOf) ?? 'UNKNOWN';
+  const regimeAt = regimeMap ? (d: string) => regimeMap.get(d) ?? null : undefined;
 
   const forced = new Map<string, string>();
   for (const f of opts.forcedCodes ?? []) forced.set(f.ts_code, f.name ?? f.ts_code);
@@ -334,7 +342,7 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
     capacity_limited: opts.prescreen.capacity_limited,
   };
 
-  forEachStockBars(db, start, asOf, (code, bars) => {
+  forEachStockBars(db, HISTORY_START, asOf, (code, bars) => {
     if ((bars.adjMissing ?? 0) > 0) { coverage.skipped_adj_missing++; return; }
     if (bars.dates.length < TECHNICAL_CAPACITY.minBars) { coverage.skipped_insufficient++; return; }
     const i = bars.dates.length - 1;
@@ -361,7 +369,7 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
       market_regime: regime,
     });
     const input: PatternInput = {
-      code, bars, x, endIdx: i, asOf, regime,
+      code, bars, x, endIdx: i, asOf, regime, regimeAt,
       rps120: null, barsBehindAsOf: behind,
     };
     const observations = detectAllPatterns(input);

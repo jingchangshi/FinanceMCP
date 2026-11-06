@@ -29,7 +29,6 @@ const { TECHNICAL_FAMILIES } = await import('../build/ashare/technicalFrameworkV
 const { scanMarket } = await import('../build/ashare/analysis.js');
 const { forEachStockBars } = await import('../build/ashare/bars.js');
 const { computeIndicators } = await import('../build/ashare/indicators.js');
-const { recentTradeDays } = await import('../build/ashare/ingest.js');
 const { regimeSeries } = await import('../build/ashare/market.js');
 const { detectAllPatterns } = await import('../build/ashare/technicalPatternsV2.js');
 
@@ -47,21 +46,24 @@ const prescreened = prescreen.finish();
 const view = analyzeTechnicalV2(DB, { asOf: AS_OF, prescreen: prescreened });
 const dayView = analyzeTechnicalDay(DB, AS_OF);
 
-const days = recentTradeDays(DB, AS_OF, 330);
-const regime = regimeSeries(DB, AS_OF).get(AS_OF) ?? 'UNKNOWN';
+const regimeMap = regimeSeries(DB, AS_OF);
+const regime = regimeMap.get(AS_OF) ?? 'UNKNOWN';
+const regimeAt = (d) => regimeMap.get(d) ?? null;
 const eligibleCodes = prescreened.eligible.map((e) => e.ts_code);
 
-/** Ground truth: the five detectors over every eligible stock, same bars/window. */
+/** Ground truth: the five detectors over every eligible stock, same bars/window.
+ *  Production reads each stock from its first bar so recursive indicators are
+ *  seeded independently of the as-of; the ground truth must do the same. */
 function fullDetection() {
   const observations = [];
-  forEachStockBars(DB, days[0], AS_OF, (code, bars) => {
+  forEachStockBars(DB, '19000101', AS_OF, (code, bars) => {
     if ((bars.adjMissing ?? 0) > 0) return;
     if (bars.dates.length < TECHNICAL_CAPACITY.minBars) return;
     const i = bars.dates.length - 1;
     const x = computeIndicators(bars);
     if (!(x.amountMa20[i] / 1e5 >= TECHNICAL_CAPACITY.minAmount20Yi)) return;
     for (const obs of detectAllPatterns({
-      code, bars, x, endIdx: i, asOf: AS_OF, regime, rps120: null,
+      code, bars, x, endIdx: i, asOf: AS_OF, regime, regimeAt, rps120: null,
       barsBehindAsOf: AS_OF === bars.dates[i] ? 0 : 1,
     })) {
       observations.push({ code, family: obs.family, strategy_id: obs.strategy_id, stage: obs.stage });

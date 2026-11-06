@@ -459,6 +459,12 @@ export interface PatternInput {
   endIdx: number;
   asOf: string;
   regime: Regime | 'UNKNOWN';
+  /**
+   * Causal market regime for one historical bar, used by detectors that may
+   * only decide a past bar from facts known on that bar. When absent, `regime`
+   * is the fallback for every bar (fixtures and single-bar callers).
+   */
+  regimeAt?: (date: string) => Regime | 'UNKNOWN' | null;
   /** Per-bar RPS120 for background only, aligned to `bars.dates`. */
   rps120: Array<number | null> | null;
   /** Trade-day distance from the last bar to `asOf` (0 = current bar). */
