@@ -1,0 +1,116 @@
+{
+  "audit": "goal-1106-wp5-recall",
+  "mode": "both",
+  "db": "/home/jcshi/.local/share/ashare-v1/backups/ashare.20261105T142010Z.sqlite",
+  "as_of": "20261015",
+  "regime": "downtrend",
+  "capacity": {
+    "perFamily": 120,
+    "union": 500,
+    "minAmount20Yi": 0.5,
+    "minBars": 130
+  },
+  "gate_counts": {
+    "adj_missing": 0,
+    "insufficient_bars": 96,
+    "st": 237,
+    "low_amount": 1226,
+    "no_as_of_bar": 8
+  },
+  "eligible": 4046,
+  "stale_eligible": 8,
+  "ground_truth": {
+    "analyzed": 4046,
+    "observations": 17579
+  },
+  "sweep_seconds": 12.711,
+  "prescreen": {
+    "seconds": 18.635,
+    "coverage": {
+      "universe": 5565,
+      "preselected": 4059,
+      "analyzed": 4057,
+      "skipped_adj_missing": 0,
+      "skipped_insufficient": 2,
+      "capacity_limited": 10726
+    },
+    "view_json_mb": 35.29,
+    "preselected_codes": 484,
+    "forced_codes": 16,
+    "per_family_preselected": {
+      "TREND_CONTINUATION": 120,
+      "PLATFORM_BREAKOUT": 120,
+      "REVERSAL": 120,
+      "VOLATILITY_EXPANSION": 120,
+      "MEAN_REVERSION": 120
+    },
+    "observation_counts": {
+      "TREND_CONTINUATION": 4009,
+      "PLATFORM_BREAKOUT": 804,
+      "REVERSAL": 6918,
+      "VOLATILITY_EXPANSION": 2663,
+      "MEAN_REVERSION": 3193
+    },
+    "comparison": {
+      "families": {
+        "TREND_CONTINUATION": {
+          "full": 3999,
+          "recalled": 3999,
+          "missed": 0,
+          "missed_by_stage": {},
+          "missed_stocks": [],
+          "missed_stock_count": 0
+        },
+        "PLATFORM_BREAKOUT": {
+          "full": 800,
+          "recalled": 800,
+          "missed": 0,
+          "missed_by_stage": {},
+          "missed_stocks": [],
+          "missed_stock_count": 0
+        },
+        "REVERSAL": {
+          "full": 6899,
+          "recalled": 6899,
+          "missed": 0,
+          "missed_by_stage": {},
+          "missed_stocks": [],
+          "missed_stock_count": 0
+        },
+        "VOLATILITY_EXPANSION": {
+          "full": 2654,
+          "recalled": 2654,
+          "missed": 0,
+          "missed_by_stage": {},
+          "missed_stocks": [],
+          "missed_stock_count": 0
+        },
+        "MEAN_REVERSION": {
+          "full": 3184,
+          "recalled": 3184,
+          "missed": 0,
+          "missed_by_stage": {},
+          "missed_stocks": [],
+          "missed_stock_count": 0
+        }
+      },
+      "missed_total": 0,
+      "missed_samples": [],
+      "missed_codes_total": 0,
+      "missed_codes": [],
+      "missed_reason_counts": {}
+    }
+  },
+  "full": {
+    "eligible_with_asof_bar": 4046,
+    "observations": 17536,
+    "per_family": {
+      "TREND_CONTINUATION": 3999,
+      "PLATFORM_BREAKOUT": 800,
+      "REVERSAL": 6899,
+      "VOLATILITY_EXPANSION": 2654,
+      "MEAN_REVERSION": 3184
+    }
+  },
+  "max_rss_mb": 479.3
+}
