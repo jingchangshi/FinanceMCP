@@ -1,15 +1,15 @@
-// Technical methodology V2 — full-market recall (goal-1106 WP5).
+// Technical methodology V2 — live full-market recall (goal-1106 WP5).
 //
 // The legacy discovery ranked every stock in each family's cheap prescreen and
 // analysed only the top 120 per family / 500 overall. That is a *proxy*: a
 // stock can satisfy a family's real definition without satisfying the proxy,
-// and the capacity cap can drop a genuine active pattern. This test measures
-// the difference against the five deterministic detectors run over every
-// eligible stock, and pins the production view to that ground truth.
+// and the capacity cap can drop a genuine live pattern. This test measures the
+// difference against the five deterministic detectors run over every eligible
+// stock, and pins the production view to that ground truth.
 //
-// It is a behavioural invariant, not a fixture ranking: every observation the
-// detectors produce for an eligible stock must appear in the published view,
-// with the same stage, and no family may be silently dropped.
+// "Live" means a currently valid episode: FORMING / CONFIRMED / FOLLOW_THROUGH.
+// FAILED / EXPIRED observations are historical records, not recall gaps, so
+// they are deliberately excluded from the recall assertion.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
@@ -33,6 +33,7 @@ const { recentTradeDays } = await import('../build/ashare/ingest.js');
 const { regimeSeries } = await import('../build/ashare/market.js');
 const { detectAllPatterns } = await import('../build/ashare/technicalPatternsV2.js');
 
+const LIVE_STAGES = new Set(['FORMING', 'CONFIRMED', 'FOLLOW_THROUGH']);
 const DATES = weekdays('20250101', 160);
 const AS_OF = DATES.at(-1);
 const DB = openAshareDb();
@@ -50,6 +51,7 @@ const dayView = analyzeTechnicalDay(DB, AS_OF);
 const days = recentTradeDays(DB, AS_OF, 330);
 const regime = regimeSeries(DB, AS_OF).get(AS_OF) ?? 'UNKNOWN';
 const eligibleCodes = prescreened.eligible.map((e) => e.ts_code);
+const legacyUnion = new Set(TECHNICAL_FAMILIES.flatMap((f) => prescreened.perFamily[f].map((e) => e.ts_code)));
 
 /** Ground truth: the five detectors over every eligible stock, same bars/window. */
 function fullDetection() {
@@ -71,64 +73,72 @@ function fullDetection() {
 }
 
 const truth = fullDetection();
-const truthKey = (o) => `${o.code}|${o.strategy_id}|${o.stage}`;
-const viewKeys = new Set(view.families.flatMap((f) => f.candidates.map((c) => `${c.ts_code}|${c.strategy_id}|${c.stage}`)));
-const truthByFamily = Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, truth.filter((o) => o.family === f)]));
-const viewByFamily = Object.fromEntries(view.families.map((f) => [f.family, f.candidates]));
+const truthLive = truth.filter((o) => LIVE_STAGES.has(o.stage));
+const truthDead = truth.filter((o) => !LIVE_STAGES.has(o.stage));
+const keyOf = (o) => `${o.code}|${o.strategy_id}|${o.stage}`;
+const liveKeys = (familyCandidates) => new Set(
+  familyCandidates.filter((c) => LIVE_STAGES.has(c.stage)).map((c) => `${c.ts_code}|${c.strategy_id}|${c.stage}`),
+);
+const viewKeys = new Set(view.families.flatMap((f) => [...liveKeys(f.candidates)]));
+const truthLiveByFamily = Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, truthLive.filter((o) => o.family === f)]));
 
 test('every eligible stock is analysed; the legacy capacity cap no longer gates detection', () => {
   assert.equal(view.status, 'OK');
   assert.ok(prescreened.eligible.length > TECHNICAL_CAPACITY.union,
     `fixture must exceed the legacy union cap (eligible=${prescreened.eligible.length})`);
   assert.ok(prescreened.capacity_limited > 0,
-    'the legacy ranking still reports truncation, so the caps remain observable');
+    'the legacy ranking still reports its diagnostic truncation');
   assert.equal(view.coverage.preselected, prescreened.eligible.length);
   assert.equal(view.coverage.analyzed, prescreened.eligible.length,
     'analyzed must equal the full eligible universe, not the ranked union');
-  const legacyUnion = new Set(TECHNICAL_FAMILIES.flatMap((f) => prescreened.perFamily[f].map((e) => e.ts_code)));
+  assert.equal(view.coverage.capacity_limited, 0,
+    'no stock is actually truncated; the legacy count is diagnostic only');
   assert.ok(legacyUnion.size < prescreened.eligible.length,
     'the legacy union must be strictly smaller than the eligible universe in this fixture');
 });
 
-test('no family is silently dropped and every family has observations', () => {
+test('no family is silently dropped and every family has live observations', () => {
   assert.deepEqual(view.families.map((f) => f.family), [...TECHNICAL_FAMILIES]);
   for (const family of TECHNICAL_FAMILIES) {
-    assert.ok(viewByFamily[family], `family ${family} missing from the view`);
-    assert.ok(truthByFamily[family].length > 0,
-      `fixture produced no ${family} observations; the recall comparison would be vacuous`);
+    assert.ok(truthLiveByFamily[family].length > 0,
+      `fixture produced no live ${family} observations; the recall comparison would be vacuous`);
   }
+  assert.ok(truthDead.length > 0, 'fixture should also exercise dead episodes for the completeness record');
 });
 
-test('the view recalls every detector observation over the eligible universe', () => {
-  const missed = truth.filter((o) => !viewKeys.has(truthKey(o)));
+test('the view recalls every LIVE detector observation over the eligible universe', () => {
+  assert.ok(truthLive.length > 0);
+  const missed = truthLive.filter((o) => !viewKeys.has(keyOf(o)));
   assert.deepEqual(
     missed.slice(0, 10).map((o) => `${o.code} ${o.family} ${o.strategy_id} ${o.stage}`),
     [],
-    `missed ${missed.length} of ${truth.length} observations`,
+    `missed ${missed.length} of ${truthLive.length} live observations`,
   );
   for (const family of TECHNICAL_FAMILIES) {
-    assert.equal(viewByFamily[family].length, truthByFamily[family].length,
-      `${family}: view=${viewByFamily[family].length} full=${truthByFamily[family].length}`);
+    const inView = view.families.find((f) => f.family === family).candidates
+      .filter((c) => LIVE_STAGES.has(c.stage));
+    assert.equal(inView.length, truthLiveByFamily[family].length,
+      `${family}: live in view=${inView.length} full=${truthLiveByFamily[family].length}`);
   }
 });
 
-test('recall differs from the legacy prescreen union, measurably', () => {
+test('live recall differs from the legacy prescreen union, measurably, in every family', () => {
   // The old design analysed only the union of the ranked per-family lists. The
-  // fixture is constructed so that real patterns exist outside that union; if
+  // fixture is constructed so that live patterns exist outside that union; if
   // this assertion ever goes false the recall test above stops proving anything.
-  const legacyUnion = new Set(TECHNICAL_FAMILIES.flatMap((f) => prescreened.perFamily[f].map((e) => e.ts_code)));
-  const outside = truth.filter((o) => !legacyUnion.has(o.code));
-  assert.ok(outside.length > 0, 'no observation outside the legacy union: the recall gap is not being exercised');
+  const outside = truthLive.filter((o) => !legacyUnion.has(o.code));
+  assert.ok(outside.length > 0, 'no live observation outside the legacy union: the recall gap is not exercised');
   for (const family of TECHNICAL_FAMILIES) {
     assert.ok(outside.some((o) => o.family === family),
-      `family ${family} has no observation outside the legacy union in this fixture`);
+      `family ${family} has no live observation outside the legacy union in this fixture`);
   }
 });
 
-test('the one-day production entry point has the same full recall', () => {
+test('the one-day production entry point has the same live recall', () => {
   assert.equal(dayView.status, 'OK');
-  const keys = new Set(dayView.families.flatMap((f) => f.candidates.map((c) => `${c.ts_code}|${c.strategy_id}|${c.stage}`)));
-  const missed = truth.filter((o) => !keys.has(truthKey(o)));
-  assert.equal(missed.length, 0, `analyzeTechnicalDay missed ${missed.length} observations`);
+  const keys = new Set(dayView.families.flatMap((f) => [...liveKeys(f.candidates)]));
+  const missed = truthLive.filter((o) => !keys.has(keyOf(o)));
+  assert.equal(missed.length, 0, `analyzeTechnicalDay missed ${missed.length} live observations`);
   assert.equal(dayView.coverage.analyzed, prescreened.eligible.length);
+  assert.equal(dayView.coverage.capacity_limited, 0);
 });
