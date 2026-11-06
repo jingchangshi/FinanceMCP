@@ -121,6 +121,34 @@ test('suspended name keeps its last bar date and cannot be confirmed for the as-
   assert.ok(!view.research_universe.daily_highlights.includes(SUSPENDED));
 });
 
+test('every candidate carries a descriptive adjusted price position', () => {
+  const required = [
+    'close', 'ma20', 'ma60', 'atr14', 'rsi6', 'rsi14',
+    'close_vs_ma20_pct', 'close_vs_ma20_atr', 'close_vs_ma60_pct',
+    'ma20_above_ma60', 'ma20_rising',
+    'reference_price', 'reference_kind', 'reference_distance_pct', 'reference_distance_atr',
+    'bars_since_confirmation',
+    'invalidation_level', 'invalidation_distance_pct', 'invalidation_distance_atr',
+    'price_extension', 'price_extension_basis',
+  ];
+  let seen = 0;
+  for (const f of view.families) {
+    for (const c of f.candidates) {
+      const p = c.price_position;
+      assert.ok(p, `${c.ts_code} ${c.strategy_id} has no price position`);
+      assert.equal(p.basis, 'adjusted_close', `${c.ts_code}: adjusted basis only`);
+      for (const key of required) assert.ok(key in p, `${c.ts_code} ${c.strategy_id} missing ${key}`);
+      assert.equal(typeof p.price_extension, 'boolean');
+      assert.ok(Array.isArray(p.price_extension_basis) && p.price_extension_basis.length > 0);
+      seen++;
+    }
+  }
+  assert.ok(seen > 0, 'the view must contain candidates');
+  for (const s of view.research_universe.stocks) {
+    for (const sig of s.signals) assert.ok('price_position' in sig, `${s.ts_code} signal missing price_position`);
+  }
+});
+
 test('repeated analysis is deterministic in families, contexts and the research universe', () => {
   const again = analyzeTechnicalDay(db, AS_OF);
   assert.deepEqual(again.families, view.families);
