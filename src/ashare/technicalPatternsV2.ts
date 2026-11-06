@@ -1138,11 +1138,13 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
     rsi14: round4(x.rsi14[k]),
   });
 
-  // A `range` regime is the documented reversion environment, so it overrides
-  // the per-bar background test. Otherwise the background is evaluated at the
-  // BAR BEING DECIDED (not at the reporting day), so a later advance cannot
-  // re-decide an earlier confirmation.
-  const rangeRegime = input.regime === 'range';
+  // The reversion environment is decided from each bar's own price facts and
+  // that bar's market regime, never from the as-of day's label: a market label
+  // read at the reporting day would re-decide (and could revoke) an earlier
+  // confirmation as the as-of advances.
+  const regimeAtBar = (k: number): string | null => (input.regimeAt
+    ? input.regimeAt(b.dates[k])
+    : input.regime);
 
   /** First bar of the oversold run that contains `k` (bar k must be oversold). */
   const runStartAt = (k: number): number => {
@@ -1165,7 +1167,10 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
     let confirm = -1;
     let obsIdx = -1;
     for (let c = o + 1; c <= confirmEnd; c++) {
-      if (!rangeRegime && downAt(c)) continue; // a downtrend cannot confirm a reversion
+      // Outside a range regime, a stock-level downtrend at the bar being
+      // decided cannot confirm a reversion. Both inputs are bar-local, so the
+      // decision is stable across as-of days.
+      if (regimeAtBar(c) !== 'range' && downAt(c)) continue;
       if (!(isFin(close[c]) && isFin(x.bollLow[c]) && isFin(close[c - 1])
         && isFin(x.rsi14[c]) && isFin(x.rsi14[c - 1]))) continue;
       if (!(close[c] > x.bollLow[c] && close[c] > close[c - 1] && x.rsi14[c] >= x.rsi14[c - 1])) continue;
@@ -1257,15 +1262,14 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
     return { terminalIdx: null, parts: { ...withLevel, stage: 'FORMING', stage_detail: 'OVERSOLD_OBSERVATION' } };
   });
 
-  // The walk's episode is the report. A `range` regime is explicitly a
-  // reversion environment; otherwise a confirmed downtrend relabels the walk's
-  // CURRENT oversold episode as a counter-trend observation. The relabel keeps
-  // the walk's dates, so the standing observation can never re-date itself as
-  // new oversold runs come and go.
+  // A stock-level downtrend relabels the CURRENT, still-unconfirmed oversold
+  // observation as a counter-trend note. It never revokes a confirmation that
+  // already happened, and it keeps the walk's dates, so the standing
+  // observation can never re-date itself as new oversold runs come and go.
   if (!resolved) return [];
   const backgroundDown = isFin(x.ma20[i]) && isFin(x.ma20[i - 10]) && x.ma20[i] < x.ma20[i - 10]
     && isFin(close[i]) && isFin(x.ma60[i]) && close[i] < x.ma60[i];
-  if (!rangeRegime && backgroundDown && obsAt(i)
+  if (regimeAtBar(i) !== 'range' && backgroundDown && resolved.parts.confirmed_on === null && obsAt(i)
     && resolved.parts.pattern_event_date === b.dates[runStartAt(i)]) {
     return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
       ...resolved.parts,

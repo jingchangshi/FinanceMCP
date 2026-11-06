@@ -109,10 +109,12 @@ function prescreenFamilies(b, x, i, name, amount20Yi) {
 // ---------------------------------------------------------------- shared pass
 
 const basic = new Map((db.prepare('SELECT ts_code, name FROM stock_basic').all()).map((r) => [r.ts_code, r.name]));
+const HISTORY_START = '19000101';
 const days = recentTradeDays(db, asOf, BAR_COUNT);
 const dayIndex = new Map(days.map((d, k) => [d, k]));
-const start = days[0];
-const regime = regimeSeries(db, asOf).get(asOf) ?? 'UNKNOWN';
+const regimeMap = regimeSeries(db, asOf);
+const regime = regimeMap.get(asOf) ?? 'UNKNOWN';
+const regimeAt = (d) => regimeMap.get(d) ?? null;
 
 function barsBehind(lastBar) {
   const a = dayIndex.get(asOf), b = dayIndex.get(lastBar);
@@ -126,7 +128,10 @@ function sweep() {
   const stale = [];                  // eligible but no as-of bar
   const rawPrescreen = new Map();    // code -> [[family, metric]]
   const gateCounts = { adj_missing: 0, insufficient_bars: 0, st: 0, low_amount: 0, no_as_of_bar: 0 };
-  forEachStockBars(db, start, asOf, (code, b) => {
+  // Same bar window as production: every stock from its first bar up to the
+  // as-of, so recursive indicators are seeded identically (see
+  // technicalCandidatesV2.analyzeTechnicalV2).
+  forEachStockBars(db, HISTORY_START, asOf, (code, b) => {
     const i = b.dates.length - 1;
     const name = basic.get(code) ?? code;
     if (isSt(name)) { gateCounts.st++; return; }
@@ -139,7 +144,7 @@ function sweep() {
     if (hasAsOfBar) eligible.push(code); else { stale.push(code); gateCounts.no_as_of_bar++; }
     rawPrescreen.set(code, prescreenFamilies(b, x, i, name, amount20Yi));
     truths.set(code, detectAllPatterns({
-      code, bars: b, x, endIdx: i, asOf, regime,
+      code, bars: b, x, endIdx: i, asOf, regime, regimeAt,
       rps120: null, barsBehindAsOf: barsBehind(b.dates[i]),
     }).map((o) => ({ code, family: o.family, strategy_id: o.strategy_id, stage: o.stage, stage_detail: o.stage_detail, confirmed_on: o.confirmed_on ?? null })));
   });
