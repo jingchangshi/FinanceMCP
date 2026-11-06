@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const { computeIndicators } = await import('../build/ashare/indicators.js');
+const { detectPullbackResume } = await import('../build/ashare/patterns.js');
 const {
   PATTERN_DEFINITIONS_V2,
   detectTrendContinuation, detectPlatformBreakout, detectReversal,
@@ -222,6 +223,26 @@ function breachThenCrossWBars() {
   return makeBars(closes);
 }
 
+/**
+ * The same W formation, but the DIF never crosses the neckline inside the
+ * 40-bar window; it drifts near zero instead. The instance therefore expires at
+ * the first elapsed bar. Only afterwards (bars 183+) does a crash push the DIF
+ * well below both lows: the late breach must not re-date the episode as FAILED.
+ */
+function expiredThenBreachWBars() {
+  const closes = [];
+  const push = (from, to, at) => { for (let i = from; i <= to; i++) closes.push(at(i)); };
+  push(0, 60, i => 20 - (8 * i) / 60);
+  push(61, 75, i => 12 + (1.8 * (i - 60)) / 15);
+  push(76, 95, i => 13.8 - (2.2 * (i - 75)) / 20);
+  push(96, 110, i => 11.6 + (2.0 * (i - 95)) / 15);
+  push(111, 127, i => 13.6 - (3.0 * (i - 110)) / 17);
+  push(128, 133, i => 10.6 + (1.2 * (i - 127)) / 6);  // instance becomes provable at 133
+  push(134, 182, i => 11.8 + 0.02 * (i - 133));       // sideways drift: no neckline cross
+  push(183, 187, i => 11.8 + 0.02 * 49 - (8 * (i - 182)) / 5); // post-expiry crash
+  return makeBars(closes);
+}
+
 const byId = (observations, id) => observations.find(o => o.strategy_id === id);
 
 // ---------------------------------------------------------------- A. trend
@@ -304,9 +325,17 @@ test('trend continuation: a close below MA60 before the reclaim fails the setup 
       'invalidated_at >= confirmed_on or confirmed_on === null');
   }
 
-  // The reclaim at 102 is real — it clears MA60 — and must still not confirm.
-  assert.ok(bars.close[102] > computeIndicators(bars).ma60[102],
-    'the fixture reclaim is above MA60, so the branch is genuinely exercised');
+  // The reclaim at 102 is a genuinely detectable resume for THIS instance: it
+  // clears MA20 after a pre-pullback advance above it, with the same pullback
+  // start and touch. Before the fix that meant confirmed_on = dates[102] was
+  // spread into the FAILED branch, giving invalidated_at < confirmed_on.
+  const x = computeIndicators(bars);
+  const touchIdx = dates.indexOf(forming.pattern_event_date);
+  const resume = detectPullbackResume(bars.close, bars.low, x.ma20, x.ma60, 102);
+  assert.ok(resume, 'the reclaim at 102 is detected, so the branch is genuinely exercised');
+  assert.equal(resume.pullbackStartIndex, touchIdx, 'same pullback start as the episode');
+  assert.equal(resume.touchIndex, touchIdx, 'same touch as the episode');
+  assert.ok(bars.close[102] > x.ma60[102], 'the reclaim also clears MA60');
 
   // No later bar may resurrect the instance or re-date the failure.
   for (let k = 102; k < bars.dates.length; k++) {
@@ -471,6 +500,54 @@ test('MACD W bottom: a breach inside the window cannot be revived by a later nec
   }
 });
 
+test('MACD W bottom: a breach after the window elapses keeps EXPIRED, never a late FAILED', () => {
+  const bars = expiredThenBreachWBars();
+  const dates = bars.dates;
+  const at = (k) => byId(detectReversal(patternInput(bars, k)), 'rv_v2_macd_w_bottom');
+
+  const forming = at(133);
+  assert.ok(forming);
+  assert.equal(forming.stage, 'FORMING');
+  const formationIdx = dates.indexOf(forming.formed_on);
+  const expiresIdx = formationIdx + 41; // first bar the 40-bar window elapsed
+  assert.equal(formationIdx, 133);
+
+  // Inside the window the instance is forming, with no confirmation and no breach.
+  const lastInside = at(expiresIdx - 1);
+  assert.ok(lastInside);
+  assert.equal(lastInside.stage, 'FORMING', 'still forming before the window elapses');
+  assert.equal(lastInside.confirmed_on, null);
+
+  // The window elapses with no neckline cross: EXPIRED at that exact bar.
+  const expired = at(expiresIdx);
+  assert.ok(expired);
+  assert.equal(expired.stage, 'EXPIRED');
+  assert.equal(expired.expires_at, dates[expiresIdx]);
+  assert.equal(expired.invalidated_at, null, 'an elapsed window is not an invalidation');
+  assert.equal(expired.confirmed_on, null);
+  assert.equal(expired.formed_on, forming.formed_on, 'the instance keeps its formation date');
+  assert.equal(expired.pattern_event_date, forming.pattern_event_date, 'episode identity is stable');
+
+  // The crash really does push DIF below both W lows — but only after expiry.
+  const x = computeIndicators(bars);
+  const lastDif = x.dif[bars.dates.length - 1];
+  const below = Math.min(expired.evidence.first_low, expired.evidence.second_low);
+  assert.ok(lastDif < below,
+    `the late breach is real (DIF ${lastDif.toFixed(4)} < low ${below.toFixed(4)})`);
+  assert.ok(lastDif < expired.evidence.neckline, 'and it is not a neckline cross');
+
+  // Every later as-of keeps the same EXPIRED episode: the post-window breach
+  // must not turn it into FAILED with a new invalidation date.
+  for (let k = expiresIdx; k < bars.dates.length; k++) {
+    const o = at(k);
+    assert.ok(o, `instance reported at bar ${k}`);
+    assert.equal(o.stage, 'EXPIRED', `a post-window breach cannot fail it (bar ${k})`);
+    assert.equal(o.expires_at, dates[expiresIdx], `expires_at is not re-dated at bar ${k}`);
+    assert.equal(o.invalidated_at, null, `no invalidation appears at bar ${k}`);
+    assert.equal(o.confirmed_on, null, `no confirmation appears at bar ${k}`);
+  }
+});
+
 // ---------------------------------------------------------------- D. volatility
 
 test('BOLL squeeze: breakout confirms on the upper-band cross', () => {
@@ -567,6 +644,7 @@ const EPISODE_FIXTURES = {
   downtrend: () => downtrendBars(),
   breachedPullback: () => breachedPullbackBars(),
   breachThenCrossW: () => breachThenCrossWBars(),
+  expiredThenBreachW: () => expiredThenBreachWBars(),
 };
 
 test('episode model: a one-bar advance never changes an existing episode\'s dates', () => {
@@ -677,7 +755,7 @@ test('lifecycle: formation precedes confirmation; invalidation only follows a va
   const fixtures = [
     pullbackBars(), extendedPullbackBars(), platformBars(), runupBars(),
     divergenceBars(), dipDivergenceBars(), squeezeBars(), rideBars(), reversionBars(), downtrendBars(),
-    breachedPullbackBars(), breachThenCrossWBars(),
+    breachedPullbackBars(), breachThenCrossWBars(), expiredThenBreachWBars(),
   ];
   for (const bars of fixtures) {
     for (let k = 0; k < bars.dates.length; k++) {
