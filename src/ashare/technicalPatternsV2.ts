@@ -316,16 +316,25 @@ export function detectTrendContinuation(input: PatternInput): PatternObservation
     };
 
     // First event decides: a close below MA60 before the reclaim kills the
-    // setup and it can never confirm later (confirmed_on stays null).
-    const failBefore = firstWhere(t, confirmEnd,
-      k => isFin(close[k]) && isFin(ma60[k]) && close[k] < ma60[k]);
+    // setup and it can never confirm later. The touch bar itself is the first
+    // bar the setup is provable on, so a close below MA60 there counts.
+    const failBefore = (isFin(close[t]) && isFin(ma60[t]) && close[t] < ma60[t]) ? t
+      : firstWhere(t, confirmEnd, k => isFin(close[k]) && isFin(ma60[k]) && close[k] < ma60[k]);
     if (failBefore >= 0 && (confirm < 0 || failBefore < confirm)) {
       return {
         terminalIdx: failBefore,
         parts: {
           ...common, stage: 'FAILED', stage_detail: 'PULLBACK_RESUME',
+          // The instance died before any confirmation: it can never confirm
+          // later, so no confirmation date may be emitted (WP2 inversion fix).
+          confirmed_on: null, confirmed_idx: null,
           invalidation: { on: b.dates[failBefore], reason: 'close_below_ma60' },
-          evidence: { ...common.evidence, invalidation_close: round4(close[failBefore]) },
+          evidence: {
+            ...common.evidence,
+            confirmation_lag: null,
+            bars_since_confirmation: null,
+            invalidation_close: round4(close[failBefore]),
+          },
         },
       };
     }
@@ -812,15 +821,18 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
       };
     };
 
+    // First event inside the instance window decides. A breach anywhere between
+    // the formation bar and the eventual neckline cross kills the instance
+    // BEFORE it ever confirmed, and a later cross must not resurrect it.
+    const failBefore = isFin(dif[formationIdx]) && dif[formationIdx] < below
+      ? formationIdx
+      : firstWhere(formationIdx, wWindowEnd, k => isFin(dif[k]) && dif[k] < below);
+    if (failBefore >= 0 && (confirmRaw < 0 || failBefore < confirmRaw)) return failed(failBefore, null);
+
     if (confirmedIdx !== null && confirmRaw >= 0) {
-      // Scan from the formation bar: a breach that happened between the second
-      // low and the eventual neckline cross kills the instance BEFORE it ever
-      // confirmed, and a late cross must not resurrect it.
-      const breach = isFin(dif[formationIdx]) && dif[formationIdx] < below
-        ? formationIdx
-        : firstWhere(formationIdx, i, k => isFin(dif[k]) && dif[k] < below);
-      if (breach >= 0 && breach < confirmedIdx) return failed(breach, null);
-      if (breach >= 0 && breach <= confirmedIdx + 40) return failed(breach, confirmedIdx);
+      const breach = firstWhere(confirmedIdx, Math.min(i, confirmedIdx + 40),
+        k => isFin(dif[k]) && dif[k] < below);
+      if (breach >= 0) return failed(breach, confirmedIdx);
       const expiresIdx = confirmedIdx + 41;
       const live: ObservationParts = {
         ...base,
@@ -846,10 +858,9 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
       };
     }
 
-    const breachBefore = isFin(dif[formationIdx]) && dif[formationIdx] < below
-      ? formationIdx
-      : firstWhere(formationIdx, i, k => isFin(dif[k]) && dif[k] < below);
-    if (breachBefore >= 0) return failed(breachBefore, null);
+    // No confirmation inside the window and no breach: the instance expires
+    // at the first bar the window elapsed. A later breach is past the window
+    // and must not re-date it as FAILED.
     const expiresIdx = formationIdx + 41;
     const forming: ObservationParts = {
       ...base, stage: 'FORMING', stage_detail: 'DIF_W_FORMING',
