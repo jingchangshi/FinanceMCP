@@ -185,21 +185,31 @@ test('expired-only episodes are INVALIDATED with the window-end date', () => {
   assert.match(s.decisive_reasons.join(''), /2026-10-27/);
 });
 
-test('a failed episode from another family and an expired window never veto a live setup', () => {
-  const live = signal({ family: 'TREND_CONTINUATION', strategy_id: 'tc_v2_pullback_resume' });
+test('a current failure from another family is conflict evidence ⇒ DETERIORATING', () => {
+  const live = signal({ family: 'TREND_CONTINUATION', strategy_id: 'tc_v2_pullback_resume', confirmed_on: '2026-10-30' });
   const deadOther = signal({
     family: 'MEAN_REVERSION', strategy_id: 'mr_v2_oversold_reversion', stage: 'FAILED',
-    stage_detail: '失效', confirmed_on: '2026-10-20', invalidated_at: '2026-10-31',
+    stage_detail: 'REVERSION_FAILED', confirmed_on: '2026-10-20', invalidated_at: '2026-10-31',
     invalidation: { on: '2026-10-31', reason: '反弹未站回中轨' }, research_ready: false,
   });
+  const s = only(build([ctx()], [live, deadOther]));
+  assert.equal(s.research_state, 'DETERIORATING', 'family does not narrow the conflict check');
+  assert.match(s.conflicting_evidence.join(''), /mr_v2_oversold_reversion/, 'names the failed strategy');
+  assert.match(s.conflicting_evidence.join(''), /2026-10-31/, 'names the failure date');
+  assert.match(s.conflicting_evidence.join(''), /tc_v2_pullback_resume/, 'names the live strategy');
+  assert.match(s.conflicting_evidence.join(''), /2026-10-30/, 'names the live confirmation date');
+});
+
+test('an EXPIRED window never counts as conflict evidence for a live setup', () => {
+  const live = signal({ family: 'TREND_CONTINUATION', strategy_id: 'tc_v2_pullback_resume' });
   const expired = signal({
     family: 'REVERSAL', strategy_id: 'rv_v2_macd_dif_divergence', stage: 'EXPIRED',
-    stage_detail: '过期', confirmed_on: null, expires_at: '2026-10-29', research_ready: false,
+    stage_detail: '过期', confirmed_on: null, expires_at: '2026-10-31', research_ready: false,
   });
-  const s = only(build([ctx()], [live, deadOther, expired]));
-  assert.equal(s.research_state, 'FOCUS', 'other-family failures and expiries are history, not current evidence');
+  const s = only(build([ctx()], [live, expired]));
+  assert.equal(s.research_state, 'FOCUS', 'an elapsed observation window is not negative evidence');
   assert.deepEqual(s.conflicting_evidence, []);
-  assert.equal(s.signals.length, 3, 'the dead episodes stay in signals for audit');
+  assert.equal(s.signals.length, 2, 'the expired episode stays in signals for audit');
 });
 
 test('a historical same-family failure before the live confirmation coexists with it', () => {

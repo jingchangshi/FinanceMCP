@@ -535,9 +535,11 @@ export interface TechnicalFamilyView {
  *   1. BLOCKED       — the day's trading/data facts forbid a same-day reading
  *                      (suspended, no bar, one-price limit-down, stale bar).
  *   2. INVALIDATED   — every signal episode is dead (failed or window elapsed).
- *   3. DETERIORATING — a live setup is contradicted by NEW negative evidence of
- *                      the SAME family dated after its confirmation. A failure
- *                      or expiry that predates the live confirmation is history
+ *   3. DETERIORATING — a live setup is contradicted by a FAILED instance dated
+ *                      after the latest live confirmation. Family does not
+ *                      narrow the check: a current failure of another strategy
+ *                      is genuine conflict evidence. An EXPIRED window, or a
+ *                      failure that predates the live confirmation, is history
  *                      and never negates the live setup.
  *   4. EXTENDED      — the setup holds but price has run too fast: either the
  *                      five-day RAPID_RUNUP tag or `price_extension`
