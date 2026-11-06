@@ -3,23 +3,26 @@
 //
 // This is an OFFLINE CORRECTNESS COMPARISON ONLY. It never writes any database,
 // never creates a shadow track, and makes no profit claim. It answers one
-// question: for one as-of day, does the production candidate discovery
-// (prescreen perFamily=120 / union=500) return every pattern that the same five
-// deterministic detectors return when run over every stock that passes the
-// basic eligibility gates?
+// question: for one as-of day, does candidate discovery return every
+// CURRENTLY VALID pattern (FORMING / CONFIRMED / FOLLOW_THROUGH) that the same
+// five deterministic detectors return when run over every stock that passes
+// the basic eligibility gates? FAILED / EXPIRED episodes are reported
+// separately as historical records, not as live recall.
 //
 // Usage:
 //   node scripts/goal-1106-recall-audit.mjs --db <read-only.sqlite> --date 20261105 --mode both
-//   node scripts/goal-1106-recall-audit.mjs --db <...> --date 20261105 --mode prescreen --out artifacts/goal-1106/recall-before-20261105.json
+//   node scripts/goal-1106-recall-audit.mjs --db <...> --date 20261105 --mode both --out artifacts/goal-1106/recall-20261105.json
 //
-// `--mode prescreen` runs the production path only (createTechnicalPrescreen +
-// analyzeTechnicalV2, exactly as analyzeTechnicalDay).
-// `--mode full` runs every detector over every eligible stock (ground truth).
-// `--mode both` runs both and prints the per-family comparison.
+// `--mode legacy`  : the capped 120/500 prescreen as the analysed universe.
+// `--mode current` : the production path in the current build.
+// `--mode both`    : runs both, prints live recall per family for each.
+//
+// The legacy universe comes from `createTechnicalPrescreen().finish()`'s
+// per-family lists, which are retained as diagnostics even after the fix, so
+// the before numbers are exact without rebuilding the old revision.
 import { DatabaseSync } from 'node:sqlite';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 import { computeIndicators } from '../build/ashare/indicators.js';
 import { forEachStockBars } from '../build/ashare/bars.js';
@@ -42,19 +45,19 @@ for (let k = 2; k < process.argv.length; k += 2) {
 const dbPath = args.get('db');
 const asOf = args.get('date');
 const mode = args.get('mode') ?? 'both';
-if (!dbPath || !asOf) throw new Error('usage: --db <sqlite> --date YYYYMMDD [--mode both|prescreen|full] [--out file.json]');
+if (!dbPath || !asOf) throw new Error('usage: --db <sqlite> --date YYYYMMDD [--mode both|legacy|current] [--out file.json]');
 
 const db = new DatabaseSync(dbPath, { readOnly: true });
 const BAR_COUNT = 330;
+const LIVE_STAGES = new Set(['FORMING', 'CONFIRMED', 'FOLLOW_THROUGH']);
 const isSt = (name) => /ST|退/.test(name ?? '');
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 
 // ---------------------------------------------------------------- prescreen replica
-// The production prescreen's per-family conditions are re-stated here ONLY so
-// the audit can explain a miss as "the proxy never matched this stock" versus
-// "the capacity cap dropped it". If the production prescreen changes, this
-// block must change with it; the audit cross-checks the replica's union count
-// against `finish()` and reports a mismatch instead of silently trusting it.
+// Re-stated only to explain WHY a live miss happened: "the proxy never matched
+// this stock" (semantic gap) vs "ranked outside the 120/500 caps" (capacity).
+// The legacy analysed universe itself is read from the production prescreen's
+// retained per-family lists, not from this replica.
 function minFrom(v, from, to) { let m = Infinity; for (let j = Math.max(0, from); j <= to; j++) if (finite(v[j]) && v[j] < m) m = v[j]; return m; }
 function maxFrom(v, from, to) { let m = -Infinity; for (let j = Math.max(0, from); j <= to; j++) if (finite(v[j]) && v[j] > m) m = v[j]; return m; }
 function argMinFrom(v, from, to) { let b = -1; for (let j = Math.max(0, from); j <= to; j++) if (finite(v[j]) && (b < 0 || v[j] < v[b])) b = j; return b; }
@@ -157,33 +160,38 @@ function collectFromView(view) {
 }
 
 const keyOf = (o) => `${o.code}|${o.strategy_id}`;
-const byFamily = () => Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, {
-  full: 0, recalled: 0, missed: 0, missed_by_stage: {}, missed_stocks: [],
-}]));
+const emptySide = () => ({ full: 0, recalled: 0, missed: 0, missed_by_stage: {}, missed_stocks: [], missed_stock_count: 0 });
+const emptyFamily = () => ({ live: emptySide(), dead: emptySide() });
+const emptyFamilies = () => Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, emptyFamily()]));
 
-function summarize(fullObs, gotObs, analyzedCodes, rawPrescreen, perFamilyLists) {
-  const got = new Map(gotObs.map((o) => [keyOf(o), o]));
-  const fam = byFamily();
-  const missed = [];
+function summarize(fullObs, producedObs, analyzedCodes, rawPrescreen, perFamilyLists) {
+  const got = new Map(producedObs.map((o) => [keyOf(o), o]));
+  const families = emptyFamilies();
+  const missedLive = [];
+  const missedDead = [];
   for (const o of fullObs) {
-    fam[o.family].full++;
+    const side = LIVE_STAGES.has(o.stage) ? families[o.family].live : families[o.family].dead;
+    side.full++;
     const g = got.get(keyOf(o));
-    if (g && g.stage === o.stage) { fam[o.family].recalled++; continue; }
-    fam[o.family].missed++;
-    fam[o.family].missed_by_stage[o.stage] = (fam[o.family].missed_by_stage[o.stage] ?? 0) + 1;
-    fam[o.family].missed_stocks.push(o.code);
-    missed.push({ ...o, prescreen_stage: g?.stage ?? null });
+    if (g && g.stage === o.stage) { side.recalled++; continue; }
+    side.missed++;
+    side.missed_by_stage[o.stage] = (side.missed_by_stage[o.stage] ?? 0) + 1;
+    side.missed_stocks.push(o.code);
+    (LIVE_STAGES.has(o.stage) ? missedLive : missedDead).push({ ...o, produced_stage: g?.stage ?? null });
   }
   for (const f of TECHNICAL_FAMILIES) {
-    fam[f].missed_stocks = [...new Set(fam[f].missed_stocks)].sort();
-    fam[f].missed_stock_count = fam[f].missed_stocks.length;
-    fam[f].missed_stocks = fam[f].missed_stocks.slice(0, 200);
+    for (const side of [families[f].live, families[f].dead]) {
+      side.missed_stocks = [...new Set(side.missed_stocks)].sort();
+      side.missed_stock_count = side.missed_stocks.length;
+      side.missed_stocks = side.missed_stocks.slice(0, 200);
+    }
   }
 
-  const missedCodes = [...new Set(missed.map((o) => o.code))].sort();
+  // Reason attribution is based on the LIVE misses only.
   const analyzed = new Set(analyzedCodes);
   const reasons = {};
-  for (const code of missedCodes) {
+  const missedLiveCodes = [...new Set(missedLive.map((o) => o.code))].sort();
+  for (const code of missedLiveCodes) {
     const listed = rawPrescreen.get(code) ?? [];
     const capListed = listed.some(([family]) => (perFamilyLists[family] ?? []).includes(code));
     const reason = analyzed.has(code) ? 'analyzed_but_family_differs'
@@ -192,13 +200,28 @@ function summarize(fullObs, gotObs, analyzedCodes, rawPrescreen, perFamilyLists)
       : 'dropped_by_per_family_cap';
     reasons[reason] = (reasons[reason] ?? 0) + 1;
   }
+
+  const totals = { live: emptySide(), dead: emptySide() };
+  for (const f of TECHNICAL_FAMILIES) {
+    for (const side of ['live', 'dead']) {
+      totals[side].full += families[f][side].full;
+      totals[side].recalled += families[f][side].recalled;
+      totals[side].missed += families[f][side].missed;
+      for (const [st, n] of Object.entries(families[f][side].missed_by_stage)) {
+        totals[side].missed_by_stage[st] = (totals[side].missed_by_stage[st] ?? 0) + n;
+      }
+    }
+  }
+  totals.live.missed_stock_count = missedLiveCodes.length;
+  totals.dead.missed_stock_count = new Set(missedDead.map((o) => o.code)).size;
   return {
-    families: fam,
-    missed_total: missed.length,
-    missed_samples: missed.slice(0, 50),
-    missed_codes_total: missedCodes.length,
-    missed_codes: missedCodes.slice(0, 500),
-    missed_reason_counts: reasons,
+    families,
+    totals,
+    live_missed_total: missedLive.length,
+    live_missed_samples: missedLive.slice(0, 50),
+    live_missed_codes_total: missedLiveCodes.length,
+    live_missed_codes: missedLiveCodes.slice(0, 500),
+    live_missed_reason_counts: reasons,
   };
 }
 
@@ -212,6 +235,7 @@ const report = {
   db: dbPath,
   as_of: asOf,
   regime,
+  live_stages: [...LIVE_STAGES],
   capacity: TECHNICAL_CAPACITY,
   gate_counts: sweepOut.gateCounts,
   eligible: sweepOut.eligible.length,
@@ -223,51 +247,49 @@ const report = {
   sweep_seconds: Number(sweepSeconds.toFixed(3)),
 };
 
-let prescreenResult = null;
-let view = null;
-if (mode === 'prescreen' || mode === 'both') {
-  const tp = performance.now();
-  const ps = createTechnicalPrescreen();
-  scanMarket(db, asOf, { onStock: (code, b, x, i, row) => ps.observe(code, b, x, i, row) });
-  const finished = ps.finish();
-  const forced = forcedResearchCodes(db, asOf);
-  view = analyzeTechnicalV2(db, { asOf, prescreen: finished, forcedCodes: forced });
-  const seconds = (performance.now() - tp) / 1000;
-  const gotObs = collectFromView(view);
-  const analyzedCodes = [...new Set([
-    ...TECHNICAL_FAMILIES.flatMap((f) => finished.perFamily[f].map((e) => e.ts_code)),
-    ...forced.map((f) => f.ts_code),
-  ])];
-  const perFamilyLists = Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, finished.perFamily[f].map((e) => e.ts_code)]));
-  // Ground truth is the eligible universe; a stale name is only in scope when
-  // production forces it (suspended / one-price-limit).
-  const ground = [...sweepOut.eligible.flatMap((c) => sweepOut.truths.get(c) ?? [])];
-  const cmp = summarize(ground, gotObs, analyzedCodes, sweepOut.rawPrescreen, perFamilyLists);
-  const includeEntries = args.has('include-entries');
-  prescreenResult = {
-    seconds: Number(seconds.toFixed(3)),
-    coverage: view.coverage,
-    view_json_mb: Number((Buffer.byteLength(JSON.stringify(view)) / 1048576).toFixed(2)),
-    preselected_codes: analyzedCodes.length,
-    forced_codes: forced.length,
-    per_family_preselected: Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, finished.perFamily[f].length])),
-    observation_counts: Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, gotObs.filter((o) => o.family === f).length])),
-    comparison: cmp,
-  };
-  if (includeEntries) prescreenResult.entries = gotObs;
-  report.prescreen = prescreenResult;
-}
+if (!['legacy', 'current', 'both'].includes(mode)) throw new Error(`unknown mode ${mode}`);
 
-if (mode === 'full' || mode === 'both') {
-  const ground = [...sweepOut.eligible.flatMap((c) => sweepOut.truths.get(c) ?? [])];
-  const fam = byFamily();
-  for (const o of ground) fam[o.family].full++;
-  report.full = {
-    eligible_with_asof_bar: sweepOut.eligible.length,
-    observations: ground.length,
-    per_family: Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, fam[f].full])),
-  };
-  if (args.has('include-entries')) report.full.entries = ground;
+const tp = performance.now();
+const ps = createTechnicalPrescreen();
+scanMarket(db, asOf, { onStock: (code, b, x, i, row) => ps.observe(code, b, x, i, row) });
+const finished = ps.finish();
+const forced = forcedResearchCodes(db, asOf);
+const view = analyzeTechnicalV2(db, { asOf, prescreen: finished, forcedCodes: forced });
+const seconds = (performance.now() - tp) / 1000;
+
+const perFamilyLists = Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, finished.perFamily[f].map((e) => e.ts_code)]));
+const legacyUnion = [...new Set(TECHNICAL_FAMILIES.flatMap((f) => perFamilyLists[f]))].sort();
+// The legacy production path analysed the union plus forced (suspended /
+// one-price-limit) names; the simulation must include the same set.
+const legacyCodes = [...new Set([...legacyUnion, ...forced.map((f) => f.ts_code)])];
+const legacySet = new Set(legacyCodes);
+const ground = [...sweepOut.eligible.flatMap((c) => sweepOut.truths.get(c) ?? [])];
+const currentObs = collectFromView(view);
+const currentCodes = [...new Set([...finished.eligible.map((e) => e.ts_code), ...forced.map((f) => f.ts_code)])];
+
+const legacyObs = ground.filter((o) => legacySet.has(o.code));
+const legacyCmp = summarize(ground, legacyObs, legacyCodes, sweepOut.rawPrescreen, perFamilyLists);
+const currentCmp = summarize(ground, currentObs, currentCodes, sweepOut.rawPrescreen, perFamilyLists);
+
+report.prescreen = {
+  seconds: Number(seconds.toFixed(3)),
+  coverage: view.coverage,
+  view_json_mb: Number((Buffer.byteLength(JSON.stringify(view)) / 1048576).toFixed(2)),
+  legacy_ranked_codes: legacyUnion.length,
+  legacy_codes: legacyCodes.length,
+  current_codes: currentCodes.length,
+  legacy_capacity_diagnostic: finished.capacity_limited,
+  per_family_preselected: Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, perFamilyLists[f].length])),
+  observation_counts: {
+    legacy: Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, legacyObs.filter((o) => o.family === f).length])),
+    current: Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, currentObs.filter((o) => o.family === f).length])),
+  },
+  legacy: legacyCmp,
+  current: currentCmp,
+};
+if (args.has('include-entries')) {
+  report.prescreen.current_entries = currentObs;
+  report.prescreen.legacy_entries = legacyObs;
 }
 
 report.max_rss_mb = Number((process.resourceUsage().maxRSS / 1024).toFixed(1));
@@ -278,29 +300,25 @@ if (args.get('out')) {
   writeFileSync(args.get('out'), JSON.stringify(report, null, 2));
 }
 
-// Human-readable summary on stdout.
+// Human-readable summary: LIVE recall first; dead history in a separate block.
 const lines = [];
 lines.push(`# ${asOf} regime=${regime} mode=${mode}`);
 lines.push(`eligible(with as-of bar)=${report.eligible} stale=${report.stale_eligible} ground_truth_obs=${report.ground_truth.observations} sweep=${report.sweep_seconds}s maxRSS=${report.max_rss_mb}MB`);
-if (report.prescreen) {
-  const { comparison, coverage } = report.prescreen;
-  lines.push(`prescreen: analyzed=${coverage.analyzed} preselected=${coverage.preselected} capacity_limited=${coverage.capacity_limited} time=${report.prescreen.seconds}s`);
-  lines.push('| family | full | recalled | missed |');
-  lines.push('|---|---|---|---|');
+lines.push(`legend: live=FORMING/CONFIRMED/FOLLOW_THROUGH; dead=FAILED/EXPIRED`);
+lines.push(`analysed: legacy(120/500)=${legacyUnion.length}+${forced.length} forced=${legacyCodes.length} current(eligible)=${currentCodes.length} capacity_diagnostic=${finished.capacity_limited} payload=${report.prescreen.view_json_mb}MB time=${report.prescreen.seconds}s`);
+for (const which of ['legacy', 'current']) {
+  const cmp = report.prescreen[which];
+  lines.push(`## ${which} — LIVE RECALL`);
+  lines.push('| family | live full | live recalled | live missed | missed stages |');
+  lines.push('|---|---:|---:|---:|---|');
   for (const f of TECHNICAL_FAMILIES) {
-    const x = comparison.families[f];
-    lines.push(`| ${f} | ${x.full} | ${x.recalled} | ${x.missed} |`);
+    const x = cmp.families[f].live;
+    lines.push(`| ${f} | ${x.full} | ${x.recalled} | ${x.missed} | ${JSON.stringify(x.missed_by_stage)} |`);
   }
-  lines.push(`missed stocks by reason: ${JSON.stringify(comparison.missed_reason_counts)}`);
-  for (const f of TECHNICAL_FAMILIES) {
-    const x = comparison.families[f];
-    if (x.missed) lines.push(`  ${f} missed by stage: ${JSON.stringify(x.missed_by_stage)}; stocks=${x.missed_stocks.slice(0, 20).join(',')}${x.missed_stocks.length > 20 ? '…' : ''}`);
-  }
-  if (mode === 'both') {
-    const pairs = TECHNICAL_FAMILIES.map((f) => [f, [report.prescreen.observation_counts[f], report.full.per_family[f]]]);
-    lines.push(`prescreen counts vs full: ${JSON.stringify(Object.fromEntries(pairs))}`);
-    lines.push(`prescreen view payload: ${report.prescreen.view_json_mb}MB`);
+  lines.push(`| ALL | ${cmp.totals.live.full} | ${cmp.totals.live.recalled} | ${cmp.totals.live.missed} | ${JSON.stringify(cmp.totals.live.missed_by_stage)} |`);
+  if (which === 'legacy') {
+    lines.push(`live missed stock reasons: ${JSON.stringify(cmp.live_missed_reason_counts)}`);
+    lines.push(`legacy DEAD HISTORY: full=${cmp.totals.dead.full} recalled=${cmp.totals.dead.recalled} missed=${cmp.totals.dead.missed} ${JSON.stringify(cmp.totals.dead.missed_by_stage)}`);
   }
 }
-if (report.full && mode === 'full') lines.push(`full per family: ${JSON.stringify(report.full.per_family)}`);
 console.log(lines.join('\n'));
