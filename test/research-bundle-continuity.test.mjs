@@ -18,6 +18,8 @@ const {
   feeVerificationStatus, resolveSessionState,
   buildEtfPenetrationState, ETF_PENETRATION_BUNDLE_SCHEMA,
 } = await import('../build/portfolio/researchBundle.js');
+const { recordResearchJournal, readResearchJournal } = await import('../build/portfolio/researchJournal.js');
+const { appendChatgptResearchRecord } = await import('../build/portfolio/chatgptIntake.js');
 const {
   normalizeEvidence, registerEvidence, invalidateEvidence, deriveEvidenceStatus,
   highConfidenceSet, dedupeEvidence, summarizeEvidenceState, fromChatgptEvidence,
@@ -90,6 +92,114 @@ test('identity hash input is byte-stable: same fixture, same report_id across in
   try {
     const ids = new Set([build(f).report_id, build(f).report_id, build(f).report_id]);
     assert.equal(ids.size, 1);
+  } finally { f.market.close?.(); f.p.close?.(); }
+});
+
+// ---------------------------------------------------------------- goal-1106 WP6: identity vs display
+//
+// 生产复现：同一交易日、同一份热点快照，max_candidates=8 得到
+// BUNDLE-20261105-335581cc99ba908aab6f，max_candidates=20 得到
+// BUNDLE-20261105-7aeb05d44ecae8563195。原因是展示截断进入了事实哈希。
+// 身份只能由完整、规范化的底层事实决定；展示上限只决定“显示哪几行”。
+
+test('max_candidates changes only the displayed rows, never the report_id', () => {
+  const f = fixture();
+  try {
+    const eight = build(f, { maxCandidates: 8 });
+    const twenty = build(f, { maxCandidates: 20 });
+    assert.equal(eight.report_id, twenty.report_id,
+      'the display limit must not enter the identity facts');
+
+    const shown = (result) => result.etf_candidates.candidates.filter(row => !row.held).length;
+    // The display still honours the requested limit: 8 shows exactly 8 non-held rows,
+    // while 20 shows every non-held row the canonical screen returned.
+    assert.equal(shown(eight), 8);
+    assert.ok(shown(twenty) > shown(eight), 'the larger display limit must show more rows');
+    assert.equal(twenty.etf_candidates.candidates.filter(row => row.held).length,
+      eight.etf_candidates.candidates.filter(row => row.held).length,
+      'held rows are always shown, regardless of the display limit');
+    assert.equal(eight.etf_candidates.total_candidates, twenty.etf_candidates.total_candidates,
+      'the canonical candidate set is the same regardless of the display limit');
+
+    // And every other identity-bearing field is identical too (same as_of, same facts).
+    assert.equal(eight.as_of_trade_date, twenty.as_of_trade_date);
+    assert.equal(eight.data_lineage.record_generated_at, twenty.data_lineage.record_generated_at);
+  } finally { f.market.close?.(); f.p.close?.(); }
+});
+
+test('a different technical implementation fingerprint produces a different report_id', () => {
+  const f = fixture();
+  try {
+    const body = hotspotBody('600001.SH');
+    const implA = 'sha256:impl-alpha';
+    const implB = 'sha256:impl-beta';
+    const savedA = saveHotspotSnapshot(f.market, {
+      ...body,
+      implementation_fingerprint: implA,
+      technical_view: { ...body.technical_view, implementation_fingerprint: implA },
+    });
+    const idA = build(f).report_id;
+    const savedB = saveHotspotSnapshot(f.market, {
+      ...body,
+      implementation_fingerprint: implB,
+      technical_view: { ...body.technical_view, implementation_fingerprint: implB },
+    });
+    const idB = build(f).report_id;
+    // The fingerprint is part of the snapshot content, so both the snapshot hash and
+    // the bundle identity distinguish the two implementations.
+    assert.notEqual(savedB.content_hash, savedA.content_hash);
+    assert.notEqual(idB, idA, 'different implementations must not share a research identity');
+  } finally { f.market.close?.(); f.p.close?.(); }
+});
+
+// ---------------------------------------------------------------- goal-1106 WP6 §4: parent links
+//
+// 身份定义修正后，重构出来的新 report_id 不会与旧 VPS 记录相同。此时写回必须明确
+// 报告“未能建立关联”，不能按日期挑一条旧父记录冒充；结果已知之后追加的正式记录
+// 仍保持补录属性。
+
+test('a report with no matching VPS parent says so and never reuses an older record', () => {
+  const f = fixture();
+  try {
+    const at = '2026-10-21T10:00:00+08:00'; // written after the 20261020 result is known
+    const oldReportId = 'BUNDLE-20261020-aaaaaaaaaaaaaaaaaaaa';
+    const old = recordResearchJournal(f.p, {
+      record_id: `VPS-${oldReportId}`, account_id: 'synthetic-account', source: 'vps',
+      as_of_trade_date: '20261020', bundle_id: oldReportId, generated_at: at,
+      versions: { journal: 'ashare-research-journal/1.0' },
+      judgement: { status: 'READY' }, candidates: [], observations: [], evidence: [],
+      payload: { report_id: oldReportId, as_of_trade_date: '20261020', status: 'READY' },
+    });
+
+    const live = build(f);
+    assert.notEqual(live.report_id, oldReportId);
+    // Read-only status: no exact identity, so no link is claimed (and no old record adopted).
+    assert.equal(live.persisted_snapshot.status, 'SNAPSHOT_NOT_FOUND');
+    assert.deepEqual(live.persisted_snapshot.record_ids, []);
+
+    // Write-back naming the new identity is refused with an explicit mismatch, not silently
+    // attached to the old record on the same date.
+    const judgement = (reportId) => ({
+      report_id: reportId, as_of_trade_date: '20261020',
+      independent_judgement: '独立判断：维持观察。', final_conclusion: '维持观察，不构成交易建议。',
+      additional_evidence: [], counter_evidence: [],
+    });
+    const before = f.p.prepare("SELECT COUNT(*) n FROM research_journal WHERE source='chatgpt'").get().n;
+    assert.throws(() => appendChatgptResearchRecord(f.p, 'synthetic-account', judgement(live.report_id), Date.parse(at)),
+      new RegExp(`bundle_identity_mismatch:.*${oldReportId}`));
+    assert.equal(f.p.prepare("SELECT COUNT(*) n FROM research_journal WHERE source='chatgpt'").get().n, before);
+
+    // Citing the record's real identity links exactly to it. Because it names a 20261020
+    // session written on 10-21, it can never be counted as forward evidence.
+    const appended = appendChatgptResearchRecord(f.p, 'synthetic-account', judgement(oldReportId), Date.parse(at));
+    assert.equal(appended.created, true);
+    // Written after the trade date: never counted as forward evidence (20261020 predates
+    // TRUE_FORWARD_START, so it is historical; either way the late-write attribute stands).
+    assert.notEqual(appended.evidence_class, 'TRUE_FORWARD');
+    assert.equal(appended.evidence_class, 'PRE_FORWARD_HISTORICAL');
+    const replay = appendChatgptResearchRecord(f.p, 'synthetic-account', judgement(oldReportId), Date.parse(at));
+    assert.equal(replay.created, false);
+    assert.deepEqual(readResearchJournal(f.p, appended.record_id).parent_record_ids, [old.record.record_id]);
   } finally { f.market.close?.(); f.p.close?.(); }
 });
 
