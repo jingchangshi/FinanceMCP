@@ -84,7 +84,44 @@ test('family list is fixed and ordered; no cross-family score exists', () => {
   assert.deepEqual([...fw.TECHNICAL_FAMILIES], [
     'TREND_CONTINUATION', 'PLATFORM_BREAKOUT', 'REVERSAL', 'VOLATILITY_EXPANSION', 'MEAN_REVERSION',
   ]);
-  assert.equal(fw.TECHNICAL_FRAMEWORK_VERSION.startsWith('technical-v2.'), true);
+  assert.equal(fw.TECHNICAL_FRAMEWORK_VERSION, 'technical-v2.1.0');
   assert.equal('compareCandidates' in fw, true);
   assert.equal('researchReadiness' in fw, true);
+});
+
+test('price position: adjusted basis, ATR extension threshold, RSI6 and RSI14 kept apart', () => {
+  assert.equal(fw.PRICE_EXTENSION_ATR_THRESHOLD, 3.0);
+  const n = 7;
+  const x = {
+    ma20: [9.5, 9.5, 9.6, 9.7, 9.8, 9.9, 10],
+    ma60: new Array(n).fill(9),
+    atr14: new Array(n).fill(0.5),
+    rsi6: new Array(n).fill(90),
+    rsi14: new Array(n).fill(75),
+  };
+  const base = { close: 11.5, x, endIdx: 6, confirmedIdx: 4, referencePrice: 10, referenceKind: 'ma20_reclaim', invalidationLevel: 9 };
+  const p = fw.buildPricePosition(base);
+  assert.equal(p.basis, 'adjusted_close');
+  assert.equal(p.ma20, 10);
+  assert.equal(p.close_vs_ma20_atr, 3, '(close-ma20)/atr14');
+  assert.equal(p.price_extension, true, '3.0 ATR is the fixed hypothesis threshold');
+  assert.match(p.price_extension_basis.join(' '), /threshold 3/);
+  assert.equal(p.rsi6, 90);
+  assert.equal(p.rsi14, 75);
+  assert.notEqual(p.rsi6, p.rsi14, 'RSI6 and RSI14 are separate facts');
+  assert.equal(p.ma20_above_ma60, true);
+  assert.equal(p.ma20_rising, true);
+  assert.equal(p.reference_kind, 'ma20_reclaim');
+  assert.equal(p.reference_distance_atr, 3);
+  assert.equal(p.bars_since_confirmation, 2);
+  assert.equal(p.invalidation_distance_atr, 5);
+
+  const below = fw.buildPricePosition({ ...base, close: 11.4 });
+  assert.ok(below.close_vs_ma20_atr < 3);
+  assert.equal(below.price_extension, false, 'no extension below the threshold');
+
+  // A missing ATR is reported as uncomputable, never guessed.
+  const noAtr = fw.buildPricePosition({ ...base, x: { ...x, atr14: new Array(n).fill(null) } });
+  assert.equal(noAtr.close_vs_ma20_atr, null);
+  assert.equal(noAtr.price_extension, false);
 });

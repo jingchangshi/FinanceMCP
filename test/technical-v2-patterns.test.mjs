@@ -88,6 +88,29 @@ function pullbackBars() {
   return makeBars(closes);
 }
 
+/**
+ * Same advance, continued for 36 more rising bars with no new pullback, so the
+ * confirmed episode's EXPIRED window actually elapses inside the series.
+ */
+function extendedPullbackBars() {
+  const closes = [];
+  for (let i = 0; i < 100; i++) closes.push(10 + 0.05 * i);
+  closes.push(14.70, 14.45, 14.20, 13.95, 14.80);
+  for (let i = 105; i <= 140; i++) closes.push(14.80 + 0.05 * (i - 104));
+  return makeBars(closes);
+}
+
+/** The divergence fixture with a pre-confirmation close below the second low. */
+function dipDivergenceBars() {
+  const bars = divergenceBars();
+  bars.close[120] = 11.0;
+  bars.low[120] = 10.9;
+  for (let i = 121; i < bars.close.length; i++) bars.close[i] = 11.8 + 0.1 * (i - 115);
+  bars.rawClose = bars.close.slice();
+  bars.rawLow = bars.low.slice();
+  return bars;
+}
+
 /** 90 rising bars, 40 tight-range bars, then a volume-qualified breakout. */
 function platformBars() {
   const closes = [];
@@ -170,33 +193,58 @@ const byId = (observations, id) => observations.find(o => o.strategy_id === id);
 
 // ---------------------------------------------------------------- A. trend
 
-test('trend continuation: MA20 pullback resumes on the confirmation bar (no backfill)', () => {
+test('trend continuation: a genuine close-based reclaim confirms, FORMING precedes it', () => {
   const bars = pullbackBars();
   const dates = bars.dates;
 
-  const before = detectTrendContinuation(patternInput(bars, 103));
-  const pullBefore = before.filter(o => o.strategy_id === 'tc_v2_pullback_resume');
-  assert.equal(pullBefore.some(o => o.stage === 'CONFIRMED'), false,
-    'the day before the resume cannot carry a confirmation');
-  assert.equal(pullBefore.some(o => o.confirmed_on === dates[104]), false,
-    'future resume date is invisible at the prior bar');
+  // The pullback is provable as FORMING from its first MA20 tag, three bars
+  // before the reclaim. This is an independent date, not the confirmation date.
+  for (const k of [101, 102, 103]) {
+    const f = byId(detectTrendContinuation(patternInput(bars, k)), 'tc_v2_pullback_resume');
+    assert.ok(f, `forming observation at bar ${k}`);
+    assert.equal(f.stage, 'FORMING');
+    assert.equal(f.stage_detail, 'PULLBACK_TO_MA20');
+    assert.equal(f.confirmed_on, null, 'nothing has confirmed yet');
+    assert.equal(f.formed_on, dates[101], 'episode anchored at the first MA20 tag');
+    assert.equal(f.pattern_event_date, dates[101]);
+    assert.equal(f.first_observed_date, dates[101], 'first provable bar, never backfilled');
+  }
 
   const resume = byId(detectTrendContinuation(patternInput(bars, 104)), 'tc_v2_pullback_resume');
   assert.ok(resume, 'resume observation exists');
   assert.equal(resume.stage, 'CONFIRMED');
   assert.equal(resume.stage_detail, 'PULLBACK_RESUME');
-  assert.equal(resume.formed_on, dates[103], 'formation is the MA20 touch date');
-  assert.equal(resume.confirmed_on, dates[104], 'confirmation is the resume date, not the touch');
+  assert.equal(resume.formed_on, dates[101], 'formation is the MA20 touch date');
+  assert.equal(resume.confirmed_on, dates[104], 'confirmation is the reclaim date, not the touch');
+  assert.ok(resume.formed_on < resume.confirmed_on, 'formation always precedes confirmation');
+  assert.equal(resume.evidence.touch_date, dates[101]);
   assert.equal(resume.evidence.rps_background_only, true, 'RPS is background only');
 });
 
-test('trend continuation: bullish alignment alone is background, never a confirmation', () => {
-  // 120 bars of steady rise: close > MA20 > MA60 the whole way, but the low
-  // never touches MA20, so there is no pullback and no resume to confirm.
+test('trend continuation: one advance is confirmed once; later bars are follow-through', () => {
+  const bars = extendedPullbackBars();
+  const dates = bars.dates;
+  const confirmedDates = new Set();
+  let sawConfirmed = false;
+  for (let k = 104; k < bars.dates.length; k++) {
+    const o = byId(detectTrendContinuation(patternInput(bars, k)), 'tc_v2_pullback_resume');
+    if (!o) continue;
+    if (o.stage === 'CONFIRMED') sawConfirmed = true;
+    if (o.confirmed_on) confirmedDates.add(o.confirmed_on);
+  }
+  assert.equal(sawConfirmed, true);
+  assert.deepEqual([...confirmedDates], [dates[104]],
+    'the sustained advance cannot be re-confirmed on a later bar');
+});
+
+test('trend continuation: MA20/MA60 alignment alone is background, never a confirmation', () => {
+  // 120 bars of steady rise: close > MA20 > MA60 the whole way, but the close
+  // never falls to MA20, so there is no pullback and no reclaim to confirm.
   const bars = makeBars(Array.from({ length: 120 }, (_, i) => 10 + 0.05 * i));
   const obs = detectTrendContinuation(patternInput(bars, 119));
   assert.equal(obs.some(o => o.stage === 'CONFIRMED' || o.stage === 'FOLLOW_THROUGH'), false,
-    'MA20 > MA60 is context; confirmation needs the pullback resume');
+    'MA20 > MA60 is context; confirmation needs the pullback reclaim');
+  assert.equal(obs.some(o => o.stage === 'FORMING'), false, 'no pullback ⇒ nothing is forming');
   assert.equal(obs.some(o => o.strategy_id === 'tc_v2_trend_established'), false,
     'there is no standalone trend-established signal');
 });
@@ -275,6 +323,30 @@ test('MACD divergence: forming before the neckline, confirmed on the cross, trun
     assert.equal(cut.formed_on, full.formed_on, `formed_on stable at ${k}`);
     if (full.confirmed_on !== null) assert.equal(cut.confirmed_on, full.confirmed_on, `confirmed_on stable at ${k}`);
   }
+});
+
+test('MACD divergence: a failure before confirmation can never be confirmed later', () => {
+  const bars = dipDivergenceBars();
+  const dates = bars.dates;
+  // Close below the second price low on 120 while the neckline is still above.
+  const failed = byId(detectReversal(patternInput(bars, 120)), 'rv_v2_macd_dif_divergence');
+  assert.ok(failed);
+  assert.equal(failed.stage, 'FAILED');
+  assert.equal(failed.confirmed_on, null, 'failed before it ever confirmed');
+  assert.equal(failed.invalidated_at, dates[120]);
+  assert.ok(failed.invalidated_at > failed.formed_on);
+  // Scanning later bars never resurrects this instance as confirmed.
+  for (let k = 120; k < 160; k++) {
+    const o = byId(detectReversal(patternInput(bars, k)), 'rv_v2_macd_dif_divergence');
+    if (!o || o.formed_on !== dates[118]) continue;
+    assert.equal(o.confirmed_on, null, `instance must stay unconfirmed at bar ${k}`);
+  }
+  // A genuinely new structure (lower low, new DIF pair) has its own dates and
+  // may confirm; it is a different instance, not a revival of the failed one.
+  const later = byId(detectReversal(patternInput(bars, 150)), 'rv_v2_macd_dif_divergence');
+  assert.ok(later);
+  assert.equal(later.stage, 'FOLLOW_THROUGH');
+  assert.notEqual(later.formed_on, dates[118]);
 });
 
 // ---------------------------------------------------------------- D. volatility
@@ -360,16 +432,21 @@ test('mean reversion in a downtrend never reaches CONFIRMED', () => {
 test('no-future: every family is truncation-invariant', () => {
   const cases = [
     { det: detectTrendContinuation, bars: pullbackBars(), at: [90, 100, 102, 103, 104] },
+    { det: detectTrendContinuation, bars: extendedPullbackBars(), at: [110, 114, 115, 116, 130] },
     { det: detectPlatformBreakout, bars: platformBars(), at: [100, 128, 129, 130, 131] },
-    { det: detectReversal, bars: divergenceBars(), at: [100, 115, 118, 130, 142, 143] },
+    { det: detectReversal, bars: divergenceBars(), at: [100, 115, 118, 130, 142, 143, 184, 185] },
+    { det: detectReversal, bars: dipDivergenceBars(), at: [119, 120, 122, 130, 150] },
     { det: detectVolatilityExpansion, bars: squeezeBars(), at: [121, 130, 138, 140, 145] },
     { det: detectVolatilityExpansion, bars: rideBars(), at: [185, 190, 192, 193, 199] },
     { det: detectMeanReversion, bars: reversionBars(), at: [135, 141, 142, 145, 153] },
   ];
   const pick = (o) => ({
     strategy_id: o.strategy_id, family: o.family, stage: o.stage, stage_detail: o.stage_detail,
+    pattern_event_date: o.pattern_event_date, first_observed_date: o.first_observed_date,
     formed_on: o.formed_on, confirmed_on: o.confirmed_on,
-    invalidation: o.invalidation, last_evaluated_on: o.last_evaluated_on,
+    invalidated_at: o.invalidated_at, expires_at: o.expires_at,
+    invalidation: o.invalidation, price_position: o.price_position,
+    last_evaluated_on: o.last_evaluated_on,
   });
   for (const { det, bars, at } of cases) {
     for (const k of at) {
@@ -377,6 +454,78 @@ test('no-future: every family is truncation-invariant', () => {
       const cut = det(patternInput(truncateBars(bars, k), k)).map(pick);
       assert.deepEqual(cut, full, `truncation mismatch at bar ${k}`);
     }
+  }
+});
+
+// ---------------------------------------------------------------- lifecycle invariants
+
+test('lifecycle: formation precedes confirmation; invalidation only follows a valid confirmation', () => {
+  const fixtures = [
+    pullbackBars(), extendedPullbackBars(), platformBars(), runupBars(),
+    divergenceBars(), dipDivergenceBars(), squeezeBars(), rideBars(), reversionBars(), downtrendBars(),
+  ];
+  for (const bars of fixtures) {
+    for (let k = 0; k < bars.dates.length; k++) {
+      const asOf = bars.dates[k];
+      for (const o of detectAllPatterns(patternInput(bars, k))) {
+        const where = `${o.strategy_id} at ${asOf}`;
+        if (o.pattern_event_date) assert.ok(o.pattern_event_date <= asOf, `${where}: event date in the future`);
+        if (o.first_observed_date !== null) assert.ok(o.first_observed_date <= asOf, `${where}: observed date in the future`);
+        if (o.confirmed_on) {
+          assert.ok(o.confirmed_on <= asOf, `${where}: confirmation date in the future`);
+          if (o.formed_on) assert.ok(o.formed_on <= o.confirmed_on, `${where}: formation after confirmation`);
+        }
+        if (o.stage === 'FORMING') assert.equal(o.confirmed_on, null, `${where}: FORMING cannot carry a confirmation`);
+        if (o.invalidated_at) {
+          assert.ok(o.invalidated_at <= asOf, `${where}: invalidation date in the future`);
+          if (o.confirmed_on) assert.ok(o.invalidated_at > o.confirmed_on,
+            `${where}: an instance may fail only after its confirmation`);
+          if (o.formed_on) assert.ok(o.invalidated_at >= o.formed_on, `${where}: invalidation before formation`);
+        }
+        if (o.stage === 'FAILED') assert.ok(o.invalidated_at, `${where}: FAILED needs an invalidation date`);
+        if (o.expires_at) assert.ok(o.expires_at <= asOf, `${where}: expiry date in the future`);
+        if (o.stage === 'EXPIRED') assert.ok(o.expires_at, `${where}: EXPIRED needs an expiry date`);
+      }
+    }
+  }
+});
+
+test('lifecycle: EXPIRED means the first expiry bar and never re-dates on later replays', () => {
+  const cases = [
+    {
+      bars: extendedPullbackBars(), sid: 'tc_v2_pullback_resume', det: detectTrendContinuation,
+      confirmedIdx: 104, window: 10,
+    },
+    {
+      bars: divergenceBars(), sid: 'rv_v2_macd_dif_divergence', det: detectReversal,
+      confirmedIdx: 143, window: 40,
+    },
+  ];
+  for (const { bars, sid, det, confirmedIdx, window } of cases) {
+    const expiryIdx = confirmedIdx + window + 1; // first bar with `i - confirmed > window`
+    const dates = bars.dates;
+    const at = (k) => byId(det(patternInput(bars, k)), sid);
+    const before = at(expiryIdx - 1);
+    assert.ok(before && before.stage !== 'EXPIRED', `${sid}: not expired before its window elapses`);
+    const first = at(expiryIdx);
+    assert.ok(first, `${sid}: instance exists at the first expiry bar`);
+    assert.equal(first.stage, 'EXPIRED');
+    assert.equal(first.expires_at, dates[expiryIdx], `${sid}: expiry is the first elapsed bar`);
+    assert.equal(first.confirmed_on, dates[confirmedIdx]);
+    for (const off of [1, 5, 20]) {
+      const replay = at(expiryIdx + off);
+      assert.ok(replay, `${sid}: instance still reported at +${off}`);
+      assert.equal(replay.stage, 'EXPIRED', `${sid}: stays expired at +${off}`);
+      assert.equal(replay.expires_at, dates[expiryIdx], `${sid}: expires_at identical at +${off}`);
+      assert.equal(replay.confirmed_on, dates[confirmedIdx], `${sid}: instance identity stable at +${off}`);
+    }
+  }
+});
+
+test('aggregate: output is deterministic on repeated evaluation', () => {
+  for (const bars of [pullbackBars(), divergenceBars(), squeezeBars(), reversionBars()]) {
+    const k = bars.dates.length - 1;
+    assert.deepEqual(detectAllPatterns(patternInput(bars, k)), detectAllPatterns(patternInput(bars, k)));
   }
 });
 
