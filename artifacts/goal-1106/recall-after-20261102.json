@@ -1,7 +1,7 @@
 {
   "audit": "goal-1106-wp5-recall",
   "mode": "both",
-  "db": "/home/jcshi/.local/share/ashare-v1/backups/ashare.20261105T142010Z.sqlite",
+  "db": "/tmp/market-copy-20261105.sqlite",
   "as_of": "20261102",
   "regime": "downtrend",
   "capacity": {
@@ -13,7 +13,7 @@
   "gate_counts": {
     "adj_missing": 0,
     "insufficient_bars": 88,
-    "st": 237,
+    "st": 299,
     "low_amount": 1188,
     "no_as_of_bar": 6
   },
@@ -21,11 +21,11 @@
   "stale_eligible": 6,
   "ground_truth": {
     "analyzed": 4099,
-    "observations": 17857
+    "observations": 28499
   },
-  "sweep_seconds": 12.683,
+  "sweep_seconds": 77.734,
   "prescreen": {
-    "seconds": 18.7,
+    "seconds": 81.252,
     "coverage": {
       "universe": 5571,
       "preselected": 4108,
@@ -34,7 +34,7 @@
       "skipped_insufficient": 0,
       "capacity_limited": 9791
     },
-    "view_json_mb": 35.7,
+    "view_json_mb": 95.25,
     "preselected_codes": 481,
     "forced_codes": 17,
     "per_family_preselected": {
@@ -45,49 +45,49 @@
       "MEAN_REVERSION": 120
     },
     "observation_counts": {
-      "TREND_CONTINUATION": 4055,
-      "PLATFORM_BREAKOUT": 802,
-      "REVERSAL": 7229,
-      "VOLATILITY_EXPANSION": 2680,
-      "MEAN_REVERSION": 3102
+      "TREND_CONTINUATION": 4104,
+      "PLATFORM_BREAKOUT": 4017,
+      "REVERSAL": 8203,
+      "VOLATILITY_EXPANSION": 8088,
+      "MEAN_REVERSION": 4108
     },
     "comparison": {
       "families": {
         "TREND_CONTINUATION": {
-          "full": 4046,
-          "recalled": 4046,
+          "full": 4095,
+          "recalled": 4095,
           "missed": 0,
           "missed_by_stage": {},
           "missed_stocks": [],
           "missed_stock_count": 0
         },
         "PLATFORM_BREAKOUT": {
-          "full": 800,
-          "recalled": 800,
+          "full": 4008,
+          "recalled": 4008,
           "missed": 0,
           "missed_by_stage": {},
           "missed_stocks": [],
           "missed_stock_count": 0
         },
         "REVERSAL": {
-          "full": 7213,
-          "recalled": 7213,
+          "full": 8185,
+          "recalled": 8185,
           "missed": 0,
           "missed_by_stage": {},
           "missed_stocks": [],
           "missed_stock_count": 0
         },
         "VOLATILITY_EXPANSION": {
-          "full": 2675,
-          "recalled": 2675,
+          "full": 8071,
+          "recalled": 8071,
           "missed": 0,
           "missed_by_stage": {},
           "missed_stocks": [],
           "missed_stock_count": 0
         },
         "MEAN_REVERSION": {
-          "full": 3094,
-          "recalled": 3094,
+          "full": 4099,
+          "recalled": 4099,
           "missed": 0,
           "missed_by_stage": {},
           "missed_stocks": [],
@@ -103,14 +103,14 @@
   },
   "full": {
     "eligible_with_asof_bar": 4099,
-    "observations": 17828,
+    "observations": 28458,
     "per_family": {
-      "TREND_CONTINUATION": 4046,
-      "PLATFORM_BREAKOUT": 800,
-      "REVERSAL": 7213,
-      "VOLATILITY_EXPANSION": 2675,
-      "MEAN_REVERSION": 3094
+      "TREND_CONTINUATION": 4095,
+      "PLATFORM_BREAKOUT": 4008,
+      "REVERSAL": 8185,
+      "VOLATILITY_EXPANSION": 8071,
+      "MEAN_REVERSION": 4099
     }
   },
-  "max_rss_mb": 516.3
+  "max_rss_mb": 751
 }

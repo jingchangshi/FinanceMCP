@@ -130,7 +130,7 @@
 ## 4. 候选发现
 
 - **全市场合格集合。** 复用 `scanMarket()` 已完成的全市场日线计算，收集所有通过基本门槛的股票：非 ST/退市、复权因子完整、至少 130 根 bar、20 日均成交额 ≥0.5 亿。
-- **全部合格股票进入五族完整检测。** `technical-v2.1.0` 不再让预筛排名决定谁被详析。只读副本实测：旧 perFamily=120 / union=500 路径在 20261105 漏掉 5,382 条仍有效（FORMING/CONFIRMED/FOLLOW_THROUGH）的形态；修复后六个交易日、五族召回均为 100%。
+- **全部合格股票进入五族完整检测。** `technical-v2.1.0` 不再让预筛排名决定谁被详析。只读副本实测：旧 perFamily=120 / union=500 路径在 20261105 漏掉 5,382 条仍有效（FORMING/CONFIRMED/FOLLOW_THROUGH）的形态；修复后六个交易日、五族召回均为 100%（每日 `missed_total=0`；20261105 合格 4,134 只、28,692 条观察）。
 - **容量上限仅诊断。** `TECHNICAL_CAPACITY.perFamily=120`、`union=500` 仍计算 `coverage.capacity_limited`，用于显示旧排名会截掉多少条，但不参与选股，也不因某次表现好坏调参。`coverage.preselected` 是合格股票数，`coverage.analyzed` 必须等于它（另加 `forcedCodes`）。
 - **不沿用旧入口垄断。** V2 入口不依赖 V1 的 `FOCUS`、RPS Top10 或 ETF 成分名单；低 RPS 的底背离、下轨回归候选同样可以进入反转或均值回归研究清单。旧 RPS 榜单只作为可选对照，不构成 V2 候选资格。
 - **独立解释。** 同一股票可被多个策略族发现，但 `contexts` 中只有一条共享量价记录；各族的 `stage` 与依据分别计算，不合并成跨族分数。
