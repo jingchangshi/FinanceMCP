@@ -259,7 +259,10 @@ test('platform breakout: tight base confirms on the volume breakout; a run-up ne
   assert.equal(forming.length, 1);
   assert.equal(forming[0].stage, 'FORMING');
   assert.equal(forming[0].stage_detail, 'PLATFORM_FORMING');
-  assert.equal(forming[0].formed_on, dates[99], 'platform window starts 30 bars before the evaluation bar');
+  const formationIdx = dates.indexOf(forming[0].pattern_event_date);
+  assert.ok(formationIdx < 129, 'the platform is dated at its first provable bar, not the evaluation bar');
+  assert.equal(forming[0].formed_on, dates[formationIdx - 30],
+    'the anchor is the first bar of the platform window at the formation bar');
   assert.equal(forming[0].confirmed_on, null);
 
   const confirmed = detectPlatformBreakout(patternInput(bars, 130));
@@ -267,7 +270,9 @@ test('platform breakout: tight base confirms on the volume breakout; a run-up ne
   assert.equal(confirmed[0].stage, 'CONFIRMED');
   assert.equal(confirmed[0].stage_detail, 'BREAKOUT_CONFIRMED');
   assert.equal(confirmed[0].confirmed_on, dates[130], 'breakout bar date');
-  assert.equal(confirmed[0].formed_on, dates[100]);
+  assert.equal(confirmed[0].formed_on, forming[0].formed_on,
+    'the platform anchor does not roll forward when the as-of advances');
+  assert.equal(confirmed[0].pattern_event_date, forming[0].pattern_event_date);
   assert.ok(confirmed[0].evidence.range_width <= 0.15);
   assert.ok(confirmed[0].evidence.volume_ratio >= 1.2);
   assert.ok(confirmed[0].key_levels.platform_high > 0);
@@ -341,12 +346,15 @@ test('MACD divergence: a failure before confirmation can never be confirmed late
     if (!o || o.formed_on !== dates[118]) continue;
     assert.equal(o.confirmed_on, null, `instance must stay unconfirmed at bar ${k}`);
   }
-  // A genuinely new structure (lower low, new DIF pair) has its own dates and
-  // may confirm; it is a different instance, not a revival of the failed one.
+  // The lower low sits on the very bar that killed the instance, so it cannot
+  // open a new episode (a new formation's event bar must be strictly after the
+  // previous terminal). The walk keeps reporting the failed instance, and it
+  // is never revived as confirmed.
   const later = byId(detectReversal(patternInput(bars, 150)), 'rv_v2_macd_dif_divergence');
   assert.ok(later);
-  assert.equal(later.stage, 'FOLLOW_THROUGH');
-  assert.notEqual(later.formed_on, dates[118]);
+  assert.equal(later.stage, 'FAILED');
+  assert.equal(later.formed_on, dates[118], 'the failed instance keeps its dates');
+  assert.equal(later.confirmed_on, null);
 });
 
 // ---------------------------------------------------------------- D. volatility
@@ -424,6 +432,96 @@ test('mean reversion in a downtrend never reaches CONFIRMED', () => {
     assert.equal(obs[0].stage, 'FORMING');
     assert.equal(obs[0].stage_detail, 'OVERSOLD_IN_DOWNTREND');
     assert.equal(obs[0].evidence.counter_trend_observation, true);
+  }
+});
+
+// ---------------------------------------------------------------- episode model
+
+// The forward walk (goal-1106 WP2): once an episode is observed its dates are a
+// pure function of the bars up to its own event, and a live/forming episode is
+// never replaced by a newer structure. These tests replay every fixture one bar
+// at a time and assert the contract directly, not just on hand-picked bars.
+const EPISODE_FIXTURES = {
+  pullback: () => pullbackBars(),
+  extendedPullback: () => extendedPullbackBars(),
+  platform: () => platformBars(),
+  divergence: () => divergenceBars(),
+  dipDivergence: () => dipDivergenceBars(),
+  squeeze: () => squeezeBars(),
+  ride: () => rideBars(),
+  reversion: () => reversionBars(),
+  downtrend: () => downtrendBars(),
+};
+
+test('episode model: a one-bar advance never changes an existing episode\'s dates', () => {
+  for (const [name, make] of Object.entries(EPISODE_FIXTURES)) {
+    const bars = make();
+    for (let k = 60; k + 1 < bars.dates.length; k++) {
+      const before = detectAllPatterns(patternInput(bars, k));
+      const after = detectAllPatterns(patternInput(bars, k + 1));
+      for (const old of before) {
+        const now = after.find(o => o.strategy_id === old.strategy_id
+          && o.pattern_event_date === old.pattern_event_date);
+        if (!now) continue;
+        for (const f of ['pattern_event_date', 'first_observed_date', 'formed_on']) {
+          assert.equal(now[f], old[f], `${name} ${old.strategy_id} ${f} stable at ${k}->${k + 1}`);
+        }
+        for (const f of ['confirmed_on', 'invalidated_at', 'expires_at']) {
+          if (old[f] !== null) {
+            assert.equal(now[f], old[f], `${name} ${old.strategy_id} ${f} must not be re-dated at ${k}->${k + 1}`);
+          }
+        }
+      }
+    }
+  }
+});
+
+test('episode model: a live or forming episode is never replaced by a new structure', () => {
+  for (const [name, make] of Object.entries(EPISODE_FIXTURES)) {
+    const bars = make();
+    for (let k = 60; k + 1 < bars.dates.length; k++) {
+      const before = detectAllPatterns(patternInput(bars, k));
+      const after = detectAllPatterns(patternInput(bars, k + 1));
+      for (const old of before) {
+        if (!['FORMING', 'CONFIRMED', 'FOLLOW_THROUGH'].includes(old.stage)) continue;
+        const same = after.find(o => o.strategy_id === old.strategy_id
+          && o.pattern_event_date === old.pattern_event_date);
+        assert.ok(same, `${name} ${old.strategy_id} live episode ${old.pattern_event_date} survived ${k}->${k + 1}`);
+        assert.ok(['FORMING', 'CONFIRMED', 'FOLLOW_THROUGH', 'FAILED', 'EXPIRED'].includes(same.stage));
+      }
+    }
+  }
+});
+
+test('episode model: a second re-entry/breakout/reclaim bar never re-confirms', () => {
+  // Trend: the reclaim at 104 is the only confirmation in the whole advance.
+  const pull = extendedPullbackBars();
+  for (const k of [105, 106, 107]) {
+    const o = byId(detectTrendContinuation(patternInput(pull, k)), 'tc_v2_pullback_resume');
+    assert.equal(o.confirmed_on, pull.dates[104], `trend confirmation stays at 104, not ${k}`);
+    assert.equal(o.stage, 'FOLLOW_THROUGH');
+  }
+  // Mean reversion: the re-entry at 142 is the confirmation; the next bar does
+  // not confirm again even though it is also above the lower band.
+  const rev = reversionBars();
+  for (const k of [143, 144]) {
+    const o = detectMeanReversion(patternInput(rev, k))[0];
+    assert.equal(o.confirmed_on, rev.dates[142], `reversion confirmation stays at 142, not ${k}`);
+    assert.equal(o.stage, 'FOLLOW_THROUGH');
+  }
+  // Squeeze: the upper-band cross at 140 confirms once.
+  const sq = squeezeBars();
+  for (const k of [141, 142, 145]) {
+    const o = byId(detectVolatilityExpansion(patternInput(sq, k)), 've_v2_boll_squeeze_breakout');
+    assert.ok(o);
+    assert.equal(o.confirmed_on, sq.dates[140], `squeeze confirmation stays at 140, not ${k}`);
+  }
+  // Platform: the breakout at 130 confirms once.
+  const pb = platformBars();
+  for (const k of [131, 132]) {
+    const o = detectPlatformBreakout(patternInput(pb, k))[0];
+    assert.ok(o);
+    assert.equal(o.confirmed_on, pb.dates[130], `breakout confirmation stays at 130, not ${k}`);
   }
 });
 
