@@ -264,6 +264,7 @@ if (mode === 'full' || mode === 'both') {
   for (const o of ground) fam[o.family].full++;
   report.full = {
     eligible_with_asof_bar: sweepOut.eligible.length,
+    eligible_codes: sweepOut.eligible,
     observations: ground.length,
     per_family: Object.fromEntries(TECHNICAL_FAMILIES.map((f) => [f, fam[f].full])),
   };
