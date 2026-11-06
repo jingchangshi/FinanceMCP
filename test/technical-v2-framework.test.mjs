@@ -125,3 +125,25 @@ test('price position: adjusted basis, ATR extension threshold, RSI6 and RSI14 ke
   assert.equal(noAtr.close_vs_ma20_atr, null);
   assert.equal(noAtr.price_extension, false);
 });
+
+test('known 20261105 case: 603606 close 41.00 / MA20 35.865 / ATR14 1.4079 is 3.6473 ATR', () => {
+  // Values read from the read-only 20261105 preview; this pins the arithmetic and
+  // the fixed hypothesis, not any return outcome.
+  const n = 7;
+  const x = {
+    ma20: new Array(n).fill(35.865),
+    ma60: new Array(n).fill(35.8505),
+    atr14: new Array(n).fill(1.4079),
+    rsi6: new Array(n).fill(90.2953),
+    rsi14: new Array(n).fill(74.0333),
+  };
+  const p = fw.buildPricePosition({ close: 41, x, endIdx: 6, referencePrice: 32.7033, referenceKind: 'boll_lower_reentry' });
+  assert.equal(p.close, 41);
+  assert.equal(p.ma20, 35.865);
+  assert.equal(p.atr14, 1.4079);
+  assert.equal(p.close_vs_ma20_atr, 3.6473);
+  assert.equal(p.price_extension, true);
+  assert.equal(p.rsi6, 90.2953);
+  assert.equal(p.rsi14, 74.0333);
+  assert.equal(p.ma20_above_ma60, true);
+});

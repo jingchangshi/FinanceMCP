@@ -1,6 +1,6 @@
 # A 股技术分析方法论 V2
 
-本文描述 `technical-v2.0.0` 的研究口径。实现契约集中在 `src/ashare/technicalFrameworkV2.ts`；A–E 五类策略独立产生研究候选，F 是每只股票只陈述一次的共享价格行为与交易状态解释层。全部输出仅为研究材料，`evidence_level` 只有 `UNVERIFIED` 一个起始值，本文不构成交易建议。
+本文描述 `technical-v2.1.0` 的研究口径（2026-11-06 修复版；`technical-v2.0.0` 的形态因果、过期时间与聚合规则已被本版取代，两者结果不可直接合并比较）。实现契约集中在 `src/ashare/technicalFrameworkV2.ts`；A–E 五类策略独立产生研究候选，F 是每只股票只陈述一次的共享价格行为与交易状态解释层。全部输出仅为研究材料，`evidence_level` 只有 `UNVERIFIED` 一个起始值，本文不构成交易建议。
 
 ## 1. 目标与边界
 
@@ -16,10 +16,11 @@
 
 ### 2.1 A｜趋势延续 `TREND_CONTINUATION`
 
-- **形态定义。** 两类可解释形态：①趋势已经建立（收盘价在 MA20 上方、MA20 在 MA60 上方且 MA20 相对若干交易日前抬升）；②上升趋势中回踩 MA20 附近后重新走强。均线多头排列只表示背景，不能替代“回踩后收复”的价格行为。
+- **形态定义。** 只认一个可解释事件：上升趋势中的回踩（收盘连续 ≤ MA20，最多 5 根）及其后的**收盘收复 MA20**。趋势背景必须在回踩点已经存在（MA20 > MA60 且 MA20 相对 5 个交易日前抬升），不能由确认当日才形成的均线排列冒充。均线多头排列本身不产生候选。
 - **数据输入。** 前复权日线、MA20/MA60、MA20 斜率、MACD 状态、RPS120。RPS120 只作为相对强度背景，不是独立胜率，也不是 V2 的硬门控。
-- **阶段语义。** `FORMING`：趋势背景成立且已发生 MA20 附近接触，但尚未出现收复；`CONFIRMED`：首次收盘重新站上 MA20 且当日走强；`FOLLOW_THROUGH`：确认后趋势契约仍成立；`FAILED`：收盘跌破 MA60 或 MA20 结构失效；`EXPIRED`：观察窗结束而契约未失效。
-- **关键阈值（研究假设）。** MA20/MA60 为趋势骨架；MA20 相对 5 个交易日前抬升；回踩发生在最近 5 根 K 线内，接触容差为 MA20 上方 1%（沿用 `DEFAULT_PULLBACK_OPTS`）；RPS120 可记录 V1 常用值 80 作为背景描述，但不据此否决低 RPS 候选。阈值是假设，不是已验证参数。
+- **阶段语义。** `FORMING`：回踩进行中（当日收盘 ≤ MA20，low 触及 MA20，回踩点趋势背景成立），尚未收复，**该分支必须可达**；`CONFIRMED`：前一日收盘 ≤ MA20、当日收盘 > MA20 且高于前一日收盘（真正的“重新站上”）；`FOLLOW_THROUGH`：确认后 10 根 K 线内未跌破 MA60 且未过期；`FAILED`：确认后收盘跌破 MA60；`EXPIRED`：确认后第 11 根 K 线仍未失效。
+- **关键阈值（研究假设）。** MA20/MA60 为趋势骨架；MA20 相对 5 个交易日前抬升；收盘回踩最多 5 根；low 触及 MA20 的容差为上方 1%（沿用 `DEFAULT_PULLBACK_OPTS`）；RPS120 可记录 V1 常用值 80 作为背景描述，但不据此否决低 RPS 候选。阈值是假设，不是已验证参数。
+- **时间字段。** `pattern_event_date = formed_on = 回踩日`，`confirmed_on = 收复日`；同一轮上涨只会在“前一日仍 ≤ MA20”的首次收复确认一次。
 - **与 V1 的区别。** V1 的 `tc_rps_hold` 把 RPS120 ≥ 80 当作触发条件，且多条趋势策略由同一组 `trend_up` 边沿驱动；V2 不再让 RPS 决定趋势候选资格，并把“回踩接触”和“收复确认”拆成可解释的前后阶段，避免把均线排列本身当作入场证据。
 
 ### 2.2 B｜平台整理与突破 `PLATFORM_BREAKOUT`
@@ -35,6 +36,7 @@
 - **形态定义。** 主模式是 MACD DIF 底背离：两个已确认的局部价格低点，第二个价格低点更低，而对应的 DIF 低点更高；背离本身只说明动能修复，不等于反转。出现价格收复短期关键位或局部颈线后，才标记反转确认。DIF W 底保留为另一种模式；MACD 金叉单独出现不构成充分反转证据。RSI 底背离可作为辅助观察，第一版不要求实现全部振荡指标。
 - **数据输入。** 前复权日线、MACD(12,26,9) 的 DIF、局部摆动低点、短期均线或颈线、RSI14（辅助）。
 - **阶段语义。** `FORMING`：两个低点及 DIF 抬高关系已可确认，但价格尚未收复关键位；`CONFIRMED`：首次收盘收复短期关键位或颈线；`FOLLOW_THROUGH`：确认后未跌回失效线且结构保持；`FAILED`：价格跌破两个低点中的较低者或背离结构被破坏；`EXPIRED`：观察窗结束。
+- **因果顺序。** 同一实例内，失效与确认都只在形成后的 40 根窗口内搜索，**先发生者决定实例**：失效先于确认 → 实例立即 `FAILED`，`confirmed_on` 必须为 `null`，之后永不补写确认；确认后失效 → `FAILED` 保留 `confirmed_on`，且 `invalidated_at >= confirmed_on`。后续重新形成的结构是新实例，不能复活旧实例。`expires_at` 记录窗口第一次走完的交易日，不随 as-of 推进改变。
 - **关键阈值（研究假设）。** 局部摆动低点采用左右各 3 根 K 线（L=3/K=3）；两个低点间隔 8–60 个交易日；第二个价格低点更低、对应 DIF 低点更高，且第二个 DIF 低点仍低于零轴；颈线取两个低点之间的最高价；形成时点为第二个低点右侧 3 根 K 线可确认之时，确认要求收盘越过颈线；形成或确认后 40 根 K 线未延续则过期。所有数值是研究假设，目的是固定语义，不是拟合结果。
 - **与 V1 的区别。** V1 的 `macd_bull_divergence` 在“近 10 日低点低于 20–60 日前的低点且 DIF 更高”的同一根 K 线上要求收阳并站上 MA5，形成与确认被压成一个边沿信号；V2 先输出背离形成，再等待价格确认，避免把“指标背离”直接当作“反转已发生”。同时保留 DIF W 底，不把金叉当替代品。
 
@@ -77,6 +79,7 @@
 
 - **确认日期不回溯。** `confirmed_on` 是形态首次可证的 K 线，`formed_on` 可以更早，但任何阶段日期都不能回填到形成低点或整理起点。用截断到评估日的 K 线重新运行，过去已确认信号的日期不得变化。
 - **形态不降级重述。** 已确认形态不会因为后续价格回落而改写成一个更早的 `FORMING`；失效就是 `FAILED`，窗口结束就是 `EXPIRED`。
+- **过期日期稳定。** `EXPIRED.expires_at` 是第一次满足过期条件的交易日，不是评估日；在过期后 +1/+5/+20 个交易日重放必须相同。`EXPIRED` 只表示观察窗口结束，不是当前负面证据。
 
 ### 3.2 `research_ready` 与交易状态
 
@@ -92,7 +95,7 @@
 {
   "status": "OK",
   "reason": null,
-  "framework_version": "technical-v2.0.0",
+  "framework_version": "technical-v2.1.0",
   "implementation_fingerprint": "<sha256>",
   "as_of": "YYYYMMDD",
   "market_regime": "uptrend | downtrend | range | UNKNOWN",
@@ -116,7 +119,9 @@
 }
 ```
 
-每个候选至少带 `ts_code`、`name`、`trade_date`、`as_of`、`strategy_id`、`family`、`stage`、`stage_detail`、`formed_on`、`confirmed_on`、`confirmation_lag`、`formation_basis`、`confirmation_conditions`、`invalidation_conditions`、`invalidation`、`key_levels`、`evidence`、`market_regime`、`price_volume_tags`、`trading_status`、`research_ready`、`research_blockers`、`evidence_level`。
+每个候选至少带 `ts_code`、`name`、`trade_date`、`as_of`、`strategy_id`、`family`、`stage`、`stage_detail`、`formed_on`、`confirmed_on`、`invalidated_at`、`expires_at`、`confirmation_lag`、`formation_basis`、`confirmation_conditions`、`invalidation_conditions`、`invalidation`、`key_levels`、`evidence`、`market_regime`、`price_volume_tags`、`trading_status`、`research_ready`、`research_blockers`、`evidence_level`，以及描述性 `price_position`。
+
+`price_position`（全部为同一前复权收盘口径，不是评分）：`close`、`ma20`、`ma60`、`atr14`、`rsi6`、`rsi14`、`close_vs_ma20_pct`、`close_vs_ma20_atr`、`close_vs_ma60_pct`、`ma20_above_ma60`、`ma20_rising`、`reference_price`、`reference_kind`、`reference_distance_pct`、`reference_distance_atr`、`bars_since_confirmation`、`invalidation_level`、`invalidation_distance_pct`、`invalidation_distance_atr`、`price_extension`、`price_extension_basis`。固定研究假设：`price_extension = (close - MA20) / ATR14 >= 3.0`；它未按案例拟合、未验证收益优势，RSI 只描述、不是失效门槛。
 
 - **确定性排序。** 同一策略族内按 `CONFIRMED` → `FOLLOW_THROUGH` → `FORMING` → `FAILED` → `EXPIRED`；同阶段按 `confirmed_on` 降序，再按 `ts_code`、`strategy_id` 升序。两次运行应序列化一致。
 - **版本与身份分离。** `framework_version` 和 `implementation_fingerprint` 描述 V2 口径；`implementation_fingerprint` 由 `TECHNICAL_MODULES` 的编译产物按固定方案 `technical-modules-v1` 计算。它和 V1 的 `entry_hash` 不是同一身份，不能互相替代。旧快照缺少 V2 字段时照常读取；新生成的 V2 快照把该字段计入内容身份，但不改写旧 `content_hash` 和历史版本号。
@@ -124,9 +129,9 @@
 
 ## 4. 候选发现
 
-- **全市场轻预选。** 复用 `scanMarket()` 已完成的全市场日线计算，按策略族做轻量预选：趋势族选强趋势附近样本；平台族选接近区间突破者；反转族选近期低点或动能修复者；波动率族选带宽收缩者；均值回归族选接近下轨或超卖反弹者。
-- **并集后详算。** 预选结果取并集，详细形态分析只对并集运行，避免对全市场每个策略都做完整历史扫描。`coverage.preselected`、`analyzed`、`skipped_adj_missing`、`skipped_insufficient` 和 `capacity_limited` 记录实际处理量。
-- **容量上限是成本控制。** 每族保留少量候选上限，用于控制运行时间；这些容量值不是通过收益优化得到的参数，不应被解释为策略阈值，也不因某次表现好坏而调参。
+- **全市场合格集合。** 复用 `scanMarket()` 已完成的全市场日线计算，收集所有通过基本门槛的股票：非 ST/退市、复权因子完整、至少 130 根 bar、20 日均成交额 ≥0.5 亿。
+- **全部合格股票进入五族完整检测。** `technical-v2.1.0` 不再让预筛排名决定谁被详析。只读副本实测：旧 perFamily=120 / union=500 路径在 20261105 漏掉 5,382 条仍有效（FORMING/CONFIRMED/FOLLOW_THROUGH）的形态；修复后六个交易日、五族召回均为 100%。
+- **容量上限仅诊断。** `TECHNICAL_CAPACITY.perFamily=120`、`union=500` 仍计算 `coverage.capacity_limited`，用于显示旧排名会截掉多少条，但不参与选股，也不因某次表现好坏调参。`coverage.preselected` 是合格股票数，`coverage.analyzed` 必须等于它（另加 `forcedCodes`）。
 - **不沿用旧入口垄断。** V2 入口不依赖 V1 的 `FOCUS`、RPS Top10 或 ETF 成分名单；低 RPS 的底背离、下轨回归候选同样可以进入反转或均值回归研究清单。旧 RPS 榜单只作为可选对照，不构成 V2 候选资格。
 - **独立解释。** 同一股票可被多个策略族发现，但 `contexts` 中只有一条共享量价记录；各族的 `stage` 与依据分别计算，不合并成跨族分数。
 
