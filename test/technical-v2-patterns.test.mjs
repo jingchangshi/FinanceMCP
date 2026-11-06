@@ -189,6 +189,39 @@ function downtrendBars() {
   return makeBars(closes);
 }
 
+/**
+ * Pullback that closes below MA60 while the setup is still forming, then puts a
+ * valid reclaim (10.70 > MA60 ≈ 10.34) inside the 5-bar window at bar 102. The
+ * first event decides: the instance died at 101 and the reclaim cannot revive it.
+ */
+function breachedPullbackBars() {
+  const closes = [];
+  for (let i = 0; i < 100; i++) closes.push(10 + 0.005 * i);
+  closes.push(10.40); // touch: below MA20, still above MA60 ⇒ FORMING
+  closes.push(9.00);  // close below MA60 ⇒ the setup fails before confirming
+  closes.push(10.70); // a reclaim inside the window that must not confirm it
+  return makeBars(closes);
+}
+
+/**
+ * DIF W bottom that breaches inside its 40-bar instance window and then rallies
+ * so hard the DIF crosses the neckline later. The failed instance must stay
+ * failed: a later cross is not evidence that the earlier breach never happened.
+ */
+function breachThenCrossWBars() {
+  const closes = [];
+  const push = (from, to, at) => { for (let i = from; i <= to; i++) closes.push(at(i)); };
+  push(0, 60, i => 20 - (8 * i) / 60);              // decline: first DIF low
+  push(61, 75, i => 12 + (1.8 * (i - 60)) / 15);    // rebound
+  push(76, 95, i => 13.8 - (2.2 * (i - 75)) / 20);  // second, lower price low
+  push(96, 110, i => 11.6 + (2.0 * (i - 95)) / 15); // rebound through the neckline
+  push(111, 127, i => 13.6 - (3.0 * (i - 110)) / 17); // decline: the W instance
+  push(128, 133, i => 10.6 + (1.2 * (i - 127)) / 6);  // bounce: instance becomes visible
+  push(134, 138, i => 11.8 - (3.5 * (i - 133)) / 5);  // breach: DIF back below the low
+  push(139, 184, i => 8.3 + 0.25 * (i - 138));        // rally: DIF ends above the neckline
+  return makeBars(closes);
+}
+
 const byId = (observations, id) => observations.find(o => o.strategy_id === id);
 
 // ---------------------------------------------------------------- A. trend
@@ -247,6 +280,42 @@ test('trend continuation: MA20/MA60 alignment alone is background, never a confi
   assert.equal(obs.some(o => o.stage === 'FORMING'), false, 'no pullback ⇒ nothing is forming');
   assert.equal(obs.some(o => o.strategy_id === 'tc_v2_trend_established'), false,
     'there is no standalone trend-established signal');
+});
+
+test('trend continuation: a close below MA60 before the reclaim fails the setup unconfirmed', () => {
+  const bars = breachedPullbackBars();
+  const dates = bars.dates;
+
+  const forming = byId(detectTrendContinuation(patternInput(bars, 100)), 'tc_v2_pullback_resume');
+  assert.ok(forming);
+  assert.equal(forming.stage, 'FORMING', 'the touch is the formation event');
+
+  // Bar 101 closes at 9.00, well below MA60: the first event is a failure.
+  for (const k of [101, 102]) {
+    const o = byId(detectTrendContinuation(patternInput(bars, k)), 'tc_v2_pullback_resume');
+    assert.ok(o, `instance reported at bar ${k}`);
+    assert.equal(o.stage, 'FAILED');
+    assert.equal(o.stage_detail, 'PULLBACK_RESUME');
+    assert.equal(o.confirmed_on, null,
+      `a breached setup can never carry a confirmation (bar ${k})`);
+    assert.equal(o.invalidated_at, dates[101], `invalidation is the first breach bar (${k})`);
+    assert.equal(o.formed_on, dates[100], 'the instance keeps its formation date');
+    assert.ok(o.invalidated_at >= (o.confirmed_on ?? o.invalidated_at),
+      'invalidated_at >= confirmed_on or confirmed_on === null');
+  }
+
+  // The reclaim at 102 is real — it clears MA60 — and must still not confirm.
+  assert.ok(bars.close[102] > computeIndicators(bars).ma60[102],
+    'the fixture reclaim is above MA60, so the branch is genuinely exercised');
+
+  // No later bar may resurrect the instance or re-date the failure.
+  for (let k = 102; k < bars.dates.length; k++) {
+    const o = byId(detectTrendContinuation(patternInput(bars, k)), 'tc_v2_pullback_resume');
+    assert.ok(o, `instance reported at bar ${k}`);
+    assert.equal(o.stage, 'FAILED', `the breached instance cannot confirm at bar ${k}`);
+    assert.equal(o.confirmed_on, null, `confirmed_on stays null at bar ${k}`);
+    assert.equal(o.invalidated_at, dates[101], `invalidated_at is not re-dated at bar ${k}`);
+  }
 });
 
 // ---------------------------------------------------------------- B. platform
@@ -357,6 +426,51 @@ test('MACD divergence: a failure before confirmation can never be confirmed late
   assert.equal(later.confirmed_on, null);
 });
 
+test('MACD W bottom: a breach inside the window cannot be revived by a later neckline cross', () => {
+  const bars = breachThenCrossWBars();
+  const dates = bars.dates;
+  const at = (k) => byId(detectReversal(patternInput(bars, k)), 'rv_v2_macd_w_bottom');
+
+  // The instance is provable from bar 133 and is still forming at 136.
+  const forming = at(133);
+  assert.ok(forming);
+  assert.equal(forming.stage, 'FORMING');
+  assert.equal(forming.pattern_event_date, dates[128], 'the second DIF low is the event');
+  assert.equal(forming.formed_on, dates[133]);
+  for (const k of [134, 135, 136]) {
+    const o = at(k);
+    assert.ok(o);
+    assert.equal(o.stage, 'FORMING', `still forming at bar ${k}`);
+    assert.equal(o.confirmed_on, null);
+  }
+
+  // Bar 137 breaches the second DIF low before any neckline cross: first event decides.
+  const failed = at(137);
+  assert.ok(failed);
+  assert.equal(failed.stage, 'FAILED');
+  assert.equal(failed.confirmed_on, null, 'the instance died before confirming');
+  assert.equal(failed.invalidated_at, dates[137]);
+  assert.equal(failed.formed_on, dates[133], 'the instance keeps its formation date');
+  const neckline = failed.evidence.neckline;
+  assert.ok(Number.isFinite(neckline));
+
+  // The rally really does push DIF through the neckline later in the series.
+  const difEnd = computeIndicators(bars).dif[bars.dates.length - 1];
+  assert.ok(difEnd > neckline, `the later cross is real (DIF ${difEnd} > neckline ${neckline})`);
+
+  // Every later as-of keeps reporting the same failed instance: no revival,
+  // no re-dated invalidation, no confirmation appearing from nowhere.
+  for (let k = 137; k < bars.dates.length; k++) {
+    const o = at(k);
+    assert.ok(o, `instance reported at bar ${k}`);
+    assert.equal(o.stage, 'FAILED', `a later neckline cross cannot confirm the dead instance (bar ${k})`);
+    assert.equal(o.confirmed_on, null, `confirmed_on stays null at bar ${k}`);
+    assert.equal(o.invalidated_at, dates[137], `invalidated_at is not re-dated at bar ${k}`);
+    assert.equal(o.expires_at, null, `a failed instance does not also expire (bar ${k})`);
+    assert.equal(o.pattern_event_date, dates[128], `episode identity is stable at bar ${k}`);
+  }
+});
+
 // ---------------------------------------------------------------- D. volatility
 
 test('BOLL squeeze: breakout confirms on the upper-band cross', () => {
@@ -451,6 +565,8 @@ const EPISODE_FIXTURES = {
   ride: () => rideBars(),
   reversion: () => reversionBars(),
   downtrend: () => downtrendBars(),
+  breachedPullback: () => breachedPullbackBars(),
+  breachThenCrossW: () => breachThenCrossWBars(),
 };
 
 test('episode model: a one-bar advance never changes an existing episode\'s dates', () => {
@@ -561,6 +677,7 @@ test('lifecycle: formation precedes confirmation; invalidation only follows a va
   const fixtures = [
     pullbackBars(), extendedPullbackBars(), platformBars(), runupBars(),
     divergenceBars(), dipDivergenceBars(), squeezeBars(), rideBars(), reversionBars(), downtrendBars(),
+    breachedPullbackBars(), breachThenCrossWBars(),
   ];
   for (const bars of fixtures) {
     for (let k = 0; k < bars.dates.length; k++) {
@@ -583,6 +700,12 @@ test('lifecycle: formation precedes confirmation; invalidation only follows a va
         if (o.stage === 'FAILED') assert.ok(o.invalidated_at, `${where}: FAILED needs an invalidation date`);
         if (o.expires_at) assert.ok(o.expires_at <= asOf, `${where}: expiry date in the future`);
         if (o.stage === 'EXPIRED') assert.ok(o.expires_at, `${where}: EXPIRED needs an expiry date`);
+        // No inverted lifecycle: a signal never claims to have confirmed after
+        // the bar that killed it (WP2/H05). This covers the fail-before-confirm
+        // branches of both the trend and W-bottom episodes.
+        assert.ok(o.confirmed_on === null || o.invalidated_at === null
+          || o.invalidated_at > o.confirmed_on,
+        `${where}: invalidated_at (${o.invalidated_at}) must be after confirmed_on (${o.confirmed_on})`);
       }
     }
   }
