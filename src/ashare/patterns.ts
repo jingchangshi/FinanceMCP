@@ -199,49 +199,143 @@ export function detectRangeBreakout(
 
 // ---------------------------------------------------------------- pullback resume
 
+/**
+ * Pullback-resume semantics (goal-1106 WP1) split three facts that the old
+ * detector conflated:
+ *
+ *   1. trend background  — MA20 above MA60 and rising, price above MA20,
+ *                          proven AT THE TOUCH (so it predates the reclaim);
+ *   2. pullback event    — a short close-based pullback (close <= MA20 for at
+ *                          most `touchWindow` bars) whose low actually tagged
+ *                          MA20;
+ *   3. reclaim event     — the previous bar closed at/below MA20 and today
+ *                          closes back above it, up on the day.
+ *
+ * MA20/MA60 alignment that only forms on the reclaim bar is NOT evidence that
+ * a trend existed before the pullback: the background is evaluated at the
+ * touch index, which is strictly earlier than the confirmation bar.
+ */
 export interface PullbackOpts {
-  /** Bars back a touch of MA20 may have occurred (exclusive of today). */
+  /** Max number of close-based pullback bars (close <= MA20) before the reclaim. */
   touchWindow: number;
-  /** Close may exceed MA20 by at most this fraction when counting as a touch. */
+  /** Low may exceed MA20 by at most this fraction when counting as a touch. */
   touchTol: number;
+  /** Bars over which MA20 must have risen at the touch (pre-existing trend). */
+  risingBars: number;
 }
 
-export const DEFAULT_PULLBACK_OPTS: PullbackOpts = { touchWindow: 5, touchTol: 0.01 };
+export const DEFAULT_PULLBACK_OPTS: PullbackOpts = { touchWindow: 5, touchTol: 0.01, risingBars: 5 };
 
-export interface PullbackResume {
-  confirmIndex: number;
-  /** Last bar (<= i) whose low touched the MA20 band. */
+/** An observed pullback inside an established uptrend, before any reclaim. */
+export interface PullbackEpisode {
+  /** First bar of the contiguous close-based pullback (close <= MA20). */
+  pullbackStartIndex: number;
+  /** Most recent bar of that pullback whose low tagged MA20. */
   touchIndex: number;
+  /** First bar at which this episode (touch + background) was provable. */
+  firstObservedIndex: number;
+  /** MA20 on the bar this record describes. */
   ma20: number;
 }
 
+export interface PullbackResume extends PullbackEpisode {
+  confirmIndex: number;
+}
+
+/** Pre-existing trend background: MA20 > MA60 and MA20 rising over `risingBars`. */
+function pullbackBackgroundAt(ma20: number[], ma60: number[], k: number, opts: PullbackOpts): boolean {
+  const back = k - opts.risingBars;
+  return back >= 0 && isFin(ma20[k]) && isFin(ma60[k]) && isFin(ma20[back])
+    && ma20[k] > ma60[k] && ma20[k] > ma20[back];
+}
+
 /**
- * Uptrend (close > MA20 > MA60) that recently tagged the MA20 from above
- * (within `touchWindow` bars, not today) and resumes: today closes back above
- * MA20 and up on the day. First-cross semantics over the episode.
+ * First index of the contiguous close <= MA20 run ending at `end`, or -1 when
+ * the run is longer than `maxLen` (a trend break, not a pullback).
+ */
+function pullbackRunStart(close: number[], ma20: number[], end: number, maxLen: number): number {
+  let s = end;
+  while (s > 0) {
+    const p = s - 1;
+    if (!isFin(close[p]) || !isFin(ma20[p]) || !(close[p] <= ma20[p])) break;
+    if (end - p + 1 > maxLen) return -1;
+    s = p;
+  }
+  return s;
+}
+
+/**
+ * First bar in [from, to] that tagged MA20 inside the pullback with the trend
+ * background intact. The FIRST tag is the pullback event: it is the earliest
+ * bar at which the episode is provable, it does not wander as later bars keep
+ * tagging the average, and it is the strictest test that the trend already
+ * existed before the pullback (the background must hold at that bar).
+ */
+function firstPullbackTouch(
+  close: number[], low: number[], ma20: number[], ma60: number[],
+  from: number, to: number, opts: PullbackOpts,
+): number {
+  for (let t = from; t <= to; t++) {
+    if (!isFin(low[t]) || !isFin(close[t]) || !isFin(ma20[t])) continue;
+    if (!(close[t] <= ma20[t])) continue;               // part of the close-based pullback
+    if (low[t] > ma20[t] * (1 + opts.touchTol)) continue; // no real tag of MA20
+    if (!pullbackBackgroundAt(ma20, ma60, t, opts)) continue; // no pre-existing trend at the touch
+    return t;
+  }
+  return -1;
+}
+
+/**
+ * Close-based reclaim inside an established uptrend. Requires ALL of:
+ *   - previous close <= MA20 (a real pullback, not a run that never left MA20);
+ *   - current close > MA20 and > previous close (the reclaim bar);
+ *   - a pullback of at most `touchWindow` bars whose low tagged MA20;
+ *   - price above MA20 before the pullback;
+ *   - MA20 > MA60 and MA20 rising at the touch.
+ * One crossing bar therefore confirms once: the next bar's previous close is
+ * already above MA20, so the same advance cannot be confirmed twice.
  */
 export function detectPullbackResume(
   close: number[], low: number[], ma20: number[], ma60: number[],
   i: number, opts: PullbackOpts = DEFAULT_PULLBACK_OPTS,
 ): PullbackResume | null {
-  if (i < 61 || i < opts.touchWindow + 1) return null;
-  if (!isFin(close[i]) || !isFin(ma20[i]) || !isFin(ma60[i])) return null;
-  if (!(close[i] > ma20[i] && ma20[i] > ma60[i])) return null;
-  if (!isFin(close[i - 1]) || !(close[i] > close[i - 1])) return null;
-  let touchIndex = -1;
-  for (let j = i - 1; j >= i - opts.touchWindow; j--) {
-    if (!isFin(low[j]) || !isFin(ma20[j])) continue;
-    if (low[j] <= ma20[j] * (1 + opts.touchTol)) { touchIndex = j; break; }
-  }
-  if (touchIndex < 0) return null;
-  // First-cross uniqueness: the compound resume condition must not have held
-  // yesterday (with yesterday not itself the touch day). This blocks re-fires
-  // on every up-bar of a multi-day run while still emitting on the first bar
-  // after a touch.
-  const resumeCond = (k: number): boolean => k >= 1 && isFin(close[k]) && isFin(ma20[k]) && isFin(ma60[k])
-    && isFin(close[k - 1]) && close[k] > ma20[k] && ma20[k] > ma60[k] && close[k] > close[k - 1];
-  if (touchIndex < i - 1 && resumeCond(i - 1)) return null;
-  return { confirmIndex: i, touchIndex, ma20: ma20[i] };
+  if (i < 61) return null;
+  if (!isFin(close[i]) || !isFin(close[i - 1]) || !isFin(ma20[i]) || !isFin(ma20[i - 1])) return null;
+  if (!(close[i] > ma20[i])) return null;      // reclaim bar: back above MA20
+  if (!(close[i - 1] <= ma20[i - 1])) return null; // previous close at/below MA20
+  if (!(close[i] > close[i - 1])) return null; // up on the reclaim day
+  const s = pullbackRunStart(close, ma20, i - 1, opts.touchWindow);
+  if (s < 1) return null;
+  if (!(close[s - 1] > ma20[s - 1])) return null; // price was above MA20 before the pullback
+  const touch = firstPullbackTouch(close, low, ma20, ma60, s, i - 1, opts);
+  if (touch < 0) return null;
+  return {
+    confirmIndex: i, pullbackStartIndex: s, touchIndex: touch,
+    firstObservedIndex: touch, ma20: ma20[i],
+  };
+}
+
+/**
+ * FORMING pullback: a valid pullback with its pre-touch trend background is
+ * still in progress (close <= MA20) and has not reclaimed MA20. The episode is
+ * provable from the touch bar onward, independently of any later confirmation.
+ */
+export function detectPullbackForming(
+  close: number[], low: number[], ma20: number[], ma60: number[],
+  i: number, opts: PullbackOpts = DEFAULT_PULLBACK_OPTS,
+): PullbackEpisode | null {
+  if (i < 61) return null;
+  if (!isFin(close[i]) || !isFin(ma20[i])) return null;
+  if (!(close[i] <= ma20[i])) return null; // the pullback is still in progress
+  const s = pullbackRunStart(close, ma20, i, opts.touchWindow);
+  if (s < 1) return null;
+  if (!(close[s - 1] > ma20[s - 1])) return null;
+  const touch = firstPullbackTouch(close, low, ma20, ma60, s, i, opts);
+  if (touch < 0) return null;
+  if (!pullbackBackgroundAt(ma20, ma60, i, opts)) return null; // background still intact
+  return {
+    pullbackStartIndex: s, touchIndex: touch, firstObservedIndex: touch, ma20: ma20[i],
+  };
 }
 
 // ---------------------------------------------------------------- RPS hold
