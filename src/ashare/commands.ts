@@ -269,7 +269,31 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       const latestAsOf = (d: DatabaseSync): string =>
         lastLiveDate(d) ?? latestTradeDay(d, shanghaiToday()) ?? (() => { throw new Error('trade_cal 无交易日，无法确定 as-of'); })();
       const asOf = h.arg('date') ? h.ymd(h.arg('date'), '--date') : latestAsOf(db);
-      h.print(runHotspotPipeline(db, asOf, { persist: !h.flag('dry-run') }));
+      const result = runHotspotPipeline(db, asOf, { persist: !h.flag('dry-run') });
+      if (h.flag('full')) {
+        h.print(result);
+        return true;
+      }
+      // goal-1106: default output is only a summary. The full snapshot body
+      // (~90MB) used to be printed to stdout, which run-hotspot-daily.sh
+      // redirected into logs/hotspot-snapshot-*.json on every run. The
+      // summary keeps the field paths the deploy script's jq summary reads
+      // (.snapshot.as_of, .saved.content_hash/version_no/state,
+      // .snapshot.technical_view.research_universe.counts).
+      const counts = (result.snapshot.technical_view as any)?.research_universe?.counts ?? {};
+      h.print({
+        snapshot: {
+          as_of: result.snapshot.as_of,
+          version_no: result.saved?.version_no ?? null,
+          content_hash: result.saved?.content_hash ?? result.snapshot.content_hash,
+          state: result.saved?.state ?? 'DRY_RUN',
+          technical_view: { research_universe: { counts } },
+        },
+        saved: result.saved,
+        seconds: result.seconds,
+        timings: result.timings,
+        readiness: result.readiness,
+      });
       return true;
     }
     case 'hotspot-versions': {

@@ -4,7 +4,7 @@ import { calculateFees, resolveFeeRules } from './fees.js';
 import { etfIdentity } from '../ashare/etfResearch.js';
 
 export const JOURNAL_VERSION = 'research-journal-20261021-v1';
-export const JOURNAL_SOURCES = ['vps', 'chatgpt', 'combined'] as const;
+export const JOURNAL_SOURCES = ['vps', 'chatgpt', 'hermes', 'combined'] as const;
 export type JournalSource = typeof JOURNAL_SOURCES[number];
 export interface JournalObservation {
   ts_code: string;
@@ -111,7 +111,7 @@ function normalized(input: ResearchJournalInput): ResearchJournalInput {
     ...(input.provenance ? { provenance: { author: text(input.provenance.author, 'author'), source_reference: text(input.provenance.source_reference, 'source_reference'), obtained_at: iso(input.provenance.obtained_at, 'obtained_at') } } : {}),
     ...(input.payload !== undefined ? { payload: input.payload } : {}),
   };
-  if (!JOURNAL_SOURCES.includes(record.source)) throw new Error('source must be vps, chatgpt or combined');
+  if (!JOURNAL_SOURCES.includes(record.source)) throw new Error('source must be vps, chatgpt, hermes or combined');
   if (!record.versions || Array.isArray(record.versions) || !Object.keys(record.versions).length || Object.values(record.versions).some(value => typeof value !== 'string' || !value)) throw new Error('versions are required');
   if (record.judgement === undefined || !Array.isArray(record.candidates) || !Array.isArray(record.observations) || !Array.isArray(record.evidence)) throw new Error('judgement, candidates, observations and evidence are required');
   if (record.source !== 'vps' && !record.provenance) throw new Error('External research requires actual provenance; no synthetic ChatGPT conclusions');
@@ -225,7 +225,9 @@ export function recordResearchJournal(db: DatabaseSync, input: ResearchJournalIn
   }
   if (record.source === 'combined') {
     const sources = new Set(record.parent_record_ids!.map(id => readResearchJournal(db, id)!.source));
-    if (!sources.has('vps') || !sources.has('chatgpt')) throw new Error('Combined research requires actual VPS and ChatGPT parent records');
+    // goal-1106: the external parent may be chatgpt or hermes — both are
+    // external-LLM research under the same daily intake cap.
+    if (!sources.has('vps') || !(sources.has('chatgpt') || sources.has('hermes'))) throw new Error('Combined research requires actual VPS and external (ChatGPT/Hermes) parent records');
   }
   const recordedAt = new Date().toISOString();
   // Journal row + binding must land together: a record that claims a snapshot

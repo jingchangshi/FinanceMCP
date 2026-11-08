@@ -11,7 +11,7 @@ import { inPortfolioTransaction } from './db.js';
  * - 只写不可变表 `research_journal`（触发器禁止 UPDATE/DELETE/REPLACE）；不碰账本、持仓、
  *   完整性声明、风险配置、费用、订单。入参是严格白名单，出现任何其它字段（含 source、
  *   created_at、record_id、哈希、持仓、订单）一律拒绝，而不是悄悄忽略。
- * - `source='chatgpt'`、生成/取得/写入时间全部由服务端取当前时钟；调用方无法提供。
+ * - `source`（goal-1106：'chatgpt' 缺省或 'hermes'，其余拒绝）、生成/取得/写入时间全部由服务端取当前时钟；调用方无法提供其它时间戳。
  * - 必须关联一份**已存在**的 VPS 研究快照（同账户、同 report_id、同交易日），不伪造关联。
  * - record_id 由 账户+交易日+report_id+(idempotency_key 或内容哈希) 派生：同键同内容幂等，
  *   同键不同内容拒绝；修正只能以新键写新记录（corrects_record_id → correction_of）。
@@ -27,7 +27,7 @@ export const INTAKE_LIMITS = {
 } as const;
 
 const TOP_KEYS = new Set(['account_id', 'report_id', 'as_of_trade_date', 'idempotency_key', 'corrects_record_id',
-  'independent_judgement', 'additional_evidence', 'counter_evidence', 'final_conclusion']);
+  'independent_judgement', 'additional_evidence', 'counter_evidence', 'final_conclusion', 'source']);
 const EVIDENCE_KEYS = new Set(['claim', 'kind', 'source_url', 'published_at']);
 const KINDS = new Set(['macro', 'industry', 'other']);
 
@@ -110,11 +110,18 @@ export function parseIntakeArgs(args: Record<string, unknown>, nowMs: number) {
     counter_evidence: evidenceList(input.counter_evidence, 'counter_evidence', INTAKE_LIMITS.counterItems, false, nowMs),
   };
   if (Buffer.byteLength(canonicalJson(content), 'utf8') > INTAKE_LIMITS.totalBytes) throw new Error(`research content exceeds ${INTAKE_LIMITS.totalBytes} bytes`);
+  // goal-1106: the intake tool serves two external-LLM sources. `source`
+  // defaults to 'chatgpt' (historical tool name); Hermes callers pass
+  // source='hermes'. It is part of the client-request whitelist — everything
+  // else about authorship stays server-derived.
+  const source = input.source === undefined || input.source === null || input.source === '' ? 'chatgpt' : String(input.source);
+  if (source !== 'chatgpt' && source !== 'hermes') throw new Error('source must be chatgpt or hermes');
   return {
     accountId: input.account_id === undefined ? undefined : String(input.account_id),
     reportId: str(input.report_id, 'report_id', 200)!, asOf, idempotencyKey,
     correctsRecordId: str(input.corrects_record_id, 'corrects_record_id', 200, false),
     content,
+    source,
   };
 }
 
@@ -143,35 +150,44 @@ function missingBundleReason(db: DatabaseSync, accountId: string, reportId: stri
  * `nowMs` is the server clock (injectable for tests only, never from the client).
  */
 export function appendChatgptResearchRecord(db: DatabaseSync, accountId: string, args: Record<string, unknown>, nowMs = Date.now(), dailyLimit: number = INTAKE_LIMITS.dailyRecords,
-  options: { market?: DatabaseSync | null } = {}): ChatgptIntakeResult {
+  options: { market?: DatabaseSync | null; source?: 'chatgpt' | 'hermes' } = {}): ChatgptIntakeResult {
   const parsed = parseIntakeArgs(args, nowMs);
+  // options.source (internal callers) overrides the request's source field.
+  const source = options.source ?? parsed.source;
   // The existence check, the daily cap and the insert run in one write transaction. Without it, two writers of the
   // same idempotency key both pass the check and the loser hits the journal's no-replace trigger, which reports a
   // retry as an error. With it the loser waits for the lock and then replays the stored row (created:false).
-  return inPortfolioTransaction(db, () => appendParsedRecord(db, accountId, parsed, nowMs, dailyLimit, options.market ?? null));
+  return inPortfolioTransaction(db, () => appendParsedRecord(db, accountId, { ...parsed, source }, nowMs, dailyLimit, options.market ?? null));
 }
 
 function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnType<typeof parseIntakeArgs>, nowMs: number, dailyLimit: number, market: DatabaseSync | null): ChatgptIntakeResult {
+  const source = parsed.source;
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get()) throw new Error(`bundle_not_found: the research journal has no VPS snapshots yet`);
   const bundles = db.prepare("SELECT record_id FROM research_journal WHERE account_id=? AND source='vps' AND bundle_id=? AND as_of_trade_date=? ORDER BY record_id LIMIT 10")
     .all(accountId, parsed.reportId, parsed.asOf) as { record_id: string }[];
   if (!bundles.length) throw new Error(missingBundleReason(db, accountId, parsed.reportId, parsed.asOf));
   if (parsed.correctsRecordId) {
     const target = readResearchJournal(db, parsed.correctsRecordId);
-    if (!target || target.account_id !== accountId || target.source !== 'chatgpt') throw new Error('corrects_record_id must be an existing ChatGPT record of this account');
+    // goal-1106: a correction may target either external source — correcting
+    // external-LLM research is the same operation regardless of which LLM
+    // wrote the original. (Message kept for compatibility.)
+    if (!target || target.account_id !== accountId || (target.source !== 'chatgpt' && target.source !== 'hermes')) throw new Error('corrects_record_id must be an existing ChatGPT record of this account');
   }
   const clientHash = createHash('sha256').update(canonicalJson({ ...parsed.content, report_id: parsed.reportId, as_of: parsed.asOf, corrects: parsed.correctsRecordId ?? null })).digest('hex');
   const identity = createHash('sha256').update(canonicalJson({ account: accountId, as_of: parsed.asOf, report: parsed.reportId, key: parsed.idempotencyKey ?? clientHash })).digest('hex').slice(0, 20);
-  const recordId = `CHATGPT-${parsed.asOf}-${identity}`;
+  const recordId = `${source === 'hermes' ? 'HERMES' : 'CHATGPT'}-${parsed.asOf}-${identity}`;
   const existing = readResearchJournal(db, recordId);
   if (existing) {
     if ((existing.payload as any)?.client_content_hash !== clientHash) throw new Error(`journal_id_conflict: ${recordId}; append a correction with a new idempotency_key`);
     return { created: false, record_id: recordId, content_hash: existing.content_hash, evidence_class: classifyRecord(existing) };
   }
-  // Daily intake cap counts only new rows, by server receipt time.
+  // Daily intake cap counts only new rows, by server receipt time. Both
+  // external sources share ONE external-research cap of 20/day (goal-1106):
+  // the cap guards write amplification, and per-source sub-caps would only
+  // double the budget without changing what the cap protects.
   const dayStart = new Date(Date.parse(`${shanghaiDate(nowMs).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')}T00:00:00+08:00`)).toISOString();
-  const today = (db.prepare("SELECT COUNT(*) n FROM research_journal WHERE source='chatgpt' AND recorded_at>=?").get(dayStart) as any).n as number;
-  if (today >= dailyLimit) throw new Error(`rate_limited: at most ${dailyLimit} ChatGPT research records per day`);
+  const today = (db.prepare("SELECT COUNT(*) n FROM research_journal WHERE source IN ('chatgpt','hermes') AND recorded_at>=?").get(dayStart) as any).n as number;
+  if (today >= dailyLimit) throw new Error(`rate_limited: at most ${dailyLimit} external (chatgpt/hermes) research records per day`);
   const received = new Date(nowMs).toISOString();
   const { content } = parsed;
   // goal-1032 follow-up: the independent research record is bound to the same
@@ -179,7 +195,7 @@ function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnT
   // Unbound when no snapshot exists — never guessed.
   const hotspot = resolveHotspotBinding(market, parsed.asOf);
   const result = recordResearchJournal(db, {
-    record_id: recordId, account_id: accountId, source: 'chatgpt', as_of_trade_date: parsed.asOf,
+    record_id: recordId, account_id: accountId, source: source as 'chatgpt' | 'hermes', as_of_trade_date: parsed.asOf,
     bundle_id: parsed.reportId, generated_at: received,
     versions: { journal: JOURNAL_VERSION, chatgpt_intake: CHATGPT_INTAKE_VERSION },
     judgement: { independent_judgement: content.independent_judgement, final_conclusion: content.final_conclusion },
@@ -190,7 +206,10 @@ function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnT
     ],
     parent_record_ids: bundles.map(row => row.record_id),
     correction_of: parsed.correctsRecordId ?? null,
-    provenance: { author: 'chatgpt', source_reference: `mcp:${CHATGPT_INTAKE_TOOL}:${parsed.reportId}`, obtained_at: received },
+    // CHATGPT_INTAKE_TOOL names the MCP tool, not the author: the tool name
+    // is historical and now serves hermes too, so authorship rides in
+    // provenance.author (= source) while source_reference keeps the tool name.
+    provenance: { author: source, source_reference: `mcp:${CHATGPT_INTAKE_TOOL}:${parsed.reportId}`, obtained_at: received },
     payload: { kind: 'chatgpt-research-record/1', client_content_hash: clientHash, idempotency_key: parsed.idempotencyKey ?? null, report_id: parsed.reportId, ...content },
   }, hotspot);
   return { created: result.created, record_id: recordId, content_hash: result.record.content_hash, evidence_class: classifyRecord(result.record) };
