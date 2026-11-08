@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS hotspot_snapshot (
   as_of TEXT NOT NULL,
   config_version TEXT NOT NULL,
   strategy_set_version TEXT,
-  payload TEXT NOT NULL,
+  payload TEXT,
   content_hash TEXT,
   generated_at TEXT NOT NULL,
   coverage TEXT,
@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS hotspot_snapshot_version (
   hash_basis TEXT NOT NULL DEFAULT 'v2',
   strategy_set_version TEXT,
   payload TEXT NOT NULL,
+  payload_format TEXT NOT NULL DEFAULT 'json',
   coverage TEXT,
   generated_at TEXT NOT NULL,
   recorded_at TEXT NOT NULL,
@@ -123,12 +124,45 @@ export const HOTSPOT_TABLES = [
 /** Idempotent: safe to call at the top of every sync and every read path. */
 export function ensureHotspotSchema(db: DatabaseSync): void {
   db.exec(HOTSPOT_SCHEMA);
+  // goal-1106: new pointer rows carry NO payload (the full ~90MB body lives
+  // only in the append-only ledger). Existing tables were created with
+  // `payload TEXT NOT NULL`, and SQLite cannot drop NOT NULL without a
+  // rebuild. The rebuild below is data-preserving (rename → create nullable
+  // → copy all columns → drop the old copy), following the migrateAshareDb
+  // precedent in db.ts; it fires once per database, only when the old
+  // definition still says NOT NULL.
+  const pointerDef = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'hotspot_snapshot'")
+    .get() as { sql?: string | null } | undefined;
+  if (pointerDef?.sql && /payload\s+TEXT\s+NOT\s+NULL/i.test(pointerDef.sql)) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec('ALTER TABLE hotspot_snapshot RENAME TO hotspot_snapshot_legacy');
+      const newCols = ['as_of', 'config_version', 'strategy_set_version', 'payload', 'content_hash', 'generated_at', 'coverage', 'version_no', 'state'];
+      db.exec(`CREATE TABLE hotspot_snapshot (
+        as_of TEXT NOT NULL, config_version TEXT NOT NULL, strategy_set_version TEXT,
+        payload TEXT, content_hash TEXT, generated_at TEXT NOT NULL, coverage TEXT,
+        version_no INTEGER, state TEXT, PRIMARY KEY (as_of, config_version))`);
+      const legacyCols = new Set((db.prepare('PRAGMA table_info(hotspot_snapshot_legacy)').all() as Array<{ name: string }>).map(c => c.name));
+      const common = newCols.filter(c => legacyCols.has(c));
+      db.exec(`INSERT INTO hotspot_snapshot (${common.join(', ')}) SELECT ${common.join(', ')} FROM hotspot_snapshot_legacy`);
+      db.exec('DROP TABLE hotspot_snapshot_legacy');
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  }
   // goal-1032: the pointer row gains the ledger position it points at. Guarded
   // by table_info — CREATE IF NOT EXISTS cannot add columns to an existing
   // table, and production already has a hotspot_snapshot.
   const snapCols = new Set((db.prepare('PRAGMA table_info(hotspot_snapshot)').all() as Array<{ name: string }>).map(c => c.name));
   if (!snapCols.has('version_no')) db.exec('ALTER TABLE hotspot_snapshot ADD COLUMN version_no INTEGER');
   if (!snapCols.has('state')) db.exec('ALTER TABLE hotspot_snapshot ADD COLUMN state TEXT');
+  // goal-1106: ledger payload compression marker. 'json' is the legacy
+  // uncompressed format; new rows are 'gzip+json'. Existing rows read as
+  // 'json' (column default) and are never rewritten.
+  const ledgerCols = new Set((db.prepare('PRAGMA table_info(hotspot_snapshot_version)').all() as Array<{ name: string }>).map(c => c.name));
+  if (!ledgerCols.has('payload_format')) db.exec("ALTER TABLE hotspot_snapshot_version ADD COLUMN payload_format TEXT NOT NULL DEFAULT 'json'");
 }
 
 export function hotspotTableExists(db: DatabaseSync, name: string): boolean {

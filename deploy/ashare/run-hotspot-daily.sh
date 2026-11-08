@@ -49,8 +49,11 @@ if [ "${ASHARE_HOTSPOT_FORCE:-0}" != "1" ] \
   && [ -f "$DATA_DIR/ashare.sqlite" ]; then
   latest_bar="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" 'SELECT MAX(trade_date) FROM daily;' 2>/dev/null || true)"
   if [ -n "$latest_bar" ] && [ "$latest_bar" = "$(TZ=Asia/Shanghai date +%Y%m%d)" ]; then
+    # goal-1106: new pointer rows carry no payload (full body lives in the
+    # append-only ledger), so the ledger readiness column is the primary
+    # answer; the pointer payload branch is the fallback for pre-ledger rows.
     already="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" \
-      "SELECT 1 FROM hotspot_snapshot WHERE as_of='$latest_bar' AND state IN ('PUBLISHED','CORRECTION') AND json_extract(payload,'\$.data_state.readiness')='READY' LIMIT 1;" \
+      "SELECT 1 FROM hotspot_snapshot_version WHERE as_of='$latest_bar' AND state IN ('PUBLISHED','CORRECTION') AND readiness='READY' LIMIT 1; SELECT 1 FROM hotspot_snapshot WHERE as_of='$latest_bar' AND state IN ('PUBLISHED','CORRECTION') AND payload IS NOT NULL AND json_extract(payload,'\$.data_state.readiness')='READY' LIMIT 1;" \
       2>/dev/null || true)"
     if [ -n "$already" ]; then
       echo "finance-ashare hotspot SKIPPED (already published): as_of=$latest_bar has a READY snapshot; nothing to repair. Set ASHARE_HOTSPOT_FORCE=1 to re-publish the same day."

@@ -1,0 +1,10 @@
+[Unit]
+Description=FinanceMCP A-share weekly database backup and rotation
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/workspace/FinanceMCP/deploy/ashare/backup-rotation.sh
+TimeoutStartSec=1800
+Nice=10
+IOSchedulingClass=idle

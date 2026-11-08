@@ -23,8 +23,8 @@ import { COMBINED_APPEND_TOOL, appendCombinedResearch } from './combinedResearch
  *
  * 与 `portfolio/tools.ts`、`decisionTool.ts` 一致的边界：
  * - 账户库只读；市场库只读；不写任何数据库，不访问网络。
- * - 唯一的写路径是 ashare_chatgpt_research_record_append（只追加、白名单入参、source 固定为 chatgpt，见
- *   chatgptIntake.ts）；成交录入、证据写入、完整性声明、风险配置、费用只能走本地 CLI。
+ * - 唯一的写路径是 ashare_chatgpt_research_record_append（只追加、白名单入参；source 取请求
+ *   的 source 字段，缺省 chatgpt、hermes 须显式传入，见 chatgptIntake.ts）；成交录入、证据写入、完整性声明、风险配置、费用只能走本地 CLI。
  * - 市场缓存缺失时返回结构化的 DATA_INSUFFICIENT，不抛异常给客户端。
  */
 

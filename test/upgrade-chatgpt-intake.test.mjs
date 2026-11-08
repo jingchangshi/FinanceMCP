@@ -97,10 +97,12 @@ test('forged source, timestamps, ids, hashes and forbidden account fields are re
   const db = seeded('20261022');
   try {
     const before = counts(db);
-    for (const field of ['source', 'created_at', 'recorded_at', 'generated_at', 'record_id', 'content_hash', 'provenance', 'observations', 'positions', 'holdings',
+    for (const field of ['created_at', 'recorded_at', 'generated_at', 'record_id', 'content_hash', 'provenance', 'observations', 'positions', 'holdings',
       'events', 'ledger_events', 'account_completeness', 'orders', 'risk_policy', 'fees', 'payload', 'parent_record_ids', 'correction_of']) {
-      assert.throws(() => appendAt(db, ACCOUNT, body({ [field]: field === 'source' ? 'vps' : [] }), NOW), /not accepted/, field);
+      assert.throws(() => appendAt(db, ACCOUNT, body({ [field]: [] }), NOW), /not accepted/, field);
     }
+    // goal-1106: `source` IS whitelisted now — but only chatgpt/hermes values.
+    assert.throws(() => appendAt(db, ACCOUNT, body({ source: 'vps' }), NOW), /source must be chatgpt or hermes/);
     assert.throws(() => appendAt(db, ACCOUNT, body({ additional_evidence: [{ claim: 'x', source_url: 'https://e.com', published_at: '2026-10-22', quantity: 100 }] }), NOW), /not accepted/);
     assert.equal(db.prepare("SELECT COUNT(*) n FROM research_journal WHERE source='chatgpt'").get().n, 0);
     assert.deepEqual(counts(db), before);
@@ -203,8 +205,9 @@ test('schema lists the append-only tools privately and nothing publicly', () => 
   const intake = writers.find(t => t.name === TOOL);
   const schema = intake.inputSchema;
   assert.equal(schema.additionalProperties, false);
+  // goal-1106: `source` (chatgpt/hermes) is the one new whitelisted field.
   assert.deepEqual(Object.keys(schema.properties).sort(), ['account_id', 'additional_evidence', 'corrects_record_id', 'counter_evidence', 'final_conclusion',
-    'idempotency_key', 'independent_judgement', 'as_of_trade_date', 'report_id'].sort());
+    'idempotency_key', 'independent_judgement', 'as_of_trade_date', 'report_id', 'source'].sort());
   assert.equal(intake.annotations.destructiveHint, false);
   assert.ok(!getAvailableToolList().some(t => t.name === TOOL));
   assert.ok(!getAvailableToolList().some(t => t.name === 'ashare_research_thesis_append'));
