@@ -49,7 +49,7 @@ const R = shanghaiToday;                       // 前瞻研究日 = 今天（上
 // （20261031 是周六；旧写法 `assert.ok(DAYS.includes(R) || ...)` 会让整份文件在
 // 每个周末必然失败，与用例自身的回退逻辑相矛盾。）
 const DAYS = (() => {
-  const base = weekdays('20261005', 30);       // 合成日历 20261005 起 30 个工作日
+  const base = weekdays('20261005', 45);       // 合成日历 20261005 起 45 个工作日（覆盖今天+5 以上交易日；见下方断言）
   return base.includes(R) ? base : [...base, R].sort();
 })();
 // 研究日之后至少 horizon 个交易日（不足则把 R 往前挪到日历内且 >= TRUE_FORWARD_START）。
