@@ -35,6 +35,43 @@ export const RESEARCH_EVAL_SCHEMA = 'research-eval/1.0';
 export const THESIS_APPEND_TOOL = 'ashare_research_thesis_append';
 export const THESIS_EVAL_TOOL = 'ashare_research_eval';
 
+/**
+ * goal-1109 P0-3：评价读失败的类型化信封。DB 满 / IO 错误绝不转为 NO_RECORDS——
+ * buildResearchEval 保持 throw 行为，但以本类抛出，工具层可据此返回
+ * status='READ_ERROR'（绝不冒充"无记录"）。校验期错误（ymd/horizon）不经此类。
+ */
+export class ResearchEvalReadError extends Error {
+  readonly status = 'READ_ERROR' as const;
+  readonly sqlite_code: string | null;
+  readonly sqlite_errno: string | number | null;
+  readonly envelope: Record<string, unknown>;
+  constructor(error: unknown, context: { account_id: string; as_of_trade_date: string; horizon_trade_days: number }) {
+    const e = error as Record<string, unknown> | null;
+    const code = e && typeof e.code === 'string' ? e.code : (e && typeof e.errcode === 'string' ? e.errcode : null);
+    const errno = e && (typeof e.errno === 'number' || typeof e.errno === 'string') ? e.errno
+      : e && typeof e.errcode === 'number' ? e.errcode : null;
+    const message = e && typeof e.message === 'string' ? e.message : String(error);
+    super(`research_eval_read_error: ${message}`);
+    this.name = 'ResearchEvalReadError';
+    this.sqlite_code = code;
+    this.sqlite_errno = errno;
+    console.error(`[research-eval] read_error sqlite_code=${code ?? 'unknown'} errno=${errno ?? 'unknown'}: ${message}`);
+    this.envelope = {
+      schema: RESEARCH_EVAL_SCHEMA,
+      status: 'READ_ERROR',
+      account_id: context.account_id,
+      as_of_trade_date: context.as_of_trade_date,
+      horizon_trade_days: context.horizon_trade_days,
+      error: { code, errno, message },
+      note: '数据库读取失败（磁盘满/IO/权限等），评价状态未知；不冒充 NO_RECORDS，不补造历史表现。',
+    };
+  }
+}
+
+export function isResearchEvalReadError(error: unknown): error is ResearchEvalReadError {
+  return error instanceof ResearchEvalReadError;
+}
+
 // goal-1106: hermes is a first-class evidence layer next to chatgpt (external
 // LLM, own layer); combined keeps measuring the merged judgement.
 export const EVAL_LAYERS = ['vps', 'chatgpt', 'hermes', 'combined'] as const;
@@ -438,6 +475,25 @@ export function buildResearchEval(input: {
   ymdCheck(asOf, 'asOf');
   const horizon = input.horizon ?? DEFAULT_HORIZONS[0];
   if (!Number.isInteger(horizon) || horizon < 1 || horizon > 252) throw new Error('horizon requires 1..252 trading days');
+
+  // goal-1109 P0-3：校验通过后的一切抛错都按读失败处理（仍抛，类型化为 READ_ERROR）。
+  try {
+    return buildResearchEvalInner(input, asOf, horizon);
+  } catch (error) {
+    if (isResearchEvalReadError(error)) throw error;
+    throw new ResearchEvalReadError(error, { account_id: input.accountId, as_of_trade_date: asOf, horizon_trade_days: horizon });
+  }
+}
+
+function buildResearchEvalInner(input: {
+  portfolioDb: DatabaseSync;
+  marketDb: DatabaseSync | null | undefined;
+  accountId: string;
+  asOf: string;
+  horizon?: number;
+  feeEstimator?: JournalFeeEstimator;
+  evaluations?: JournalEvaluation[];
+}, asOf: string, horizon: number): ResearchEvalResult {
 
   const records = listResearchJournal(input.portfolioDb, { accountId: input.accountId, asOf, limit: 1000 });
   const recordStats0 = records.map(record => ({ record, cls: classifyRecord(record) }));
