@@ -35,7 +35,9 @@ export const RESEARCH_EVAL_SCHEMA = 'research-eval/1.0';
 export const THESIS_APPEND_TOOL = 'ashare_research_thesis_append';
 export const THESIS_EVAL_TOOL = 'ashare_research_eval';
 
-export const EVAL_LAYERS = ['vps', 'chatgpt', 'combined'] as const;
+// goal-1106: hermes is a first-class evidence layer next to chatgpt (external
+// LLM, own layer); combined keeps measuring the merged judgement.
+export const EVAL_LAYERS = ['vps', 'chatgpt', 'hermes', 'combined'] as const;
 export type EvalLayer = typeof EVAL_LAYERS[number];
 export const THESIS_DIRECTIONS = ['bullish', 'bearish', 'neutral', 'conditional', 'evidence_insufficient'] as const;
 export type ThesisDirection = typeof THESIS_DIRECTIONS[number];
@@ -419,7 +421,7 @@ function windowFromEvaluation(record: JournalRecord, e: JournalEvaluation, compa
  *
  * 输入：研究日志（portfolioDb 里的 research_journal + research_thesis）与结果数据
  * （marketDb 行情缓存上的评价窗口；可注入 evaluations 覆盖缺省计算）。
- * 输出：`{ schema, as_of_trade_date, true_forward_start, horizon_trade_days, layers: { vps, chatgpt, combined }, records, theses, limitations, evaluation_id }`，
+ * 输出：`{ schema, as_of_trade_date, true_forward_start, horizon_trade_days, layers: { vps, chatgpt, hermes, combined }, records, theses, limitations, evaluation_id }`，
  * 每层六个指标桶（见 LayerMetrics）；分层/分指标的 PENDING 语义见各桶的
  * `pending`/`pending_reasons`/`by_class`。
  */
@@ -705,7 +707,7 @@ function assembleEval(input: {
   const bySource: Record<string, number> = {};
   for (const { record, cls } of input.recordStats) { byClass[cls]++; bySource[record.source] = (bySource[record.source] ?? 0) + 1; }
   const thesisByClass = classCountInit();
-  const thesisByLayer: Record<EvalLayer, number> = { vps: 0, chatgpt: 0, combined: 0 };
+  const thesisByLayer: Record<EvalLayer, number> = { vps: 0, chatgpt: 0, hermes: 0, combined: 0 };
   const thesisPendingReasons: Record<string, number> = {};
   let thesisWithWindow = 0;
   for (const view of input.unitViews) {

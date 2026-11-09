@@ -8,7 +8,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const {
-  confirmedLocalLows, detectWBottom, detectRangeBreakout, detectPullbackResume, detectRpsHold,
+  confirmedLocalLows, detectWBottom, detectRangeBreakout, detectPullbackResume,
+  detectPullbackForming, detectRpsHold,
   DEFAULT_MACD_W_OPTS, DEFAULT_RSI_W_OPTS, DEFAULT_RANGE_BREAKOUT_OPTS,
 } = await import('../build/ashare/patterns.js');
 
@@ -182,22 +183,89 @@ test('range breakout: requires prior-window high exclude and volume; first-cross
 
 // ---------------------------------------------------------------- pullback resume
 
-test('pullback resume: touch within window + resume day; first-cross only', () => {
+/**
+ * Goal-1106 WP1 fixture: a rising MA20 above a rising MA60, price above both,
+ * a four-bar close-based pullback (bars 76–79), and a close-based reclaim at 80.
+ * The low of every pullback bar is below its close and therefore below MA20, so
+ * the pullback genuinely tags the average.
+ */
+function pullbackFixture() {
   const n = 100;
-  const close = series(n, 12), low = series(n, 11.5);
-  const ma20 = series(n, 11), ma60 = series(n, 10);
-  // Steady uptrend already: close > ma20 > ma60 throughout ⇒ no touch ⇒ no signal.
-  assert.equal(detectPullbackResume(close, low, ma20, ma60, 80), null);
-  // Introduce a touch at bar 76 (low dips to ma20), resume at 80.
-  low[76] = 11 * 1.005; // within +1% band of ma20
-  close[79] = 11.8; close[80] = 12.2; low[80] = 11.9;
+  const ma20 = [], ma60 = [], close = [], low = [];
+  for (let i = 0; i < n; i++) {
+    ma20[i] = 10 + 0.02 * i;
+    ma60[i] = 9 + 0.01 * i;
+    close[i] = ma20[i] + 0.5;
+    low[i] = close[i] - 0.2;
+  }
+  for (let k = 76; k <= 79; k++) { close[k] = ma20[k] - 0.1; low[k] = close[k] - 0.1; }
+  close[80] = ma20[80] + 0.4;
+  low[80] = close[80] - 0.1;
+  return { ma20, ma60, close, low };
+}
+
+test('pullback resume: a close-based reclaim after a short MA20 tag confirms once', () => {
+  const { ma20, ma60, close, low } = pullbackFixture();
   const p = detectPullbackResume(close, low, ma20, ma60, 80);
-  assert.ok(p, 'resume detected');
+  assert.ok(p, 'genuine reclaim detected');
   assert.equal(p.confirmIndex, 80);
-  assert.equal(p.touchIndex, 76);
-  // Touch too old (bar 70, window 5) ⇒ nothing.
-  low[76] = 11.5; low[70] = 11 * 1.005; close[79] = 12; close[80] = 12.2;
+  assert.equal(p.pullbackStartIndex, 76);
+  assert.equal(p.touchIndex, 76, 'episode anchored at the first MA20 tag');
+  assert.equal(p.firstObservedIndex, 76);
+  // The next bar's previous close is already above MA20, so the same advance
+  // can never be confirmed a second time.
+  close[81] = ma20[81] + 0.6; low[81] = close[81] - 0.1;
+  assert.equal(detectPullbackResume(close, low, ma20, ma60, 81), null, 'no second confirmation');
+});
+
+test('pullback resume: FORMING is observable while the pullback is still in progress', () => {
+  const { ma20, ma60, close, low } = pullbackFixture();
+  for (const i of [76, 78, 79]) {
+    const f = detectPullbackForming(close, low, ma20, ma60, i);
+    assert.ok(f, `forming at ${i}`);
+    assert.equal(f.touchIndex, 76, 'dates do not wander as the pullback extends');
+    assert.equal(f.firstObservedIndex, 76);
+    assert.equal(f.pullbackStartIndex, 76);
+  }
+  // Once price is back above MA20 the forming observation ends (the resume
+  // primitive takes over).
+  assert.equal(detectPullbackForming(close, low, ma20, ma60, 80), null);
+});
+
+test('pullback resume: a prior close above MA20 is not a pullback reclaim', () => {
+  const { ma20, ma60, close, low } = pullbackFixture();
+  // No pullback at all: price stays above MA20 into the "resume" bar.
+  for (let k = 76; k <= 79; k++) { close[k] = ma20[k] + 0.5; low[k] = close[k] - 0.2; }
+  close[80] = ma20[80] + 0.7;
   assert.equal(detectPullbackResume(close, low, ma20, ma60, 80), null);
+});
+
+test('pullback resume: same-day MA20/MA60 alignment alone is not a pre-existing trend', () => {
+  const { ma20, ma60, close, low } = pullbackFixture();
+  // MA20 sits below MA60 for the whole pullback and only crosses above it on
+  // the reclaim bar: that alignment did not exist when the pullback started.
+  for (let i = 0; i <= 79; i++) {
+    ma20[i] = 9.5 + 0.01 * i;
+    ma60[i] = 10.5;
+    close[i] = ma20[i] + 0.5;
+    low[i] = close[i] - 0.2;
+  }
+  for (let k = 76; k <= 79; k++) { close[k] = ma20[k] - 0.1; low[k] = close[k] - 0.1; }
+  ma20[80] = 10.6;
+  ma60[80] = 10.5;
+  close[80] = ma20[80] + 0.4;
+  low[80] = close[80] - 0.1;
+  assert.equal(detectPullbackResume(close, low, ma20, ma60, 80), null,
+    'alignment must precede the pullback, not appear on the reclaim bar');
+  assert.equal(detectPullbackForming(close, low, ma20, ma60, 79), null);
+});
+
+test('pullback resume: a pullback longer than the touch window is a trend break, not a setup', () => {
+  const { ma20, ma60, close, low } = pullbackFixture();
+  for (let k = 72; k <= 79; k++) { close[k] = ma20[k] - 0.1; low[k] = close[k] - 0.1; }
+  close[80] = ma20[80] + 0.4;
+  assert.equal(detectPullbackResume(close, low, ma20, ma60, 80), null);
+  assert.equal(detectPullbackForming(close, low, ma20, ma60, 79), null);
 });
 
 // ---------------------------------------------------------------- RPS hold

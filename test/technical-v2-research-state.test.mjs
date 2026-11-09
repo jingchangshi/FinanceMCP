@@ -73,6 +73,24 @@ function signal(over = {}) {
     research_ready: true,
     research_blockers: [],
     evidence_level: 'UNVERIFIED',
+    price_position: null,
+    ...over,
+  };
+}
+
+/** A descriptive price-position record as the framework builds it. */
+function position(over = {}) {
+  return {
+    basis: 'adjusted_close',
+    close: 11.5, ma20: 10, ma60: 9.4, atr14: 0.5, rsi6: 55, rsi14: 52,
+    close_vs_ma20_pct: 15, close_vs_ma20_atr: 3, close_vs_ma60_pct: 22.3,
+    ma20_above_ma60: true, ma20_rising: true,
+    reference_price: 10, reference_kind: 'ma20_reclaim',
+    reference_distance_pct: 15, reference_distance_atr: 3,
+    bars_since_confirmation: 2,
+    invalidation_level: 9.4, invalidation_distance_pct: 18.3, invalidation_distance_atr: 4.2,
+    price_extension: true,
+    price_extension_basis: ['(close-ma20)/atr14=3.0000 vs threshold 3.0'],
     ...over,
   };
 }
@@ -167,24 +185,93 @@ test('expired-only episodes are INVALIDATED with the window-end date', () => {
   assert.match(s.decisive_reasons.join(''), /2026-10-27/);
 });
 
-test('live and dead evidence from different families coexist as DETERIORATING, not netted out', () => {
-  const live = signal({ family: 'TREND_CONTINUATION', strategy_id: 'trend_pullback_confirm' });
-  const dead = signal({
-    family: 'MEAN_REVERSION', strategy_id: 'mean_reversion_reclaim', stage: 'FAILED',
-    stage_detail: '失效', invalidated_at: '2026-10-31',
-    invalidation: { on: '2026-10-31', reason: '反弹未站回中轨' }, research_ready: false,
+test('an expired window never vetoes a live setup', () => {
+  const live = signal({ family: 'TREND_CONTINUATION', strategy_id: 'tc_v2_pullback_resume' });
+  const expired = signal({
+    family: 'REVERSAL', strategy_id: 'rv_v2_macd_dif_divergence', stage: 'EXPIRED',
+    stage_detail: '过期', confirmed_on: null, expires_at: '2026-10-29', research_ready: false,
   });
-  const s = only(build([ctx()], [live, dead]));
+  const s = only(build([ctx()], [live, expired]));
+  assert.equal(s.research_state, 'FOCUS', 'an elapsed observation window is not negative evidence');
+  assert.deepEqual(s.conflicting_evidence, []);
+  assert.equal(s.signals.length, 2, 'the expired episode stays in signals for audit');
+});
+
+test('a failure from another family after the live confirmation is current evidence ⇒ DETERIORATING', () => {
+  const live = signal({
+    family: 'TREND_CONTINUATION', strategy_id: 'tc_v2_pullback_resume',
+    confirmed_on: '2026-10-29', formed_on: '2026-10-26',
+  });
+  const deadOther = signal({
+    family: 'MEAN_REVERSION', strategy_id: 'mr_v2_oversold_reversion', stage: 'FAILED',
+    stage_detail: '失效', confirmed_on: '2026-10-20', invalidated_at: '2026-11-01',
+    invalidation: { on: '2026-11-01', reason: '反弹未站回中轨' }, research_ready: false,
+  });
+  const s = only(build([ctx()], [live, deadOther]));
+  assert.equal(s.research_state, 'DETERIORATING',
+    'the stock state is not family-scoped: a later failure in any family is current evidence');
+  assert.match(s.decisive_reasons.join(''), /tc_v2_pullback_resume/);
+  assert.match(s.decisive_reasons.join(''), /2026-10-29/);
+  assert.match(s.conflicting_evidence.join(''), /mr_v2_oversold_reversion/);
+  assert.match(s.conflicting_evidence.join(''), /2026-11-01/);
+  assert.equal(s.signals.length, 2, 'the failed episode stays in signals for audit');
+});
+
+test('a failure dated before the live confirmation is history, whatever its family', () => {
+  const live = signal({ confirmed_on: '2026-11-01', formed_on: '2026-10-28' });
+  const history = signal({
+    family: 'MEAN_REVERSION', strategy_id: 'mr_v2_oversold_reversion',
+    stage: 'FAILED', stage_detail: '失效', confirmed_on: '2026-10-10',
+    invalidated_at: '2026-10-20', invalidation: { on: '2026-10-20', reason: '跌破 MA60' },
+    research_ready: false,
+  });
+  const s = only(build([ctx()], [live, history]));
+  assert.equal(s.research_state, 'FOCUS');
+  assert.deepEqual(s.conflicting_evidence, [], 'an already-superseded failure cannot negate the live setup');
+  assert.equal(s.signals.filter(x => x.stage === 'FAILED').length, 1, 'history is preserved');
+});
+
+test('a failure after the live confirmation is current evidence ⇒ DETERIORATING', () => {
+  const live = signal({
+    family: 'REVERSAL', strategy_id: 'rv_v2_macd_w_bottom', stage: 'FOLLOW_THROUGH',
+    confirmed_on: '2026-10-26', formed_on: '2026-10-19',
+  });
+  const failed = signal({
+    family: 'REVERSAL', strategy_id: 'rv_v2_macd_dif_divergence', stage: 'FAILED',
+    stage_detail: 'DIF_DIVERGENCE_FAILED', confirmed_on: null, invalidated_at: '2026-10-30',
+    invalidation: { on: '2026-10-30', reason: '收盘跌破背离低点' }, research_ready: false,
+  });
+  const s = only(build([ctx()], [live, failed]));
   assert.equal(s.research_state, 'DETERIORATING');
-  assert.equal(s.decisive_reasons.length, 1);
-  assert.equal(s.conflicting_evidence.length, 1);
-  assert.match(s.conflicting_evidence[0], /反弹未站回中轨/);
+  assert.match(s.decisive_reasons.join(''), /rv_v2_macd_w_bottom/);
+  assert.match(s.decisive_reasons.join(''), /2026-10-26/);
+  assert.match(s.conflicting_evidence.join(''), /rv_v2_macd_dif_divergence/);
+  assert.match(s.conflicting_evidence.join(''), /2026-10-30/);
 });
 
 test('a live setup after a rapid run-up is EXTENDED, never FOCUS', () => {
   const s = only(build([ctx({ price_volume_tags: ['RAPID_RUNUP'] })], [signal()]));
   assert.equal(s.research_state, 'EXTENDED');
   assert.match(s.decisive_reasons.join(''), /15%/);
+});
+
+test('a live setup with price extension is EXTENDED, described by its ATR distance', () => {
+  const s = only(build([ctx()], [signal({ price_position: position() })]));
+  assert.equal(s.research_state, 'EXTENDED');
+  assert.match(s.decisive_reasons.join(''), /价格延伸/);
+  assert.match(s.decisive_reasons.join(''), /3 倍 ATR14/);
+  assert.equal(s.price_position.price_extension, true);
+  assert.equal(s.signals[0].price_position.price_extension, true);
+});
+
+test('a high RSI is descriptive only and never gates the state', () => {
+  const s = only(build([ctx()], [signal({
+    price_position: position({ price_extension: false, close_vs_ma20_atr: 2.9, rsi6: 92, rsi14: 88 }),
+  })]));
+  assert.equal(s.research_state, 'FOCUS');
+  assert.equal(s.price_position.rsi6, 92);
+  assert.equal(s.price_position.rsi14, 88);
+  assert.equal(s.price_position.price_extension, false);
 });
 
 test('a live, tradable, executable confirmation is FOCUS', () => {
@@ -274,11 +361,20 @@ test('no cross-family score, priority, entry or ranking field exists on a stock 
   }
   assert.deepEqual(Object.keys(s).sort(), [
     'as_of_trade_date', 'bars_behind_as_of', 'conflicting_evidence', 'counter_evidence',
-    'decisive_reasons', 'evidence_level', 'market_regime', 'name', 'price_volume_tags',
-    'primary_family', 'primary_pattern', 'research_ready', 'research_state', 'research_state_label',
-    'rps120', 'sectors', 'signals', 'trade_date', 'trade_permission', 'trade_permission_reason',
-    'trading_constraints', 'trading_status', 'ts_code', 'watch_conditions',
+    'decisive_reasons', 'evidence_level', 'market_regime', 'name', 'price_position',
+    'price_volume_tags', 'primary_family', 'primary_pattern', 'research_ready',
+    'research_state', 'research_state_label', 'rps120', 'sectors', 'signals', 'trade_date',
+    'trade_permission', 'trade_permission_reason', 'trading_constraints', 'trading_status',
+    'ts_code', 'watch_conditions',
   ]);
+  assert.equal(s.price_position, null, 'no position snapshot when the primary signal has none');
+});
+
+test('the price position is carried on the stock and on every signal', () => {
+  const s = only(build([ctx()], [signal({ price_position: position() })]));
+  assert.equal(s.price_position.basis, 'adjusted_close');
+  assert.equal(s.price_position.close, 11.5);
+  assert.equal(s.signals[0].price_position.price_extension, true);
 });
 
 test('the aggregation is deterministic', () => {

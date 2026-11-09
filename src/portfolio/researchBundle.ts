@@ -4,7 +4,7 @@ import { resolveResearchDate, type ResearchDateResolution } from '../ashare/rese
 import { latestReportMeta, loadReport } from '../ashare/report.js';
 import { checkQuality } from '../ashare/ingest.js';
 import { etfStatus } from '../ashare/etf.js';
-import { screenEtfCandidates, ETF_UNIVERSE_VERSION } from '../ashare/etfUniverse.js';
+import { screenEtfCandidates, ETF_UNIVERSE_VERSION, ETF_CANDIDATE_DEFAULT_LIMIT } from '../ashare/etfUniverse.js';
 import {
   collectEtfPenetrationInputs, buildEtfPenetrationSummary, type EtfPenetrationSummary,
 } from '../ashare/etfPenetration.js';
@@ -357,6 +357,12 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
   const market = input.marketDb;
   const requestedLimit = input.maxCandidates ?? 8;
   if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 20) throw new Error('max_candidates must be 1..20');
+  // 身份与展示分离（goal-1106 WP6）：筛选一律按固定规范上限执行，事实包哈希使用完整的
+  // 规范化筛选结果；max_candidates 只决定结果里展示多少行，绝不进入身份。
+  // 之前把 requestedLimit 传给 screenEtfCandidates 并在 facts 里再切片，同一 as_of 的
+  // 同一份数据会因展示参数不同而得到不同 report_id（生产 20261105：8 → 335581cc…，
+  // 20 → 7aeb05d4…）。规范上限取 ETF 候选筛选自己的默认值（20），由该模块定义。
+  const canonicalCandidateLimit = ETF_CANDIDATE_DEFAULT_LIMIT;
   let quality: any = null;
   let published: any = null;
   let meta: any = null;
@@ -386,7 +392,7 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
       };
     }
     screening = safe('etf_candidates', () => screenEtfCandidates(market, {
-      asOf, limit: requestedLimit, heldCodes: (portfolio?.holdings ?? snapshot.snapshot.positions).map((holding: any) => holding.ts_code),
+      asOf, limit: canonicalCandidateLimit, heldCodes: (portfolio?.holdings ?? snapshot.snapshot.positions).map((holding: any) => holding.ts_code),
     }));
     etf = safe('etf_quality', () => etfStatus(market, { date: asOf }));
     const baselineDate = snapshot.snapshot.as_of.replace(/-/g, '');
@@ -421,8 +427,10 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
       feeEstimator: journalFeeEstimator(input.portfolioDb, market, account.account_id),
     }),
   })) : null;
+  // `candidates` is the complete canonical screen (fixed limit), and is what the
+  // identity hash consumes. `held`/`other` are display projections only: held
+  // instruments stay present even if missing or below any screen threshold.
   const candidates = screening?.candidates ?? [];
-  // Held instruments stay present even if missing or below any screen threshold.
   const held = candidates.filter((row: any) => row.held);
   const other = candidates.filter((row: any) => !row.held).slice(0, requestedLimit);
   const feeContext = asOf ? loadFeeContext(input.portfolioDb, account.account_id, asOf) : null;
@@ -523,7 +531,8 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     portfolio, benchmarks, validation, gaps,
     ...(portfolio?.portfolio_risk ? { portfolio_risk: portfolio.portfolio_risk } : {}),
     versions, quality: quality?.status ?? 'NOT_READY', fees: feeSummary,
-    candidates: [...held, ...other], account_snapshot_id: snapshot.snapshot_id,
+    // 完整的规范筛选结果（固定上限），不随 max_candidates 截断。
+    candidates, account_snapshot_id: snapshot.snapshot_id,
     // goal-1102 §6.2: the bundle pins the exact technical snapshot it read. Two
     // versions of the same trade date therefore get different report_id values,
     // and a report can never mix half of S1 with half of S2.

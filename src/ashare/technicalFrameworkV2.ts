@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 import type { Regime } from './market.js';
 import type { Bars, IndicatorSet } from './indicators.js';
 
-export const TECHNICAL_FRAMEWORK_VERSION = 'technical-v2.0.0';
+export const TECHNICAL_FRAMEWORK_VERSION = 'technical-v2.1.0';
 /** Bump only when the fingerprint algorithm changes, never when a module does. */
 export const TECHNICAL_IMPLEMENTATION_SCHEME = 'technical-modules-v1';
 /**
@@ -308,6 +308,147 @@ export function buildPriceVolumeContext(input: RawContextInput): PriceVolumeCont
   };
 }
 
+// ---------------------------------------------------------------- price position
+
+/**
+ * Fixed engineering hypothesis (goal-1106 WP4): a live setup is "price
+ * extended" when the close sits at least 3.0 ATR14 units above its MA20.
+ *
+ * Why 3.0: MA20 is the structural anchor the trend families are defined
+ * against (20 trading days ≈ one month of cost basis); ATR14 is the trailing
+ * daily range, so `(close - MA20) / ATR14` measures how many *typical days of
+ * movement* the price has already travelled away from that anchor. Three
+ * typical days is far enough that the current price is no longer a normal
+ * continuation entry relative to the confirmed structure, regardless of which
+ * family produced the confirmation. It is a fixed, pre-registered research
+ * hypothesis — NOT fitted to any example stock, NOT validated against returns,
+ * and it carries no proven return edge. It applies to any live family; RSI is
+ * descriptive only and never a gate, and MA250 is not used at all.
+ */
+export const PRICE_EXTENSION_ATR_THRESHOLD = 3.0;
+
+/**
+ * Descriptive price-location facts for one observation. Every price field is
+ * expressed on the SAME forward-adjusted close basis as the bars/indicators
+ * (`close`, MA20, MA60, ATR14, reference and invalidation levels). Raw display
+ * prices live in `key_levels`; they are never subtracted from adjusted values.
+ *
+ * These fields explain where price is relative to the structure. They are not
+ * an entry score, probability or ranking.
+ */
+export interface PricePosition {
+  basis: 'adjusted_close';
+  close: number | null;
+  ma20: number | null;
+  ma60: number | null;
+  atr14: number | null;
+  rsi6: number | null;
+  rsi14: number | null;
+  /** Fractional change `close / MA20 - 1` (0.05 = +5%). */
+  close_vs_ma20_pct: number | null;
+  /** `(close - MA20) / ATR14`: distance from the structural anchor in volatility units. */
+  close_vs_ma20_atr: number | null;
+  /** Fractional change `close / MA60 - 1`. */
+  close_vs_ma60_pct: number | null;
+  ma20_above_ma60: boolean | null;
+  /** MA20 today above MA20 five bars ago. */
+  ma20_rising: boolean | null;
+  /** Adjusted price the pattern's confirmation is measured against (MA20 / neckline / band / close). */
+  reference_price: number | null;
+  /** What `reference_price` is, e.g. `ma20_reclaim`, `neckline`, `boll_upper`. */
+  reference_kind: string | null;
+  reference_distance_pct: number | null;
+  reference_distance_atr: number | null;
+  /** Trading bars since the confirmation bar; null when not confirmed. */
+  bars_since_confirmation: number | null;
+  /** Adjusted price level whose breach invalidates the pattern, when it is a price (not a DIF) level. */
+  invalidation_level: number | null;
+  invalidation_distance_pct: number | null;
+  invalidation_distance_atr: number | null;
+  /** Leading hypothesis: `close_vs_ma20_atr >= PRICE_EXTENSION_ATR_THRESHOLD`. */
+  price_extension: boolean;
+  /** Field names and arithmetic behind `price_extension`, for audit. */
+  price_extension_basis: string[];
+}
+
+export interface PricePositionInput {
+  /** Adjusted close of the evaluated bar. */
+  close: number | null;
+  x: IndicatorSet;
+  endIdx: number;
+  /** Index of the confirmation bar, or null when the observation is not confirmed. */
+  confirmedIdx?: number | null;
+  /** Adjusted reference price (pattern key level). */
+  referencePrice?: number | null;
+  referenceKind?: string | null;
+  /** Adjusted invalidation price level, when the invalidation is a price condition. */
+  invalidationLevel?: number | null;
+}
+
+const r4 = (v: number | null): number | null => (typeof v === 'number' && Number.isFinite(v)
+  ? Math.round(v * 10_000) / 10_000 : null);
+
+function finiteOrNull(v: number | undefined | null): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/** Build the descriptive price-position record. Pure; reads only indices <= endIdx. */
+export function buildPricePosition(input: PricePositionInput): PricePosition {
+  const i = input.endIdx;
+  const close = finiteOrNull(input.close);
+  const ma20 = finiteOrNull(input.x.ma20[i]);
+  const ma60 = finiteOrNull(input.x.ma60[i]);
+  const atr14 = finiteOrNull(input.x.atr14[i]);
+  const reference = finiteOrNull(input.referencePrice);
+  const invalidation = finiteOrNull(input.invalidationLevel);
+  const confirmedIdx = typeof input.confirmedIdx === 'number' && input.confirmedIdx >= 0 ? input.confirmedIdx : null;
+
+  const closeVsMa20Pct = close !== null && ma20 !== null && ma20 !== 0 ? close / ma20 - 1 : null;
+  const closeVsMa20Atr = close !== null && ma20 !== null && atr14 !== null && atr14 > 0 ? (close - ma20) / atr14 : null;
+  const closeVsMa60Pct = close !== null && ma60 !== null && ma60 !== 0 ? close / ma60 - 1 : null;
+  const refPct = close !== null && reference !== null && reference !== 0 ? close / reference - 1 : null;
+  const refAtr = close !== null && reference !== null && atr14 !== null && atr14 > 0 ? (close - reference) / atr14 : null;
+  const invPct = close !== null && invalidation !== null && invalidation !== 0 ? close / invalidation - 1 : null;
+  const invAtr = close !== null && invalidation !== null && atr14 !== null && atr14 > 0 ? (close - invalidation) / atr14 : null;
+
+  const extended = closeVsMa20Atr !== null && closeVsMa20Atr >= PRICE_EXTENSION_ATR_THRESHOLD;
+  const basis: string[] = [];
+  if (close !== null) basis.push(`close(adjusted)=${r4(close)}`);
+  if (ma20 !== null) basis.push(`ma20=${r4(ma20)}`);
+  if (atr14 !== null) basis.push(`atr14=${r4(atr14)}`);
+  if (closeVsMa20Atr !== null) {
+    basis.push(`(close-ma20)/atr14=${r4(closeVsMa20Atr)} vs threshold ${PRICE_EXTENSION_ATR_THRESHOLD}`);
+  } else {
+    basis.push('(close-ma20)/atr14 不可计算：缺少 close/MA20/ATR14');
+  }
+
+  return {
+    basis: 'adjusted_close',
+    close: r4(close),
+    ma20: r4(ma20),
+    ma60: r4(ma60),
+    atr14: r4(atr14),
+    rsi6: r4(finiteOrNull(input.x.rsi6[i])),
+    rsi14: r4(finiteOrNull(input.x.rsi14[i])),
+    close_vs_ma20_pct: r4(closeVsMa20Pct),
+    close_vs_ma20_atr: r4(closeVsMa20Atr),
+    close_vs_ma60_pct: r4(closeVsMa60Pct),
+    ma20_above_ma60: ma20 !== null && ma60 !== null ? ma20 > ma60 : null,
+    ma20_rising: i >= 5 && Number.isFinite(input.x.ma20[i]) && Number.isFinite(input.x.ma20[i - 5])
+      ? input.x.ma20[i] > input.x.ma20[i - 5] : null,
+    reference_price: r4(reference),
+    reference_kind: input.referenceKind ?? null,
+    reference_distance_pct: r4(refPct),
+    reference_distance_atr: r4(refAtr),
+    bars_since_confirmation: confirmedIdx !== null ? i - confirmedIdx : null,
+    invalidation_level: r4(invalidation),
+    invalidation_distance_pct: r4(invPct),
+    invalidation_distance_atr: r4(invAtr),
+    price_extension: extended,
+    price_extension_basis: basis,
+  };
+}
+
 // ---------------------------------------------------------------- candidates
 
 /** Everything a family detector may read. Only indices <= endIdx are valid. */
@@ -318,6 +459,12 @@ export interface PatternInput {
   endIdx: number;
   asOf: string;
   regime: Regime | 'UNKNOWN';
+  /**
+   * Causal market regime for one historical bar, used by detectors that may
+   * only decide a past bar from facts known on that bar. When absent, `regime`
+   * is the fallback for every bar (fixtures and single-bar callers).
+   */
+  regimeAt?: (date: string) => Regime | 'UNKNOWN' | null;
   /** Per-bar RPS120 for background only, aligned to `bars.dates`. */
   rps120: Array<number | null> | null;
   /** Trade-day distance from the last bar to `asOf` (0 = current bar). */
@@ -356,6 +503,8 @@ export interface PatternObservation {
   evidence: Record<string, number | string | boolean | null>;
   /** Facts that argue AGAINST the reading; never deleted when a stage passes. */
   counter_evidence: string[];
+  /** Descriptive price-location facts (adjusted basis); never a score. */
+  price_position: PricePosition;
 }
 
 export interface TechnicalCandidateV2 extends Omit<PatternObservation, 'family'> {
@@ -392,9 +541,14 @@ export interface TechnicalFamilyView {
  *   1. BLOCKED       — the day's trading/data facts forbid a same-day reading
  *                      (suspended, no bar, one-price limit-down, stale bar).
  *   2. INVALIDATED   — every signal episode is dead (failed or window elapsed).
- *   3. DETERIORATING — live signals and dead signals of other families coexist;
- *                      the conflict is shown, never averaged away.
- *   4. EXTENDED      — the setup holds but price has run too fast (RAPID_RUNUP).
+ *   3. DETERIORATING — a live setup is contradicted by NEW negative evidence
+ *                      dated after the latest live confirmation. The state is
+ *                      the stock's, so a failure from any family counts. A
+ *                      failure or expiry that predates the live confirmation
+ *                      is history and never negates the live setup.
+ *   4. EXTENDED      — the setup holds but price has run too fast: either the
+ *                      five-day RAPID_RUNUP tag or `price_extension`
+ *                      ((close - MA20) / ATR14 >= 3.0) on a live signal.
  *   5. FOCUS         — a live, research-ready confirmation with normal trading.
  *   6. WATCH         — forming only, or a live setup the account cannot execute
  *                      at normal prices (one-price limit-up / non-mainboard).
@@ -432,6 +586,7 @@ export interface ResearchSignalView {
   key_levels: Record<string, number | null>;
   evidence: Record<string, number | string | boolean | null>;
   counter_evidence: string[];
+  price_position: PricePosition;
 }
 
 export interface ResearchStockView {
@@ -445,6 +600,8 @@ export interface ResearchStockView {
   research_state_label: string;
   primary_family: TechnicalFamily | null;
   primary_pattern: string | null;
+  /** Price position of the primary signal; descriptive, never a score. */
+  price_position: PricePosition | null;
   signals: ResearchSignalView[];
   decisive_reasons: string[];
   conflicting_evidence: string[];

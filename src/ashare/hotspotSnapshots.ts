@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import type { DatabaseSync } from 'node:sqlite';
 import { ensureHotspotSchema, hotspotTableExists } from './hotspotTables.js';
 import type { HotspotSnapshot } from './hotspotTypes.js';
@@ -22,6 +23,28 @@ import type { HotspotSnapshot } from './hotspotTypes.js';
  * per-stock record lives once inside `technical_view.research_universe`; the
  * old `hotspot_candidate` mirror is left as read-only archive.
  */
+
+/**
+ * Ledger payload storage formats (goal-1106). `content_hash` is ALWAYS computed
+ * over the uncompressed stableJson; the marker only records how the body is
+ * stored. New ledger rows are gzip-compressed (~12× smaller, ~0.9s per row);
+ * legacy rows remain plain JSON and are never rewritten.
+ */
+export const PAYLOAD_FORMAT_JSON = 'json';
+export const PAYLOAD_FORMAT_GZIP = 'gzip+json';
+
+/** Compress a ledger body for storage. Returns the storable value + marker. */
+export function encodeLedgerPayload(json: string): { payload: string | Uint8Array; payload_format: string } {
+  return { payload: gzipSync(Buffer.from(json, 'utf8'), { level: 6 }), payload_format: PAYLOAD_FORMAT_GZIP };
+}
+
+/** Decode and parse a ledger body, honouring its storage marker. */
+export function decodeLedgerPayload(payload: string | Uint8Array, format: string | null | undefined): HotspotSnapshot {
+  const json = payload instanceof Uint8Array || format === PAYLOAD_FORMAT_GZIP
+    ? gunzipSync(payload as Uint8Array).toString('utf8')
+    : payload as string;
+  return JSON.parse(json) as HotspotSnapshot;
+}
 
 /** Stable JSON: object keys sorted recursively so hashes do not drift. */
 export function stableJson(value: unknown): string {
@@ -136,21 +159,26 @@ export function saveHotspotSnapshot(db: DatabaseSync, snapshot: HotspotSnapshot,
     // `strategy_set_version` is a legacy column name kept for schema
     // compatibility; it now carries the technical framework version that
     // actually produced the view.
+    // The ledger stores the gzipped body under payload_format='gzip+json'
+    // (hash stays over the UNCOMPRESSED stableJson). The pointer row stores
+    // no payload at all — resolution goes through the ledger by content_hash.
+    const encoded = encodeLedgerPayload(stableJson(versioned));
     db.prepare(`INSERT INTO hotspot_snapshot_version
-      (as_of, config_version, version_no, content_hash, hash_basis, strategy_set_version, payload, coverage,
+      (as_of, config_version, version_no, content_hash, hash_basis, strategy_set_version,
+       payload, payload_format, coverage,
        generated_at, recorded_at, state, superseded_by, correction_of, readiness, data_state)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`)
       .run(snapshot.as_of, snapshot.config_version, version_no, content_hash, hash_basis,
-        snapshot.framework_version, stableJson(versioned), stableJson(snapshot.coverage),
+        snapshot.framework_version, encoded.payload, encoded.payload_format, stableJson(snapshot.coverage),
         snapshot.generated_at, new Date().toISOString(),
         opts.correctionOf ? 'CORRECTION' : 'PUBLISHED', opts.correctionOf ?? null,
         snapshot.data_state.readiness,
         stableJson(snapshot.data_state));
     db.prepare(`INSERT OR REPLACE INTO hotspot_snapshot
       (as_of, config_version, strategy_set_version, payload, content_hash, generated_at, coverage, version_no, state)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PUBLISHED')`)
+      VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'PUBLISHED')`)
       .run(snapshot.as_of, snapshot.config_version, snapshot.framework_version,
-        stableJson(versioned), content_hash, snapshot.generated_at,
+        content_hash, snapshot.generated_at,
         stableJson(snapshot.coverage), version_no);
     db.exec('COMMIT');
   } catch (e) {
@@ -165,20 +193,28 @@ export function saveHotspotSnapshot(db: DatabaseSync, snapshot: HotspotSnapshot,
   };
 }
 
+/** Whether the ledger carries the payload_format marker (older tables predate it). */
+function ledgerHasPayloadFormat(db: DatabaseSync): boolean {
+  return (db.prepare('PRAGMA table_info(hotspot_snapshot_version)').all() as Array<{ name: string }>)
+    .some(c => c.name === 'payload_format');
+}
+
 /** One historical version, read by position. */
 export function loadHotspotVersion(db: DatabaseSync, asOf: string, configVersion: string, versionNo: number): HotspotSnapshot | null {
   if (!hotspotTableExists(db, 'hotspot_snapshot_version')) return null;
-  const row = db.prepare('SELECT payload, version_no, state FROM hotspot_snapshot_version WHERE as_of = ? AND config_version = ? AND version_no = ?')
-    .get(asOf, configVersion, versionNo) as { payload: string; version_no: number; state: 'PUBLISHED' | 'SUPERSEDED' | 'CORRECTION' } | undefined;
-  return row ? stampPosition(JSON.parse(row.payload) as HotspotSnapshot, row.version_no, row.state) : null;
+  const fmt = ledgerHasPayloadFormat(db) ? ', payload_format' : '';
+  const row = db.prepare(`SELECT payload${fmt}, version_no, state FROM hotspot_snapshot_version WHERE as_of = ? AND config_version = ? AND version_no = ?`)
+    .get(asOf, configVersion, versionNo) as { payload: string | Uint8Array; payload_format?: string | null; version_no: number; state: 'PUBLISHED' | 'SUPERSEDED' | 'CORRECTION' } | undefined;
+  return row ? stampPosition(decodeLedgerPayload(row.payload, row.payload_format ?? PAYLOAD_FORMAT_JSON), row.version_no, row.state) : null;
 }
 
 /** Whichever version carried this content hash (the hash is unique per (as_of, config)). */
 export function loadHotspotVersionByHash(db: DatabaseSync, contentHash: string): HotspotSnapshot | null {
   if (!hotspotTableExists(db, 'hotspot_snapshot_version')) return null;
-  const row = db.prepare('SELECT payload, version_no, state FROM hotspot_snapshot_version WHERE content_hash = ? LIMIT 1')
-    .get(contentHash) as { payload: string; version_no: number; state: 'PUBLISHED' | 'SUPERSEDED' | 'CORRECTION' } | undefined;
-  return row ? stampPosition(JSON.parse(row.payload) as HotspotSnapshot, row.version_no, row.state) : null;
+  const fmt = ledgerHasPayloadFormat(db) ? ', payload_format' : '';
+  const row = db.prepare(`SELECT payload${fmt}, version_no, state FROM hotspot_snapshot_version WHERE content_hash = ? LIMIT 1`)
+    .get(contentHash) as { payload: string | Uint8Array; payload_format?: string | null; version_no: number; state: 'PUBLISHED' | 'SUPERSEDED' | 'CORRECTION' } | undefined;
+  return row ? stampPosition(decodeLedgerPayload(row.payload, row.payload_format ?? PAYLOAD_FORMAT_JSON), row.version_no, row.state) : null;
 }
 
 /** Ledger rows for a day, newest first — the audit view of "what did we ever publish". */
@@ -209,13 +245,38 @@ export function loadHotspotSnapshot(db: DatabaseSync, asOf: string, configVersio
   const columns = new Set((db.prepare('PRAGMA table_info(hotspot_snapshot)').all() as Array<{ name: string }>)
     .map(c => c.name));
   const pos = columns.has('version_no') && columns.has('state') ? ', version_no, state' : '';
-  const sql = `SELECT payload${pos} FROM hotspot_snapshot WHERE as_of = ?`;
+  const sql = `SELECT payload, content_hash${pos} FROM hotspot_snapshot WHERE as_of = ?`;
   const row = configVersion
     ? db.prepare(`${sql} AND config_version = ?`).get(asOf, configVersion)
     : db.prepare(`${sql} ORDER BY config_version DESC LIMIT 1`).get(asOf);
   if (!row) return null;
-  const typed = row as { payload: string; version_no?: number | null; state?: HotspotSnapshot['state'] | null };
-  return stampPosition(JSON.parse(typed.payload) as HotspotSnapshot, typed.version_no ?? null, typed.state ?? null);
+  const typed = row as { payload: string | Uint8Array | null; content_hash?: string | null; version_no?: number | null; state?: HotspotSnapshot['state'] | null };
+  // Legacy pointer rows still carry their payload inline; new pointer rows
+  // store no payload (goal-1106) — resolve the body from the ledger instead.
+  if (typed.payload !== null && typed.payload !== undefined && typed.payload !== '') {
+    return stampPosition(JSON.parse(typed.payload as string) as HotspotSnapshot, typed.version_no ?? null, typed.state ?? null);
+  }
+  if (typed.content_hash) {
+    const fromLedger = loadHotspotVersionByHash(db, typed.content_hash);
+    if (fromLedger) {
+      // Re-stamp from the pointer row so its own position metadata wins.
+      if (typed.version_no !== null && typed.version_no !== undefined) fromLedger.version_no = typed.version_no;
+      if (typed.state) fromLedger.state = typed.state;
+      return fromLedger;
+    }
+  }
+  // No hash on the pointer (very old row): fall back to the latest ledger
+  // version for the same day rather than fabricating a body.
+  if (hotspotTableExists(db, 'hotspot_snapshot_version')) {
+    const fmt = ledgerHasPayloadFormat(db) ? ', payload_format' : '';
+    const stmt = db.prepare(configVersion
+      ? `SELECT payload${fmt}, version_no, state FROM hotspot_snapshot_version WHERE as_of = ? AND config_version = ? ORDER BY version_no DESC LIMIT 1`
+      : `SELECT payload${fmt}, version_no, state FROM hotspot_snapshot_version WHERE as_of = ? ORDER BY config_version DESC, version_no DESC LIMIT 1`);
+    const raw = configVersion ? stmt.get(asOf, configVersion) : stmt.get(asOf);
+    const latest = raw as { payload: string | Uint8Array; payload_format?: string | null; version_no: number; state: HotspotSnapshot['state'] } | undefined;
+    if (latest) return stampPosition(decodeLedgerPayload(latest.payload, latest.payload_format ?? PAYLOAD_FORMAT_JSON), latest.version_no, latest.state);
+  }
+  return null;
 }
 
 /**

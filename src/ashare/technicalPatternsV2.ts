@@ -23,11 +23,12 @@
  * Deliberate boundaries: no sell signals. A touch of an upper band is an
  * observation, not an order.
  */
-import type {
-  PatternInput, PatternObservation, TechnicalFamily, TechnicalStage,
+import {
+  buildPricePosition,
+  type PatternInput, type PatternObservation, type TechnicalFamily, type TechnicalStage,
 } from './technicalFrameworkV2.js';
 import {
-  confirmedLocalLows, detectPullbackResume, detectWBottom,
+  confirmedLocalLows, detectPullbackForming, detectPullbackResume, detectWBottom,
   DEFAULT_MACD_W_OPTS, DEFAULT_PULLBACK_OPTS,
 } from './patterns.js';
 
@@ -91,7 +92,8 @@ function lastWhere(from: number, to: number, pred: (k: number) => boolean): numb
 
 export const PATTERN_DEFINITIONS_V2: Record<TechnicalFamily, string> = {
   TREND_CONTINUATION:
-    '趋势内回踩 MA20 后重新收上 MA20；均线多头排列只是背景，不单独构成信号；失效为收盘跌破 MA60。',
+    '上升趋势内收盘回踩 MA20（前一日收盘 ≤ MA20、low 触及 MA20）后重新收上 MA20；'
+    + '趋势背景须在回踩时已存在，当日才形成的 MA20/MA60 多头排列不算；失效为收盘跌破 MA60。',
   PLATFORM_BREAKOUT:
     '30 日窄幅平台（振幅 ≤15%、后半段波动收缩、非急涨）被放量收盘突破；无平台的急涨新高不算平台突破。',
   REVERSAL:
@@ -122,12 +124,22 @@ interface ObservationParts {
   key_levels?: Record<string, number | null>;
   evidence?: Record<string, number | string | boolean | null>;
   counter_evidence?: string[];
+  /** Adjusted reference price for the descriptive PricePosition (never a raw key level). */
+  reference_price?: number | null;
+  reference_kind?: string | null;
+  /** Adjusted price invalidation level; null when the invalidation is not a price (e.g. DIF). */
+  invalidation_level?: number | null;
+  /** Confirmation bar index; null while the observation is unconfirmed. */
+  confirmed_idx?: number | null;
 }
 
 function makeObservation(
   input: PatternInput, strategy_id: string, family: TechnicalFamily, parts: ObservationParts,
 ): PatternObservation {
   const eventDate = parts.pattern_event_date ?? parts.confirmed_on ?? parts.formed_on ?? null;
+  const confirmedIdx = parts.confirmed_idx !== undefined
+    ? parts.confirmed_idx
+    : (parts.confirmed_on ? input.bars.dates.indexOf(parts.confirmed_on) : null);
   return {
     strategy_id,
     family,
@@ -137,7 +149,9 @@ function makeObservation(
     first_observed_date: parts.first_observed_date ?? parts.confirmed_on ?? parts.formed_on
       ?? input.bars.dates[input.endIdx],
     invalidated_at: parts.invalidated_at ?? (parts.stage === 'FAILED' ? parts.invalidation?.on ?? null : null),
-    expires_at: parts.expires_at ?? (parts.stage === 'EXPIRED' ? input.bars.dates[input.endIdx] : null),
+    // EXPIRED must name the first bar the window elapsed; never default to the
+    // evaluation bar (goal-1106 WP3).
+    expires_at: parts.expires_at ?? null,
     formed_on: parts.formed_on ?? null,
     confirmed_on: parts.confirmed_on ?? null,
     last_evaluated_on: input.bars.dates[input.endIdx],
@@ -149,6 +163,15 @@ function makeObservation(
     evidence: parts.evidence ?? {},
     counter_evidence: parts.counter_evidence
       ?? (parts.stage === 'FORMING' ? ['尚无可观察的确认价格行为'] : []),
+    price_position: buildPricePosition({
+      close: input.bars.close[input.endIdx],
+      x: input.x,
+      endIdx: input.endIdx,
+      confirmedIdx,
+      referencePrice: parts.reference_price ?? null,
+      referenceKind: parts.reference_kind ?? null,
+      invalidationLevel: parts.invalidation_level ?? null,
+    }),
   };
 }
 
@@ -166,14 +189,64 @@ function rpsValue(input: PatternInput): number | null {
   return isFin(r) ? round4(r) : null;
 }
 
+// ---------------------------------------------------------------- episode walk
+
+/**
+ * One candidate formation. `visibleFrom` is the earliest bar at which the
+ * formation is provable from data <= that bar; `eventIdx` is the price-event
+ * bar the episode is about (a touch, a second low, a platform start...).
+ */
+interface Formation {
+  eventIdx: number;
+  visibleFrom: number;
+}
+
+/** Everything an episode knows before its stage is decided at the reporting bar. */
+type EpisodeBase = Omit<ObservationParts, 'stage' | 'stage_detail'>;
+
+interface ResolvedEpisode {
+  parts: ObservationParts;
+  /** First fail/expiry bar, or null while the episode is still live / forming. */
+  terminalIdx: number | null;
+}
+
+/**
+ * Forward episode walk (goal-1106 WP2 rules 5 and 8).
+ *
+ * Formations are enumerated chronologically. The EARLIEST formation is
+ * followed to its first terminal event (fail or expiry); only a formation whose
+ * own event bar lies strictly after that terminal may begin next. The last
+ * episode is reported — live if it has no terminal, otherwise the most recent
+ * terminal one. An observed episode is never re-dated and a live episode is
+ * never replaced by a newer structure that formed underneath it.
+ */
+function walkEpisodes<F extends Formation>(
+  formations: F[], end: number, resolve: (f: F) => ResolvedEpisode,
+): ResolvedEpisode | null {
+  let cursor = -Infinity;
+  let last: ResolvedEpisode | null = null;
+  for (const f of formations) {
+    if (f.visibleFrom > end) break;
+    if (f.eventIdx <= cursor) continue;
+    const ep = resolve(f);
+    last = ep;
+    if (ep.terminalIdx === null) return ep;
+    cursor = ep.terminalIdx;
+  }
+  return last;
+}
+
 // ---------------------------------------------------------------- A. trend continuation
 
 /**
  * TREND_CONTINUATION — a pullback-to-MA20 resume inside an established trend.
  *
- * Thresholds: MA20 above its value 5 bars ago; pullback touch tolerance 1%
- * (shared with `DEFAULT_PULLBACK_OPTS`); evaluation window 10 bars for the
- * pullback resume.
+ * Thresholds (goal-1106 WP1): a close-based pullback of at most 5 bars
+ * (close <= MA20) whose low tags MA20 within 1%; price above MA20 before the
+ * pullback; MA20 > MA60 and MA20 rising AT THE TOUCH (strictly before the
+ * reclaim, so same-day alignment cannot fake a pre-existing trend). The
+ * reclaim bar is the first bar closing back above MA20, up on the day. The
+ * 10-bar evaluation window starts at that confirmation bar.
  *
  * A bullish MA20 > MA60 alignment is background context, never a standalone
  * event: the family only dates a pullback into MA20 and its later resume.
@@ -181,97 +254,150 @@ function rpsValue(input: PatternInput): number | null {
  */
 export function detectTrendContinuation(input: PatternInput): PatternObservation[] {
   const { bars: b, x, endIdx: i } = input;
-  if (i < 0) return [];
+  if (i < 61) return [];
   const close = b.close;
   const ma20 = x.ma20;
   const ma60 = x.ma60;
   const toRaw = rawScaler(input);
-  const out: PatternObservation[] = [];
+  const opts = DEFAULT_PULLBACK_OPTS;
+  const rpsEvidence = { rps_background_only: true, rps120: rpsValue(input) };
 
   // ---- tc_v2_pullback_resume
-  const pullbackAt = (k: number) => detectPullbackResume(close, b.low, ma20, ma60, k, DEFAULT_PULLBACK_OPTS);
-  const current = i >= 61 ? pullbackAt(i) : null;
+  // One formation per pullback run, dated at its FIRST MA20 tag. The tag is
+  // provable on its own bar, so the episode cannot drift as later bars keep
+  // tagging the average.
+  interface PullbackFormation extends Formation { startIdx: number; touchIdx: number }
+  const formations: PullbackFormation[] = [];
+  const seenStarts = new Set<number>();
+  for (let k = 61; k <= i; k++) {
+    const ep = detectPullbackForming(close, b.low, ma20, ma60, k, opts);
+    if (!ep || seenStarts.has(ep.pullbackStartIndex)) continue;
+    seenStarts.add(ep.pullbackStartIndex);
+    formations.push({
+      eventIdx: ep.touchIndex,
+      visibleFrom: ep.touchIndex,
+      startIdx: ep.pullbackStartIndex,
+      touchIdx: ep.touchIndex,
+    });
+  }
+  formations.sort((a, b) => a.eventIdx - b.eventIdx);
 
-  // Latest earlier confirmation inside the tracking window. First-cross
-  // semantics of `detectPullbackResume` prevent re-firing while the resume
-  // condition is already in force.
-  const confirmations: number[] = [];
-  for (let k = Math.max(61, i - 200); k <= i; k++) if (pullbackAt(k)) confirmations.push(k);
-  const latest = confirmations.length > 0 ? confirmations[confirmations.length - 1] : -1;
-
-  const rpsEvidence = { rps_background_only: true, rps120: rpsValue(input) };
-  if (current) {
-    out.push(makeObservation(input, 'tc_v2_pullback_resume', 'TREND_CONTINUATION', {
-      stage: 'CONFIRMED', stage_detail: 'PULLBACK_RESUME',
-      pattern_event_date: b.dates[current.touchIndex], first_observed_date: b.dates[i],
-      formed_on: b.dates[current.touchIndex], confirmed_on: b.dates[i],
-      formation_basis: ['上升趋势中回踩 MA20（low ≤ MA20 × 1.01）'],
-      confirmation_conditions: ['收盘重新站上 MA20 且高于前一日收盘，MA20 > MA60'],
+  const resolved = walkEpisodes(formations, i, (f): ResolvedEpisode => {
+    const { startIdx: s, touchIdx: t } = f;
+    // A confirmation must be a first close-cross back above MA20 while the
+    // pullback is still at most `touchWindow` bars old.
+    const confirmEnd = Math.min(i, s + opts.touchWindow);
+    let confirm = -1;
+    for (let c = t + 1; c <= confirmEnd; c++) {
+      const r = detectPullbackResume(close, b.low, ma20, ma60, c, opts);
+      if (r && r.pullbackStartIndex === s && r.touchIndex === t) { confirm = c; break; }
+    }
+    const levelIdx = confirm >= 0 ? confirm : t;
+    const common: EpisodeBase = {
+      pattern_event_date: b.dates[t],
+      first_observed_date: b.dates[t],
+      formed_on: b.dates[t],
+      confirmed_on: confirm >= 0 ? b.dates[confirm] : null,
+      confirmed_idx: confirm >= 0 ? confirm : null,
+      reference_price: ma20[levelIdx], reference_kind: 'ma20_reclaim',
+      invalidation_level: isFin(ma60[levelIdx]) ? ma60[levelIdx] : null,
+      formation_basis: ['上升趋势中，收盘回踩 MA20（前一日收盘 ≤ MA20，low 触及 MA20）'],
+      confirmation_conditions: ['前一日收盘 ≤ MA20，当日收盘 > MA20 且高于前一日收盘'],
       invalidation_conditions: ['收盘跌破 MA60'],
-      key_levels: { ma20: toRaw(current.ma20), ma60: toRaw(ma60[i]), touch_low: toRaw(b.low[current.touchIndex]) },
+      key_levels: { ma20: toRaw(ma20[levelIdx]), ma60: toRaw(ma60[levelIdx]), touch_low: toRaw(b.low[t]) },
       evidence: {
         ...rpsEvidence,
-        touch_date: b.dates[current.touchIndex],
-        ma20: round4(current.ma20),
-        confirmation_lag: i - current.touchIndex,
+        touch_date: b.dates[t],
+        pullback_start_date: b.dates[s],
+        ma20: round4(ma20[t]),
+        confirmation_lag: confirm >= 0 ? confirm - t : null,
+        bars_since_confirmation: confirm >= 0 ? i - confirm : null,
       },
-    }));
-  } else if (latest >= 0) {
-    const fail = firstWhere(latest, i, k => isFin(close[k]) && isFin(ma60[k]) && close[k] < ma60[k]);
-    const priorTouch = pullbackAt(latest)?.touchIndex ?? latest;
-    const common = {
-      pattern_event_date: b.dates[priorTouch],
-      first_observed_date: b.dates[latest],
-      formed_on: null as string | null,
-      confirmed_on: b.dates[latest],
-      formation_basis: ['上升趋势中回踩 MA20（low ≤ MA20 × 1.01）'],
-      confirmation_conditions: ['收盘重新站上 MA20 且高于前一日收盘，MA20 > MA60'],
-      invalidation_conditions: ['收盘跌破 MA60'],
-      key_levels: { ma20: toRaw(ma20[latest]), ma60: toRaw(ma60[latest]) },
     };
-    if (fail >= 0) {
-      out.push(makeObservation(input, 'tc_v2_pullback_resume', 'TREND_CONTINUATION', {
-        ...common, stage: 'FAILED', stage_detail: 'PULLBACK_RESUME',
-        invalidation: { on: b.dates[fail], reason: 'close_below_ma60' },
-        evidence: { ...rpsEvidence, bars_since_confirmation: i - latest, invalidation_close: round4(close[fail]) },
-      }));
-    } else if (i - latest > 10) {
-      out.push(makeObservation(input, 'tc_v2_pullback_resume', 'TREND_CONTINUATION', {
-        ...common, stage: 'EXPIRED', stage_detail: 'PULLBACK_RESUME',
-        evidence: { ...rpsEvidence, bars_since_confirmation: i - latest, expired: true },
-      }));
-    } else {
-      out.push(makeObservation(input, 'tc_v2_pullback_resume', 'TREND_CONTINUATION', {
-        ...common, stage: 'FOLLOW_THROUGH', stage_detail: 'PULLBACK_RESUME',
-        evidence: { ...rpsEvidence, bars_since_confirmation: i - latest },
-      }));
-    }
-  } else {
-    // FORMING only while the uptrend background itself still holds; a close
-    // below MA20 is a pullback in progress, not a confirmed resume.
-    const background = i >= 60 && isFin(close[i]) && isFin(ma20[i]) && isFin(ma60[i]) && isFin(ma20[i - 5])
-      && close[i] > ma20[i] && ma20[i] > ma60[i] && ma20[i] > ma20[i - 5];
-    let touch = -1;
-    if (background) {
-      for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
-        if (isFin(b.low[j]) && isFin(ma20[j]) && b.low[j] <= ma20[j] * (1 + DEFAULT_PULLBACK_OPTS.touchTol)) { touch = j; break; }
-      }
-    }
-    const notAboveMa20 = isFin(close[i]) && isFin(ma20[i]) && close[i] <= ma20[i];
-    if (background && touch >= 0 && notAboveMa20) {
-      out.push(makeObservation(input, 'tc_v2_pullback_resume', 'TREND_CONTINUATION', {
-        stage: 'FORMING', stage_detail: 'PULLBACK_TO_MA20',
-        formed_on: b.dates[touch], confirmed_on: null,
-        formation_basis: ['上升趋势中回踩 MA20（low ≤ MA20 × 1.01），尚未收上 MA20'],
-        confirmation_conditions: ['收盘重新站上 MA20 且高于前一日收盘'],
-        invalidation_conditions: ['收盘跌破 MA60'],
-        key_levels: { ma20: toRaw(ma20[i]), ma60: toRaw(ma60[i]), touch_low: toRaw(b.low[touch]) },
-        evidence: { ...rpsEvidence, touch_date: b.dates[touch], ma20: round4(ma20[i]), close: round4(close[i]) },
-      }));
-    }
-  }
 
-  return out;
+    // First event decides: a close below MA60 before the reclaim kills the
+    // setup and it can never confirm later. The touch bar itself is the first
+    // bar the setup is provable on, so a close below MA60 there counts.
+    const failBefore = (isFin(close[t]) && isFin(ma60[t]) && close[t] < ma60[t]) ? t
+      : firstWhere(t, confirmEnd, k => isFin(close[k]) && isFin(ma60[k]) && close[k] < ma60[k]);
+    if (failBefore >= 0 && (confirm < 0 || failBefore < confirm)) {
+      return {
+        terminalIdx: failBefore,
+        parts: {
+          ...common, stage: 'FAILED', stage_detail: 'PULLBACK_RESUME',
+          // The instance died before any confirmation: it can never confirm
+          // later, so no confirmation date may be emitted (WP2 inversion fix).
+          confirmed_on: null, confirmed_idx: null,
+          invalidation: { on: b.dates[failBefore], reason: 'close_below_ma60' },
+          evidence: {
+            ...common.evidence,
+            confirmation_lag: null,
+            bars_since_confirmation: null,
+            invalidation_close: round4(close[failBefore]),
+          },
+        },
+      };
+    }
+
+    if (confirm >= 0) {
+      const failAfter = firstWhere(confirm, Math.min(i, confirm + 10),
+        k => isFin(close[k]) && isFin(ma60[k]) && close[k] < ma60[k]);
+      if (failAfter >= 0) {
+        return {
+          terminalIdx: failAfter,
+          parts: {
+            ...common, stage: 'FAILED', stage_detail: 'PULLBACK_RESUME',
+            invalidation: { on: b.dates[failAfter], reason: 'close_below_ma60' },
+            evidence: { ...common.evidence, invalidation_close: round4(close[failAfter]) },
+          },
+        };
+      }
+      const expiresIdx = confirm + 11; // first bar with `i - confirm > 10`
+      if (i >= expiresIdx) {
+        return {
+          terminalIdx: expiresIdx,
+          parts: {
+            ...common, stage: 'EXPIRED', stage_detail: 'PULLBACK_RESUME',
+            expires_at: b.dates[expiresIdx],
+            evidence: { ...common.evidence, expired: true },
+          },
+        };
+      }
+      return {
+        terminalIdx: null,
+        parts: {
+          ...common,
+          stage: confirm === i ? 'CONFIRMED' : 'FOLLOW_THROUGH',
+          stage_detail: 'PULLBACK_RESUME',
+        },
+      };
+    }
+
+    // No reclaim inside the pullback window: the setup simply ages out.
+    const expiresIdx = s + opts.touchWindow + 1;
+    if (i >= expiresIdx) {
+      return {
+        terminalIdx: expiresIdx,
+        parts: {
+          ...common, stage: 'EXPIRED', stage_detail: 'PULLBACK_TO_MA20',
+          expires_at: b.dates[expiresIdx],
+          evidence: { ...common.evidence, expired: true },
+        },
+      };
+    }
+    return {
+      terminalIdx: null,
+      parts: {
+        ...common, stage: 'FORMING', stage_detail: 'PULLBACK_TO_MA20',
+        reference_kind: 'ma20_reclaim_level',
+        evidence: { ...common.evidence, close: round4(close[i]) },
+      },
+    };
+  });
+
+  return resolved
+    ? [makeObservation(input, 'tc_v2_pullback_resume', 'TREND_CONTINUATION', resolved.parts)]
+    : [];
 }
 
 // ---------------------------------------------------------------- B. platform breakout
@@ -323,89 +449,120 @@ export function detectPlatformBreakout(input: PatternInput): PatternObservation[
     return { high, low, rangeWidth };
   };
 
-  const breakoutAt = (k: number): PlatformZone | null => {
-    const zone = zoneAt(k);
-    if (!zone) return null;
-    if (!isFin(close[k]) || !isFin(b.vol[k]) || !isFin(x.volMa20[k])) return null;
-    if (!(close[k] > zone.high)) return null;
-    if (!(b.vol[k] >= 1.2 * x.volMa20[k])) return null;
-    return zone;
+  // Every platform from a FIXED start of the loaded history: a bar's zone
+  // depends only on bars before it, so a platform keeps its identity as the
+  // as-of advances.
+  const zones: (PlatformZone | null)[] = new Array(i + 1).fill(null);
+  for (let k = 61; k <= i; k++) zones[k] = zoneAt(k);
+
+  const breakoutAt = (k: number): boolean => {
+    const zone = zones[k];
+    if (!zone) return false;
+    if (!isFin(close[k]) || !isFin(b.vol[k]) || !isFin(x.volMa20[k])) return false;
+    if (!(close[k] > zone.high)) return false;
+    return b.vol[k] >= 1.2 * x.volMa20[k];
   };
 
-  const currentZone = zoneAt(i);
-  const currentBreak = currentZone !== null && breakoutAt(i) !== null;
+  interface PlatformFormation extends Formation { zone: PlatformZone }
+  const formations: PlatformFormation[] = [];
+  for (let k = 61; k <= i; k++) {
+    const zone = zones[k];
+    if (!zone) continue;
+    if (k > 61 && zones[k - 1]) continue; // inside the same platform run
+    formations.push({ eventIdx: k, visibleFrom: k, zone });
+  }
 
-  const build = (
-    stage: TechnicalStage, stage_detail: string, zone: PlatformZone,
-    formedIdx: number, confirmedIdx: number,
-    extra: Omit<ObservationParts, 'stage' | 'stage_detail'> = {},
-  ): PatternObservation => makeObservation(input, 'pb_v2_platform_breakout', 'PLATFORM_BREAKOUT', {
-    stage,
-    stage_detail,
-    pattern_event_date: stage === 'FORMING' ? b.dates[i] : b.dates[confirmedIdx],
-    first_observed_date: stage === 'FORMING' ? b.dates[i] : b.dates[confirmedIdx],
-    formed_on: b.dates[formedIdx],
-    confirmed_on: b.dates[confirmedIdx],
-    formation_basis: ['30 日平台振幅 ≤15%，近 10 日波动 ≤ 前 20 日的 0.8 倍，且非急涨'],
-    confirmation_conditions: ['收盘突破平台高点，且成交量 ≥ 20 日均量 1.2 倍'],
-    invalidation_conditions: ['收盘跌破平台高点 ×0.97 或跌破平台低点'],
-    key_levels: {
-      platform_high: toRaw(zone.high),
-      platform_low: toRaw(zone.low),
-      invalidation_level: toRaw(zone.high * 0.97),
-    },
-    evidence: {
-      platform_high: toRaw(zone.high),
-      platform_low: toRaw(zone.low),
-      range_width: round4(zone.rangeWidth),
-      volume_ratio: stage === 'FORMING' ? null
-        : isFin(b.vol[confirmedIdx]) && isFin(x.volMa20[confirmedIdx]) && x.volMa20[confirmedIdx] > 0
-          ? round4(b.vol[confirmedIdx] / x.volMa20[confirmedIdx]) : null,
-      ...(extra.evidence ?? {}),
-    },
-    ...extra,
+  const resolved = walkEpisodes(formations, i, (f): ResolvedEpisode => {
+    let confirm = -1;
+    let runEnd = -1;
+    for (let k = f.eventIdx; k <= i; k++) {
+      if (!zones[k]) { runEnd = k; break; } // the platform aged out first
+      if (breakoutAt(k)) { confirm = k; break; }
+    }
+    const zone = confirm >= 0 ? (zones[confirm] as PlatformZone) : f.zone;
+    const common: EpisodeBase = {
+      pattern_event_date: b.dates[f.eventIdx],
+      first_observed_date: b.dates[f.eventIdx],
+      formed_on: b.dates[Math.max(0, f.eventIdx - 30)],
+      confirmed_on: confirm >= 0 ? b.dates[confirm] : null,
+      confirmed_idx: confirm >= 0 ? confirm : null,
+      reference_price: zone.high, reference_kind: 'platform_high',
+      invalidation_level: zone.high * 0.97,
+      formation_basis: ['30 日平台振幅 ≤15%，近 10 日波动 ≤ 前 20 日的 0.8 倍，且非急涨'],
+      confirmation_conditions: ['收盘突破平台高点，且成交量 ≥ 20 日均量 1.2 倍'],
+      invalidation_conditions: ['收盘跌破平台高点 ×0.97 或跌破平台低点'],
+      key_levels: {
+        platform_high: toRaw(zone.high),
+        platform_low: toRaw(zone.low),
+        invalidation_level: toRaw(zone.high * 0.97),
+      },
+      evidence: {
+        platform_high: toRaw(zone.high),
+        platform_low: toRaw(zone.low),
+        range_width: round4(zone.rangeWidth),
+        volume_ratio: confirm >= 0 && isFin(b.vol[confirm]) && isFin(x.volMa20[confirm]) && x.volMa20[confirm] !== 0
+          ? round4(b.vol[confirm] / x.volMa20[confirm]) : null,
+        bars_since_confirmation: confirm >= 0 ? i - confirm : null,
+      },
+    };
+
+    if (confirm >= 0) {
+      const fail = firstWhere(confirm, Math.min(i, confirm + 20),
+        k => isFin(close[k]) && close[k] < zone.high * 0.97);
+      if (fail >= 0) {
+        return {
+          terminalIdx: fail,
+          parts: {
+            ...common, stage: 'FAILED', stage_detail: 'PLATFORM_BREAKOUT_FAILED',
+            invalidation: { on: b.dates[fail], reason: 'close_below_platform_high' },
+            evidence: { ...common.evidence, invalidation_close: round4(close[fail]) },
+          },
+        };
+      }
+      const expiresIdx = confirm + 21; // first bar with `i - confirm > 20`
+      if (i >= expiresIdx) {
+        return {
+          terminalIdx: expiresIdx,
+          parts: {
+            ...common, stage: 'EXPIRED', stage_detail: 'PLATFORM_BREAKOUT_EXPIRED',
+            expires_at: b.dates[expiresIdx],
+            evidence: { ...common.evidence, expired: true },
+          },
+        };
+      }
+      return {
+        terminalIdx: null,
+        parts: {
+          ...common,
+          stage: confirm === i ? 'CONFIRMED' : 'FOLLOW_THROUGH',
+          stage_detail: confirm === i ? 'BREAKOUT_CONFIRMED' : 'FOLLOW_THROUGH',
+        },
+      };
+    }
+
+    if (runEnd >= 0) {
+      // The platform lost its shape before any volume breakout: terminal.
+      return {
+        terminalIdx: runEnd,
+        parts: {
+          ...common, stage: 'EXPIRED', stage_detail: 'PLATFORM_BREAKOUT_EXPIRED',
+          expires_at: b.dates[runEnd],
+          evidence: { ...common.evidence, expired: true },
+        },
+      };
+    }
+    return {
+      terminalIdx: null,
+      parts: {
+        ...common, stage: 'FORMING', stage_detail: 'PLATFORM_FORMING',
+        evidence: { ...common.evidence, close: round4(close[i]) },
+      },
+    };
   });
 
-  if (currentBreak) {
-    return [build('CONFIRMED', 'BREAKOUT_CONFIRMED', currentZone as PlatformZone, i - 30, i)];
-  }
-
-  // Most recent earlier breakout; scan far enough to reach EXPIRED (20 bars).
-  let confirmed = -1;
-  for (let k = i - 1; k >= Math.max(61, i - 120); k--) {
-    if (breakoutAt(k)) { confirmed = k; break; }
-  }
-  if (confirmed >= 0) {
-    const zone = zoneAt(confirmed) as PlatformZone;
-    const fail = firstWhere(confirmed, i, k => isFin(close[k]) && close[k] < zone.high * 0.97);
-    if (fail >= 0) {
-      return [build('FAILED', 'PLATFORM_BREAKOUT_FAILED', zone, confirmed - 30, confirmed, {
-        invalidation: { on: b.dates[fail], reason: 'close_below_platform_high' },
-        evidence: { bars_since_confirmation: i - confirmed, invalidation_close: round4(close[fail]) },
-      })];
-    }
-    if (i - confirmed > 20) {
-      return [build('EXPIRED', 'PLATFORM_BREAKOUT_EXPIRED', zone, confirmed - 30, confirmed, {
-        evidence: { bars_since_confirmation: i - confirmed, expired: true },
-      })];
-    }
-    if (isFin(close[i]) && close[i] > close[confirmed]) {
-      return [build('FOLLOW_THROUGH', 'FOLLOW_THROUGH', zone, confirmed - 30, confirmed, {
-        evidence: { bars_since_confirmation: i - confirmed },
-      })];
-    }
-    return [];
-  }
-
-  // No breakout: a close inside the upper 3% of a valid platform is forming.
-  if (currentZone && isFin(close[i])
-    && close[i] >= currentZone.high * 0.97 && close[i] <= currentZone.high) {
-    return [build('FORMING', 'PLATFORM_FORMING', currentZone, i - 30, i - 30, {
-      confirmed_on: null,
-      evidence: { close: round4(close[i]) },
-    })];
-  }
-  return [];
+  return resolved
+    ? [makeObservation(input, 'pb_v2_platform_breakout', 'PLATFORM_BREAKOUT', resolved.parts)]
+    : [];
 }
 
 // ---------------------------------------------------------------- C. reversal
@@ -427,12 +584,19 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
   const invalidConds = ['收盘跌破背离低点（两低点较低者）'];
 
   // ---- rv_v2_macd_dif_divergence
-  const lows = confirmedLocalLows(b.low, i, { L: 3, K: 3 }, i - 180);
-  let pair: { j1: number; j2: number } | null = null;
-  for (let n = 0; n < lows.length - 1 && !pair; n++) {
-    const j2 = lows[n].index;
-    for (let m = n + 1; m < lows.length; m++) {
-      const j1 = lows[m].index;
+  interface DivFormation extends Formation {
+    j1: number; j2: number; formationIdx: number; neckline: number; divergenceLow: number;
+  }
+  // Oldest first: the walk must consume formations in chronological order.
+  const priceLows = confirmedLocalLows(b.low, i, { L: 3, K: 3 }, 0)
+    .slice().sort((a, b2) => a.index - b2.index);
+  const divFormations: DivFormation[] = [];
+  for (let n = 0; n < priceLows.length; n++) {
+    const j2 = priceLows[n].index;
+    const formationIdx = j2 + 3;
+    if (formationIdx > i) continue; // the second low is not provable yet
+    for (let m = n - 1; m >= 0; m--) {
+      const j1 = priceLows[m].index;
       const gap = j2 - j1;
       if (gap < 8) continue;
       if (gap > 60) break;
@@ -440,175 +604,284 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
       if (!(b.low[j2] < b.low[j1])) continue;   // lower price low
       if (!(dif[j2] > dif[j1])) continue;       // higher DIF low
       if (!(dif[j2] < 0)) continue;             // still below the zero line
-      pair = { j1, j2 };
+      const neckline = maxFinite(b.high, j1 + 1, j2 - 1);
+      if (!isFin(neckline) || !(neckline > b.low[j2])) break; // nearest pair decides, even if unusable
+      divFormations.push({
+        eventIdx: j2, visibleFrom: formationIdx, j1, j2, formationIdx,
+        neckline, divergenceLow: Math.min(b.low[j1], b.low[j2]),
+      });
       break;
     }
   }
 
-  if (pair) {
-    const { j1, j2 } = pair;
-    const formationIdx = j2 + 3;
-    const neckline = maxFinite(b.high, j1 + 1, j2 - 1);
-    if (formationIdx <= i && isFin(neckline) && neckline > b.low[j2]) {
-      const divergenceLow = Math.min(b.low[j1], b.low[j2]);
-      const fail = firstWhere(formationIdx, i, k => isFin(close[k]) && close[k] < divergenceLow);
-      const confirm = firstWhere(formationIdx, i, k => isFin(close[k]) && close[k] > neckline);
-      const base = {
-        pattern_event_date: b.dates[j2],
-        first_observed_date: b.dates[formationIdx],
-        formed_on: b.dates[formationIdx],
-        formation_basis: [
-          `价格低点 ${b.dates[j2]} < ${b.dates[j1]}，但 DIF 低点抬高`,
-        ],
-        confirmation_conditions: ['收盘越过两低点之间的颈线'],
-        invalidation_conditions: invalidConds,
-        key_levels: {
-          neckline: toRaw(neckline),
-          divergence_low: toRaw(divergenceLow),
-          first_low: toRaw(b.low[j1]),
-          second_low: toRaw(b.low[j2]),
-        },
-        evidence: {
-          first_low_date: b.dates[j1],
-          second_low_date: b.dates[j2],
-          first_low: toRaw(b.low[j1]),
-          second_low: toRaw(b.low[j2]),
-          dif_first_low: round4(dif[j1]),
-          dif_second_low: round4(dif[j2]),
-          neckline: toRaw(neckline),
-          rsi_divergence: isFin(x.rsi14[j1]) && isFin(x.rsi14[j2]) ? x.rsi14[j2] > x.rsi14[j1] : null,
+  const resolvedDiv = walkEpisodes(divFormations, i, (f): ResolvedEpisode => {
+    const { j1, j2, formationIdx, neckline, divergenceLow } = f;
+    // One finite instance window: the 40-bar evaluation starts at the
+    // formation bar. Confirmation and invalidation are both searched only
+    // inside it, so the FIRST event decides the instance (goal-1106 WP2).
+    const expiresIdx = formationIdx + 41;           // first bar with `i - formationIdx > 40`
+    const windowEnd = Math.min(i, formationIdx + 40);
+    // The formation bar itself is the first bar the pair is provable on, so a
+    // condition already true there must be dated there rather than one bar late.
+    const fail = isFin(close[formationIdx]) && close[formationIdx] < divergenceLow
+      ? formationIdx
+      : firstWhere(formationIdx, windowEnd, k => isFin(close[k]) && close[k] < divergenceLow);
+    const confirm = isFin(close[formationIdx]) && close[formationIdx] > neckline
+      ? formationIdx
+      : firstWhere(formationIdx, windowEnd, k => isFin(close[k]) && close[k] > neckline);
+    const base: EpisodeBase = {
+      pattern_event_date: b.dates[j2],
+      first_observed_date: b.dates[formationIdx],
+      formed_on: b.dates[formationIdx],
+      reference_price: neckline, reference_kind: 'neckline',
+      invalidation_level: divergenceLow,
+      formation_basis: [`价格低点 ${b.dates[j2]} < ${b.dates[j1]}，但 DIF 低点抬高`],
+      confirmation_conditions: ['收盘越过两低点之间的颈线'],
+      invalidation_conditions: invalidConds,
+      key_levels: {
+        neckline: toRaw(neckline),
+        divergence_low: toRaw(divergenceLow),
+        first_low: toRaw(b.low[j1]),
+        second_low: toRaw(b.low[j2]),
+      },
+      evidence: {
+        first_low_date: b.dates[j1],
+        second_low_date: b.dates[j2],
+        first_low: toRaw(b.low[j1]),
+        second_low: toRaw(b.low[j2]),
+        dif_first_low: round4(dif[j1]),
+        dif_second_low: round4(dif[j2]),
+        neckline: toRaw(neckline),
+        rsi_divergence: isFin(x.rsi14[j1]) && isFin(x.rsi14[j2]) ? x.rsi14[j2] > x.rsi14[j1] : null,
+      },
+    };
+
+    if (fail >= 0 && (confirm < 0 || fail < confirm)) {
+      // The instance died BEFORE it ever confirmed: it can never be confirmed
+      // later, and confirmed_on stays null.
+      return {
+        terminalIdx: fail,
+        parts: {
+          ...base, stage: 'FAILED', stage_detail: 'DIF_DIVERGENCE_FAILED',
+          confirmed_on: null, confirmed_idx: null,
+          invalidation: { on: b.dates[fail], reason: 'close_below_divergence_low' },
+          evidence: { ...base.evidence, bars_since_formation: fail - formationIdx },
         },
       };
-      if (fail >= 0) {
-        out.push(makeObservation(input, 'rv_v2_macd_dif_divergence', 'REVERSAL', {
-          ...base, stage: 'FAILED', stage_detail: 'DIF_DIVERGENCE_FAILED',
-          confirmed_on: confirm >= 0 ? b.dates[confirm] : null,
-          invalidation: { on: b.dates[fail], reason: 'close_below_divergence_low' },
-        }));
-      } else if (confirm >= 0) {
-        if (i - confirm > 40) {
-          out.push(makeObservation(input, 'rv_v2_macd_dif_divergence', 'REVERSAL', {
-            ...base, stage: 'EXPIRED', stage_detail: 'DIF_DIVERGENCE_EXPIRED',
-            confirmed_on: b.dates[confirm],
-            evidence: { ...base.evidence, bars_since_confirmation: i - confirm, expired: true },
-          }));
-        } else {
-          out.push(makeObservation(input, 'rv_v2_macd_dif_divergence', 'REVERSAL', {
-            ...base,
-            stage: confirm === i ? 'CONFIRMED' : 'FOLLOW_THROUGH',
-            stage_detail: 'DIF_DIVERGENCE_CONFIRMED',
-            confirmed_on: b.dates[confirm],
-            evidence: { ...base.evidence, bars_since_confirmation: i - confirm },
-          }));
-        }
-      } else if (i - formationIdx > 40) {
-        out.push(makeObservation(input, 'rv_v2_macd_dif_divergence', 'REVERSAL', {
-          ...base, stage: 'EXPIRED', stage_detail: 'DIF_DIVERGENCE_EXPIRED',
-          confirmed_on: null,
-          evidence: { ...base.evidence, bars_since_formation: i - formationIdx, expired: true },
-        }));
-      } else {
-        out.push(makeObservation(input, 'rv_v2_macd_dif_divergence', 'REVERSAL', {
-          ...base, stage: 'FORMING', stage_detail: 'DIVERGENCE_FORMING',
-          confirmed_on: null,
-          evidence: { ...base.evidence, dif_at_end: round4(dif[i]) },
-        }));
+    }
+    if (confirm >= 0) {
+      const confirmExpiresIdx = confirm + 41;        // first bar with `i - confirm > 40`
+      const failAfter = firstWhere(confirm, Math.min(i, confirm + 40),
+        k => isFin(close[k]) && close[k] < divergenceLow);
+      if (failAfter >= 0) {
+        return {
+          terminalIdx: failAfter,
+          parts: {
+            ...base, stage: 'FAILED', stage_detail: 'DIF_DIVERGENCE_FAILED',
+            confirmed_on: b.dates[confirm], confirmed_idx: confirm,
+            invalidation: { on: b.dates[failAfter], reason: 'close_below_divergence_low' },
+            evidence: { ...base.evidence, bars_since_confirmation: failAfter - confirm, invalidation_close: round4(close[failAfter]) },
+          },
+        };
       }
+      if (i >= confirmExpiresIdx) {
+        return {
+          terminalIdx: confirmExpiresIdx,
+          parts: {
+            ...base, stage: 'EXPIRED', stage_detail: 'DIF_DIVERGENCE_EXPIRED',
+            confirmed_on: b.dates[confirm], confirmed_idx: confirm,
+            expires_at: b.dates[confirmExpiresIdx],
+            evidence: { ...base.evidence, bars_since_confirmation: i - confirm, expired: true },
+          },
+        };
+      }
+      return {
+        terminalIdx: null,
+        parts: {
+          ...base,
+          stage: confirm === i ? 'CONFIRMED' : 'FOLLOW_THROUGH',
+          stage_detail: 'DIF_DIVERGENCE_CONFIRMED',
+          confirmed_on: b.dates[confirm], confirmed_idx: confirm,
+          evidence: { ...base.evidence, bars_since_confirmation: i - confirm },
+        },
+      };
+    }
+    if (i >= expiresIdx) {
+      return {
+        terminalIdx: expiresIdx,
+        parts: {
+          ...base, stage: 'EXPIRED', stage_detail: 'DIF_DIVERGENCE_EXPIRED',
+          confirmed_on: null, confirmed_idx: null,
+          expires_at: b.dates[expiresIdx],
+          evidence: { ...base.evidence, bars_since_formation: i - formationIdx, expired: true },
+        },
+      };
+    }
+    return {
+      terminalIdx: null,
+      parts: {
+        ...base, stage: 'FORMING', stage_detail: 'DIVERGENCE_FORMING',
+        confirmed_on: null, confirmed_idx: null,
+        evidence: { ...base.evidence, dif_at_end: round4(dif[i]) },
+      },
+    };
+  });
+  if (resolvedDiv) out.push(makeObservation(input, 'rv_v2_macd_dif_divergence', 'REVERSAL', resolvedDiv.parts));
+
+  // ---- rv_v2_macd_w_bottom
+  interface WFormation extends Formation {
+    j1: number; j2: number; formationIdx: number;
+    neckline: number; below: number; v1: number; v2: number;
+  }
+  const wOpts = DEFAULT_MACD_W_OPTS;
+  const difLows = confirmedLocalLows(dif, i, wOpts, 0).slice().sort((a, b2) => a.index - b2.index);
+  const wFormations: WFormation[] = [];
+  for (let n = 0; n < difLows.length; n++) {
+    const j2 = difLows[n].index;
+    // The second low is only a *confirmed* swing low `L` bars to its right, so
+    // the pair is unknowable before then.
+    const formationIdx = j2 + wOpts.L;
+    if (formationIdx > i) continue;
+    for (let m = n - 1; m >= 0; m--) {
+      const j1 = difLows[m].index;
+      const gap = j2 - j1;
+      if (gap < wOpts.minGap) continue;
+      if (gap > wOpts.maxGap) break;
+      const v1 = dif[j1];
+      const v2 = dif[j2];
+      if (!isFin(v1) || !isFin(v2)) continue;
+      if (v1 > wOpts.lowCeiling || v2 > wOpts.lowCeiling) continue;
+      const scale = Math.max(Math.abs(v1), Math.abs(v2));
+      if (!(Math.abs(v2 - v1) <= wOpts.relTol * scale)) continue;
+      const neckline = maxFinite(dif, j1 + 1, j2 - 1);
+      if (!isFin(neckline) || !(neckline > v1 && neckline > v2)) continue;
+      wFormations.push({
+        eventIdx: j2, visibleFrom: formationIdx, j1, j2, formationIdx,
+        neckline, below: Math.min(v1, v2), v1, v2,
+      });
+      break;
     }
   }
 
-  // ---- rv_v2_macd_w_bottom
-  const w = detectWBottom(dif, i, DEFAULT_MACD_W_OPTS);
-  if (w) {
-    // The second low is only a *confirmed* swing low `L` bars to its right, so
-    // the pair is unknowable before then even if the neckline cross came
-    // earlier. Both the visibility date and the confirmation date respect that.
-    const firstObsIdx = Math.max(w.confirmIndex, w.j2 + DEFAULT_MACD_W_OPTS.L);
-    const base = {
-      pattern_event_date: b.dates[w.j2],
-      first_observed_date: b.dates[firstObsIdx],
-      formed_on: b.dates[firstObsIdx],
-      confirmed_on: b.dates[firstObsIdx],
-      formation_basis: [`DIF 双底 ${b.dates[w.j1]} / ${b.dates[w.j2]}，颈线 ${round4(w.neckline)}`],
+  const resolvedW = walkEpisodes(wFormations, i, (f): ResolvedEpisode => {
+    const { j1, j2, formationIdx, neckline, below, v1, v2 } = f;
+    // First neckline cross at or after the second low; before the pair is
+    // provable it is only a latent event, so the effective confirmation is
+    // max(cross, formation) — never a date the detector could not know.
+    // A confirmation must land inside the episode's own evaluation window: a
+    // neckline cross that only appears after the window elapsed cannot revive
+    // an episode that has already expired.
+    const wWindowEnd = Math.min(i, formationIdx + 40);
+    let confirmRaw = -1;
+    for (let c = Math.max(j2, 1); c <= wWindowEnd; c++) {
+      if (isFin(dif[c]) && isFin(dif[c - 1]) && dif[c] > neckline && dif[c - 1] <= neckline) {
+        confirmRaw = c; break;
+      }
+    }
+    const confirmedIdx = confirmRaw >= 0 ? Math.max(confirmRaw, formationIdx) : null;
+    const base: EpisodeBase = {
+      pattern_event_date: b.dates[j2],
+      first_observed_date: b.dates[formationIdx],
+      formed_on: b.dates[formationIdx],
+      formation_basis: [`DIF 双底 ${b.dates[j1]} / ${b.dates[j2]}，颈线 ${round4(neckline)}`],
       confirmation_conditions: ['DIF 上穿两低点之间的颈线'],
       invalidation_conditions: ['DIF 跌破两个低点'],
       key_levels: {
-        neckline_dif: round4(w.neckline),
-        first_low_dif: round4(w.firstLow),
-        second_low_dif: round4(w.secondLow),
+        neckline_dif: round4(neckline),
+        first_low_dif: round4(v1),
+        second_low_dif: round4(v2),
       },
       evidence: {
-        first_low_date: b.dates[w.j1],
-        second_low_date: b.dates[w.j2],
-        first_low: round4(w.firstLow),
-        second_low: round4(w.secondLow),
-        neckline: round4(w.neckline),
+        first_low_date: b.dates[j1],
+        second_low_date: b.dates[j2],
+        first_low: round4(v1),
+        second_low: round4(v2),
+        neckline: round4(neckline),
       },
     };
-    if (i === firstObsIdx) {
-      out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
-        ...base, stage: 'CONFIRMED', stage_detail: 'DIF_W_CONFIRMED',
-      }));
-    } else if (w.invalidateIndex !== null) {
-      out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
-        ...base, stage: 'FAILED', stage_detail: 'DIF_W_INVALIDATED',
-        invalidated_at: b.dates[Math.max(w.invalidateIndex, firstObsIdx)],
-        invalidation: { on: b.dates[Math.max(w.invalidateIndex, firstObsIdx)], reason: 'dif_w_invalidated' },
-        evidence: { ...base.evidence, invalidate_below: round4(w.invalidateBelow) },
-      }));
-    } else if (i - firstObsIdx > 40) {
-      out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
-        ...base, stage: 'EXPIRED', stage_detail: 'DIF_W_CONFIRMED',
-        evidence: { ...base.evidence, bars_since_confirmation: i - firstObsIdx, expired: true },
-      }));
-    } else {
-      out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
-        ...base, stage: 'FOLLOW_THROUGH', stage_detail: 'DIF_W_CONFIRMED',
-        evidence: { ...base.evidence, bars_since_confirmation: i - firstObsIdx },
-      }));
-    }
-  } else {
-    // FORMING W: same pair test as `detectForming` in strategies.ts (local copy,
-    // because that helper is intentionally not exported).
-    const opts = DEFAULT_MACD_W_OPTS;
-    const difLows = confirmedLocalLows(dif, i, opts, i - opts.lookback - opts.L);
-    outer:
-    for (let n = 0; n < difLows.length - 1; n++) {
-      const j2 = difLows[n].index;
-      for (let m = n + 1; m < difLows.length; m++) {
-        const j1 = difLows[m].index;
-        const gap = j2 - j1;
-        if (gap < opts.minGap) continue;
-        if (gap > opts.maxGap) break;
-        const v1 = dif[j1];
-        const v2 = dif[j2];
-        if (!isFin(v1) || !isFin(v2)) continue;
-        if (v1 > opts.lowCeiling || v2 > opts.lowCeiling) continue;
-        const scale = Math.max(Math.abs(v1), Math.abs(v2));
-        if (!(Math.abs(v2 - v1) <= opts.relTol * scale)) continue;
-        const neckline = maxFinite(dif, j1 + 1, j2 - 1);
-        if (!isFin(neckline) || !(neckline > v1 && neckline > v2)) continue;
-        if (isFin(dif[i]) && dif[i] <= neckline) {
-          out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', {
-            stage: 'FORMING', stage_detail: 'DIF_W_FORMING',
-            pattern_event_date: b.dates[j2],
-            first_observed_date: b.dates[j2 + opts.L],
-            formed_on: b.dates[j2 + opts.L], confirmed_on: null,
-            formation_basis: [`DIF 双底 ${b.dates[j1]} / ${b.dates[j2]}，尚未越过颈线`],
-            confirmation_conditions: ['DIF 上穿两低点之间的颈线'],
-            invalidation_conditions: ['DIF 跌破两个低点'],
-            key_levels: { neckline_dif: round4(neckline), first_low_dif: round4(v1), second_low_dif: round4(v2) },
-            evidence: {
-              first_low_date: b.dates[j1], second_low_date: b.dates[j2],
-              first_low: round4(v1), second_low: round4(v2), neckline: round4(neckline),
-              dif_at_end: round4(dif[i]),
-            },
-          }));
-        }
-        break outer;
+    const failed = (breach: number, confirmed: number | null): ResolvedEpisode => {
+      // A breach before the pair was provable cannot be dated before the
+      // formation itself; anchor formed_on at the second low in that case.
+      const formedOn = breach < formationIdx ? b.dates[j2] : b.dates[formationIdx];
+      const levelIdx = confirmed !== null ? confirmed : j2;
+      return {
+        terminalIdx: breach,
+        parts: {
+          ...base, formed_on: formedOn,
+          stage: 'FAILED', stage_detail: 'DIF_W_INVALIDATED',
+          confirmed_on: confirmed === null ? null : b.dates[confirmed],
+          confirmed_idx: confirmed,
+          invalidated_at: b.dates[breach],
+          invalidation: { on: b.dates[breach], reason: 'dif_w_invalidated' },
+          reference_price: isFin(close[levelIdx]) ? close[levelIdx] : null,
+          reference_kind: 'confirmation_close',
+          invalidation_level: null,
+          evidence: { ...base.evidence, invalidate_below: round4(below) },
+        },
+      };
+    };
+
+    // First event inside the instance window decides. A breach anywhere between
+    // the formation bar and the eventual neckline cross kills the instance
+    // BEFORE it ever confirmed, and a later cross must not resurrect it.
+    const failBefore = isFin(dif[formationIdx]) && dif[formationIdx] < below
+      ? formationIdx
+      : firstWhere(formationIdx, wWindowEnd, k => isFin(dif[k]) && dif[k] < below);
+    if (failBefore >= 0 && (confirmRaw < 0 || failBefore < confirmRaw)) return failed(failBefore, null);
+
+    if (confirmedIdx !== null && confirmRaw >= 0) {
+      const breach = firstWhere(confirmedIdx, Math.min(i, confirmedIdx + 40),
+        k => isFin(dif[k]) && dif[k] < below);
+      if (breach >= 0) return failed(breach, confirmedIdx);
+      const expiresIdx = confirmedIdx + 41;
+      const live: ObservationParts = {
+        ...base,
+        stage: 'FOLLOW_THROUGH', stage_detail: 'DIF_W_CONFIRMED',
+        confirmed_on: b.dates[confirmedIdx], confirmed_idx: confirmedIdx,
+        reference_price: isFin(close[confirmedIdx]) ? close[confirmedIdx] : null,
+        reference_kind: 'confirmation_close',
+        invalidation_level: null,
+        evidence: { ...base.evidence, bars_since_confirmation: i - confirmedIdx },
+      };
+      if (i >= expiresIdx) {
+        return {
+          terminalIdx: expiresIdx,
+          parts: {
+            ...live, stage: 'EXPIRED', expires_at: b.dates[expiresIdx],
+            evidence: { ...live.evidence, expired: true },
+          },
+        };
       }
+      return {
+        terminalIdx: null,
+        parts: { ...live, stage: i === confirmedIdx ? 'CONFIRMED' : 'FOLLOW_THROUGH' },
+      };
     }
-  }
+
+    // No confirmation inside the window and no breach: the instance expires
+    // at the first bar the window elapsed. A later breach is past the window
+    // and must not re-date it as FAILED.
+    const expiresIdx = formationIdx + 41;
+    const forming: ObservationParts = {
+      ...base, stage: 'FORMING', stage_detail: 'DIF_W_FORMING',
+      confirmed_on: null, confirmed_idx: null,
+      reference_price: isFin(close[i]) ? close[i] : null,
+      reference_kind: 'confirmation_close_pending',
+      invalidation_level: null,
+      evidence: { ...base.evidence, dif_at_end: round4(dif[i]) },
+    };
+    if (i >= expiresIdx) {
+      return {
+        terminalIdx: expiresIdx,
+        parts: {
+          ...forming, stage: 'EXPIRED', expires_at: b.dates[expiresIdx],
+          evidence: { ...forming.evidence, expired: true },
+        },
+      };
+    }
+    return { terminalIdx: null, parts: forming };
+  });
+  if (resolvedW) out.push(makeObservation(input, 'rv_v2_macd_w_bottom', 'REVERSAL', resolvedW.parts));
 
   return out;
 }
@@ -621,8 +894,8 @@ export function detectReversal(input: PatternInput): PatternObservation[] {
  *
  * Thresholds (research hypotheses): squeeze = width ≤ 20th percentile of the
  * prior 120 bars (at least 100 finite); breakout = close crosses above the
- * upper band within 5 bars of a squeeze; ride = ≥3 of the last 5 closes at or
- * above the upper band while width exceeds its 120-bar median. Touching the
+ * upper band within 5 bars of a squeeze run; ride = ≥3 of the last 5 closes at
+ * or above the upper band while width exceeds its 120-bar median. Touching the
  * upper band is never a sell instruction.
  */
 export function detectVolatilityExpansion(input: PatternInput): PatternObservation[] {
@@ -642,18 +915,10 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
     return width <= level ? { level, width } : null;
   };
 
-  const recentSqueeze = (from: number, to: number): number => lastWhere(from, to, k => squeezeAt(k) !== null);
-
-  const breakoutAt = (k: number): boolean => {
-    if (k < 121 || !isFin(close[k]) || !isFin(close[k - 1]) || !isFin(x.bollUp[k]) || !isFin(x.bollUp[k - 1])) return false;
-    if (!(close[k] > x.bollUp[k] && close[k - 1] <= x.bollUp[k - 1])) return false;
-    return recentSqueeze(k - 5, k - 1) >= 0;
-  };
-
-  // ---- ve_v2_boll_squeeze_breakout
-  const squeezeBreak = breakoutAt(i);
-  const currentSqueeze = recentSqueeze(i - 5, i);
-
+  // Bar k's squeeze flag depends only on bars before k, so the run structure
+  // is fixed as the as-of advances.
+  const squeeze: ({ level: number; width: number } | null)[] = new Array(i + 1).fill(null);
+  for (let k = 120; k <= i; k++) squeeze[k] = squeezeAt(k);
 
   const bandLevels = (k: number): Record<string, number | null> => ({
     boll_up: toRaw(x.bollUp[k]),
@@ -661,84 +926,101 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
     boll_low: toRaw(x.bollLow[k]),
   });
 
-  if (squeezeBreak) {
-    const sq = recentSqueeze(i - 5, i - 1);
-    out.push(makeObservation(input, 've_v2_boll_squeeze_breakout', 'VOLATILITY_EXPANSION', {
-      stage: 'CONFIRMED', stage_detail: 'SQUEEZE_BREAKOUT',
-      pattern_event_date: b.dates[i], first_observed_date: b.dates[i],
-      formed_on: b.dates[sq], confirmed_on: b.dates[i],
+  // ---- ve_v2_boll_squeeze_breakout
+  interface SqueezeFormation extends Formation { runEnd: number }
+  const sqFormations: SqueezeFormation[] = [];
+  for (let k = 120; k <= i; k++) {
+    if (!squeeze[k]) continue;
+    if (k > 120 && squeeze[k - 1]) continue; // inside the same squeeze run
+    let runEnd = k;
+    while (runEnd + 1 <= i && squeeze[runEnd + 1]) runEnd++;
+    sqFormations.push({ eventIdx: k, visibleFrom: k, runEnd });
+  }
+
+  const resolvedSq = walkEpisodes(sqFormations, i, (f): ResolvedEpisode => {
+    const k0 = f.eventIdx;
+    // A breakout is only attributable to this run while its squeeze is within
+    // the last 5 bars, i.e. through `runEnd + 5`.
+    const confirmEnd = Math.min(i, f.runEnd + 5);
+    let confirm = -1;
+    for (let c = k0; c <= confirmEnd; c++) {
+      if (!isFin(close[c]) || !isFin(close[c - 1]) || !isFin(x.bollUp[c]) || !isFin(x.bollUp[c - 1])) continue;
+      if (close[c] > x.bollUp[c] && close[c - 1] <= x.bollUp[c - 1]) { confirm = c; break; }
+    }
+    const squeezeInfo = squeeze[k0];
+    const common: EpisodeBase = {
+      pattern_event_date: b.dates[k0],
+      first_observed_date: b.dates[k0],
+      formed_on: b.dates[k0],
+      confirmed_on: confirm >= 0 ? b.dates[confirm] : null,
+      confirmed_idx: confirm >= 0 ? confirm : null,
+      reference_price: x.bollUp[confirm >= 0 ? confirm : k0],
+      reference_kind: confirm >= 0 ? 'boll_upper' : 'boll_upper_pending',
+      invalidation_level: x.bollMid[confirm >= 0 ? confirm : k0],
       formation_basis: ['布林带宽处于近 120 日 20% 分位（收口）'],
       confirmation_conditions: ['收盘上穿上轨，且前一日收盘不高于上轨'],
       invalidation_conditions: ['收盘跌破布林中轨'],
       key_levels: bandLevels(i),
       evidence: {
-        squeeze_date: b.dates[sq],
-        squeeze_level: squeezeAt(sq)?.level != null ? round4(squeezeAt(sq)!.level) : null,
+        squeeze_date: b.dates[k0],
+        squeeze_level: squeezeInfo?.level !== undefined && isFin(squeezeInfo.level) ? round4(squeezeInfo.level) : null,
         boll_width: round4(x.bollWidth[i]),
+        boll_width_at_formation: round4(x.bollWidth[k0]),
         boll_up: round4(x.bollUp[i]),
         close: round4(close[i]),
       },
-    }));
-  } else {
-    let confirmed = -1;
-    for (let k = i - 1; k >= Math.max(121, i - 60); k--) {
-      if (breakoutAt(k)) { confirmed = k; break; }
-    }
-    if (confirmed >= 0) {
-      const sq = recentSqueeze(confirmed - 5, confirmed - 1);
-      const fail = firstWhere(confirmed, i, k => isFin(close[k]) && isFin(x.bollMid[k]) && close[k] < x.bollMid[k]);
-      const tail = (extra: ObservationParts): PatternObservation => makeObservation(input, 've_v2_boll_squeeze_breakout', 'VOLATILITY_EXPANSION', {
-        stage: extra.stage, stage_detail: extra.stage_detail ?? 'EXPANSION_FOLLOW_THROUGH',
-        pattern_event_date: b.dates[confirmed], first_observed_date: b.dates[confirmed],
-        formed_on: b.dates[sq], confirmed_on: b.dates[confirmed],
-        formation_basis: ['布林带宽处于近 120 日 20% 分位（收口）'],
-        confirmation_conditions: ['收盘上穿上轨'],
-        invalidation_conditions: ['收盘跌破布林中轨'],
-        key_levels: bandLevels(i),
-        evidence: {
-          squeeze_date: b.dates[sq],
-          boll_width_at_confirmation: round4(x.bollWidth[confirmed]),
-          boll_width: round4(x.bollWidth[i]),
-          bars_since_confirmation: i - confirmed,
-          ...(extra.evidence ?? {}),
-        },
-        invalidation: extra.invalidation ?? null,
-      });
+    };
+
+    if (confirm >= 0) {
+      const fail = firstWhere(confirm, Math.min(i, confirm + 20),
+        k => isFin(close[k]) && isFin(x.bollMid[k]) && close[k] < x.bollMid[k]);
       if (fail >= 0) {
-        out.push(tail({ stage: 'FAILED', stage_detail: 'SQUEEZE_BREAKOUT_FAILED',
-          invalidation: { on: b.dates[fail], reason: 'close_below_boll_mid' } }));
-      } else if (i - confirmed > 20) {
-        out.push(tail({ stage: 'EXPIRED', stage_detail: 'EXPANSION_FOLLOW_THROUGH', evidence: { expired: true } }));
-      } else {
-        let staysAboveMid = true;
-        for (let k = confirmed; k <= i; k++) {
-          if (!isFin(close[k]) || !isFin(x.bollMid[k]) || close[k] < x.bollMid[k]) { staysAboveMid = false; break; }
-        }
-        const expanding = isFin(x.bollWidth[i]) && isFin(x.bollWidth[confirmed]) && x.bollWidth[i] > x.bollWidth[confirmed];
-        if (staysAboveMid && expanding) {
-          out.push(tail({ stage: 'FOLLOW_THROUGH', stage_detail: 'EXPANSION_FOLLOW_THROUGH' }));
-        }
+        return {
+          terminalIdx: fail,
+          parts: {
+            ...common, stage: 'FAILED', stage_detail: 'SQUEEZE_BREAKOUT_FAILED',
+            invalidation: { on: b.dates[fail], reason: 'close_below_boll_mid' },
+            evidence: { ...common.evidence, bars_since_confirmation: fail - confirm, invalidation_close: round4(close[fail]) },
+          },
+        };
       }
-    } else if (currentSqueeze >= 0 && isFin(close[i]) && isFin(x.bollUp[i]) && isFin(x.bollMid[i])
-      && close[i] <= x.bollUp[i] && close[i] > x.bollMid[i]) {
-      out.push(makeObservation(input, 've_v2_boll_squeeze_breakout', 'VOLATILITY_EXPANSION', {
-        stage: 'FORMING', stage_detail: 'SQUEEZE_FORMING',
-        pattern_event_date: b.dates[currentSqueeze], first_observed_date: b.dates[currentSqueeze],
-        formed_on: b.dates[currentSqueeze], confirmed_on: null,
-        formation_basis: ['布林带宽处于近 120 日 20% 分位（收口）'],
-        confirmation_conditions: ['收盘上穿上轨，且前一日收盘不高于上轨'],
-        invalidation_conditions: ['收盘跌破布林中轨'],
-        key_levels: bandLevels(i),
-        evidence: {
-          squeeze_date: b.dates[currentSqueeze],
-          squeeze_level: squeezeAt(currentSqueeze)?.level != null ? round4(squeezeAt(currentSqueeze)!.level) : null,
-          boll_width: round4(x.bollWidth[i]),
-          boll_up: round4(x.bollUp[i]),
-          close: round4(close[i]),
+      const expiresIdx = confirm + 21; // first bar with `i - confirm > 20`
+      if (i >= expiresIdx) {
+        return {
+          terminalIdx: expiresIdx,
+          parts: {
+            ...common, stage: 'EXPIRED', stage_detail: 'EXPANSION_FOLLOW_THROUGH',
+            expires_at: b.dates[expiresIdx],
+            evidence: { ...common.evidence, bars_since_confirmation: i - confirm, expired: true },
+          },
+        };
+      }
+      return {
+        terminalIdx: null,
+        parts: {
+          ...common,
+          stage: confirm === i ? 'CONFIRMED' : 'FOLLOW_THROUGH',
+          stage_detail: confirm === i ? 'SQUEEZE_BREAKOUT' : 'EXPANSION_FOLLOW_THROUGH',
+          evidence: { ...common.evidence, bars_since_confirmation: i - confirm },
         },
-      }));
+      };
     }
-  }
+
+    if (i >= f.runEnd + 6) {
+      // The squeeze run ended and the 5-bar breakout window elapsed.
+      const expiresIdx = f.runEnd + 6;
+      return {
+        terminalIdx: expiresIdx,
+        parts: {
+          ...common, stage: 'EXPIRED', stage_detail: 'EXPANSION_FOLLOW_THROUGH',
+          expires_at: b.dates[expiresIdx],
+          evidence: { ...common.evidence, expired: true },
+        },
+      };
+    }
+    return { terminalIdx: null, parts: { ...common, stage: 'FORMING', stage_detail: 'SQUEEZE_FORMING' } };
+  });
+  if (resolvedSq) out.push(makeObservation(input, 've_v2_boll_squeeze_breakout', 'VOLATILITY_EXPANSION', resolvedSq.parts));
 
   // ---- ve_v2_boll_upper_ride
   const background = (k: number): boolean => k >= 60
@@ -762,19 +1044,26 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
     return isFin(med) && x.bollWidth[k] > med;
   };
 
+  // First-cross by construction: the ride must not already hold on the
+  // previous bar, so one advance cannot be confirmed twice.
   const rideStart = (k: number): boolean => k >= 1 && rideAt(k) && !rideAt(k - 1) && background(k);
 
-  const latestRide = rideStart(i)
-    ? i
-    : lastWhere(Math.max(1, i - 120), i - 1, k => rideStart(k));
+  const rideFormations: Formation[] = [];
+  for (let k = 1; k <= i; k++) if (rideStart(k)) rideFormations.push({ eventIdx: k, visibleFrom: k });
 
-  if (latestRide >= 0 && background(i)) {
-    const fail = firstWhere(latestRide, i, k => isFin(close[k]) && isFin(x.bollMid[k]) && close[k] < x.bollMid[k]);
-    const base = {
-      pattern_event_date: b.dates[latestRide],
-      first_observed_date: b.dates[latestRide],
-      formed_on: b.dates[latestRide],
-      confirmed_on: b.dates[latestRide],
+  const resolvedRide = walkEpisodes(rideFormations, i, (f): ResolvedEpisode => {
+    const c = f.eventIdx;
+    const expiresIdx = c + 21; // first bar with `i - c > 20`
+    const fail = firstWhere(c, Math.min(i, c + 20),
+      k => isFin(close[k]) && isFin(x.bollMid[k]) && close[k] < x.bollMid[k]);
+    const common: EpisodeBase = {
+      pattern_event_date: b.dates[c],
+      first_observed_date: b.dates[c],
+      formed_on: b.dates[c],
+      confirmed_on: b.dates[c],
+      confirmed_idx: c,
+      reference_price: x.bollUp[c], reference_kind: 'boll_upper',
+      invalidation_level: x.bollMid[c],
       formation_basis: ['上升趋势中，近 5 日至少 3 日收盘触及/站上布林上轨，且带宽高于 120 日中位数'],
       confirmation_conditions: ['上轨骑行条件首次成立'],
       invalidation_conditions: ['收盘跌破布林中轨（触碰上轨不是卖出信号）'],
@@ -784,28 +1073,37 @@ export function detectVolatilityExpansion(input: PatternInput): PatternObservati
         boll_width: round4(x.bollWidth[i]),
         width_median_120: round4(medianFinite(x.bollWidth.slice(Math.max(0, i - 120), i).filter(isFin))),
         touching_upper_band_is_not_a_sell_signal: true,
+        bars_since_confirmation: i - c,
       },
     };
     if (fail >= 0) {
-      out.push(makeObservation(input, 've_v2_boll_upper_ride', 'VOLATILITY_EXPANSION', {
-        ...base, stage: 'FAILED', stage_detail: 'UPPER_BAND_RIDE_FAILED',
-        invalidation: { on: b.dates[fail], reason: 'close_below_boll_mid' },
-        evidence: { ...base.evidence, boll_mid: round4(x.bollMid[i]) },
-      }));
-    } else if (i - latestRide > 20) {
-      out.push(makeObservation(input, 've_v2_boll_upper_ride', 'VOLATILITY_EXPANSION', {
-        ...base, stage: 'EXPIRED', stage_detail: 'UPPER_BAND_RIDE',
-        evidence: { ...base.evidence, bars_since_confirmation: i - latestRide, expired: true },
-      }));
-    } else if (isFin(close[i]) && isFin(x.bollMid[i]) && close[i] > x.bollMid[i]) {
-      out.push(makeObservation(input, 've_v2_boll_upper_ride', 'VOLATILITY_EXPANSION', {
-        ...base,
-        stage: latestRide === i ? 'CONFIRMED' : 'FOLLOW_THROUGH',
-        stage_detail: 'UPPER_BAND_RIDE',
-        evidence: { ...base.evidence, bars_since_confirmation: i - latestRide },
-      }));
+      return {
+        terminalIdx: fail,
+        parts: {
+          ...common, stage: 'FAILED', stage_detail: 'UPPER_BAND_RIDE_FAILED',
+          invalidation: { on: b.dates[fail], reason: 'close_below_boll_mid' },
+          evidence: { ...common.evidence, boll_mid: round4(x.bollMid[i]), invalidation_close: round4(close[fail]) },
+        },
+      };
     }
-  }
+    if (i >= expiresIdx) {
+      return {
+        terminalIdx: expiresIdx,
+        parts: {
+          ...common, stage: 'EXPIRED', stage_detail: 'UPPER_BAND_RIDE',
+          expires_at: b.dates[expiresIdx],
+          evidence: { ...common.evidence, expired: true },
+        },
+      };
+    }
+    return {
+      terminalIdx: null,
+      parts: {
+        ...common, stage: c === i ? 'CONFIRMED' : 'FOLLOW_THROUGH', stage_detail: 'UPPER_BAND_RIDE',
+      },
+    };
+  });
+  if (resolvedRide) out.push(makeObservation(input, 've_v2_boll_upper_ride', 'VOLATILITY_EXPANSION', resolvedRide.parts));
 
   return out;
 }
@@ -827,14 +1125,12 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
   const obsAt = (k: number): boolean => (isFin(close[k]) && isFin(x.bollLow[k]) && close[k] <= x.bollLow[k] * 1.01)
     || (isFin(x.rsi14[k]) && x.rsi14[k] < 30);
 
-  const latestObs = lastWhere(Math.max(0, i - 5), i, k => obsAt(k));
-
-  // Environment: range regime, or "not a confirmed downtrend". A market
-  // downtrend with close < MA60 and a falling MA20 is never a reversion buy.
-  const ma20Falling = isFin(x.ma20[i]) && isFin(x.ma20[i - 10]) && x.ma20[i] < x.ma20[i - 10];
-  const belowMa60 = isFin(close[i]) && isFin(x.ma60[i]) && close[i] < x.ma60[i];
-  const backgroundDown = ma20Falling && belowMa60;
-  const rangeEnvironment = input.regime === 'range' || !backgroundDown;
+  // Environment at each bar: a confirmed downtrend (falling MA20 and close
+  // below MA60) never confirms a reversion. Evaluated per bar, not at the
+  // as-of, so a later advance cannot re-decide an earlier confirmation.
+  const downAt = (k: number): boolean => k >= 10
+    && isFin(x.ma20[k]) && isFin(x.ma20[k - 10]) && x.ma20[k] < x.ma20[k - 10]
+    && isFin(close[k]) && isFin(x.ma60[k]) && close[k] < x.ma60[k];
 
   const bandLevels = (k: number): Record<string, number | null> => ({
     boll_low: toRaw(x.bollLow[k]),
@@ -842,120 +1138,158 @@ export function detectMeanReversion(input: PatternInput): PatternObservation[] {
     rsi14: round4(x.rsi14[k]),
   });
 
-  if (!rangeEnvironment) {
-    if (latestObs < 0) return [];
-    return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
-      stage: 'FORMING', stage_detail: 'OVERSOLD_IN_DOWNTREND',
-      formed_on: b.dates[latestObs], confirmed_on: null,
-      counter_evidence: ['下跌趋势仍在：超卖只作逆势观察，不构成低风险机会'],
-      formation_basis: ['下跌趋势中出现超卖（收盘 ≤ 布林下轨 ×1.01 或 RSI14 < 30）'],
-      confirmation_conditions: [],
-      invalidation_conditions: ['收盘跌破超卖区低点', '超卖不等于低风险机会'],
-      key_levels: bandLevels(i),
-      evidence: {
-        counter_trend_observation: true,
-        observation_date: b.dates[latestObs],
-        rsi14: round4(x.rsi14[i]),
-        boll_low: round4(x.bollLow[i]),
-        close: round4(close[i]),
-      },
-    })];
-  }
+  // The reversion environment is decided from each bar's own price facts and
+  // that bar's market regime, never from the as-of day's label: a market label
+  // read at the reporting day would re-decide (and could revoke) an earlier
+  // confirmation as the as-of advances.
+  const regimeAtBar = (k: number): string | null => (input.regimeAt
+    ? input.regimeAt(b.dates[k])
+    : input.regime);
 
-  const confirmObsAt = (k: number): number => {
-    if (k < 1) return -1;
-    if (!(isFin(close[k]) && isFin(x.bollLow[k]) && isFin(close[k - 1]) && isFin(x.rsi14[k]) && isFin(x.rsi14[k - 1]))) return -1;
-    if (!(close[k] > x.bollLow[k] && close[k] > close[k - 1] && x.rsi14[k] >= x.rsi14[k - 1])) return -1;
-    return lastWhere(Math.max(0, k - 5), k, j => obsAt(j));
+  /** First bar of the oversold run that contains `k` (bar k must be oversold). */
+  const runStartAt = (k: number): number => {
+    let f = k;
+    while (f > 0 && obsAt(f - 1)) f--;
+    return f;
   };
 
-  // Current re-entry confirmation.
-  if (latestObs >= 0 && confirmObsAt(i) >= 0) {
-    return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
-      stage: 'CONFIRMED', stage_detail: 'BAND_REENTRY_CONFIRMED',
-      pattern_event_date: b.dates[latestObs], first_observed_date: b.dates[i],
-      formed_on: b.dates[latestObs], confirmed_on: b.dates[i],
-      formation_basis: ['震荡环境中出现超卖观察（布林下轨附近或 RSI14 < 30）'],
-      confirmation_conditions: ['收盘高于下轨、高于前一日收盘，且 RSI14 不低于前一日'],
-      invalidation_conditions: ['收盘跌破超卖区低点'],
-      key_levels: bandLevels(i),
-      evidence: {
-        observation_date: b.dates[latestObs],
-        counter_trend_observation: false,
-        band_observation: isFin(close[i]) && isFin(x.bollLow[i]) && close[i] <= x.bollLow[i] * 1.01,
-        rsi14: round4(x.rsi14[i]),
-        boll_low: round4(x.bollLow[i]),
-        close: round4(close[i]),
-      },
-    })];
+  interface MrFormation extends Formation { obsIdx: number }
+  const formations: MrFormation[] = [];
+  for (let k = 1; k <= i; k++) {
+    if (!obsAt(k)) continue;
+    if (obsAt(k - 1)) continue; // inside the same oversold run
+    formations.push({ eventIdx: k, visibleFrom: k, obsIdx: k });
   }
 
-  // Prior confirmation: follow / fail / expire.
-  let confirmed = -1;
-  let confirmedObs = -1;
-  for (let k = i - 1; k >= Math.max(1, i - 60); k--) {
-    const o = confirmObsAt(k);
-    if (o >= 0) { confirmed = k; confirmedObs = o; break; }
-  }
-  if (confirmed >= 0) {
-    const observationLow = minFinite(b.low, confirmedObs, i);
-    const failed = isFin(observationLow) && isFin(close[i]) && close[i] < observationLow;
-    const base = {
-      pattern_event_date: b.dates[confirmedObs],
-      first_observed_date: b.dates[confirmed],
-      formed_on: b.dates[confirmedObs], confirmed_on: b.dates[confirmed],
+  const resolved = walkEpisodes(formations, i, (f): ResolvedEpisode => {
+    const o = f.obsIdx;
+    const confirmEnd = Math.min(i, o + 5);
+    let confirm = -1;
+    let obsIdx = -1;
+    for (let c = o + 1; c <= confirmEnd; c++) {
+      // Outside a range regime, a stock-level downtrend at the bar being
+      // decided cannot confirm a reversion. Both inputs are bar-local, so the
+      // decision is stable across as-of days.
+      if (regimeAtBar(c) !== 'range' && downAt(c)) continue;
+      if (!(isFin(close[c]) && isFin(x.bollLow[c]) && isFin(close[c - 1])
+        && isFin(x.rsi14[c]) && isFin(x.rsi14[c - 1]))) continue;
+      if (!(close[c] > x.bollLow[c] && close[c] > close[c - 1] && x.rsi14[c] >= x.rsi14[c - 1])) continue;
+      const seen = lastWhere(Math.max(o, c - 5), c, obsAt);
+      if (seen < 0) continue;
+      confirm = c; obsIdx = seen; break;
+    }
+    const common: EpisodeBase = {
+      pattern_event_date: b.dates[o],
+      first_observed_date: b.dates[o],
+      formed_on: b.dates[o],
+      confirmed_on: confirm >= 0 ? b.dates[confirm] : null,
+      confirmed_idx: confirm >= 0 ? confirm : null,
+      reference_price: x.bollLow[confirm >= 0 ? confirm : o],
+      reference_kind: confirm >= 0 ? 'boll_lower_reentry' : 'boll_lower_pending',
       formation_basis: ['震荡环境中出现超卖观察（布林下轨附近或 RSI14 < 30）'],
       confirmation_conditions: ['收盘高于下轨、高于前一日收盘，且 RSI14 不低于前一日'],
       invalidation_conditions: ['收盘跌破超卖区低点'],
       key_levels: bandLevels(i),
       evidence: {
-        observation_date: b.dates[confirmedObs],
+        observation_date: b.dates[o],
         counter_trend_observation: false,
-        reached_mid_band: isFin(close[i]) && isFin(x.bollMid[i]) && close[i] >= x.bollMid[i],
+        band_observation: isFin(close[o]) && isFin(x.bollLow[o]) && close[o] <= x.bollLow[o] * 1.01,
         rsi14: round4(x.rsi14[i]),
         boll_low: round4(x.bollLow[i]),
         close: round4(close[i]),
-        bars_since_confirmation: i - confirmed,
+        bars_since_confirmation: confirm >= 0 ? i - confirm : null,
       },
     };
-    if (failed) {
-      return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
-        ...base, stage: 'FAILED', stage_detail: 'REVERSION_FAILED',
-        invalidation: { on: b.dates[i], reason: 'new_low_after_oversold' },
-        evidence: { ...base.evidence, observation_low: toRaw(observationLow) },
-      })];
-    }
-    if (i - confirmed > 10) {
-      return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
-        ...base, stage: 'EXPIRED', stage_detail: 'REVERSION_EXPIRED',
-        evidence: { ...base.evidence, expired: true },
-      })];
-    }
-    return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
-      ...base, stage: 'FOLLOW_THROUGH', stage_detail: 'REVERSION_FOLLOW_THROUGH',
-    })];
-  }
 
-  // Range environment, oversold today, no re-entry yet.
-  if (obsAt(i)) {
+    if (confirm >= 0) {
+      // The oversold low is frozen at the confirmation bar; later lows must not
+      // move the invalidation level (no rolling self-reference).
+      const observationLow = minFinite(b.low, obsIdx, confirm);
+      const failIdx = firstWhere(confirm, Math.min(i, confirm + 10),
+        k => isFin(observationLow) && isFin(close[k]) && close[k] < observationLow);
+      const withLevel: EpisodeBase = {
+        ...common,
+        invalidation_level: observationLow,
+        evidence: { ...common.evidence, observation_low: toRaw(observationLow) },
+      };
+      if (failIdx >= 0) {
+        return {
+          terminalIdx: failIdx,
+          parts: {
+            ...withLevel, stage: 'FAILED', stage_detail: 'REVERSION_FAILED',
+            invalidation: { on: b.dates[failIdx], reason: 'new_low_after_oversold' },
+            evidence: { ...withLevel.evidence, invalidation_close: round4(close[failIdx]) },
+          },
+        };
+      }
+      const expiresIdx = confirm + 11; // first bar with `i - confirm > 10`
+      if (i >= expiresIdx) {
+        return {
+          terminalIdx: expiresIdx,
+          parts: {
+            ...withLevel, stage: 'EXPIRED', stage_detail: 'REVERSION_EXPIRED',
+            expires_at: b.dates[expiresIdx],
+            evidence: { ...withLevel.evidence, expired: true },
+          },
+        };
+      }
+      return {
+        terminalIdx: null,
+        parts: {
+          ...withLevel,
+          stage: confirm === i ? 'CONFIRMED' : 'FOLLOW_THROUGH',
+          stage_detail: confirm === i ? 'BAND_REENTRY_CONFIRMED' : 'REVERSION_FOLLOW_THROUGH',
+          evidence: { ...withLevel.evidence, reached_mid_band: isFin(close[i]) && isFin(x.bollMid[i]) && close[i] >= x.bollMid[i] },
+        },
+      };
+    }
+
+    const expiresIdx = o + 6; // first bar after the 5-bar re-entry window
+    const withLevel: EpisodeBase = {
+      ...common,
+      invalidation_level: isFin(b.low[o]) ? b.low[o] : null,
+    };
+    if (i >= expiresIdx) {
+      return {
+        terminalIdx: expiresIdx,
+        parts: {
+          ...withLevel, stage: 'EXPIRED', stage_detail: 'REVERSION_EXPIRED',
+          expires_at: b.dates[expiresIdx],
+          evidence: { ...withLevel.evidence, expired: true },
+        },
+      };
+    }
+    return { terminalIdx: null, parts: { ...withLevel, stage: 'FORMING', stage_detail: 'OVERSOLD_OBSERVATION' } };
+  });
+
+  // A stock-level downtrend relabels the CURRENT, still-unconfirmed oversold
+  // observation as a counter-trend note. It never revokes a confirmation that
+  // already happened, and it keeps the walk's dates, so the standing
+  // observation can never re-date itself as new oversold runs come and go.
+  if (!resolved) return [];
+  const backgroundDown = isFin(x.ma20[i]) && isFin(x.ma20[i - 10]) && x.ma20[i] < x.ma20[i - 10]
+    && isFin(close[i]) && isFin(x.ma60[i]) && close[i] < x.ma60[i];
+  if (regimeAtBar(i) !== 'range' && backgroundDown && resolved.parts.confirmed_on === null && obsAt(i)
+    && resolved.parts.pattern_event_date === b.dates[runStartAt(i)]) {
     return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', {
-      stage: 'FORMING', stage_detail: 'OVERSOLD_OBSERVATION',
-      formed_on: b.dates[i], confirmed_on: null,
-      formation_basis: ['震荡环境中出现超卖观察（布林下轨附近或 RSI14 < 30）'],
-      confirmation_conditions: ['收盘高于下轨、高于前一日收盘，且 RSI14 不低于前一日'],
-      invalidation_conditions: ['收盘跌破超卖区低点'],
-      key_levels: bandLevels(i),
+      ...resolved.parts,
+      stage: 'FORMING', stage_detail: 'OVERSOLD_IN_DOWNTREND',
+      confirmed_on: null, confirmed_idx: null,
+      invalidated_at: null, expires_at: null,
+      counter_evidence: ['下跌趋势仍在：超卖只作逆势观察，不构成低风险机会'],
+      confirmation_conditions: [],
+      invalidation_conditions: ['收盘跌破超卖区低点', '超卖不等于低风险机会'],
       evidence: {
-        observation_date: b.dates[i],
-        counter_trend_observation: false,
-        band_observation: isFin(close[i]) && isFin(x.bollLow[i]) && close[i] <= x.bollLow[i] * 1.01,
+        ...resolved.parts.evidence,
+        counter_trend_observation: true,
+        observation_date: resolved.parts.pattern_event_date,
         rsi14: round4(x.rsi14[i]),
         boll_low: round4(x.bollLow[i]),
         close: round4(close[i]),
       },
     })];
   }
-  return [];
+  return [makeObservation(input, 'mr_v2_oversold_reversion', 'MEAN_REVERSION', resolved.parts)];
 }
 
 // ---------------------------------------------------------------- aggregate
