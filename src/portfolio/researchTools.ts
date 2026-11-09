@@ -13,7 +13,7 @@ import { appendChatgptResearchRecord, CHATGPT_INTAKE_TOOL } from './chatgptIntak
 import { journalFeeEstimator } from './researchJournal.js';
 import {
   THESIS_APPEND_TOOL, THESIS_EVAL_TOOL, RESEARCH_EVAL_SCHEMA,
-  appendResearchThesis, buildResearchEval,
+  appendResearchThesis, buildResearchEval, isResearchEvalReadError,
 } from './researchEval.js';
 import { SNAPSHOT_GET_TOOL, getResearchSnapshot, listResearchSnapshots } from './researchSnapshot.js';
 import { COMBINED_APPEND_TOOL, appendCombinedResearch } from './combinedResearch.js';
@@ -207,6 +207,13 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
           portfolioDb: db, marketDb: market, accountId: account.account_id, asOf, horizon,
           feeEstimator: journalFeeEstimator(db, market, account.account_id),
         }));
+      } catch (error) {
+        // 数据库/磁盘错误必须返回结构化 READ_ERROR（goal-1109 P0-3/A07）：
+        // 永不翻译成 NO_RECORDS（那是"没有记录"，不是"读失败"），永不假成功。
+        if (isResearchEvalReadError(error)) {
+          return json(error.envelope);
+        }
+        throw error;
       } finally { db.close(); }
     }
 

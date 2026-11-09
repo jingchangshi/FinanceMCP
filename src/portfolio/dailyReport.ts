@@ -468,6 +468,14 @@ const YMD = /^\d{8}$/;
 const r2 = (value: number): number => Math.round(value * 100) / 100;
 const r6 = (value: number): number => Math.round(value * 1000000) / 1000000;
 
+/**
+ * Tick-aware price formatting (P0-1, goal-1109): ETFs trade at 0.001 tick below
+ * 10 yuan (e.g. 159558 → 0.686); stocks at 0.01 tick. Never 4-decimal padding.
+ */
+export function tickPrice(value: number): string {
+  return value < 10 ? value.toFixed(3) : value.toFixed(2);
+}
+
 function tableExists(db: DatabaseSync | null | undefined, name: string): boolean {
   if (!db) return false;
   try {
@@ -694,8 +702,11 @@ function buildHoldingResearch(
     {
       stance: 'WATCH',
       when: [
-        `收盘跌破最近 20 日最低收盘（${low20 === null ? '不可用' : low20.toFixed(4)} 元）后，重新评估。`,
-        ...(ma20 === null ? [] : [`收盘持续低于 20 日均价（${ma20.toFixed(4)} 元）且相对宽基继续走弱。`]),
+        // Next-open watch threshold: 20 completed bars ending at as-of (P0-1).
+        // The bar set is the last 20 closes up to and including as-of; it can
+        // never be the same-day close of the future day being tested (no circularity).
+        `收盘跌破最近 20 日最低收盘（${low20 === null ? '不可用' : tickPrice(low20)} 元，前复权口径）后，重新评估。`,
+        ...(ma20 === null ? [] : [`收盘持续低于 20 日均价（${tickPrice(ma20)} 元）且相对宽基继续走弱。`]),
       ],
     },
     {
@@ -1146,7 +1157,7 @@ function buildAccountView(
   snapshot_as_of: string | null;
   snapshot_basis: { securities_mv_cents: number; cash_cents: number; total_assets_cents: number; hhi: number | null };
   revalued_basis: {
-    securities_mv_cents: number; cash_cents: number; total_assets_cents: number; hhi: number | null;
+    securities_mv_cents: number; cash_cents: number; wealth_cents: number; total_assets_cents: number; hhi: number | null;
     price_source: 'server_cache_close' | 'snapshot_reference_price' | 'mixed';
     codes_from_snapshot_price: string[];
   };
@@ -1182,6 +1193,7 @@ function buildAccountView(
     revalued_basis: {
       securities_mv_cents: revaluedSecurities,
       cash_cents: revaluedCash,
+      wealth_cents: revaluedWealth,
       total_assets_cents: revaluedTotal,
       hhi: concentration.hhi,
       price_source: fallbackCodes.length === 0
