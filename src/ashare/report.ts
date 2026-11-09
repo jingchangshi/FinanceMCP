@@ -107,6 +107,11 @@ function marketJudgement(regime: Regime | undefined, breadth: ReturnType<typeof 
     const ratio = breadth.amount_yi / breadth.amount_ma20_yi;
     points.push(`两市成交额 ${breadth.amount_yi.toFixed(0)} 亿，为 20 日均值的 ${(ratio * 100).toFixed(0)}%（${ratio > 1.1 ? '放量' : ratio < 0.9 ? '缩量' : '量能持平'}）`);
   }
+  // Basis-labeled day-over-day (P1-2, goal-1109): never write bare 放量/缩量.
+  // The vs-20日均值 and 环比 baselines can legitimately disagree; both are labeled.
+  if (breadth.amount_chg_pct !== null && breadth.amount_chg_pct !== undefined) {
+    points.push(`两市成交额较上日 ${breadth.amount_chg_pct > 0 ? '+' : ''}${breadth.amount_chg_pct.toFixed(1)}%（环比）`);
+  }
   const big = indices.find(i => i.ts_code === '000300.SH');
   const small = indices.find(i => i.ts_code === '000852.SH');
   if (big?.ret20 != null && small?.ret20 != null) {
