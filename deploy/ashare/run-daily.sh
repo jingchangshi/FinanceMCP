@@ -46,6 +46,9 @@ if docker exec "$CONTAINER" node build/ashare/cli.js daily "$@" >"$OUT" 2>"$ERR"
     OBS_DATE="$(jq -r '.report.trade_date // empty' "$OUT" 2>/dev/null || true)"
     case "$OBS_DATE" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) OBS_DATE="" ;; esac
     VAL_OUT="$LOG_DIR/validation-$STAMP.json"; VAL_ERR="$LOG_DIR/validation-$STAMP.log"
+# goal-1109 P0-3：显式区分"市场日报成功"与"前瞻观察闭环成功"。
+# closed_loop 取值：ok（观察已记录）/ failed（观察失败且单元失败）/
+# skipped_no_freeze（无冻结协议或冻结期未到，属单次 OK）。
     if [ -n "$OBS_DATE" ] && docker exec "$CONTAINER" node build/ashare/cli.js research-validation observe \
       --source /data/ashare.sqlite --research-db /data/research-validation/validation.sqlite --as-of "$OBS_DATE" \
       >"$VAL_OUT" 2>"$VAL_ERR"; then
@@ -57,18 +60,23 @@ if docker exec "$CONTAINER" node build/ashare/cli.js daily "$@" >"$OUT" 2>"$ERR"
         # start_after_as_of just means the freeze's first day has not arrived; anything else
         # (implementation_hash, rule_hash, cost_hash, no_freeze_registered ...) will not fix itself.
         if ! jq -e '(.mismatched // []) == ["start_after_as_of"]' "$VAL_OUT" >/dev/null 2>&1; then
+          echo "closed_loop: failed (observation UNAVAILABLE; market report retained; unit exit 79)" >&2
           exit 79
         fi
+        echo "closed_loop: skipped_no_freeze (observation UNAVAILABLE start_after_as_of; market report retained)" >&2
       else
         echo "finance-ashare validation observation recorded: $VAL_OUT"
+        echo "closed_loop: ok (observation recorded)" >&2
       fi
     else
       echo "finance-ashare validation observation FAILED (market report retained); see $VAL_ERR" >&2
+      echo "closed_loop: failed (observe process failed; market report retained; unit exit 76)" >&2
       exit 76
     fi
   else
     # Not an error, but never silent: without a frozen protocol nothing counts as forward observation.
     echo "finance-ashare validation observation SKIPPED: no frozen protocol (/data/research-validation/validation.sqlite missing); run 'research-validation freeze' to start the forward record" >&2
+    echo "closed_loop: skipped_no_freeze (no frozen protocol; market report retained)" >&2
   fi
 else
   code=$?

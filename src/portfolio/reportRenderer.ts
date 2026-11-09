@@ -45,6 +45,9 @@ export const USER_REPORT_FORBIDDEN: readonly string[] = [
   // 任务书 8.1 逐字列出的工程术语。
   'DEGRADED', 'UNVERIFIED', 'NOT_EXECUTABLE', 'REAL_ACCOUNT_VERIFIED', 'persisted_snapshot',
   'evidence_status', 'report_id', 'schema', 'OAuth', 'API', 'idempotency_key', 'content_hash',
+  // goal-1109 §2 逐字列出的工程术语（8.1 之后补登记，渲染侧翻译成投资者语言）。
+  'research_eval', 'MCP', 'snapshot_get', 'HHI', 'implementation_fingerprint',
+  'hash', 'V1', 'V2',
   // 8.1 类目一：内部状态码 / 状态枚举（含日报 status、质量分层、证据等级）。
   'READY', 'STALE', 'NOT_READY', 'MISSING', 'INSUFFICIENT', 'ACTIONABLE', 'ILLUSTRATIVE',
   'NO_ACTION', 'DATA_INSUFFICIENT', 'RESEARCH_VERIFIED', 'UNCONFIRMED_RISK',
@@ -199,6 +202,7 @@ interface RenderView {
   asOf: string;
   total: number;
   cash: number;
+  wealth: number;
   securities: number;
   focus: DailyReportResult['decision_comparison']['focus'];
   hhi: number | null;
@@ -255,6 +259,7 @@ function buildView(r: DailyReportResult): RenderView {
     asOf: r.as_of_trade_date,
     total: r.account_view.revalued_basis.total_assets_cents,
     cash: r.account_view.revalued_basis.cash_cents,
+    wealth: r.account_view.revalued_basis.wealth_cents,
     securities: r.account_view.revalued_basis.securities_mv_cents,
     focus,
     hhi,
@@ -848,16 +853,19 @@ function renderSectionC(r: DailyReportResult, view: RenderView): string {
     ? '当日收盘重估'
     : priceSource === 'snapshot_reference_price' ? '快照参考价重估' : '混合价格重估';
   lines.push(`- **总资产**：${yuan(view.total)} 元（${ymd(r.as_of_trade_date)}，${basisNote}；参考快照日期 ${isoDate(r.account_view.snapshot_as_of)}，证券数量与快照${r.account_view.quantity_consistent ? '一致' : '不一致，差异见核对说明'}）。`);
-  lines.push(`- **现金**：${yuan(view.cash)} 元，占总资产 ${weightPct(view.cashRatio)}；证券市值 ${yuan(view.securities)} 元。`);
+  lines.push(`- **现金**：${yuan(view.cash)} 元，占总资产 ${weightPct(view.cashRatio)}；证券市值 ${yuan(view.securities)} 元；理财/其他资产 ${yuan(view.wealth)} 元（总资产 = 证券市值 + 现金 + 理财/其他资产）。`);
   const snapshotTotal = r.account_view.snapshot_basis.total_assets_cents;
   const delta = view.total - snapshotTotal;
   lines.push(`- **区间变化**：与参考快照（${isoDate(r.account_view.snapshot_as_of)}）相比总资产${delta >= 0 ? '增加' : '减少'} ${yuan(Math.abs(delta))} 元——差异来自快照之后已记录的账户事件与价格重估，不是当日盈亏的精确计量。`);
   const holdingRows = [...r.holdings].sort((a, b) => b.weight - a.weight)
     .map(holding => `${holding.name}（${holding.ts_code}）${weightPct(holding.weight)}`);
   lines.push(`- **五只持仓权重**：${holdingRows.join('；')}。`);
-  lines.push(`- **集中风险**：第一大持仓 ${weightPct(view.focus?.weight ?? null)}，HHI ${pct(view.hhi, 4)}，有效持仓数 ${pct(view.effective)}——显著集中，是账户的第一风险来源；集中度是风险披露，不是卖出指令。`);
+  lines.push(`- **集中风险**：第一大持仓 ${weightPct(view.focus?.weight ?? null)}，持仓非常集中（等效持仓数约 ${pct(view.effective)} 只）——是账户的第一风险来源；集中度是风险披露，不是卖出指令。`);
   if (view.drawdown) {
-    lines.push(`- **观察窗口回撤**：当前 ${pctPoint(view.drawdown.current)}（窗口 ${ymd(view.drawdown.start)}至${ymd(view.drawdown.end)}，${view.drawdown.points ?? '—'} 个净值点，窗口内最大 ${pctPoint(view.drawdown.max)}）；账户全历史最大回撤数据不足，不计算。`);
+    // Frozen labels (P1-1, goal-1109): 当前回撤（自基线高水位）/ 观察窗口内最大回撤
+    // （基线至今，非全历史）/ 预警状态（按当前回撤评判，政策 <approved>）。窗口最大值
+    // 永远不得挂「历史最大回撤」标签。
+    lines.push(`- **观察窗口回撤**：当前 ${pctPoint(view.drawdown.current)}（自基线高水位；窗口 ${ymd(view.drawdown.start)}至${ymd(view.drawdown.end)}，${view.drawdown.points ?? '—'} 个净值点，观察窗口内最大 ${pctPoint(view.drawdown.max)}，非全历史）；账户全历史最大回撤数据不足，不计算。`);
   } else {
     lines.push('- **观察窗口回撤**：数据不足，未计算。');
   }
@@ -993,7 +1001,7 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
   lines.push(`1. **继续持有现有五只 ETF**：当前基准方案。代价是承担集中与继续下行的风险；好处是不放弃任何反弹、不产生费用。`);
   const focus = view.focus;
   if (focus && view.reduceStressCents !== null && view.reduceEquityWeight !== null) {
-    lines.push(`2. **适度降低集中暴露（对 ${focus.ts_code}）**：同一压力假设下，压力损失从约 ${yuan(Math.abs(view.holdStressCents ?? 0))} 元降到约 ${yuan(Math.abs(view.reduceStressCents))} 元，权益占比从 ${weightPct(view.equityWeight)} 降到约 ${view.reduceEquityWeight.toFixed(2)}%，HHI 从 ${pct(view.hhi, 4)} 降到约 ${pct(view.reduceHhi, 4)}；代价是若该 ETF 反弹，按 ${weightPct(focus.weight)} 的权重将放弃其上涨的约 ${(focus.weight * 100).toFixed(0)}%，且卖出产生预估费用。`);
+    lines.push(`2. **适度降低集中暴露（对 ${focus.ts_code}）**：同一压力假设下，压力损失从约 ${yuan(Math.abs(view.holdStressCents ?? 0))} 元降到约 ${yuan(Math.abs(view.reduceStressCents))} 元，权益占比从 ${weightPct(view.equityWeight)} 降到约 ${view.reduceEquityWeight.toFixed(2)}%，等效持仓数从 ${pct(view.effective)} 只升到约 ${view.reduceHhi ? pct(1 / view.reduceHhi) : '—'} 只；代价是若该 ETF 反弹，按 ${weightPct(focus.weight)} 的权重将放弃其上涨的约 ${(focus.weight * 100).toFixed(0)}%，且卖出产生预估费用。`);
     lines.push(`   （该对照不生成数量：卖出多少必须由你给出研究数量或由已确认的风险政策触发，系统不按任何固定阈值自动计算。）`);
     // 8.5 行内来源：聚焦持仓的证据标注；无匹配时不加注（保持原句）。
     const focusSources = annotations.get(focus.ts_code) ?? [];
