@@ -65,7 +65,9 @@ def _tick_price(value: Any) -> str:
 
 def _ymd(ymd: Any) -> str:
     s = str(ymd or "")
-    return f"{s[:4]}年{s[4:6]}月{s[6:8]}日" if len(s) == 8 and s.isdigit() else s
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}年{int(s[4:6])}月{int(s[6:8])}日"
+    return s
 
 
 def _iso(date: Any) -> str:
@@ -273,17 +275,20 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
     ]
 
     holdings_rows: List[Dict[str, str]] = []
+    _STANCE_ZH = {"HOLD": "继续观察", "WATCH": "重点观察", "REDUCE": "可研究降低风险",
+                  "ROTATE": "可研究轮动（未验证）"}
     for h in holdings:
         ts_code = h.get("ts_code") or ""
         name = h.get("name") or ts_code
         weight = h.get("weight")
         research = h.get("research") or {}
-        summary = research.get("summary") or ""
-        risk_txt = research.get("risk") or research.get("counter") or "数据不足以单独评述风险。"
+        reasons = h.get("reasons") or []
+        counter = h.get("counter_evidence") or []
+        stance = h.get("stance") or ""
         holdings_rows.append({
             "symbol": f"{ts_code}（{name}）",
-            "judgment": summary or "证据不足以确定调整",
-            "basis": risk_txt,
+            "judgment": _STANCE_ZH.get(stance, "证据不足以确定调整"),
+            "basis": "；".join(str(x) for x in (list(reasons)[:1] + list(counter)[:1])) or "数据不足以单独评述风险。",
         })
 
     next_date = _get(bundle, "portfolio", "expected_next_trade_date") or ""
@@ -298,14 +303,29 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
     gaps = evidence_gaps
     notes: List[str] = []
     if not verified:
-        notes.append("账户成交仅核对至历史日期，资产、仓位与回撤为参考重估，未冒充已对账正式绩效。")
+        last_confirmed = gate.get("last_user_reconciled_at") or ""
+        notes.append(
+            (f"账户成交仅核对至 {_ymd(last_confirmed)}，资产、仓位与回撤为参考重估，未冒充已对账正式绩效。"
+             if last_confirmed else
+             "账户成交尚未完成核对，资产、仓位与回撤为参考重估，未冒充已对账正式绩效。"))
     if gaps:
-        notes.append(f"主要数据缺口：{'; '.join(str(g) for g in gaps[:3])}。")
+        # Gaps here are structured dicts ({module, reason, affected}); render the
+        # investor meaning, never the internal code or the raw dict.
+        _GAP_ZH = {
+            "unreported_trade_risk": "存在未录入的券商成交，账户尚未完成核对",
+        }
+        gap_texts = []
+        for g in gaps[:3]:
+            if isinstance(g, dict):
+                gap_texts.append(_GAP_ZH.get(str(g.get("reason")), "存在数据缺口，详见技术审计记录"))
+            else:
+                gap_texts.append(str(g))
+        notes.append("主要数据缺口：" + "；".join(gap_texts) + "。")
     if evidence_gaps or not verified or current_dd is None:
         pass  # already disclosed above
 
     return {
-        "title": f"A 股账户研究日报｜{as_of.replace('-', ' 年 ')}",
+        "title": f"A 股账户研究日报｜{_ymd(as_of)}收盘",
         "subtitle": (
             f"生成于 {generated_at}（北京时间）｜市场数据截至交易日 {_iso(as_of)}"
         ),
