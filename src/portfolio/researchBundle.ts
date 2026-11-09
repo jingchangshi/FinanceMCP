@@ -578,6 +578,24 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     record_generated_at: generatedAt,
   };
   const conclusionRefs = buildConclusionRefs({ asOf, targetReport, validation, portfolio, benchmarks, feeSummary, screening });
+  // goal-1109 P1-3：研究立场（research_stance）与执行资格（execution_eligibility）严格分层。
+  // 两者均由已算好的 decision_tracks + account_verification + evidence gaps 确定性派生，
+  // 绝不由 LLM 打分；不参与 report_id 身份哈希（与 lineage 同样只作披露）。
+  const riskTrack = portfolio?.decision_tracks?.risk_track as { gates_satisfied?: boolean; blocked_by?: string[] } | undefined;
+  const accountVerified = verification?.summary_status === 'VERIFIED';
+  const gatesSatisfied = riskTrack?.gates_satisfied === true;
+  const canQuoteQuantity = gatesSatisfied && accountVerified;
+  const blockedBy = [...new Set([
+    ...(riskTrack?.blocked_by ?? []),
+    ...(!accountVerified ? [`account_verification_${(verification?.summary_status ?? 'unavailable').toLowerCase()}`] : []),
+  ])];
+  // INSUFFICIENT_EVIDENCE：核心数据未就绪，或证据缺口占主导（gaps 达 2 项以上）。
+  // 其余：ACTIONABLE→相对优势研究；其余一律 HOLD_OBSERVE（本日无足够新证据支持换仓）。
+  const researchStance = !coreReady || gaps.length >= 2
+    ? 'INSUFFICIENT_EVIDENCE'
+    : portfolio?.status === 'ACTIONABLE'
+      ? 'RELATIVE_ADVANTAGE'
+      : 'HOLD_OBSERVE';
   return {
     schema: RESEARCH_BUNDLE_SCHEMA, report_id: reportId, generated_at: generatedAt,
     // Declares whether this report_id is a persisted snapshot. Derived from stored state, so it is not part of identity.
@@ -592,6 +610,11 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     // §3.2 八项账户真实性与完整性分离状态（全量机器可读）+ 面向人的自然语言摘要。
     account_verification: verification,
     account_narrative: verification ? accountNarrative(verification) : null,
+    // P1-3：研究立场 vs 执行资格。research_stance 是证据层结论（持有观察/风险研究/
+    // 相对优势/证据不足）；execution_eligibility 只回答"能否给出交易数量"。
+    // NO_ACTION 仍是执行层结果（见 portfolio.decision_tracks），不冒充"已证明持有最优"。
+    research_stance: researchStance,
+    execution_eligibility: { can_quote_quantity: canQuoteQuantity, blocked_by: blockedBy },
     // §3.3 统一证据模型登记与变化状态汇总（接入层，只读）。
     evidence_register: {
       schema: EVIDENCE_MODEL_SCHEMA,
@@ -638,6 +661,8 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     transaction_fees: { as_of_trade_date: asOf, securities: feeSummary, accounting: 'actual booked fees remain immutable; slippage estimates are separate' },
     benchmarks,
     ...(portfolio?.portfolio_risk ? { portfolio_risk: portfolio.portfolio_risk } : {}),
+    // goal-1109 §6：research_tracking（近 5 条日志+评价回放）只作只读审计披露，
+    // 经核查 facts（:528-547）未包含它，故不在 report_id 身份哈希内；改变其内容不改身份。
     research_tracking: historical,
     evidence_gaps: gaps,
     rules: versions,
@@ -681,11 +706,21 @@ function stableFacts(value: unknown): string {
  */
 export function persistedSnapshotStatus(db: DatabaseSync, accountId: string, asOf: string | null, reportId: string) {
   const none = { status: 'SNAPSHOT_NOT_FOUND', record_ids: [] as string[], content_hash: null as string | null, recorded_at: null as string | null };
-  if (!asOf || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get()) return none;
-  const rows = db.prepare("SELECT record_id, content_hash, recorded_at FROM research_journal WHERE account_id=? AND source='vps' AND as_of_trade_date=? AND bundle_id=? ORDER BY record_id LIMIT 10")
-    .all(accountId, asOf, reportId) as { record_id: string; content_hash: string; recorded_at: string }[];
-  if (!rows.length) return none;
-  return { status: 'PERSISTED', record_ids: rows.map(row => row.record_id), content_hash: rows[0].content_hash, recorded_at: rows[0].recorded_at };
+  if (!asOf) return none;
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get()) return none;
+    const rows = db.prepare("SELECT record_id, content_hash, recorded_at FROM research_journal WHERE account_id=? AND source='vps' AND as_of_trade_date=? AND bundle_id=? ORDER BY record_id LIMIT 10")
+      .all(accountId, asOf, reportId) as { record_id: string; content_hash: string; recorded_at: string }[];
+    if (!rows.length) return none;
+    return { status: 'PERSISTED', record_ids: rows.map(row => row.record_id), content_hash: rows[0].content_hash, recorded_at: rows[0].recorded_at };
+  } catch (error: any) {
+    // goal-1109 P0-3: 查询抛错 ≠ 不存在。区分 READ_ERROR，附 sqlite 码/errno，不进身份哈希。
+    const code = typeof error?.code === 'string' ? error.code : (typeof error?.errcode === 'string' ? error.errcode : null);
+    const errno = error?.errno ?? (typeof error?.errcode === 'number' ? error.errcode : null);
+    console.error(`[research-bundle] persisted_snapshot read_error sqlite_code=${code ?? 'unknown'} errno=${errno ?? 'unknown'}: ${error?.message ?? error}`);
+    return { status: 'READ_ERROR', record_ids: [] as string[], content_hash: null as string | null, recorded_at: null as string | null,
+      error_code: code, error_errno: errno, error_message: String(error?.message ?? error) };
+  }
 }
 
 function readTracking(db: DatabaseSync, accountId: string, asOf: string): any[] {

@@ -79,6 +79,30 @@ function journalTable(db: DatabaseSync): boolean {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_journal'").get();
 }
 
+/** goal-1109 P0-3：提取 sqlite_code/errno 并落内部日志；不抛错。 */
+function sqliteErrorInfo(error: unknown): { code: string | null; errno: string | number | null; message: string } {
+  const e = error as Record<string, unknown> | null;
+  const code = e && typeof e.code === 'string' ? e.code
+    : e && typeof e.errcode === 'string' ? e.errcode : null;
+  const errno = e && (typeof e.errno === 'number' || typeof e.errno === 'string') ? e.errno
+    : e && (typeof e.errcode === 'number') ? e.errcode : null;
+  const message = e && typeof e.message === 'string' ? e.message : String(error);
+  console.error(`[research-snapshot] read_error sqlite_code=${code ?? 'unknown'} errno=${errno ?? 'unknown'}: ${message}`);
+  return { code, errno, message };
+}
+
+function snapshotReadError(query: SnapshotGetResult['query'], error: unknown): SnapshotGetResult {
+  const info = sqliteErrorInfo(error);
+  return {
+    schema: RESEARCH_SNAPSHOT_SCHEMA,
+    status: 'READ_ERROR',
+    error_code: info.code, error_errno: info.errno, error_message: info.message,
+    query, snapshot: null, frozen_payload: null, payload_verification: null,
+    same_date_snapshots: [],
+    note: `read_error：快照读取失败（sqlite_code=${info.code ?? 'unknown'} errno=${info.errno ?? 'unknown'}），状态未知；不冒充不存在，不回退 Live Bundle，不创建快照。`,
+  };
+}
+
 export interface SnapshotListInput {
   accountId: string;
   asOf?: string;
@@ -91,26 +115,45 @@ export interface SnapshotListInput {
  * 版本各一条），全部列出，由调用方选择；不隐式挑选"最新"。
  */
 export function listResearchSnapshots(db: DatabaseSync, input: SnapshotListInput): {
-  schema: string; account_id: string; as_of_trade_date: string | null;
+  schema: string; status: 'FOUND' | 'NOT_FOUND' | 'READ_ERROR';
+  error_code: string | null; error_errno: string | number | null; error_message: string | null;
+  account_id: string; as_of_trade_date: string | null;
   snapshots: SnapshotMetadata[]; total: number;
 } {
-  if (!journalTable(db)) {
-    return { schema: RESEARCH_SNAPSHOT_SCHEMA, account_id: input.accountId, as_of_trade_date: input.asOf ?? null, snapshots: [], total: 0 };
-  }
-  const records = listResearchJournal(db, { accountId: input.accountId, asOf: input.asOf, limit: input.limit ?? 100 })
-    .filter(record => record.source === 'vps' && (!input.asOf || record.as_of_trade_date === input.asOf));
-  const snapshots = records.map(metadataOf);
-  return {
-    schema: RESEARCH_SNAPSHOT_SCHEMA,
-    account_id: input.accountId,
-    as_of_trade_date: input.asOf ?? null,
-    snapshots,
-    total: snapshots.length,
+  const base = {
+    schema: RESEARCH_SNAPSHOT_SCHEMA, account_id: input.accountId, as_of_trade_date: input.asOf ?? null,
+    error_code: null as string | null, error_errno: null as string | number | null, error_message: null as string | null,
   };
+  try {
+    if (!journalTable(db)) {
+      return { ...base, status: 'NOT_FOUND' as const, snapshots: [], total: 0 };
+    }
+    const records = listResearchJournal(db, { accountId: input.accountId, asOf: input.asOf, limit: input.limit ?? 100 })
+      .filter(record => record.source === 'vps' && (!input.asOf || record.as_of_trade_date === input.asOf));
+    const snapshots = records.map(metadataOf);
+    return {
+      ...base,
+      status: snapshots.length ? 'FOUND' as const : 'NOT_FOUND' as const,
+      snapshots,
+      total: snapshots.length,
+    };
+  } catch (error) {
+    const info = sqliteErrorInfo(error);
+    return { ...base, status: 'READ_ERROR' as const, error_code: info.code, error_errno: info.errno, error_message: info.message, snapshots: [], total: 0 };
+  }
 }
 
 export interface SnapshotGetResult {
   schema: string;
+  /**
+   * goal-1109 P0-3：FOUND（行存在）/ NOT_FOUND（表在、查无此行）/ READ_ERROR
+   * （SQLite 抛错，含 journalTable 探针；不冒充不存在，不回退 Live Bundle）。
+   */
+  status: 'FOUND' | 'NOT_FOUND' | 'READ_ERROR';
+  /** READ_ERROR 时的 sqlite 码/errno（供内部排障；不写入飞书正文）。其余为 null。 */
+  error_code: string | null;
+  error_errno: string | number | null;
+  error_message: string | null;
   /** 查询时元数据（服务端生成，不属于冻结内容）。 */
   query: {
     account_id: string;
@@ -156,10 +199,22 @@ export function getResearchSnapshot(db: DatabaseSync, input: {
     retrieved_at: now.toISOString(),
   };
   const empty: SnapshotGetResult = {
-    schema: RESEARCH_SNAPSHOT_SCHEMA, query, snapshot: null, frozen_payload: null,
+    schema: RESEARCH_SNAPSHOT_SCHEMA, status: 'NOT_FOUND',
+    error_code: null, error_errno: null, error_message: null,
+    query, snapshot: null, frozen_payload: null,
     payload_verification: null, same_date_snapshots: [],
     note: 'snapshot_not_found：按给定身份没有持久化快照；只读查询不会创建快照，也不会回退到 Live Bundle。',
   };
+  try {
+    return getResearchSnapshotInner(db, input, query, empty);
+  } catch (error) {
+    return snapshotReadError(query, error);
+  }
+}
+
+function getResearchSnapshotInner(db: DatabaseSync, input: {
+  accountId: string; recordId?: string; asOf?: string;
+}, query: SnapshotGetResult['query'], empty: SnapshotGetResult): SnapshotGetResult {
   if (!journalTable(db)) return empty;
   let record: JournalRecord | null = null;
   if (input.recordId) {
@@ -197,6 +252,8 @@ export function getResearchSnapshot(db: DatabaseSync, input: {
     .map(row => ({ record_id: row.record_id, bundle_id: row.bundle_id, recorded_at: row.recorded_at }));
   return {
     schema: RESEARCH_SNAPSHOT_SCHEMA,
+    status: 'FOUND',
+    error_code: null, error_errno: null, error_message: null,
     query,
     snapshot,
     frozen_payload: hasPayload ? payload : null,
