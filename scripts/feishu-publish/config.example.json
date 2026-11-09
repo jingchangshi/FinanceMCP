@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "identity": "bot",
+  "format": "docx",
+  "name_prefix": "A股账户研究日报",
+  "folder_token_env": "FEISHU_ACCOUNT_FOLDER_TOKEN",
+  "folder_token": "",
+  "image_width_px": 780
+}

@@ -1,0 +1,4 @@
+# Local credentials / runtime output — never commit.
+config.json
+data/
+__pycache__/
