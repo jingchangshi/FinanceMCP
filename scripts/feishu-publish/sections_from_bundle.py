@@ -116,6 +116,123 @@ def judgment_of(bundle: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_options(
+    bundle: Dict[str, Any],
+    focus_name: str,
+    focus_weight: Any,
+    verified: bool,
+) -> List[Dict[str, str]]:
+    """Section 5 "是否存在更好的选择": the three genuinely-compared schemes.
+
+    Source: the frozen bundle's own ``portfolio.decision_comparison`` (its
+    five non-executable study schemes). Only HOLD / REDUCE / ROTATE are the
+    investor-facing comparisons; DEFENSIVE (stress control) and NO_ACTION
+    (no-trade control) stay in the audit layer, never in the report.
+
+    The ROTATE (rotation) option names the single best-screened main-board
+    stock (watchlist focused candidates) and the top non-held ETF candidate
+    as qualitative alternatives only: no score figures, no ranked list, no
+    pool dump. Benefit/cost/gap are phrased from the bundle's own
+    opportunity_cost / gates / evidence fields; when the rotation advantage
+    is unverified, the option says so explicitly instead of recommending
+    (goal-1109 A10: never force rotation). Every number comes from the
+    frozen payload; nothing here is recomputed.
+    """
+    decision = _get(bundle, "portfolio", "decision_comparison") or {}
+    raw_options = decision.get("options") or []
+    by_action = {}
+    for opt in raw_options:
+        if isinstance(opt, dict):
+            by_action[str(opt.get("action") or "")] = opt
+    wanted = ("HOLD", "REDUCE", "ROTATE")
+    if not any(a in by_action for a in wanted):
+        return []
+
+    top_stock = _top_stock_alternative(bundle)
+    top_etf = _top_etf_alternative(bundle)
+
+    options: List[Dict[str, str]] = []
+
+    if "HOLD" in by_action:
+        weight_txt = _fmt_pct(focus_weight * 100 if isinstance(focus_weight, (int, float)) and focus_weight < 2 else focus_weight)
+        options.append({
+            "name": f"维持「{focus_name}」集中暴露",
+            "upside": "账户核对完成前不扩大风险，保留行情上涨期权",
+            "cost": f"集中度维持在 {weight_txt}，回撤放大时首当其冲",
+            "gap": "账户成交尚未核对完成，核对后重估",
+        })
+    if "REDUCE" in by_action:
+        options.append({
+            "name": "降低集中度（减仓研究）",
+            "upside": "卖出部分集中持仓，单一持仓权重下降",
+            "cost": "产生交易费用；若行情反弹可能错过上涨",
+            "gap": "账户核对完成前不提供买卖数量" if not verified else "需用户逐笔确认研究数量",
+        })
+    if "ROTATE" in by_action:
+        alpha = (by_action["ROTATE"].get("alpha_track") or {})
+        verified_advantage = alpha.get("evidence_verified") is True
+        alt_bits: List[str] = []
+        if top_stock:
+            alt_bits.append(
+                f"主板股票研究池当前居前：{top_stock['name']}（{top_stock['industry']}）"
+            )
+        if top_etf:
+            alt_bits.append(f"ETF 候选中居前：{top_etf['name']}")
+        upside = "、".join(alt_bits) if alt_bits else "其他合格标的"
+        if not verified_advantage:
+            upside += "（仅供研究参考，不构成买入建议）"
+        gap_bits = ["轮动相对优势尚未经独立复核，不作推荐"]
+        if top_etf and top_etf.get("degraded"):
+            gap_bits.append("ETF 候选当日行情覆盖不全，部分数据缺失")
+        if not verified:
+            gap_bits.append("账户核对完成前不提供买卖数量")
+        options.append({
+            "name": "轮动至其他合格标的（研究储备）",
+            "upside": upside,
+            "cost": "换仓费用与不确定性；可能踏空原持仓上涨",
+            "gap": "；".join(gap_bits),
+        })
+    return options
+
+
+def _top_stock_alternative(bundle: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Single best-focused main-board stock from the frozen watchlist.
+
+    Returns name/industry only (no score, no list). The watchlist member
+    order is the engine's own focused order; this helper only names the
+    first entry of that frozen order, never re-sorts.
+    """
+    watchlist = bundle.get("watchlist") or {}
+    focused = watchlist.get("focused_candidates") or []
+    for cand in focused:
+        if isinstance(cand, dict) and cand.get("name"):
+            return {
+                "name": str(cand["name"]),
+                "industry": str(cand.get("industry") or "行业未标"),
+            }
+    return None
+
+
+def _top_etf_alternative(bundle: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Top non-held ETF candidate by the engine's frozen screen order.
+
+    Only the name is surfaced (no score); ``degraded`` records whether the
+    ETF screen coverage was incomplete for that candidate.
+    """
+    etf_candidates = bundle.get("etf_candidates") or {}
+    coverage = etf_candidates.get("data_coverage") or {}
+    screen_degraded = str(coverage.get("status") or "") != "READY"
+    for cand in etf_candidates.get("candidates") or []:
+        if not isinstance(cand, dict) or cand.get("held"):
+            continue
+        name = cand.get("name") or cand.get("ts_code")
+        if not name:
+            continue
+        degraded = screen_degraded or str(cand.get("status") or "") != "READY"
+        return {"name": str(name), "degraded": bool(degraded)}
+    return None
+
+
 def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[str, Any]:
     """Bundle payload -> the sections object feishu_render/render_xml consumes."""
     as_of = str(bundle.get("as_of_trade_date") or "")
@@ -274,6 +391,8 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
         },
     ]
 
+    options = _build_options(bundle, focus_name, focus_weight, verified)
+
     holdings_rows: List[Dict[str, str]] = []
     _STANCE_ZH = {"HOLD": "继续观察", "WATCH": "重点观察", "REDUCE": "可研究降低风险",
                   "ROTATE": "可研究轮动（未验证）"}
@@ -346,7 +465,7 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
             },
             "三项主要证据": {"items": items},
             "持仓判断": {"holdings": holdings_rows},
-            "是否存在更好的选择": {"options": []},
+            "是否存在更好的选择": {"options": options},
             "下一交易日关注": {"conditions": conditions},
             "数据说明与参考来源": {"notes": notes, "sources": []},
         },
