@@ -339,7 +339,7 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
     analyzed: 0,
     skipped_adj_missing: 0,
     skipped_insufficient: 0,
-    capacity_limited: opts.prescreen.capacity_limited,
+    capacity_limited: 0,
   };
 
   forEachStockBars(db, HISTORY_START, asOf, (code, bars) => {
@@ -536,7 +536,7 @@ export function renderTechnicalViewMarkdown(view: TechnicalViewV2): string {
   out.push(`- framework_version: \`${view.framework_version}\``);
   out.push(`- implementation_fingerprint: \`${view.implementation_fingerprint.slice(0, 16)}…\``);
   out.push(`- 市场环境: ${view.market_regime}`);
-  out.push(`- 覆盖: 全市场 ${view.coverage.universe} 只，合格 ${view.coverage.preselected} 只，详析 ${view.coverage.analyzed} 只，预筛排名截断（仅诊断，不参与选股）${view.coverage.capacity_limited} 条`);
+  out.push(`- 覆盖: 全市场 ${view.coverage.universe} 只，合格 ${view.coverage.preselected} 只，全部详析 ${view.coverage.analyzed} 只，未执行容量截断（五族检测覆盖全部合格股票；旧 120/500 排名仅保留为诊断）`);
   out.push(`- 证据等级: ${view.evidence_level}（仅研究观察，不构成交易指令）`);
   out.push('');
   for (const f of view.families) {
