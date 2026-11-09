@@ -201,13 +201,14 @@ ashareToolDefinitions.push(
   },
   {
     name: 'ashare_hotspot_opportunities',
-    description: `交易日研究快照（V2 唯一路径）：每只股票一个 research_state（FOCUS/WATCH/EXTENDED/DETERIORATING/BLOCKED/INVALIDATED），由服务端确定性规则计算，非交易指令、非收益预测。五类技术族（趋势延续/平台突破/底部反转/波动率扩张/均值回归）独立列信号与阶段（FORMING/CONFIRMED/FOLLOW_THROUGH/FAILED/EXPIRED），不合并跨家族分数；每个信号带 pattern_event_date（价格事件日）与 first_observed_date（首次可证日），确认日绝不回填。停牌、当日无K线、一字跌停的股票为 BLOCKED，不进入正常研究重点。daily_highlights 是 2–5 只可读研究重点，不是买入推荐。返回 as-of、version_no、content_hash、implementation_fingerprint 与 data_state 供核对；快照缺失或为 V2 之前归档时返回 NOT_READY 与原因。${DATA_NOTE}`,
+    description: `交易日研究快照（V2 唯一路径）：每只股票一个 research_state（FOCUS/WATCH/EXTENDED/DETERIORATING/BLOCKED/INVALIDATED），由服务端确定性规则计算，非交易指令、非收益预测。五类技术族（趋势延续/平台突破/底部反转/波动率扩张/均值回归）独立列信号与阶段（FORMING/CONFIRMED/FOLLOW_THROUGH/FAILED/EXPIRED），不合并跨家族分数；每个信号带 pattern_event_date（价格事件日）与 first_observed_date（首次可证日），确认日绝不回填。停牌、当日无K线、一字跌停的股票为 BLOCKED，不进入正常研究重点。daily_highlights 是 2–5 只可读研究重点，不是买入推荐。返回 as-of、version_no、content_hash、implementation_fingerprint 与 data_state 供核对；快照缺失或为 V2 之前归档时返回 NOT_READY 与原因。stocks 默认只返回摘要：无过滤时最多 50 只，给 ts_code/research_state 过滤时返回全部匹配（上限 2000），可用 max_stocks 扩大；total_matched/returned/truncated 说明是否截断。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: {
         date: dateProp,
         ts_code: { type: 'string', description: '只看单只股票' },
-        research_state: { type: 'string', enum: ['FOCUS', 'WATCH', 'EXTENDED', 'DETERIORATING', 'BLOCKED', 'INVALIDATED'], description: '按股票唯一研究状态过滤；缺省返回全部观察对象' },
+        research_state: { type: 'string', enum: ['FOCUS', 'WATCH', 'EXTENDED', 'DETERIORATING', 'BLOCKED', 'INVALIDATED'], description: '按股票唯一研究状态过滤；缺省返回摘要（最多 50 只）' },
+        max_stocks: { type: 'number', description: 'stocks 上限：无过滤时默认 50、上限 500；有 ts_code/research_state 过滤时默认全部、上限 2000' },
       },
     },
     annotations: READ_ONLY,
@@ -366,12 +367,13 @@ export const portfolioToolDefinitions: { name: string; description: string; inpu
   },
   {
     name: 'ashare_chatgpt_research_record_append',
-    description: '只追加：把 ChatGPT 日报任务**已经产出**的独立研究判断写入不可变研究日志（source 固定为 chatgpt；时间戳、record_id、哈希由服务器生成，调用方无法设置）。必须在日报写完之后调用，且只提交实际产出的内容，不得补写。必须关联已存在的 VPS 研究快照（report_id 与 as_of_trade_date 须与之一致，否则拒绝）。不接受也不会写入任何账本事件、持仓、账户完整性、订单、风险政策或费用。同键同内容幂等；同键不同内容拒绝；更正请用新的 idempotency_key 并填 corrects_record_id。每日有条数上限。仅返回 record_id、content_hash 与证据分类（TRUE_FORWARD 仅当交易日>=20261022 且当天上海时间内写入，否则 RETROSPECTIVE_RECORD）。只在受认证的 /private/mcp 提供。',
+    description: '只追加：把外部 LLM 日报任务**已经产出**的独立研究判断写入不可变研究日志（source 默认 chatgpt；Hermes 调用方请传 source=\'hermes\'；时间戳、record_id、哈希由服务器生成，调用方无法设置；工具名含 chatgpt 为历史命名，内部已同时服务 chatgpt 与 hermes 两源）。必须在日报写完之后调用，且只提交实际产出的内容，不得补写。必须关联已存在的 VPS 研究快照（report_id 与 as_of_trade_date 须与之一致，否则拒绝）。不接受也不会写入任何账本事件、持仓、账户完整性、订单、风险政策或费用。同键同内容幂等；同键不同内容拒绝；更正请用新的 idempotency_key 并填 corrects_record_id。每日有条数上限（chatgpt 与 hermes 共用同一外部研究上限）。仅返回 record_id、content_hash 与证据分类（TRUE_FORWARD 仅当交易日>=20261022 且当天上海时间内写入，否则 RETROSPECTIVE_RECORD）。只在受认证的 /private/mcp 提供。',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
+        source: { type: 'string', enum: ['chatgpt', 'hermes'], description: '研究记录来源；默认 chatgpt。Hermes 写入必须传 hermes（记录 source 与 provenance.author 均为 hermes）' },
         report_id: { type: 'string', maxLength: 200, description: '所关联的 VPS 研究快照 bundle 的 report_id（来自 ashare_investment_research_bundle）' },
         as_of_trade_date: { type: 'string', description: 'YYYYMMDD，须与该 report_id 的交易日一致，不得晚于今天' },
         idempotency_key: { type: 'string', maxLength: 64, description: '可选；字母数字及 . _ : -。省略则按内容哈希幂等' },
@@ -452,7 +454,7 @@ export const portfolioToolDefinitions: { name: string; description: string; inpu
   },
   {
     name: 'ashare_research_combined_append',
-    description: '只追加：按事先冻结的联合规则（rule_version 可追溯）生成并持久化一条 Combined 联合研究判断（goal-1027 P0-3）。Combined 表达的是：同一研究时点，以一条真实 VPS 研究记录和一条真实 ChatGPT 研究记录为父输入，按版本化规则形成的一份联合研究决策——不是把两套历史收益平均。任一父记录缺失即拒绝（combined_inputs_incomplete），不虚构联合判断。方向语义只取自 ChatGPT 侧的结构化判断单元（research_thesis），不从自由文本推断；无结构化方向时沿用 VPS 原判断并披露。冲突（ChatGPT 结构化方向含行动性主张而 VPS 判定无动作）按规则沿用 VPS 并保留分歧，不凭 ChatGPT 置信度覆盖。NO_ACTION 是合法联合决策。record_id 由父记录身份+规则版本派生：同输入幂等，不重复组合；记录不可变，结果已知后追加自动降为补录并被评价器排除在前瞻之外。只做研究判断合并，不产生换仓执行、不写账本。时间戳与 ID 由服务端生成。仅在受认证的 /private/mcp 提供。',
+    description: '只追加：按事先冻结的联合规则（rule_version 可追溯）生成并持久化一条 Combined 联合研究判断（goal-1027 P0-3）。Combined 表达的是：同一研究时点，以一条真实 VPS 研究记录和一条真实外部研究记录（ChatGPT 或 Hermes，goal-1106 起两者均可为父输入）为父输入，按版本化规则形成的一份联合研究决策——不是把两套历史收益平均。任一父记录缺失即拒绝（combined_inputs_incomplete），不虚构联合判断。方向语义只取自外部父记录的结构化判断单元（research_thesis），不从自由文本推断；无结构化方向时沿用 VPS 原判断并披露。冲突（外部结构化方向含行动性主张而 VPS 判定无动作）按规则沿用 VPS 并保留分歧，不凭置信度覆盖。NO_ACTION 是合法联合决策。record_id 由父记录身份+规则版本派生：同输入幂等，不重复组合；记录不可变，结果已知后追加自动降为补录并被评价器排除在前瞻之外。只做研究判断合并，不产生换仓执行、不写账本。时间戳与 ID 由服务端生成。仅在受认证的 /private/mcp 提供。',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

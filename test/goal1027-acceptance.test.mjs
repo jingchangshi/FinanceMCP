@@ -481,9 +481,10 @@ test('C1: 仅 VPS 存在时不虚构联合判断', () => {
   const { portfolio } = openPair('c1');
   try {
     seedVps(portfolio, {});
+    // goal-1106: the missing-side label for the external parent is 'external'.
     assert.throws(() => combinedResearch.appendCombinedResearch(portfolio, {
       accountId: ACCOUNT, asOf: AS_OF,
-    }), /combined_inputs_incomplete.*chatgpt/s);
+    }), /combined_inputs_incomplete.*external/s);
   } finally { portfolio.close(); }
 });
 

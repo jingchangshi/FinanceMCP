@@ -15,9 +15,14 @@
  *                       impossible (suspended, no as-of bar, stale bar,
  *                       one-price limit-down, unknown limit).
  *   2. INVALIDATED    — every signal episode is dead (FAILED / EXPIRED).
- *   3. DETERIORATING  — live signals coexist with another family's failure.
- *                       The conflict is reported, never netted out.
- *   4. EXTENDED       — the setup holds but the day carries RAPID_RUNUP.
+ *   3. DETERIORATING  — NEW negative evidence is dated AFTER the latest live
+ *                       confirmation. The state belongs to the stock, so a
+ *                       failure from any family counts; a failure or expiry
+ *                       that predates the live setup is history and never
+ *                       negates the live reading. EXPIRED never triggers
+ *                       DETERIORATING.
+ *   4. EXTENDED       — the setup holds but price has run: RAPID_RUNUP or a
+ *                       live signal's `price_extension` (close >= MA20 + 3 ATR14).
  *   5. FOCUS          — a live, research-ready confirmation and normal trading.
  *   6. WATCH          — forming only, or a live setup the account cannot
  *                       execute at normal prices (limit-up / non-mainboard).
@@ -59,6 +64,7 @@ function toSignalView(s: TechnicalCandidateV2): ResearchSignalView {
     key_levels: s.key_levels,
     evidence: s.evidence,
     counter_evidence: s.counter_evidence,
+    price_position: s.price_position,
   };
 }
 
@@ -147,18 +153,52 @@ function decideState(
     };
   }
 
-  // 3. Live evidence contradicted by another family's failure.
-  if (live.length > 0 && failed.length + expired.length > 0) {
-    for (const s of live) decisive.push(`${signalLabel(s)} 于 ${s.confirmed_on ?? '未标注日期'} 确认`);
-    for (const s of failed) conflicting.push(`${signalLabel(s)} 于 ${s.invalidated_at ?? '未标注日期'} 失效：${s.invalidation?.reason ?? '触发失效条件'}`);
-    for (const s of expired) conflicting.push(`${signalLabel(s)} 观察窗口已于 ${s.expires_at ?? '未标注日期'} 结束`);
-    return { state: 'DETERIORATING', decisive, conflicting, constraints };
+  // 3. ONLY current negative evidence can contradict a live setup: a FAILED
+  //    instance dated strictly after the latest live confirmation. The state
+  //    is the stock's, not the family's, so a failure in ANY family after the
+  //    live setup was confirmed is current evidence; the reverse (a failure
+  //    dated before it) is history that the live setup already superseded.
+  //    An EXPIRED window is observation-window end, never current negative
+  //    evidence. Everything dead stays in `signals` for audit; no score is
+  //    computed and no family's evidence is netted against another's.
+  if (live.length > 0) {
+    const latestLiveConfirm = live.reduce(
+      (m, s) => (s.confirmed_on && s.confirmed_on > m ? s.confirmed_on : m), '',
+    );
+    const currentFailures = failed.filter((f) => f.invalidated_at !== null
+      && latestLiveConfirm !== '' && f.invalidated_at > latestLiveConfirm);
+    if (currentFailures.length > 0) {
+      for (const s of live) {
+        decisive.push(`${signalLabel(s)}（${s.strategy_id}）于 ${s.confirmed_on ?? '未标注日期'} 确认`);
+      }
+      for (const f of currentFailures) {
+        conflicting.push(`${signalLabel(f)}（${f.strategy_id}）于 ${f.invalidated_at} 失效，`
+          + `晚于当前有效形态最新确认日 ${latestLiveConfirm}：`
+          + `${f.invalidation?.reason ?? '触发失效条件'}`);
+      }
+      return { state: 'DETERIORATING', decisive, conflicting, constraints };
+    }
   }
 
   // 4. Position risk: the setup holds, but the price has already run.
-  if (live.length > 0 && ctx.price_volume_tags.includes('RAPID_RUNUP')) {
-    for (const s of live) decisive.push(`${signalLabel(s)} 于 ${s.confirmed_on ?? '未标注日期'} 确认，但近 5 日涨幅 ≥15%`);
-    return { state: 'EXTENDED', decisive, conflicting, constraints };
+  if (live.length > 0) {
+    const extended = live.filter(s => s.price_position?.price_extension === true);
+    if (extended.length > 0 || ctx.price_volume_tags.includes('RAPID_RUNUP')) {
+      for (const s of live) {
+        decisive.push(`${signalLabel(s)}（${s.strategy_id}）于 ${s.confirmed_on ?? '未标注日期'} 确认`);
+      }
+      for (const s of extended) {
+        const atr = s.price_position?.close_vs_ma20_atr;
+        const close = s.price_position?.close;
+        const ma20 = s.price_position?.ma20;
+        decisive.push(`价格延伸：${signalLabel(s)} 收盘 ${close} 距 MA20 ${ma20} 为 ${atr} 倍 ATR14`
+          + '（固定研究假设阈值 3.0，未经验证收益优势）');
+      }
+      if (ctx.price_volume_tags.includes('RAPID_RUNUP')) {
+        decisive.push('近 5 日涨幅 ≥15%：短期急涨，位置风险上升');
+      }
+      return { state: 'EXTENDED', decisive, conflicting, constraints };
+    }
   }
 
   // 5/6. FOCUS needs a live confirmation, a tradable day and an executable name.
@@ -224,6 +264,7 @@ function buildStock(
     research_state_label: RESEARCH_STATE_LABELS[decision.state],
     primary_family: primary?.family ?? null,
     primary_pattern: primary?.stage_detail ?? null,
+    price_position: primary?.price_position ?? null,
     signals: sorted.map(toSignalView),
     decisive_reasons: decision.decisive,
     conflicting_evidence: decision.conflicting,

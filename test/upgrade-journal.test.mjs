@@ -72,7 +72,8 @@ test('ChatGPT and combined results require real provenance and actual source par
   try {
     recordAt(db, record());
     assert.throws(() => journal.recordResearchJournal(db, record('chat', { source: 'chatgpt' })), /provenance/);
-    assert.throws(() => journal.recordResearchJournal(db, record('combined', { source: 'combined', provenance, parent_record_ids: ['r1'] })), /actual VPS and ChatGPT/);
+    // goal-1106: the external parent may be chatgpt or hermes.
+    assert.throws(() => journal.recordResearchJournal(db, record('combined', { source: 'combined', provenance, parent_record_ids: ['r1'] })), /actual VPS and external/);
     journal.recordResearchJournal(db, record('chat', { source: 'chatgpt', provenance }));
     journal.recordResearchJournal(db, record('combined', { source: 'combined', provenance, parent_record_ids: ['r1', 'chat'] }));
     assert.deepEqual(new Set(journal.listResearchJournal(db, { accountId: 'synthetic' }).map(row => row.source)), new Set(['vps', 'chatgpt', 'combined']));

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the FinanceMCP A-share weekly database backup (Asia/Shanghai)
+
+[Timer]
+# Sunday 02:00: after the Friday research cadence, before Monday's daily runs.
+OnCalendar=Sun *-*-* 02:00:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

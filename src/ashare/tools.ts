@@ -387,10 +387,24 @@ function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
   let stocks = universe.stocks;
   if (args.ts_code) stocks = stocks.filter(s => s.ts_code === String(args.ts_code));
   if (args.research_state) stocks = stocks.filter(s => s.research_state === String(args.research_state));
-  const highlightSet = new Set(universe.daily_highlights);
   const highlights = universe.daily_highlights
     .map(code => universe.stocks.find(s => s.ts_code === code))
     .filter((s): s is NonNullable<typeof s> => !!s);
+  // goal-1106: an unfiltered call returns the whole ~4,100-stock universe
+  // (~42MB). Default to a 50-stock summary unless the caller narrows with a
+  // filter; filtered calls return all matches up to 2,000. daily_highlights
+  // is always included in full. truncation tells the caller whether
+  // total_matched > returned (narrow max_stocks first, then filter).
+  const filtered = !!(args.ts_code || args.research_state);
+  let maxStocks: number;
+  if (args.max_stocks !== undefined && args.max_stocks !== null && args.max_stocks !== '') {
+    const n = Math.trunc(Number(args.max_stocks));
+    maxStocks = Number.isFinite(n) ? Math.min(filtered ? 2000 : 500, Math.max(1, n)) : (filtered ? 2000 : 50);
+  } else {
+    maxStocks = filtered ? 2000 : 50;
+  }
+  const totalMatched = stocks.length;
+  const returnedStocks = stocks.slice(0, maxStocks);
 
   return json({
     as_of: snap.as_of,
@@ -416,7 +430,10 @@ function hotspotOpportunitiesTool(args: Record<string, any>): ToolResult {
     filter: args.ts_code || args.research_state
       ? { ts_code: args.ts_code ?? null, research_state: args.research_state ?? null }
       : null,
-    stocks,
+    total_matched: totalMatched,
+    returned: returnedStocks.length,
+    truncated: totalMatched > returnedStocks.length,
+    stocks: returnedStocks,
     note: note ?? undefined,
   });
 }

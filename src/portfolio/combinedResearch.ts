@@ -135,21 +135,25 @@ function appendCombinedParsed(db: DatabaseSync, input: CombinedAppendInput, nowM
   const dayRecords = listResearchJournal(db, { accountId: input.accountId, asOf: input.asOf, limit: 1000 })
     .filter(r => r.as_of_trade_date === input.asOf);
   const vpsCandidates = dayRecords.filter(r => r.source === 'vps');
-  const chatgptCandidates = dayRecords.filter(r => r.source === 'chatgpt');
+  // goal-1106: the external parent is either chatgpt or hermes — one external
+  // parent is required, its source labels which LLM wrote it.
+  const externalCandidates = dayRecords.filter(r => r.source === 'chatgpt' || r.source === 'hermes');
   const pick = (rows: JournalRecord[], explicitId: string | undefined, label: string) => {
     if (explicitId) {
       const found = rows.find(r => r.record_id === explicitId);
-      if (!found) throw new Error(`${label}_record_not_found: ${explicitId} is not a ${label === 'vps' ? 'VPS' : 'ChatGPT'} record of account ${input.accountId} on ${input.asOf}`);
+      if (!found) throw new Error(`${label}_record_not_found: ${explicitId} is not a ${label === 'vps' ? 'VPS' : 'external (ChatGPT/Hermes)'} record of account ${input.accountId} on ${input.asOf}`);
       return found;
     }
     if (!rows.length) return null;
     return [...rows].sort((a, b) => b.recorded_at.localeCompare(a.recorded_at))[0];
   };
   const vps = pick(vpsCandidates, input.vpsRecordId, 'vps');
-  const chatgpt = pick(chatgptCandidates, input.chatgptRecordId, 'chatgpt');
+  // chatgptRecordId is the historical field name for the external parent; it
+  // accepts a hermes record id unchanged.
+  const chatgpt = pick(externalCandidates, input.chatgptRecordId, 'external');
   // 1. 任一侧缺失即拒绝，不虚构联合判断。
   if (!vps || !chatgpt) {
-    const missing = [!vps ? 'vps' : null, !chatgpt ? 'chatgpt' : null].filter(Boolean).join('+');
+    const missing = [!vps ? 'vps' : null, !chatgpt ? 'external' : null].filter(Boolean).join('+');
     throw new Error(`combined_inputs_incomplete: missing ${missing} record for ${input.accountId} on ${input.asOf}; combined research is only generated from two real parent records`);
   }
   const identity = createHash('sha256').update(canonicalJson({
@@ -220,7 +224,8 @@ function appendCombinedParsed(db: DatabaseSync, input: CombinedAppendInput, nowM
       divergences,
       input_candidates: {
         vps: vpsCandidates.map(r => ({ record_id: r.record_id, recorded_at: r.recorded_at })),
-        chatgpt: chatgptCandidates.map(r => ({ record_id: r.record_id, recorded_at: r.recorded_at })),
+        // Historical key name: holds the external (chatgpt/hermes) candidates.
+        chatgpt: externalCandidates.map(r => ({ record_id: r.record_id, recorded_at: r.recorded_at })),
       },
       frozen_before_outcome: true,
       execution: 'none: research judgement merge only; no rebalancing, no order, no account write',
