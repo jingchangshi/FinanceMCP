@@ -438,6 +438,39 @@ test('D1-5d 全部退出的轮动：摘要与首选使用实际卖出数量，�
   assert.doesNotMatch(preferred.label, /undefined/);
 });
 
+test('D1-5e 未指定建仓标的时，现金建仓/加仓比较仍以 QUANTITY_REQUIRED 出现，不自动挑标的', () => {
+  const db = confirmedPortfolio('portfolio-cash-add-default.sqlite');
+  const report = buildDailyReport({
+    portfolioDb: db, marketDb: marketMain, accountId: 'confirmed-account', asOfTradeDate: LAST,
+    generatedAt: '2026-10-16T21:55:00+08:00',
+  });
+  const actions = report.decision_comparison.options.map(option => option.action);
+  assert.deepEqual(actions, ['HOLD', 'REDUCE', 'ADD', 'ROTATE', 'DEFENSIVE', 'NO_ACTION']);
+  const add = report.decision_comparison.options.find(option => option.action === 'ADD');
+  assert.equal(add.funding_status, 'QUANTITY_REQUIRED');
+  assert.equal(add.quantity_basis, 'not_provided');
+  assert.equal(add.executable, false);
+  assert.match(add.summary, /现有现金\d+分/);
+  assert.doesNotMatch(add.summary, /510300|159558/, '未指定候选时不得用候选或持仓代替建仓标的');
+});
+
+test('D1-5f 指定候选取现金建仓时，ADD 方案给出成交后现金、费用与敞口变化', () => {
+  const db = confirmedPortfolio('portfolio-cash-add-option.sqlite');
+  const report = buildDailyReport({
+    portfolioDb: db, marketDb: marketMain, accountId: 'confirmed-account', asOfTradeDate: LAST,
+    generatedAt: '2026-10-16T21:55:00+08:00',
+    researchScenario: { buyCode: '510300.SH', buyQuantity: 100 },
+  });
+  const add = report.decision_comparison.options.find(option => option.action === 'ADD');
+  const hold = report.decision_comparison.options.find(option => option.action === 'HOLD');
+  assert.equal(add.funding_status, 'FUNDED');
+  assert.match(add.summary, /510300\.SH/);
+  assert.ok(add.fees_cents > 0 && add.fee_breakdowns.length === 1);
+  assert.ok(add.cash_after_cents < hold.cash_after_cents, '建仓后现金必须下降');
+  assert.ok(add.exposure_after.equity_weight >= hold.exposure_after.equity_weight, '加仓不降低权益敞口');
+  assert.equal(add.executable, false);
+});
+
 test('D1-6 plan_tracking 缺表 → 明确降级为 not_available，不建表、不补造历史', () => {
   const report = build();
   assert.equal(report.plan_tracking.available, false);

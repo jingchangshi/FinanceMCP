@@ -1010,6 +1010,10 @@ function buildDecisionComparison(input: {
   const rotate = option('ROTATE', '显式数量轮动研究', '需要用户提供卖出、买入标的和整手数量；没有优势证据时不产生动作。');
   const defensive = option('DEFENSIVE', '权益清零压力对照', '仅作权益清零压力对照，保留债券、黄金和跨境资产；受可卖数量与费用约束。');
   const noAction = option('NO_ACTION', '没有充分证据时不操作', '缺少经过复核的相对优势证据或用户已确认的风险策略约束，明确不操作。');
+  // 现金建仓/加仓研究是第六个比较项：只用现有现金，不依赖卖出回款。
+  // 未指定候选时如实标 QUANTITY_REQUIRED，不按候选排名自动挑标的。
+  const add = option('ADD', '现金建仓/加仓研究', '只用现有现金，不依赖卖出回款；需要指定建仓标的与整手数量，不自动推荐标的。');
+  add.quantity_basis = 'not_provided';
   reduce.quantity_basis = rotate.quantity_basis = scenario ? 'user_research_parameter' : 'not_provided';
   reduce.funding_status = rotate.funding_status = 'QUANTITY_REQUIRED';
   const reject = (target: Option, status: Option['funding_status'], detail: string) => {
@@ -1157,6 +1161,32 @@ function buildDecisionComparison(input: {
         funding_status: funded ? 'FUNDED' : 'INSUFFICIENT_CASH' };
     }
   }
+  // 现金建仓/加仓比较：把 cash_plan 的结果映射成第六个方案，费用、敞口与集中度
+  // 按同一模型计算。未指定候选时只披露现金容量与缺口原因，不生成建仓数量。
+  if (cashPlan.funding_status === 'FUNDED' && cashPlan.code && cashPlan.spend_cents != null && cashPlan.cash_after_cents != null) {
+    const addRows = positions.map(p => ({ ...p }));
+    const existing = addRows.find(p => p.ts_code === cashPlan.code);
+    if (existing) existing.value += cashPlan.spend_cents;
+    else {
+      const basic = input.marketDb?.prepare('SELECT * FROM fund_basic WHERE ts_code=?').get(cashPlan.code) as any;
+      addRows.push({ ts_code: cashPlan.code, value: cashPlan.spend_cents, asset_class: classifyAssetClass(basic).asset_class,
+        theme: THEME_BY_CODE[cashPlan.code] ?? 'unknown', industry: INDUSTRY_BY_CODE[cashPlan.code] ?? 'unclassified' });
+    }
+    const buyFee = feeFor(cashPlan.code, cashPlan.spend_cents, 'buy');
+    Object.assign(add, metrics(addRows, cashPlan.cash_after_cents));
+    add.funding_status = 'FUNDED';
+    add.fees_cents = buyFee.total_cents;
+    add.fee_breakdowns = [{ ts_code: cashPlan.code, side: 'BUY', breakdown: buyFee }];
+    add.summary = `用现有现金买入${cashPlan.quantity}份/股${cashPlan.code}；一手成本${cashPlan.one_lot_cost_cents}分，可负担${cashPlan.affordable_lots}手，费用及滑点占拟投入${cashPlan.fee_pct_of_spend}%；仅示意。`;
+  } else {
+    const status: Option['funding_status'] = cashPlan.funding_status === 'NOT_PROVIDED' || cashPlan.funding_status === 'CASH_UNAVAILABLE'
+      ? 'QUANTITY_REQUIRED' : cashPlan.funding_status;
+    add.funding_status = status;
+    add.summary = cashPlan.funding_status === 'NOT_PROVIDED'
+      ? `现有现金${cash}分；未指定建仓标的，只给出现金容量，不生成建仓数量，也不按候选排名代替用户选择。`
+      : `现金建仓/加仓研究未成立：${cashPlan.funding_status}。`;
+    add.not_actionable_because.push(`cash_plan:${cashPlan.funding_status}`);
+  }
 
   // A named stress comparison, never an automatically generated sell instruction.
   defensive.quantity_basis = 'equity_liquidation_stress_only';
@@ -1191,7 +1221,7 @@ function buildDecisionComparison(input: {
 
   // 风险轨定稿（§5.1）：在所有 funding_status 直接赋值与 reject 路径之后统一重建，
   // 保证 blocked_by 只反映账户/权限/费用/行情门控 + 资金可得性，永不混入 Alpha 证据。
-  for (const o of [hold, reduce, rotate, defensive, noAction]) {
+  for (const o of [hold, reduce, add, rotate, defensive, noAction]) {
     const fundingBlocked = o.funding_status !== 'NO_TRADE' && o.funding_status !== 'FUNDED'
       ? [`funding_status:${o.funding_status}`] : [];
     o.risk_track = riskTrackOf(fundingBlocked);
@@ -1307,11 +1337,11 @@ function buildDecisionComparison(input: {
     cash: { before_cents: cash, min_equity_lot_cents: minLot, sufficient_for_one_lot: minLot === null ? null : cash >= minLot },
     concentration_before: { hhi: baseline.concentration_after.hhi, effective_positions: baseline.concentration_after.effective_positions,
       top_weight: focus?.weight ?? null, equity_weight: baseline.exposure_after.equity_weight },
-    sellable, options: [hold, reduce, rotate, defensive, noAction],
+    sellable, options: [hold, reduce, add, rotate, defensive, noAction],
     cash_plan: cashPlan,
     decision_plans: decisionPlans,
     scenario_matrix: scenarioMatrix,
-    note: '五方案均为非执行研究比较（executable 恒为 false：研究比较不是下单授权），但风险轨与 Alpha 轨分列披露：'
+    note: '五个情景方案加现金建仓/加仓比较均为非执行研究比较（executable 恒为 false：研究比较不是下单授权），但风险轨与 Alpha 轨分列披露：'
       + 'risk_track 只列账户/权限/费用/行情门控，alpha_track 只在轮动轨出现。'
       + 'HHI仅累加证券权重平方，分母含现金与理财；现金不作为证券加入分子。数量来自显式研究参数，费用采用账户/代码模型；'
       + '缺乏优势与已确认风险策略时不生成交易动作；情景幅度为声明式假设，不是预测。',
