@@ -122,75 +122,67 @@ def _build_options(
     focus_weight: Any,
     verified: bool,
 ) -> List[Dict[str, str]]:
-    """Section 5 "是否存在更好的选择": the three genuinely-compared schemes.
+    """Render every engine-computed scenario without choosing a ranked-list item.
 
-    Source: the frozen bundle's own ``portfolio.decision_comparison`` (its
-    five non-executable study schemes). Only HOLD / REDUCE / ROTATE are the
-    investor-facing comparisons; DEFENSIVE (stress control) and NO_ACTION
-    (no-trade control) stay in the audit layer, never in the report.
-
-    The ROTATE (rotation) option names the single best-screened main-board
-    stock (watchlist focused candidates) and the top non-held ETF candidate
-    as qualitative alternatives only: no score figures, no ranked list, no
-    pool dump. Benefit/cost/gap are phrased from the bundle's own
-    opportunity_cost / gates / evidence fields; when the rotation advantage
-    is unverified, the option says so explicitly instead of recommending
-    (goal-1109 A10: never force rotation). Every number comes from the
-    frozen payload; nothing here is recomputed.
+    The deterministic comparison is the source of option names, cash, fees,
+    risk effects and blockers. Research candidates are named only when the
+    engine itself produced a funded rotation plan. No score order is treated as
+    a preferred trade.
     """
     decision = _get(bundle, "portfolio", "decision_comparison") or {}
     raw_options = decision.get("options") or []
-    by_action = {}
-    for opt in raw_options:
-        if isinstance(opt, dict):
-            by_action[str(opt.get("action") or "")] = opt
-    wanted = ("HOLD", "REDUCE", "ROTATE")
-    if not any(a in by_action for a in wanted):
-        return []
-
-    top_stock = _top_stock_alternative(bundle)
-    top_etf = _top_etf_alternative(bundle)
-
+    first_actions = _get(bundle, "portfolio", "first_section", "actions") or []
+    preferred_codes = {str(a.get("code") or "") for a in first_actions if isinstance(a, dict)}
     options: List[Dict[str, str]] = []
 
-    if "HOLD" in by_action:
-        weight_txt = _fmt_pct(focus_weight * 100 if isinstance(focus_weight, (int, float)) and focus_weight < 2 else focus_weight)
+    for raw in raw_options:
+        if not isinstance(raw, dict):
+            continue
+        action = str(raw.get("action") or "")
+        label = str(raw.get("label") or action or "方案")
+        is_preferred = any(code == action or code.startswith(action + "-") for code in preferred_codes if action)
+        title = ("首选｜" if is_preferred else "") + label
+        summary = str(raw.get("summary") or "")
+        opportunity_cost = str(raw.get("opportunity_cost") or "")
+        details: List[str] = []
+        cash_after = raw.get("cash_after_cents")
+        if isinstance(cash_after, (int, float)):
+            details.append(f"方案后现金 {_fmt_money(cash_after)}")
+        fees = raw.get("fees_cents")
+        if isinstance(fees, (int, float)):
+            details.append(f"假设费用 {_fmt_money(fees)}")
+        stress = raw.get("stress_after") or {}
+        stress_loss = stress.get("loss_cents") if isinstance(stress, dict) else None
+        if isinstance(stress_loss, (int, float)):
+            details.append(f"声明式压力情景损失 {_fmt_money(stress_loss)}")
+
+        rotation = raw.get("rotation_plan") or {}
+        if action == "ROTATE" and isinstance(rotation, dict) and rotation.get("buy_code"):
+            code = str(rotation["buy_code"])
+            name = str(rotation.get("buy_name") or code)
+            title += f"（研究候选：{name} {code}）"
+            if rotation.get("advantage_status") == "UNVERIFIED":
+                details.append("相对优势未经独立验证")
+        elif action == "ROTATE":
+            details.append("引擎未形成满足资金条件的具体轮动候选")
+
+        blocker = raw.get("not_actionable_because") or []
+        if isinstance(blocker, list):
+            blocker_parts = [str(x) for x in blocker if x]
+        else:
+            blocker_parts = [str(blocker)] if blocker else []
+        alpha = raw.get("alpha_track") or {}
+        if action == "ROTATE" and alpha.get("evidence_verified") is not True:
+            blocker_parts.append("轮动相对优势尚未经独立验证")
+        blocker_text = "；".join(blocker_parts)
+        if not verified and not blocker_text:
+            blocker_text = "账户事实尚未完成全项核对；不能把参考数量当作可直接使用数量"
+
         options.append({
-            "name": f"维持「{focus_name}」集中暴露",
-            "upside": "账户核对完成前不扩大风险，保留行情上涨期权",
-            "cost": f"集中度维持在 {weight_txt}，回撤放大时首当其冲",
-            "gap": "账户成交尚未核对完成，核对后重估",
-        })
-    if "REDUCE" in by_action:
-        options.append({
-            "name": "降低集中度（减仓研究）",
-            "upside": "卖出部分集中持仓，单一持仓权重下降",
-            "cost": "产生交易费用；若行情反弹可能错过上涨",
-            "gap": "账户核对完成前不提供买卖数量" if not verified else "需用户逐笔确认研究数量",
-        })
-    if "ROTATE" in by_action:
-        alpha = (by_action["ROTATE"].get("alpha_track") or {})
-        verified_advantage = alpha.get("evidence_verified") is True
-        alt_bits: List[str] = []
-        if top_stock:
-            alt_bits.append(
-                f"主板股票研究池当前居前：{top_stock['name']}（{top_stock['industry']}）"
-            )
-        if top_etf:
-            alt_bits.append(f"ETF 候选中居前：{top_etf['name']}")
-        upside = "、".join(alt_bits) if alt_bits else "其他合格标的"
-        if not verified_advantage:
-            upside += "（仅供研究参考，不构成买入建议）"
-        gap_bits = ["轮动相对优势尚未经独立复核，不作推荐"]
-        if top_etf and top_etf.get("degraded"):
-            gap_bits.append("ETF 候选当日行情覆盖不全，部分数据缺失")
-        if not verified:
-            gap_bits.append("账户核对完成前不提供买卖数量")
-        options.append({
-            "name": "轮动至其他合格标的（研究储备）",
-            "upside": upside,
-            "cost": "换仓费用与不确定性；可能踏空原持仓上涨",
-            "gap": "；".join(gap_bits),
+            "name": title,
+            "upside": summary or "引擎未提供该方案的研究说明。",
+            "cost": "；".join(([opportunity_cost] if opportunity_cost else []) + details) or "本包未提供可量化成本或风险结果。",
+            "gap": blocker_text or "本包未报告额外执行阻碍。",
         })
     return options
 
@@ -348,46 +340,92 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
         + "。"
     )
 
-    # Conclusion from the frozen decision itself.
-    judgement = bundle.get("judgement") or {}
-    status = bundle.get("status") or ""
-    actionable = _get(bundle, "portfolio", "actionable")
+    # State the engine's selected plan; a no-trade choice is not evidence that
+    # the existing holdings are optimal. Keep research preference separate from
+    # account execution eligibility.
+    stance = str(bundle.get("research_stance") or "")
+    first_section = _get(bundle, "portfolio", "first_section") or {}
+    first_actions = first_section.get("actions") or []
+    preferred = next((a for a in first_actions if isinstance(a, dict)), None)
     evidence_gaps = bundle.get("evidence_gaps") or []
-    if actionable or status == "READY" and not evidence_gaps:
-        conclusion = "本日证据支持维持当前仓位观察；无足够新证据支持调整。"
+    # WP5: the bundle carries one report model. When present, its conclusion is
+    # used verbatim; this producer never re-derives the preferred action.
+    report_model = bundle.get("report_model") if isinstance(bundle.get("report_model"), dict) else None
+    model_conclusion = str((report_model or {}).get("conclusion") or "")
+    if model_conclusion:
+        conclusion = model_conclusion
+    elif preferred:
+        title = str(preferred.get("title") or preferred.get("code") or "条件化研究方案")
+        why = [str(x) for x in preferred.get("reasons", []) if x]
+        conclusion = f"本期研究首选：{title}。"
+        if why:
+            conclusion += "依据：" + "；".join(why[:2]) + "。"
+        if not verified:
+            conclusion += "账户未完成券商核对，方案仅作比较，不提供可直接使用的数量。"
+    elif stance in {"INSUFFICIENT_EVIDENCE", "DATA_INSUFFICIENT"}:
+        conclusion = (
+            "本期不提出需要精确账户数量的交易方案：账户核对或相应证据仍有缺口。"
+            "这不等于当前持仓已被证明优于其他方案；市场与持仓证据仍按可用范围呈现。"
+        )
     else:
-        conclusion = "当前证据不足以确定哪种调整更优，维持当前持仓观察。"
+        reason = str(first_section.get("no_action_reason") or "没有达到既有证据门槛的交易计划")
+        conclusion = (
+            f"本期首选为等待条件复核：{reason}。这是暂不交易的选择，不代表当前持仓已被证明最优。"
+        )
 
-    reasons: List[str] = []
+    market_reasons: List[str] = []
     if breadth_txt != "涨跌家数数据不足":
-        reasons.append(f"市场广度：{breadth_txt}；{regime_label}。")
+        market_reasons.append(f"市场广度：{breadth_txt}；{regime_label}。")
     if volume_txt != "成交额数据不足":
-        reasons.append(f"量能：{volume_txt}。")
-    reasons.append(core_obs)
+        market_reasons.append(f"量能：{volume_txt}。")
+    market_reasons.append(core_obs)
     if not verified:
-        reasons.append("账户成交未完成核对，资产与持仓只能作参考重估。")
+        market_reasons.append("账户成交未完成券商核对，资产与持仓只能作参考重估。")
+
+    market_missing = []
+    if not isinstance(up, (int, float)) or not isinstance(down, (int, float)):
+        market_missing.append("涨跌家数")
+    if not isinstance(breadth.get("amount_ma20_yi"), (int, float)):
+        market_missing.append("前20个交易日成交额均值")
+    market_missing_text = "缺少" + "、".join(market_missing) if market_missing else "本包提供了当日涨跌家数与前20日成交额均值"
+
+    focus_research = next((h.get("research") or {} for h in holdings if h.get("ts_code") == focus_code), {})
+    availability = focus_research.get("availability") or {}
+    unavailable = availability.get("unavailable") or []
+    core_missing_text = (
+        "持仓研究缺项：" + "、".join(str(x) for x in unavailable[:3])
+        if unavailable else "本包没有附带可核验的新增产业事件；这表示事件证据未随包提供，不代表没有相关事件。"
+    )
+    reported_through = gate.get("reported_events_through")
+    reconciled_at = gate.get("last_user_reconciled_at")
+    if reconciled_at:
+        account_observation = f"账户记录的最近人工对账时间：{_ymd(reconciled_at)}。"
+        account_missing = "券商对账覆盖范围以该次核对回执为准；未覆盖日期不能推定已核对。"
+    else:
+        account_observation = (
+            f"用户完整性声明覆盖至 {_ymd(reported_through)}，当前未记录券商对账时间。"
+            if reported_through else "当前未记录用户完整性声明或券商对账时间。"
+        )
+        account_missing = "用户声明与券商实际对账是两项不同事实；账户金额仅为账本重建参考。"
 
     items = [
         {
             "label": "① 市场",
             "observation": f"{breadth_txt}；{volume_txt}；{regime_label}。",
-            "why": "量能与广度方向决定本日是否需要信任趋势延续。",
-            "missing": "成交额的 20 日均值基准与当日涨跌家数在部分数据中仍不足，无法判定结构性放量。",
+            "why": "指数趋势与个股广度来自不同统计口径，应分别观察。",
+            "missing": market_missing_text + "。",
         },
         {
             "label": "② 核心持仓",
             "observation": core_obs,
-            "why": "决定集中仓位是否已触发重新研究条件。",
-            "missing": "缺少最新产业订单金额与业绩兑现核对，基本面只能部分核对。",
+            "why": "持仓权重、相对表现与失效条件共同决定是否需要重新评估。",
+            "missing": core_missing_text,
         },
         {
             "label": "③ 当前主要不确定性",
-            "observation": (
-                "账户成交未完成核对。" if not verified
-                else "账户已对账，但前瞻证据窗口尚未成熟。"
-            ),
-            "why": "影响仓位、权重与回撤数字的可信度。",
-            "missing": "补录未录入成交并完成核对后重估；前瞻评价待窗口成熟后验证。",
+            "observation": account_observation,
+            "why": "它影响账户资产、持仓数量与交易资金结论。",
+            "missing": account_missing,
         },
     ]
 
@@ -396,28 +434,42 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
     holdings_rows: List[Dict[str, str]] = []
     _STANCE_ZH = {"HOLD": "继续观察", "WATCH": "重点观察", "REDUCE": "可研究降低风险",
                   "ROTATE": "可研究轮动（未验证）"}
-    for h in holdings:
+    model_rows = (report_model or {}).get("holdings_rows") or []
+    if model_rows:
+        for row in model_rows:
+            if not isinstance(row, dict):
+                continue
+            holdings_rows.append({
+                "symbol": f"{row.get('ts_code') or ''}（{row.get('name') or row.get('ts_code') or ''}）",
+                "judgment": str(row.get("stance") or "证据不足以确定调整"),
+                "basis": str(row.get("basis") or "数据不足以单独评述风险。"),
+            })
+    for h in ([] if model_rows else holdings):
         ts_code = h.get("ts_code") or ""
         name = h.get("name") or ts_code
         weight = h.get("weight")
         research = h.get("research") or {}
-        reasons = h.get("reasons") or []
+        holding_reasons = h.get("reasons") or []
         counter = h.get("counter_evidence") or []
         stance = h.get("stance") or ""
         holdings_rows.append({
             "symbol": f"{ts_code}（{name}）",
             "judgment": _STANCE_ZH.get(stance, "证据不足以确定调整"),
-            "basis": "；".join(str(x) for x in (list(reasons)[:1] + list(counter)[:1])) or "数据不足以单独评述风险。",
+            "basis": "；".join(str(x) for x in (list(holding_reasons)[:1] + list(counter)[:1])) or "数据不足以单独评述风险。",
         })
 
     next_date = _get(bundle, "portfolio", "expected_next_trade_date") or ""
     conditions: List[str] = []
     if focus_watch:
         conditions.append(f"{_ymd(next_date)}：{focus_watch}")
-    if isinstance(amount_chg, (int, float)):
-        conditions.append(f"{_ymd(next_date)}：核对成交额相对 5 日均量是否转为明显放量/缩量。")
-    if not verified:
-        conditions.append(f"{_ymd(next_date)}：核对账户成交补录进度；未核对完成前不提供买卖数量。")
+    if isinstance(breadth.get("amount_ma20_yi"), (int, float)):
+        conditions.append(f"{_ymd(next_date)}：观察当日成交额相对前20个交易日均值的变化；单日上涨广度不单独视为趋势反转。")
+    if not reconciled_at:
+        conditions.append(f"{_ymd(next_date)}：取得覆盖最新交易日的券商持仓与现金核对后，再评估参考数量。")
+    if not conditions:
+        conditions.extend(str(x) for x in (first_section.get("observation_triggers") or []) if x)
+    if not conditions:
+        conditions.append(f"{_ymd(next_date)}：复核新的账户或持仓事实；本期没有具体价格触发条件。")
 
     gaps = evidence_gaps
     notes: List[str] = []
@@ -431,7 +483,7 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
         # Gaps here are structured dicts ({module, reason, affected}); render the
         # investor meaning, never the internal code or the raw dict.
         _GAP_ZH = {
-            "unreported_trade_risk": "存在未录入的券商成交，账户尚未完成核对",
+            "unreported_trade_risk": "账户完整性声明尚未覆盖本报告日，无法确认声明时点之后是否有新增成交",
         }
         gap_texts = []
         for g in gaps[:3]:
@@ -443,6 +495,19 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
     if evidence_gaps or not verified or current_dd is None:
         pass  # already disclosed above
 
+    action_triggers = [
+        str(trigger)
+        for action in first_actions if isinstance(action, dict)
+        for trigger in (action.get("triggers") or []) if trigger
+    ]
+    observation_triggers = [str(x) for x in (first_section.get("observation_triggers") or []) if x]
+    change_conditions = action_triggers or observation_triggers
+    change_condition = (
+        "；".join(change_conditions[:2])
+        if change_conditions else
+        "出现覆盖报告日的新账户核对、重大持仓事实或既有风险政策触发条件时重新评估。"
+    )
+
     return {
         "title": f"A 股账户研究日报｜{_ymd(as_of)}收盘",
         "subtitle": (
@@ -452,11 +517,9 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
         "sections": {
             "今日判断": {
                 "conclusion": conclusion,
-                "reasons": reasons[:3],
+                "reasons": market_reasons[:3],
                 "max_risk": narrative_parts[0] if narrative_parts else "最大持仓集中度为当前组合的主要风险。",
-                "change_condition": (
-                    f"如{focus_code} 收盘跌破近 20 个交易日最低收盘，或账户完成成交核对，将重估是否需要调整。"
-                ),
+                "change_condition": change_condition,
                 "execution_note": "当前不提供买卖数量；研究判断与执行数量门控分离。",
             },
             "账户与风险": {

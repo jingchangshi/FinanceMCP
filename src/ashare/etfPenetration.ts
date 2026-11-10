@@ -7,9 +7,8 @@
  *    供开发期与验收组装真实输入（不访问网络）。
  *  - 成分股权重必须带有效日期（weight_date）；相对 as_of 过期时显式标注
  *    `freshness.status`，禁止把历史权重称为最新权重。
- *  - 权重来源三级：显式传入 weightRows+weightDate → 数据文件缓存
- *    `$ASHARE_DATA_DIR/etf-weights/<code>.json`（weightCaptureCli 只读采集落盘）→
- *    均无则 UNAVAILABLE（不 throw、不臆造）。
+ *  - 权重来源顺序：显式传入 → SQLite 点时快照 → 数据文件缓存
+ *    `$ASHARE_DATA_DIR/etf-weights/<code>.json` → 均无则 UNAVAILABLE。
  *  - 覆盖率按分量计算（成分/财报/估值/预测/行情），缺口逐条列出；
  *    **禁止用代表性企业代替 ETF 整体**：覆盖不足时对应结论块置为
  *    `insufficient_evidence` 且不给出伪精确数字。
@@ -27,9 +26,10 @@ import { join } from 'node:path';
 import { financialsAsOf } from './data.js';
 import { addDays } from './ingest.js';
 import { ashareDataDir } from './db.js';
+import { weightsAvailableAt } from './etfWeightStore.js';
 
 export const ETF_PENETRATION_SCHEMA = 'etf-penetration-summary@1';
-export const ETF_PENETRATION_VERSION = 'etf-penetration-20261026-v1';
+export const ETF_PENETRATION_VERSION = 'etf-penetration-v2';
 /** 权重新鲜度阈值：成分权重多为月末刷新，超过 45 个自然日判为过期。 */
 export const DEFAULT_MAX_WEIGHT_AGE_DAYS = 45;
 
@@ -164,6 +164,8 @@ export interface EtfPenetrationInput {
     weight_date: string;
     /** 数据发布/公告日（fund_portfolio 的最晚 ann_date；index_weight 未知为 null）。 */
     publication_date?: string | null;
+    /** Point-in-time date from which this snapshot is usable. */
+    available_from?: string | null;
     rows: ConstituentRow[];
   };
   fundamentals?: Record<string, FundamentalFact>;
@@ -207,6 +209,11 @@ export interface EtfPenetrationSummary {
     source: string;
     weight_date: string;
     publication_date: string | null;
+    available_from: string | null;
+    /** fund_portfolio stk_mkv_ratio uses equity market value, not fund NAV. */
+    weight_denominator: 'tracking_index_total_weight_pct' | 'reported_equity_market_value_pct';
+    /** Sum of reported constituent weights on weight_denominator. */
+    weight_coverage_pct: number;
     count: number;
     weight_sum_pct: number;
     freshness: WeightFreshness;
@@ -682,6 +689,9 @@ export function buildEtfPenetrationSummary(input: EtfPenetrationInput): EtfPenet
       source: input.weight.source,
       weight_date: input.weight.weight_date,
       publication_date: input.weight.publication_date ?? null,
+      available_from: input.weight.available_from ?? (input.weight.source === 'index_weight' ? input.weight.weight_date : input.weight.publication_date ?? null),
+      weight_denominator: input.weight.source === 'index_weight' ? 'tracking_index_total_weight_pct' : 'reported_equity_market_value_pct',
+      weight_coverage_pct: round(weightSum),
       count: n,
       weight_sum_pct: round(weightSum),
       freshness,
@@ -723,6 +733,7 @@ export interface CollectOptions {
   benchmarkIndexCode?: string | null;
   /** fund_portfolio 口径下的报告期公告日。 */
   weightPublicationDate?: string | null;
+  weightAvailableFrom?: string | null;
   forecastRows?: Record<string, ForecastFact[]>;
   comparables?: Array<{ ts_code: string; kind: ComparableRow['kind'] }>;
   driverEvidence?: DriverEvidence;
@@ -854,24 +865,36 @@ export function collectEtfPenetrationInputs(db: DatabaseSync, opts: CollectOptio
     : undefined) ?? null;
   const etfCode = opts.etfCode;
 
-  // ---- 权重解析（三级）：显式传入 → etf-weights 数据文件缓存 → UNAVAILABLE。
-  // 显式成立条件 = 有行 且 weightDate 为合法 8 位日期；否则尝试缓存文件；
-  // 缓存也无 → weight_date=''（weightFreshness → UNAVAILABLE）且 rows 为空，
-  // 调用方（bundle 层）按 rows.length===0 降级，全程不 throw、不臆造。
+  // ---- 权重解析：显式传入 → SQLite PIT 快照 → JSON 缓存 → UNAVAILABLE。
+  // 仅接受完整且质量为 OK 的 SQLite 快照；混合来源/分母由 store 层拒绝。
   const explicitWeight = (opts.weightRows?.length ?? 0) > 0 && /^\d{8}$/.test(opts.weightDate ?? '');
   let weightRows: Array<{ con_code: string; weight: number }> = explicitWeight ? opts.weightRows! : [];
   let weightDate = explicitWeight ? opts.weightDate! : '';
   let weightSource: 'index_weight' | 'fund_portfolio' | null = explicitWeight ? (opts.weightSource ?? null) : null;
   let publicationDate: string | null = explicitWeight ? (opts.weightPublicationDate ?? null) : null;
+  let availableFrom: string | null = explicitWeight ? (opts.weightAvailableFrom ?? (weightSource === 'index_weight' ? weightDate : publicationDate)) : null;
   let indexCode: string | null = explicitWeight ? (opts.indexCode ?? null) : null;
   if (!explicitWeight) {
-    const cached = readEtfWeightCache(etfCode, opts.dataDir);
-    if (cached) {
-      weightRows = cached.weightRows.map(r => ({ con_code: r.ts_code, weight: r.weight }));
-      weightDate = cached.weight_date;
-      weightSource = cached.weight_source;
-      publicationDate = cached.publication_date;
-      indexCode = cached.index_code;
+    const stored = weightsAvailableAt(db, etfCode, asOf);
+    if (stored.rows.length && stored.rows.every(row => row.quality_status === 'OK' && row.weight !== null && Number.isFinite(row.weight))) {
+      const first = stored.rows[0];
+      weightRows = stored.rows.map(row => ({ con_code: row.stock_code, weight: row.weight! }));
+      weightDate = first.effective_date;
+      weightSource = first.source;
+      publicationDate = stored.rows.map(row => row.published_at).filter((date): date is string => !!date).sort().at(-1) ?? null;
+      availableFrom = stored.rows.map(row => row.available_from).sort().at(-1) ?? null;
+      indexCode = first.index_code;
+    }
+    if (!weightRows.length) {
+      const cached = readEtfWeightCache(etfCode, opts.dataDir);
+      if (cached) {
+        weightRows = cached.weightRows.map(r => ({ con_code: r.ts_code, weight: r.weight }));
+        weightDate = cached.weight_date;
+        weightSource = cached.weight_source;
+        publicationDate = cached.publication_date;
+        availableFrom = cached.weight_source === 'index_weight' ? cached.weight_date : cached.publication_date;
+        indexCode = cached.index_code;
+      }
     }
   }
 
@@ -888,6 +911,7 @@ export function collectEtfPenetrationInputs(db: DatabaseSync, opts: CollectOptio
     index_code: indexCode,
     weight_date: weightDate,
     publication_date: publicationDate,
+    available_from: availableFrom,
     rows: weightRows.map(r => ({
       con_code: r.con_code, weight: r.weight,
       name: nameMap.get(r.con_code)?.name ?? null,
