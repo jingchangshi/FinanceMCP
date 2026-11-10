@@ -192,7 +192,7 @@ export function buildInvestorReportModel(input: {
     evidence_refs: input.gaps.flatMap(gap => gap.affected ?? []).filter((value, index, all) => all.indexOf(value) === index),
     limitations: [
       '研究倾向、执行可行性与策略有效性是三件不同的事：本报告不提供下单授权。',
-      '未执行部署、推送、调度修改或飞书写入；预览与回读状态以交付说明为准。',
+      '本报告由只读研究引擎生成；发布与回读由发布流程负责，研究引擎不写账户、不改调度、不产生下单授权。',
       '没有经过前瞻验证的收益证据，不承诺盈利，也不把检测数量当作业绩。',
     ],
   };
