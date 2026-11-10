@@ -61,6 +61,11 @@ export function indexPerformance(db: DatabaseSync, date: string): IndexPerforman
   return out;
 }
 
+/**
+ * Counts and turnover use all daily rows present for `date` (same-day market
+ * coverage). `amount_ma20_yi` is the mean of the prior 20 trading-day totals,
+ * excluding `date`; `amount_chg_pct` separately compares with the prior day.
+ */
 export function marketBreadth(db: DatabaseSync, date: string): MarketBreadth {
   const row: any = breadthByDate(db, date, date).get(date) ?? { stocks: 0, up: 0, down: 0, flat: 0, limit_up: 0, limit_down: 0, amount: 0 };
   const pcts = (db.prepare('SELECT pct_chg FROM daily WHERE trade_date = ? ORDER BY pct_chg').all(date) as any[]).map(r => r.pct_chg);
@@ -87,9 +92,11 @@ export function marketBreadth(db: DatabaseSync, date: string): MarketBreadth {
 }
 
 /**
- * Market regime from CSI 300 trend: uptrend when close > MA60 and MA20 is
- * rising over 5 days, downtrend when close < MA60 and MA20 is falling,
- * otherwise range. Uses index data up to `date` only.
+ * Market regime from CSI 300 only: uptrend when close > MA60 and today's
+ * MA20 > MA20 five trading sessions earlier; downtrend when close < MA60 and
+ * today's MA20 <= MA20 five sessions earlier; otherwise range. Requires the
+ * current MA60 and five-session MA20 comparison to be available and uses no
+ * index data after `end`.
  */
 export function regimeSeries(db: DatabaseSync, end: string): Map<string, Regime> {
   const rows = db.prepare("SELECT trade_date, close FROM index_daily WHERE ts_code = '000300.SH' AND trade_date <= ? ORDER BY trade_date").all(end) as any[];
