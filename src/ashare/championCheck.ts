@@ -211,10 +211,10 @@ export async function checkProductionChampion(db: any, asOf: string): Promise<Ch
   // the pure check should not have to load the analysis module and its config
   // side effects, and `import()` is the project's module form (`"type": "module"`).
   const analysis = await import('./analysis.js');
-  const scan = analysis.scanMarket(db, asOf);
-  const breakdowns = analysis.scoreRows(scan.rows, scan.sectors, analysis.SCORE_VERSION);
+  const scan = analysis.scanMarket(db, asOf, { score_version: analysis.LEGACY_SCORE_VERSION });
+  const breakdowns = analysis.scoreRows(scan.rows, scan.sectors, analysis.LEGACY_SCORE_VERSION);
   return checkChampionConsistency({
-    version: analysis.SCORE_VERSION,
+    version: analysis.LEGACY_SCORE_VERSION,
     weights: { ...analysis.SCORE_RULES.weights },
     rules: {
       min_listed_days: analysis.SCORE_RULES.min_listed_days,

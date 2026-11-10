@@ -199,14 +199,15 @@ export function loadVerdicts(db: DatabaseSync, asOf?: string): { verdicts: Map<s
 }
 
 /**
- * Realised forward performance of the stored watchlist (research record, not
- * a backtest): for each watchlist date t, members' return from the open of
- * t+1 to the close of t+h versus the equal-weight return of every stock
- * trading on both days. Prices are adjusted with adj_factor.
+ * Realised forward performance of the stored watchlist (a pool research
+ * record, not a signal study, account study, or backtest): for each watchlist
+ * date t, priced members' adjusted return from the open of t+1 to the close of
+ * t+h is compared with the equal-weight return of all sufficiently covered
+ * stocks priced over the same endpoints.
  *
- * Strictly as of `end`: only dates whose whole window t+1..t+h lies on or
- * before `end` are counted, and no price after `end` is read, so data that
- * arrives later cannot change an earlier report's figures.
+ * Strictly as of `end`: a horizon is immature until t+h is on or before `end`.
+ * Mature dates excluded for inadequate market coverage or no priced pool
+ * members are counted separately. No price after `end` is read.
  */
 export function evaluateWatchlist(db: DatabaseSync, start: string, end: string, horizon = 5, minUniverse = 1000) {
   const days = (db.prepare('SELECT cal_date FROM trade_cal WHERE is_open = 1 AND cal_date BETWEEN ? AND ? ORDER BY cal_date').all(start, end) as any[]).map(r => r.cal_date as string);
@@ -219,20 +220,50 @@ export function evaluateWatchlist(db: DatabaseSync, start: string, end: string, 
     JOIN adj_factor ah ON ah.ts_code = dh.ts_code AND ah.trade_date = dh.trade_date
     WHERE d1.trade_date = ? AND d1.open > 0`);
   const members = db.prepare('SELECT ts_code FROM watchlist WHERE trade_date = ?');
-  const perDate: { trade_date: string; members: number; pool_ret: number; market_ret: number; excess: number }[] = [];
+  const perDate: { trade_date: string; members: number; selected_members: number; priced_members: number; pool_coverage: number; market_priced_stocks: number; pool_ret: number; market_ret: number; excess: number }[] = [];
+  const excluded: { trade_date: string; reason: 'market_coverage_below_minimum' | 'no_priced_pool_members' | 'missing_calendar_date'; selected_members?: number; priced_members?: number; market_priced_stocks?: number; minimum_market_coverage_stocks?: number }[] = [];
+  let immatureDates = 0;
+  let matureDates = 0;
+  let inadequateMarketCoverageDates = 0;
+  let noPricedPoolDates = 0;
+  let selectedMembers = 0;
+  let pricedMembers = 0;
   for (const t of wlDates) {
     const i = days.indexOf(t);
-    if (i < 0 || i + horizon >= days.length) continue;
-    // A NULL return (e.g. missing adj_factor) must not enter the benchmark mean as 0.
+    if (i < 0) {
+      excluded.push({ trade_date: t, reason: 'missing_calendar_date' });
+      continue;
+    }
+    if (i + horizon >= days.length) {
+      immatureDates++;
+      continue;
+    }
+    matureDates++;
+    const selected = members.all(t) as any[];
+    selectedMembers += selected.length;
+    // NULL/absent prices or adjustment factors are missing observations, never zero returns.
     const rows = (ret.all(days[i + horizon], days[i + 1]) as any[]).filter(r => Number.isFinite(r.r));
-    if (rows.length < minUniverse) continue;
     const byCode = new Map(rows.map(r => [r.ts_code, r.r as number]));
-    const pool = (members.all(t) as any[]).map(m => byCode.get(m.ts_code)).filter((v): v is number => Number.isFinite(v));
-    if (!pool.length) continue;
+    const pool = selected.map(m => byCode.get(m.ts_code)).filter((v): v is number => Number.isFinite(v));
+    pricedMembers += pool.length;
+    if (rows.length < minUniverse) {
+      inadequateMarketCoverageDates++;
+      excluded.push({ trade_date: t, reason: 'market_coverage_below_minimum', selected_members: selected.length, priced_members: pool.length, market_priced_stocks: rows.length, minimum_market_coverage_stocks: minUniverse });
+      continue;
+    }
+    if (!pool.length) {
+      noPricedPoolDates++;
+      excluded.push({ trade_date: t, reason: 'no_priced_pool_members', selected_members: selected.length, priced_members: 0, market_priced_stocks: rows.length, minimum_market_coverage_stocks: minUniverse });
+      continue;
+    }
     const mean = (v: number[]) => v.reduce((s, x) => s + x, 0) / v.length;
     const p = mean(pool);
     const m = mean(rows.map(r => r.r));
-    perDate.push({ trade_date: t, members: pool.length, pool_ret: p, market_ret: m, excess: p - m });
+    perDate.push({
+      trade_date: t, members: pool.length, selected_members: selected.length, priced_members: pool.length,
+      pool_coverage: selected.length ? pool.length / selected.length : 0,
+      market_priced_stocks: rows.length, pool_ret: p, market_ret: m, excess: p - m,
+    });
   }
   const ex = perDate.map(d => d.excess);
   const avg = ex.length ? ex.reduce((s, v) => s + v, 0) / ex.length : NaN;
@@ -240,14 +271,27 @@ export function evaluateWatchlist(db: DatabaseSync, start: string, end: string, 
   const pct = (v: number) => Math.round(v * 1e4) / 100;
   return {
     horizon,
+    horizon_unit: 'trading_days',
     as_of: end,
-    pending_dates: wlDates.length - perDate.length,
+    selected_dates: wlDates.length,
+    mature_dates: matureDates,
+    immature_dates: immatureDates,
+    evaluated_dates: perDate.length,
+    excluded_dates: excluded.length,
+    inadequate_market_coverage_dates: inadequateMarketCoverageDates,
+    no_priced_pool_member_dates: noPricedPoolDates,
+    pending_dates: immatureDates + excluded.length,
     dates: perDate.length,
+    selected_members: selectedMembers,
+    priced_pool_members: pricedMembers,
+    pool_member_coverage: selectedMembers ? Math.round((pricedMembers / selectedMembers) * 1000) / 1000 : null,
+    minimum_market_coverage_stocks: minUniverse,
     mean_excess_pct: pct(avg),
     hit_rate: ex.length ? Math.round((ex.filter(v => v > 0).length / ex.length) * 1000) / 1000 : null,
     // Overlapping windows: consecutive dates share h-1 days, so this t-stat overstates significance.
     t_stat_overlapping: sd > 0 ? Math.round((avg / (sd / Math.sqrt(ex.length))) * 100) / 100 : null,
-    note: '股票池为启发式评分结果；样本短且持有期重叠，不能据此推断盈利概率',
-    per_date: perDate.map(d => ({ ...d, pool_ret: pct(d.pool_ret), market_ret: pct(d.market_ret), excess: pct(d.excess) })),
+    note: '股票池是按成员日期记录的启发式评分池；这里只比较已定价成员与同期全市场等权收益。该记录不同于今日信号事件分类、召回率研究或个人账户前向研究；样本短且窗口重叠，不能据此推断盈利概率。',
+    exclusions: excluded,
+    per_date: perDate.map(d => ({ ...d, pool_coverage: Math.round(d.pool_coverage * 1000) / 1000, pool_ret: pct(d.pool_ret), market_ret: pct(d.market_ret), excess: pct(d.excess) })),
   };
 }

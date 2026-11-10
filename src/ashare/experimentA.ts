@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { SCORE_RULES, SCORE_VERSION, scanMarket, scoreRows, sectorRank, type StockRow } from './analysis.js';
+import { LEGACY_SCORE_VERSION, SCORE_RULES, SCORE_VERSION, scanMarket, scoreRows, sectorRank, type StockRow } from './analysis.js';
 import { evaluateEvents } from './evaluation.js';
 
 /**
@@ -158,9 +158,9 @@ function rankKey(
 
 /** Draw the top `POOL_SIZE` names by the arm's ranking statistic. */
 export function selectPool(db: Parameters<typeof scanMarket>[0], asOf: string, arm: SelectionArm): ArmSelection {
-  const scan = scanMarket(db, asOf);
+  const scan = scanMarket(db, asOf, { score_version: LEGACY_SCORE_VERSION });
   const eligible = scan.rows.filter(r => r.eligible);
-  const breakdowns = scoreRows(scan.rows, scan.sectors, SCORE_VERSION);
+  const breakdowns = scoreRows(scan.rows, scan.sectors, LEGACY_SCORE_VERSION);
   const keys = rankKey(arm, eligible, breakdowns, scan.sectors);
   const ranked = eligible
     .filter(r => Number.isFinite(keys.get(r.ts_code) ?? NaN))
@@ -173,7 +173,7 @@ export function selectPool(db: Parameters<typeof scanMarket>[0], asOf: string, a
   return { arm, as_of: asOf, universe_size: eligible.length, pool, mean_score };
 }
 
-export { SCORE_RULES, SCORE_VERSION, sectorRank };
+export { LEGACY_SCORE_VERSION, SCORE_RULES, SCORE_VERSION, sectorRank };
 
 
 // ---------------------------------------------------------------- forward evaluation

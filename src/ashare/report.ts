@@ -13,7 +13,7 @@ import { EVIDENCE_SCOPE, EVIDENCE_VERSION, evaluateWatchlist, loadVerdicts, Sign
 
 export { resolveReportPath };
 
-export const REPORT_SCHEMA_VERSION = 'ashare-report-1.0.0';
+export const REPORT_SCHEMA_VERSION = 'ashare-report-1.1.0';
 
 export const DATA_SOURCES = [
   'Tushare Pro trade_cal（交易日历）',
@@ -79,6 +79,7 @@ function memberView(row: StockRow, verdicts: Map<string, SignalVerdict>, extra: 
       atr_pct: r2(row.state.atr_pct * 100),
       ma20: r2(row.ma20),
       ma60: r2(row.ma60),
+      trend_context: '技术趋势描述价格与均线状态，仅作背景信息；趋势变化本身不是股票池移除条件。',
     },
     fundamentals: f ? {
       report_period: f.end_date,
@@ -90,9 +91,15 @@ function memberView(row: StockRow, verdicts: Map<string, SignalVerdict>, extra: 
     } : null,
     valuation: { pe_ttm: r2(row.pe_ttm), pb: r2(row.pb) },
     signals_today: row.signals.map(id => signalView(id, verdicts)),
+    pool_membership: {
+      status: extra.status,
+      entered_on: extra.entered_on,
+      current_membership_reason: extra.membership_reason,
+      policy: `成员资格由准入条件、排名保留阈值（${WATCHLIST_RULES.exit_rank}）、最短持有期（${WATCHLIST_RULES.min_hold_days} 个交易日）、行业上限（${WATCHLIST_RULES.industry_cap} 只）及每日新增/替换规则共同决定；MA60 或技术趋势变化本身不直接触发移除。`,
+    },
     watch_invalidation: [
-      `收盘价跌破 MA60（约 ${r2(row.ma60)}）视为趋势条件失效`,
-      `评分排名跌出前 ${WATCHLIST_RULES.exit_rank} 或不再满足准入条件时移出股票池`,
+      `按股票池规则评估：准入条件、排名保留阈值（${WATCHLIST_RULES.exit_rank}）、最短持有期（${WATCHLIST_RULES.min_hold_days} 个交易日）、行业上限及新增/替换规则；今日实际成员理由见 pool_membership.current_membership_reason。`,
+      'MA60 与技术趋势仅为技术背景，不是独立的股票池移除条件。',
     ],
     risks: row.risk_flags,
   };
@@ -100,27 +107,26 @@ function memberView(row: StockRow, verdicts: Map<string, SignalVerdict>, extra: 
 
 function marketJudgement(regime: Regime | undefined, breadth: ReturnType<typeof marketBreadth>, pctMa20: number, pctMa60: number, indices: ReturnType<typeof indexPerformance>) {
   const points: string[] = [];
-  if (regime) points.push(`沪深300 趋势状态：${REGIME_LABELS[regime]}（规则：收盘相对 MA60 与 MA20 五日斜率）`);
-  points.push(`上涨 ${breadth.up} 家 / 下跌 ${breadth.down} 家（上涨占比 ${(breadth.up_ratio * 100).toFixed(1)}%），涨停 ${breadth.limit_up}、跌停 ${breadth.limit_down}`);
-  points.push(`站上 MA20 的个股占比 ${(pctMa20 * 100).toFixed(1)}%，站上 MA60 占比 ${(pctMa60 * 100).toFixed(1)}%`);
+  if (regime) points.push(`市场趋势状态（沪深300）：${REGIME_LABELS[regime]}；仅按沪深300收盘相对 MA60 与 MA20 相对五个交易日前的斜率判定，上升需收盘高于 MA60 且 MA20 上行，下降需收盘低于 MA60 且 MA20 不上行，其余为震荡。`);
+  points.push(`全市场当日有日线记录的 ${breadth.stocks} 只股票中，上涨 ${breadth.up} 家 / 下跌 ${breadth.down} 家（上涨占比 ${(breadth.up_ratio * 100).toFixed(1)}%），涨停 ${breadth.limit_up}、跌停 ${breadth.limit_down}；停牌或当日无行情股票不在此分母内。`);
+  points.push(`扫描股票中站上 MA20 的占比 ${(pctMa20 * 100).toFixed(1)}%，站上 MA60 占比 ${(pctMa60 * 100).toFixed(1)}%；这是技术广度，分母与全市场上涨占比不同。`);
   if (breadth.amount_ma20_yi) {
     const ratio = breadth.amount_yi / breadth.amount_ma20_yi;
-    points.push(`两市成交额 ${breadth.amount_yi.toFixed(0)} 亿，为 20 日均值的 ${(ratio * 100).toFixed(0)}%（${ratio > 1.1 ? '放量' : ratio < 0.9 ? '缩量' : '量能持平'}）`);
+    points.push(`全市场当日成交额 ${breadth.amount_yi.toFixed(0)} 亿，相对前 20 个交易日（不含当日）日成交额均值为 ${(ratio * 100).toFixed(0)}%（${ratio > 1.1 ? '高于均值' : ratio < 0.9 ? '低于均值' : '接近均值'}）。`);
   }
-  // Basis-labeled day-over-day (P1-2, goal-1109): never write bare 放量/缩量.
-  // The vs-20日均值 and 环比 baselines can legitimately disagree; both are labeled.
   if (breadth.amount_chg_pct !== null && breadth.amount_chg_pct !== undefined) {
-    points.push(`两市成交额较上日 ${breadth.amount_chg_pct > 0 ? '+' : ''}${breadth.amount_chg_pct.toFixed(1)}%（环比）`);
+    points.push(`全市场成交额较前一交易日 ${breadth.amount_chg_pct > 0 ? '+' : ''}${breadth.amount_chg_pct.toFixed(1)}%（环比；与20日均值为不同基准）。`);
   }
   const big = indices.find(i => i.ts_code === '000300.SH');
   const small = indices.find(i => i.ts_code === '000852.SH');
   if (big?.ret20 != null && small?.ret20 != null) {
     const diff = small.ret20 - big.ret20;
-    points.push(`近 20 日中证1000 相对沪深300 ${diff >= 0 ? '强' : '弱'} ${Math.abs(diff).toFixed(1)} 个百分点（${diff >= 0 ? '小盘占优' : '大盘占优'}）`);
+    points.push(`近 20 日中证1000 相对沪深300 ${diff >= 0 ? '强' : '弱'} ${Math.abs(diff).toFixed(1)} 个百分点（指数相对收益，不参与上述市场宽度或成交额判定）。`);
   }
   let tone: 'risk_on' | 'neutral' | 'risk_off' = 'neutral';
   if (breadth.up_ratio >= 0.6 && pctMa20 >= 0.5) tone = 'risk_on';
   else if (breadth.up_ratio <= 0.35 && pctMa20 <= 0.4) tone = 'risk_off';
+  points.push(`市场情绪 tone=${tone}：risk_on 要求全市场上涨占比 ≥60% 且扫描股票站上 MA20 占比 ≥50%；risk_off 要求分别 ≤35% 与 ≤40%；其他情况为 neutral。`);
   return { tone, points };
 }
 
@@ -252,14 +258,18 @@ export function generateReport(db: DatabaseSync, date: string, mode: RunMode = '
     market: {
       regime: regime ?? null,
       regime_label: regime ? REGIME_LABELS[regime] : '历史不足',
+      regime_method: '沪深300收盘价与MA60比较，并比较当日MA20与五个交易日前MA20：收盘高于MA60且MA20上行=uptrend；收盘低于MA60且MA20不高于五日前=downtrend；其他=range。需要足够历史数据，使用截至报告日的数据。',
       tone: judgement.tone,
+      tone_method: 'risk_on: 全市场当日有行情股票上涨占比≥60%且扫描股票站上MA20占比≥50%；risk_off: 两者分别≤35%和≤40%；否则neutral。两个比例的股票分母口径不同。',
       judgement: judgement.points,
       indices,
+      breadth_scope: 'up/down/flat、涨跌停和成交额覆盖当日 daily 表中有市场行记录的全市场股票；MA20/MA60 技术广度来自 scanMarket 扫描股票。没有当日市场行的停牌或缺行情股票不在日线宽度分母中。',
+      volume_scope: '全市场成交额由当日有行情记录的股票 daily.amount 求和；20日基准为前20个交易日（不含当日）的日成交额均值，环比为前一交易日基准。',
       breadth: { ...breadth, pct_above_ma20: r2(scan.pct_above_ma20 * 100, 1), pct_above_ma60: r2(scan.pct_above_ma60 * 100, 1) },
       suspended_or_missing: scan.suspended_or_missing,
     },
     sectors: {
-      method: '行业为 Tushare stock_basic 行业；强度 = 0.5·pr(20日中位收益) + 0.3·pr(5日中位收益) + 0.2·pr(站上MA20比例)',
+      method: '行业为 Tushare stock_basic 当前行业分类；每行业至少5只扫描股票才纳入。strength 是当日纳入行业之间的横截面复合百分位（0.5×行业成分股20日收益中位数百分位 + 0.3×5日收益中位数百分位 + 0.2×站上MA20比例百分位），用于行业间相对排序，不是市场趋势、全市场宽度或绝对收益指标。amount20_yi 为行业扫描股票各自20日平均成交额之和。',
       top: scan.sectors.slice(0, 8).map(sectorView),
       bottom: scan.sectors.slice(-5).reverse().map(sectorView),
       all: scan.sectors.map(sectorView),
@@ -273,7 +283,10 @@ export function generateReport(db: DatabaseSync, date: string, mode: RunMode = '
       industry_distribution: watch.industry_distribution,
       track_record: {
         ...trackRecord,
-        method: `近 60 个交易日内每个股票池日期：成员次日开盘至第 5 个交易日收盘的等权收益，减去全市场等权收益；只统计截至 ${date} 已完整实现的窗口`,
+        horizon: 5,
+        horizon_unit: 'trading_days',
+        method: `实际 horizon 固定为5个交易日：每个股票池日期 t 的成员在 t+1 日开盘入场，于 t+5 日收盘退出，计算已定价池成员等权收益减去同期全市场等权收益。最多回看60个池日期；日期分母及排除情况见 selected_dates、mature_dates、evaluated_dates、immature_dates、excluded_dates、inadequate_market_coverage_dates、no_priced_pool_member_dates；成员分母为成熟池日期上的 selected_members 观察数，priced_pool_members 是其中可定价观察数，pool_member_coverage=priced_pool_members/selected_members。pending_dates 为 immature_dates 加 excluded_dates；exclusions 逐日给出原因与市场覆盖数。`,
+        research_scope: '这是按历史股票池成员日期计算的描述性池表现记录，不是今日信号事件证据分类、召回率测量、个人账户研究或完整策略回测。历史成员来自各日期当时形成的评分和股票池规则，可能跨越不同 score/watchlist 版本；该结果不能作为当前 score-3 或当前规则有效性的证据。',
       },
       added: watch.changes.filter(c => c.action === 'add'),
       removed: watch.changes.filter(c => c.action === 'remove'),
@@ -283,7 +296,7 @@ export function generateReport(db: DatabaseSync, date: string, mode: RunMode = '
       market_summary: signalSummary,
       evidence_window: evidenceMeta,
       evidence_scope: EVIDENCE_SCOPE,
-      note: 'evidence_supported = 样本内方向性证据（收益窗口重叠、未做多重检验校正），不是策略有效性；research_only 为研究指标；contradicted 为样本内方向相反。均不应视为交易规则。',
+      note: 'evidence_supported = 样本内信号触发事件的方向性统计证据（收益窗口重叠、未做多重检验校正），不是策略有效性；research_only 为研究指标；contradicted 为样本内方向相反。此分类是信号事件研究，与历史股票池成员 track_record、召回率评估及个人账户前向研究分别独立；均不应视为交易规则。',
     },
     risks: [
       ...(quality.status === 'DEGRADED' ? quality.reasons.map(r => `数据降级：${r}`) : []),

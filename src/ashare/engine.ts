@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { SCORE_RULES, SCORE_VERSION, RESEARCH_SCORE_VERSION, scanMarket, scoreRows, type ScoreVersion, type ScoreBreakdown, type StockRow } from './analysis.js';
+import { SCORE_RULES, LEGACY_SCORE_VERSION, SCORE_VERSION, RESEARCH_SCORE_VERSION, scanMarket, scoreRows, type ScoreVersion, type ScoreBreakdown, type StockRow } from './analysis.js';
 import { DATA_CONTRACT, defaultTradeDate, parseYmd, resolveCode } from './data.js';
 import { checkQuality, recentTradeDays } from './ingest.js';
 import { INDICATOR_VERSION } from './indicators.js';
@@ -23,16 +23,22 @@ export const FACTOR_UNITS = {
 
 export const SCORING_POLICY = {
   weights: SCORE_RULES.weights,
+  default_version: SCORE_VERSION,
   cash: {
-    'score-1.0.0': 'Legacy preserved: percent value >= 0.8 scores 1, > 0 scores 0.5, otherwise 0; missing ratio scores 0.5',
-    'score-2.0.0': 'Percent value >= 80 scores 1, > 0 scores 0.5, otherwise 0; missing ratio scores 0.5',
+    [LEGACY_SCORE_VERSION]: 'Legacy behavior preserved: raw percentage value >= 0.8 scores 1, > 0 scores 0.5, otherwise 0; missing ratio scores 0.5',
+    [RESEARCH_SCORE_VERSION]: 'Raw percentage value >= 80 scores 1, > 0 scores 0.5, otherwise 0; missing ratio scores 0.5',
+    [SCORE_VERSION]: 'Raw percentage value >= 80 scores 1, > 0 scores 0.5, otherwise 0; missing ratio scores 0.5',
     financial_industries: 'Banks, securities, insurance and diversified financials use the same cash threshold; this is a heuristic with limited cross-industry comparability, not a claim of accounting equivalence',
-    profit_anomalies: 'Negative ROE remains excluded by V1 eligibility in both versions. Nonpositive EPS is flagged but does not change scores: EPS and ocf_to_profit do not prove the same profit denominator. Unavailable/zero/negative denominator cannot be reconstructed from this cache; no denominator validity is asserted. Null ratio remains null in observations and uses the explicit neutral scoring default',
+    profit_anomalies: 'Negative ROE remains excluded by the shared eligibility rule in all score versions. Nonpositive EPS is flagged but does not change scores: EPS and ocf_to_profit do not prove the same profit denominator. Unavailable/zero/negative denominator cannot be reconstructed from this cache; no denominator validity is asserted. Null ratio remains null in observations and uses the explicit neutral scoring default',
   },
   leverage: 'Financial industries and missing debt ratio use neutral 0.5; other industries use <60%:1, <80%:0.5, otherwise 0',
   missing: 'Raw and observed normalized factors remain null. scoring_factors and imputations expose every formula default; absent entire financial report uses component 0.3',
-  normalization: 'Full-market eligible universe, lower positive PE ranked within industry; sector strength uses all scanned stocks with >=5 members per industry. Subset requests never change the normalization universe',
-  ties: 'Legacy ordinal percentile ties retain full-market ts_code scan order; final equal-score ranks sort by ts_code',
+  normalization: 'Full-market eligible universe, lower positive PE ranked within industry; sector strength uses all scanned stocks with >=5 members per industry. The requested score version controls percentile tie handling for both stock factors and sector strength. Subset requests never change the normalization universe',
+  ties: {
+    [LEGACY_SCORE_VERSION]: 'Ordinal percentile ties retain full-market ts_code scan order; final equal-score ranks sort by ts_code',
+    [RESEARCH_SCORE_VERSION]: 'Ordinal percentile ties retain full-market ts_code scan order, including sector-factor normalization; final equal-score ranks sort by ts_code',
+    [SCORE_VERSION]: 'Tied values receive the average of their ordinal percentile ranks for stock factors and sector-factor normalization; final equal-score ranks sort by ts_code',
+  },
 };
 
 export interface AnalysisRequest {
@@ -119,13 +125,13 @@ export function analyzeMarket(db: DatabaseSync, request: AnalysisRequest) {
   const date = parseYmd(request.date, 'date');
   if (!date) throw new Error('date is required');
   const version = request.score_version ?? SCORE_VERSION;
-  if (version !== SCORE_VERSION && version !== RESEARCH_SCORE_VERSION) throw new Error(`Unsupported score version: ${version}`);
+  if (version !== SCORE_VERSION && version !== RESEARCH_SCORE_VERSION && version !== LEGACY_SCORE_VERSION) throw new Error(`Unsupported score version: ${version}`);
   if (request.parameters?.include_components !== undefined && typeof request.parameters.include_components !== 'boolean') throw new Error('include_components must be boolean');
   for (const key of Object.keys(request.parameters ?? {})) if (key !== 'include_components') throw new Error(`Unsupported research parameter: ${key}`);
   if (request.ts_codes != null && !Array.isArray(request.ts_codes)) throw new Error('ts_codes must be an array');
   const codes = request.ts_codes ? [...new Set(request.ts_codes.map(code => resolveCode(db, code)))].sort() : undefined;
   if (!recentTradeDays(db, date, 1).length) throw new Error(`No cached trading calendar on or before ${date}`);
-  const scan = scanMarket(db, date);
+  const scan = scanMarket(db, date, { score_version: version });
   const breakdowns = scoreRows(scan.rows, scan.sectors, version);
   const byCode = new Map(scan.rows.map(row => [row.ts_code, row]));
   const sourceQuality = sourceQualityForDate(db, date);
