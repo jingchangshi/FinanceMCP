@@ -20,10 +20,8 @@ import { HOTSPOT_CONFIG_VERSION } from './hotspotTypes.js';
  * silently scores zero).
  *
  * Time semantics: every factor at date d reads only rows with trade_date ≤ d.
- * Rank history (5d/20d ago) is computed from the index-only factor subset at
- * those dates (member metrics exist only for the as-of pass — recomputing
- * full-market member history per historical date is out of scope for v1 and
- * is recorded as a documented approximation, not a hidden one).
+ * Current and historical ranks use the same available factors, including the
+ * point-in-time sector-member metrics reconstructed for each historical date.
  */
 
 export interface HotspotConfig {
@@ -66,10 +64,6 @@ export const DEFAULT_HOTSPOT_CONFIG: HotspotConfig = {
 
 export const RANK_LOOKBACK_5D = 5;
 export const RANK_LOOKBACK_20D = 20;
-const INDEX_ONLY_FACTORS = new Set([
-  'ret_5', 'ret_20', 'ret_60', 'excess_20', 'excess_60', 'risk_adj_20',
-  'amount_trend', 'excess_streak', 'vol_dd',
-]);
 export const CSI300_CODE = '000300.SH';
 
 // ---------------------------------------------------------------- index panel
@@ -162,12 +156,26 @@ interface MemberMetrics {
   /** ts_code → { pctUp (as-of day breadth), above20, above60 } */
   perStock: Map<string, { pctUp: boolean; above20: boolean; above60: boolean }>;
   rps80: Set<string>;
+  rps120Available: Set<string>;
   quality: DataQuality;
   members: number;
 }
 
+/** RPS80 density among sector members with an available 120-bar RPS value. */
+export function rps80Density(
+  members: Iterable<string>, rps120Available: ReadonlySet<string>, rps80: ReadonlySet<string>, minMembers: number,
+): number | null {
+  let eligible = 0, above80 = 0;
+  for (const ts of members) {
+    if (!rps120Available.has(ts)) continue;
+    eligible++;
+    if (rps80.has(ts)) above80++;
+  }
+  return eligible >= minMembers ? above80 / eligible : null;
+}
+
 function loadMemberMetrics(db: DatabaseSync, asOf: string, tradeDays: string[]): MemberMetrics {
-  const empty: MemberMetrics = { perStock: new Map(), rps80: new Set(), quality: 'UNAVAILABLE', members: 0 };
+  const empty: MemberMetrics = { perStock: new Map(), rps80: new Set(), rps120Available: new Set(), quality: 'UNAVAILABLE', members: 0 };
   if (!hotspotTableExists(db, 'sw_member') || !hotspotTableExists(db, 'sw_index_daily')) return empty;
   const rows = db.prepare('SELECT ts_code, l1_code, l2_code, l3_code, name, in_date, out_date, is_new FROM sw_member').all() as any[];
   if (rows.length === 0) return empty;
@@ -175,8 +183,10 @@ function loadMemberMetrics(db: DatabaseSync, asOf: string, tradeDays: string[]):
   if (members.length === 0) return { ...empty, quality: 'DEGRADED', members: 0 };
   const uniqueMembers = new Set(members.map(m => m.ts_code));
 
-  // RPS over the full stock_basic universe (cross-section needs the market).
-  const rpsStart = tradeDays[Math.max(0, tradeDays.length - 260)];
+  // RPS needs 120 trading bars. The sector panel only retains 70 for its
+  // shorter index factors, so fetch the wider date boundary separately.
+  const rpsDays = recentTradeDays(db, asOf, 260);
+  const rpsStart = rpsDays[0] ?? tradeDays[0];
   const rps = computeRps(db, rpsStart, asOf);
 
   // One batched pass per member for MA20/MA60 at asOf (70 bars is enough for MA60).
@@ -195,11 +205,14 @@ function loadMemberMetrics(db: DatabaseSync, asOf: string, tradeDays: string[]):
   }, memberCodes);
 
   const rps80 = new Set<string>();
+  const rps120Available = new Set<string>();
   for (const ts of uniqueMembers) {
-    const row = rps.rows.get(ts);
-    if (row && row.rps[120] !== null && row.rps[120] >= 80) rps80.add(ts);
+    const value = rps.rows.get(ts)?.rps[120];
+    if (value === null || value === undefined || !Number.isFinite(value)) continue;
+    rps120Available.add(ts);
+    if (value >= 80) rps80.add(ts);
   }
-  return { perStock, rps80, quality: 'OK', members: uniqueMembers.size };
+  return { perStock, rps80, rps120Available, quality: 'OK', members: uniqueMembers.size };
 }
 
 // ---------------------------------------------------------------- evaluation
@@ -210,7 +223,7 @@ interface SectorRow {
   raw: Record<string, number | null>;
   quality: DataQuality;
   qualityNotes: Array<{ quality: DataQuality; reason: string; detail?: string }>;
-  memberAgg: { breadth: number | null; above20: number | null; above60: number | null; rps80Count: number | null } | null;
+  memberAgg: { breadth: number | null; above20: number | null; above60: number | null; rps80Density: number | null } | null;
   rankNow: number | null; rank5: number | null; rank20: number | null;
   strength: number | null;
   barsAvailable: number;
@@ -253,10 +266,11 @@ function evaluateAt(db: DatabaseSync, asOf: string, tradeDays: string[],
           if (pm.above20) a20++;
           if (pm.above60) a60++;
         }
-        let rps80 = 0;
-        for (const ts of ms.keys()) if (memberMetrics.rps80.has(ts)) rps80++;
         if (counted >= cfg.minMembers) {
-          memberAgg = { breadth: up / counted, above20: a20 / counted, above60: a60 / counted, rps80Count: rps80 };
+          memberAgg = {
+            breadth: up / counted, above20: a20 / counted, above60: a60 / counted,
+            rps80Density: rps80Density(ms.keys(), memberMetrics.rps120Available, memberMetrics.rps80, cfg.minMembers),
+          };
         } else {
           quality = quality === 'OK' ? 'DEGRADED' : quality;
           qualityNotes.push({ quality: 'DEGRADED', reason: 'member_metrics_thin', detail: `${counted}<${cfg.minMembers}` });
@@ -278,7 +292,7 @@ function evaluateAt(db: DatabaseSync, asOf: string, tradeDays: string[],
       raw.breadth = memberAgg.breadth;
       raw.above_ma20_ratio = memberAgg.above20;
       raw.above_ma60_ratio = memberAgg.above60;
-      raw.rps80_density = memberAgg.rps80Count;
+      raw.rps80_density = memberAgg.rps80Density;
     }
     rows.push({ key: s.key, name: s.name, source: s.source, indexCode: s.indexCode, raw, quality, qualityNotes, memberAgg, rankNow: null, rank5: null, rank20: null, strength: null, barsAvailable: bars.length });
   }
@@ -322,11 +336,10 @@ function assignHistoricalRanks(db: DatabaseSync, asOf: string, tradeDays: string
   for (const [field, back] of [['rank5', RANK_LOOKBACK_5D], ['rank20', RANK_LOOKBACK_20D]] as const) {
     if (tradeDays.length <= back) continue;
     const pastDate = tradeDays[tradeDays.length - 1 - back];
-    const pastRows = evaluateAt(db, pastDate, tradeDays, sectors, null, cfg);
-    // Index-only historical composite (member metrics are as-of-only in v1).
-    const subsetWeights: Record<string, number> = {};
-    for (const id of Object.keys(cfg.weights)) if (INDEX_ONLY_FACTORS.has(id)) subsetWeights[id] = cfg.weights[id];
-    standardizeAndRank(pastRows, { ...cfg, weights: subsetWeights });
+    const pastTradeDays = recentTradeDays(db, pastDate, 70);
+    const pastMemberMetrics = loadMemberMetrics(db, pastDate, pastTradeDays);
+    const pastRows = evaluateAt(db, pastDate, pastTradeDays, sectors, pastMemberMetrics, cfg);
+    standardizeAndRank(pastRows, cfg);
     for (const r of into) {
       const p = pastRows.find(x => x.key === r.key);
       (r as any)[field] = p ? p.rankNow : null;
@@ -411,7 +424,7 @@ export function evaluateHotspotSectors(
   const memberMetrics = loadMemberMetrics(db, asOf, tradeDays);
   const rows = evaluateAt(db, asOf, tradeDays, sectors, memberMetrics, config);
   standardizeAndRank(rows, config);
-  assignHistoricalRanks(db, asOf, tradeDays, swSectors, config, rows);
+  assignHistoricalRanks(db, asOf, tradeDays, sectors, config, rows);
 
   // Build output sectors.
   const outSectors: HotspotSector[] = rows.map(r => {
@@ -449,6 +462,12 @@ export function evaluateHotspotSectors(
   const coverage: CoverageSummary[] = [
     ...hotspotCoverage(db, asOf),
     { dataset: 'member_metrics', rows: memberMetrics.members, quality: memberMetrics.quality },
+    {
+      dataset: 'sector_rank_universe', rows: sectors.length,
+      quality: thsSectors.length ? 'DEGRADED' : 'OK',
+      reason: `SW2021 L1全量(${swSectors.length})${thsSectors.length ? ` + THS N/I 当前目录按成分数取前30且要求至少 ${config.minIndexBars} 根指数行情(${thsSectors.length})` : ''}；历史与当日排名均在此固定横截面内计算`
+        + `；回看日的排名只含该日有足够历史的行业，缺历史的行业在该日截面中缺位（不补零、不沿用当日顺序），因此 rank_5d_ago/rank_20d_ago 的分母与当日 rank 不完全相同`,
+    },
     { dataset: 'csi300_daily', rows: (db.prepare("SELECT COUNT(*) n FROM index_daily WHERE ts_code = ? AND trade_date <= ?").get(CSI300_CODE, asOf) as { n: number }).n, quality: 'OK' },
   ];
 

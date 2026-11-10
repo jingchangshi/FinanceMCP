@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Producer tests: frozen bundle -> §5 options (goal-1109 A10/A19).
+"""Producer regressions for evidence-driven conclusions and scenario rendering.
 
-Covers the section-5 population in sections_from_bundle.build_sections:
-- HOLD / REDUCE / ROTATE from decision_comparison are the only three
-  investor-facing comparisons (DEFENSIVE / NO_ACTION stay in audit).
-- ROTATE names one top-screened stock + one top non-held ETF qualitatively
-  (no score figures, no ranked list, no pool dump).
-- An unverified rotation advantage is labelled "不构成买入建议" (A10:
-  never force rotation); a degraded ETF screen discloses its coverage gap.
-- No decision_comparison at all -> options [] (renderer fallback), no crash.
+Covers the section builder's decision boundary:
+- All engine-computed alternatives stay visible, including defensive and wait.
+- A ranked stock/ETF candidate is never promoted without a funded engine plan.
+- An unverified rotation remains explicitly unverified.
+- Market reasons survive the holdings loop; no-action does not imply HOLD is best.
+- Missing-data descriptions reflect the payload rather than stale fixed claims.
 """
 
 import sys
@@ -105,39 +103,36 @@ def options_of(bundle):
 
 
 class TestSectionFiveOptions(unittest.TestCase):
-    def test_three_compared_schemes_only(self):
-        actions_names = [opt["name"] for opt in options_of(minimal_bundle())[1]]
-        self.assertEqual(len(actions_names), 3)
-        text = "".join(actions_names)
-        self.assertIn("维持", text)
-        self.assertIn("降低集中度", text)
+    def test_all_engine_scenarios_are_visible(self):
+        options = options_of(minimal_bundle())[1]
+        self.assertEqual(len(options), 5)
+        text = "".join(opt["name"] for opt in options)
+        self.assertIn("继续持有", text)
+        self.assertIn("减仓", text)
         self.assertIn("轮动", text)
-        self.assertNotIn("权益清零", text)
-        self.assertNotIn("不操作", text)
+        self.assertIn("权益清零", text)
+        self.assertIn("不操作", text)
 
-    def test_unverified_rotation_is_never_a_recommendation(self):
-        _, options = options_of(minimal_bundle())
-        rotate = options[-1]
-        self.assertIn("贵州茅台", rotate["upside"])
-        self.assertIn("华宝现金添益货币ETF-A", rotate["upside"])
-        self.assertIn("不构成买入建议", rotate["upside"])
-        self.assertIn("不作推荐", rotate["gap"])
-        self.assertIn("覆盖不全", rotate["gap"])
-        # No scores, no ranks, no pool dump anywhere in the option text.
+    def test_ranked_alternatives_are_not_guessed_as_rotation_targets(self):
+        options = options_of(minimal_bundle())[1]
+        rotate = next(opt for opt in options if "轮动" in opt["name"])
+        self.assertIn("未形成满足资金条件", rotate["cost"])
+        self.assertIn("尚未经独立验证", rotate["gap"])
         blob = "".join(f"{o['name']}{o['upside']}{o['cost']}{o['gap']}" for o in options)
+        for ranked_candidate in ("贵州茅台", "今世缘", "华宝现金添益货币ETF-A"):
+            self.assertNotIn(ranked_candidate, blob)
         self.assertNotIn("88.4", blob)
         self.assertNotIn("0.999", blob)
-        self.assertNotIn("排名 1", blob)
-        self.assertNotIn("今世缘", blob)
 
-    def test_verified_rotation_drops_caution_label(self):
+    def test_verified_rotation_drops_unverified_evidence_blocker(self):
         bundle = minimal_bundle()
         bundle["portfolio"]["decision_comparison"]["options"][2]["alpha_track"] = {
             "evidence_verified": True,
             "status": "SUPPLIED",
         }
         options = options_of(bundle)[1]
-        self.assertNotIn("不构成买入建议", options[-1]["upside"])
+        rotate = next(opt for opt in options if "轮动" in opt["name"])
+        self.assertNotIn("未经独立验证", rotate["gap"])
 
     def test_no_decision_comparison_falls_back_to_empty(self):
         bundle = minimal_bundle()
@@ -152,9 +147,53 @@ class TestSectionFiveOptions(unittest.TestCase):
 
     def test_full_sections_stay_valid_with_options(self):
         sections, options = options_of(minimal_bundle())
-        self.assertEqual(len(options), 3)
+        self.assertEqual(len(options), 5)
         self.assertEqual(validate_sections(sections), [])
         self.assertEqual(check_forbidden(strip_tags(render_xml(sections))), [])
+
+    def test_market_reasons_are_not_replaced_by_last_holding(self):
+        bundle = minimal_bundle()
+        bundle["portfolio"]["holdings"].append({
+            "ts_code": "560390.SH", "name": "ETF-B", "weight": 0.1,
+            "stance": "HOLD", "reasons": ["最后一只持仓的专属理由"],
+            "counter_evidence": [], "research": {},
+        })
+        sections = build_sections(bundle)
+        reasons = sections["sections"]["今日判断"]["reasons"]
+        self.assertTrue(any(reason.startswith("市场广度") for reason in reasons))
+        self.assertNotIn("最后一只持仓的专属理由", reasons)
+
+    def test_no_trade_does_not_claim_holdings_are_best(self):
+        bundle = minimal_bundle()
+        bundle["research_stance"] = "HOLD_OBSERVE"
+        bundle["portfolio"]["first_section"] = {
+            "actions": [], "no_action_reason": "没有达到既有证据门槛的交易计划",
+        }
+        sections = build_sections(bundle)
+        conclusion = sections["sections"]["今日判断"]["conclusion"]
+        self.assertIn("首选为等待条件复核", conclusion)
+        self.assertIn("不代表当前持仓已被证明最优", conclusion)
+        self.assertNotIn("维持当前持仓观察", conclusion)
+
+    def test_preferred_engine_plan_drives_the_conclusion(self):
+        bundle = minimal_bundle()
+        bundle["research_stance"] = "RELATIVE_ADVANTAGE"
+        bundle["portfolio"]["first_section"] = {
+            "actions": [{"code": "REDUCE-159558", "title": "降低集中暴露", "reasons": ["风险政策触发复核"]}],
+        }
+        sections = build_sections(bundle)
+        conclusion = sections["sections"]["今日判断"]["conclusion"]
+        self.assertIn("降低集中暴露", conclusion)
+        self.assertIn("风险政策触发复核", conclusion)
+
+    def test_missing_data_copy_reflects_payload(self):
+        bundle = minimal_bundle()
+        bundle["portfolio"]["gate"] = {"reported_events_through": "20261106", "last_user_reconciled_at": None}
+        sections = build_sections(bundle)
+        items = sections["sections"]["三项主要证据"]["items"]
+        self.assertIn("前20个交易日成交额均值", items[0]["missing"])
+        self.assertIn("不代表没有相关事件", items[1]["missing"])
+        self.assertIn("用户声明与券商实际对账", items[2]["missing"])
 
 
 if __name__ == "__main__":

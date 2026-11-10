@@ -87,7 +87,14 @@ export interface DailyReportInput {
   fees?: FeeRules;
   lots?: LotRules;
   /** Explicit hypothetical quantities; never approval of a strategy or an order. */
-  researchScenario?: { sellCode: string; sellQuantity: number; buyCode?: string; buyQuantity?: number };
+  /**
+   * 显式研究参数。`sellAll` 表达“全部退出”语义（数量取届时可卖数量内的全部持仓）；
+   * `buyCode` 不带 `sellCode` 时表示用现有现金建仓/加仓。两者都只是研究比较。
+   */
+  researchScenario?: {
+    sellCode?: string; sellQuantity?: number; sellAll?: boolean;
+    buyCode?: string; buyQuantity?: number;
+  };
 }
 
 export type ActionKind = 'REDUCE' | 'ROTATE';
@@ -224,7 +231,7 @@ export interface HoldingResearch {
  * 轮动证据状态；风险管理轨的研究与门控判定不再被 Alpha 证据缺失涂黑。
  * §5.2 七情景：`scenario_matrix` 给出七情景 × 五方案的十列对照（幅度为声明式假设）。
  */
-export type RotationScenario = 'HOLD' | 'REDUCE' | 'ROTATE' | 'DEFENSIVE' | 'NO_ACTION';
+export type RotationScenario = 'HOLD' | 'REDUCE' | 'ROTATE' | 'DEFENSIVE' | 'NO_ACTION' | 'ADD';
 
 /** 风险轨门控状态：只编码账户完整性、权限、费用、行情（+已确认风险策略，由 risk_budget 披露）。 */
 export interface DailyRiskTrack {
@@ -290,6 +297,8 @@ export interface DecisionComparison {
     opportunity_cost: string;
     sell_plan: {
       ts_code: string; quantity: number; sellable_quantity: number; settlement_rule: string;
+      /** 全部退出研究（数量 = 持仓，且必须在可卖数量内）。 */
+      sell_all: boolean;
       one_lot_cents: number; gross_cents: number; fees_cents: number; net_cents: number; cash_after_cents: number;
     } | null;
     rotation_plan: {
@@ -300,6 +309,48 @@ export interface DecisionComparison {
     } | null;
     invalidation_conditions: string[];
     fact_meta: FactMeta;
+  }[];
+  /**
+   * 现金建仓/加仓研究（WP4）。只要账户有现金就给出容量（一手成本、可买手数、
+   * 摩擦成本占拟投入比例）；指定了 `buyCode` 时再给出该标的的整手方案。
+   * 现金建仓同样不带执行授权，`executable` 恒为 false。
+   */
+  cash_plan: {
+    code: string | null;
+    name: string | null;
+    price_milli: number | null;
+    one_lot_cents: number | null;
+    one_lot_cost_cents: number | null;
+    /** 现有现金可负担的整手数量（不含加仓的卖出回款）。 */
+    affordable_lots: number | null;
+    max_quantity: number | null;
+    quantity: number | null;
+    spend_cents: number | null;
+    fees_cents: number | null;
+    /** 预估摩擦成本占拟投入金额比例（%）；滑点单列为估计。 */
+    fee_pct_of_spend: number | null;
+    cash_after_cents: number | null;
+    funded: boolean;
+    funding_status: 'FUNDED' | 'PRICE_UNAVAILABLE' | 'INSUFFICIENT_CASH' | 'INVALID_QUANTITY' | 'NOT_PROVIDED' | 'CASH_UNAVAILABLE';
+    invalidation_conditions: string[];
+    fact_meta: FactMeta;
+  };
+  /**
+   * 首选＋备选（WP4）。研究倾向、执行可行性、策略证据等级分开列示：
+   * 首选只表示“在当前证据与资金约束下更值得研究的方向”，不是下单指令；
+   * 没有经复核的优势证据时策略证据恒为 UNVERIFIED。
+   */
+  decision_plans: {
+    role: 'PREFERRED' | 'BACKUP';
+    action: RotationScenario;
+    label: string;
+    research_lean: string;
+    execution_feasibility: 'NOT_AUTHORIZED' | 'BLOCKED';
+    execution_blockers: string[];
+    strategy_evidence: 'UNVERIFIED' | 'VERIFIED';
+    strongest_counter: string;
+    conditions: string[];
+    invalidation_conditions: string[];
   }[];
   /** §5.2 七情景 × 五方案十列对照（幅度为声明式假设；情景 1 与 r1-asset-stress 同口径合并）。 */
   scenario_matrix: ScenarioMatrix;
@@ -970,33 +1021,40 @@ function buildDecisionComparison(input: {
   };
   let soldRows: Position[] | null = null;
   let rotationRows: Position[] | null = null;
-  if (scenario) {
+  if (scenario?.sellCode) {
     const code = normalizeSecurityCode(scenario.sellCode);
     const holding = holdings.find(h => h.ts_code === code);
-    const quantity = scenario.sellQuantity;
+    // sellAll = 全部退出研究：数量取全部持仓；零股退出的整手约束只对部分卖出生效。
+    const requestedQuantity = scenario.sellAll ? (holding?.quantity ?? 0) : (scenario.sellQuantity ?? 0);
     const availability = sellable[code];
-    if (!holding || !Number.isSafeInteger(quantity) || quantity <= 0 || quantity % lots.etf_sell_multiple !== 0 || quantity > holding.quantity) {
-      reject(reduce, 'INVALID_QUANTITY', '研究卖量必须是持仓以内的正整数整手，不自动截断或补足。');
+    const quantityValid = Number.isSafeInteger(requestedQuantity) && requestedQuantity > 0
+      && (!holding || requestedQuantity <= holding.quantity)
+      && (scenario.sellAll === true || requestedQuantity % lots.etf_sell_multiple === 0);
+    if (!holding || !quantityValid) {
+      reject(reduce, 'INVALID_QUANTITY', scenario.sellAll
+        ? '全部退出研究需要该持仓存在且数量大于零；不自动补足零股。'
+        : '研究卖量必须是持仓以内的正整数整手，不自动截断或补足。');
     } else if (!availability) {
       reject(reduce, 'SELLABILITY_UNKNOWN', '账本未提供可卖数量，不能假设全部持仓可卖。');
-    } else if (quantity > availability.sellable_quantity) {
+    } else if (requestedQuantity > availability.sellable_quantity) {
       reject(reduce, 'NOT_SELLABLE', `研究卖量超过截至${asOf}的可卖数量${availability.sellable_quantity}。`);
     } else if (holding.bar_quality !== 'READY' || holding.latest_bar_date !== asOf || holding.price_source !== 'server_cache_close') {
       reject(reduce, 'PRICE_UNAVAILABLE', '卖出标的缺少目标交易日可校验行情。');
     } else {
-      const gross = valueCents(quantity, holding.price_milli);
+      const gross = valueCents(requestedQuantity, holding.price_milli);
       const fee = feeFor(code, gross, 'sell');
       const nextCash = cash + gross - fee.total_cents;
       if (nextCash < 0) reject(reduce, 'INSUFFICIENT_CASH', '卖出后现金不足支付费用。');
       else {
-        soldRows = positions.map(p => p.ts_code === code ? { ...p, value: valueCents(holding.quantity - quantity, holding.price_milli) } : { ...p });
+        soldRows = positions.map(p => p.ts_code === code ? { ...p, value: valueCents(holding.quantity - requestedQuantity, holding.price_milli) } : { ...p });
         Object.assign(reduce, metrics(soldRows, nextCash));
         reduce.funding_status = 'FUNDED'; reduce.fees_cents = fee.total_cents;
         reduce.fee_breakdowns = [{ ts_code: code, side: 'SELL', breakdown: fee }];
-        reduce.sell_plan = { ts_code: code, quantity, sellable_quantity: availability.sellable_quantity,
-          settlement_rule: availability.settlement_rule, one_lot_cents: valueCents(lots.etf_lot_size, holding.price_milli),
+        reduce.sell_plan = { ts_code: code, quantity: requestedQuantity, sellable_quantity: availability.sellable_quantity,
+          settlement_rule: availability.settlement_rule, sell_all: scenario.sellAll === true,
+          one_lot_cents: valueCents(lots.etf_lot_size, holding.price_milli),
           gross_cents: gross, fees_cents: fee.total_cents, net_cents: gross - fee.total_cents, cash_after_cents: nextCash };
-        reduce.summary = `研究卖出${quantity}份${code}，费用及滑点估计${fee.total_cents}分，现金${nextCash}分；仅示意。`;
+        reduce.summary = `${scenario.sellAll === true ? '全部退出' : '研究卖出'}${requestedQuantity}份${code}，费用及滑点估计${fee.total_cents}分，现金${nextCash}分；仅示意。`;
       }
     }
     if (!soldRows) reject(rotate, reduce.funding_status, reduce.summary);
@@ -1037,11 +1095,69 @@ function buildDecisionComparison(input: {
           rotate.funding_status = 'FUNDED'; rotate.sell_plan = reduce.sell_plan;
           rotate.fees_cents = reduce.fees_cents + buyFee.total_cents;
           rotate.fee_breakdowns = [...reduce.fee_breakdowns, { ts_code: buyCode, side: 'BUY', breakdown: buyFee }];
-          rotate.summary = `研究卖出${scenario.sellQuantity}份${code}并买入${quantity}份${buyCode}；双边费用及滑点估计${rotate.fees_cents}分，优势UNVERIFIED。`;
+          // sellAll 场景的卖出数量只在 reduce.sell_plan 里；直接读 scenario.sellQuantity 会渲染 undefined。
+          rotate.summary = `研究卖出${reduce.sell_plan?.quantity ?? quantity}份${code}并买入${quantity}份${buyCode}；双边费用及滑点估计${rotate.fees_cents}分，优势UNVERIFIED。`;
         }
       }
     }
   }
+  // ---- 现金建仓/加仓（WP4）：只用现有现金，不依赖卖出回款；一手成本与摩擦占比
+  // 按同一费用模型计算。没有指定候选时如实返回 NOT_PROVIDED，不用持仓价格代替。
+  const requestedBuyCode = scenario?.buyCode ? normalizeSecurityCode(scenario.buyCode) : null;
+  const buyInstrument = requestedBuyCode && input.marketDb ? resolveInstrument(input.marketDb, requestedBuyCode) : null;
+  const buyKind = buyInstrument?.kind === 'STOCK' ? 'STOCK' : buyInstrument?.kind === 'ETF' ? 'ETF' : null;
+  const buyQuote = requestedBuyCode && input.marketDb && buyKind
+    ? loadServerQuote(input.marketDb, requestedBuyCode, asOf, buyKind) : null;
+  const buyLotSize = buyKind === 'STOCK' ? 100 : lots.etf_lot_size;
+  const cashPlanBase = {
+    code: requestedBuyCode, name: (buyInstrument as any)?.name ?? null,
+    price_milli: null as number | null, one_lot_cents: null as number | null, one_lot_cost_cents: null as number | null,
+    affordable_lots: null as number | null, max_quantity: null as number | null, quantity: null as number | null,
+    spend_cents: null as number | null, fees_cents: null as number | null, fee_pct_of_spend: null as number | null,
+    cash_after_cents: null as number | null, funded: false,
+    funding_status: 'NOT_PROVIDED' as DecisionComparison['cash_plan']['funding_status'],
+    invalidation_conditions: [
+      '行情、现金、费用模型或账户可卖/可买数量变化后重算。',
+      '候选与现有持仓的行业重叠或集中度超出已确认政策时，本方案不再成立。',
+    ],
+    fact_meta: { as_of: asOf, source: 'research_summary + server_cache + portfolio_fee_model', quality: 'OK', claim_status: 'UNVERIFIED' } as FactMeta,
+  };
+  let cashPlan: DecisionComparison['cash_plan'];
+  if (!requestedBuyCode) {
+    cashPlan = { ...cashPlanBase, funding_status: 'NOT_PROVIDED' };
+  } else if (!input.marketDb || !buyKind || !buyQuote || buyQuote.quality !== 'READY' || buyQuote.trade_date !== asOf || buyQuote.price === null) {
+    cashPlan = { ...cashPlanBase, funding_status: 'PRICE_UNAVAILABLE' };
+  } else {
+    const price = Math.round(buyQuote.price * 1000);
+    const oneLot = valueCents(buyLotSize, price);
+    const oneLotCost = oneLot + feeFor(requestedBuyCode, oneLot, 'buy').total_cents;
+    const quantityRequested = scenario?.buyQuantity ?? null;
+    const affordableLots = oneLotCost > 0 ? Math.floor(cash / oneLotCost) : 0;
+    const maxQuantity = affordableLots * buyLotSize;
+    const quantity = quantityRequested ?? maxQuantity;
+    const quantityValid = Number.isSafeInteger(quantity) && quantity > 0 && quantity % buyLotSize === 0
+      && (buyKind !== 'ETF' || quantity >= lots.etf_min_buy);
+    if (cash <= 0) {
+      cashPlan = { ...cashPlanBase, price_milli: price, one_lot_cents: oneLot, one_lot_cost_cents: oneLotCost,
+        affordable_lots: 0, max_quantity: 0, funding_status: 'CASH_UNAVAILABLE' };
+    } else if (!quantityValid) {
+      // 未指定买量时，quantity 取可负担上限；上限为 0 是现金不足一手，而不是数量格式非法。
+      const status = quantityRequested == null && affordableLots === 0 ? 'INSUFFICIENT_CASH' : 'INVALID_QUANTITY';
+      cashPlan = { ...cashPlanBase, price_milli: price, one_lot_cents: oneLot, one_lot_cost_cents: oneLotCost,
+        affordable_lots: affordableLots, max_quantity: maxQuantity, funding_status: status };
+    } else {
+      const gross = valueCents(quantity, price);
+      const fee = feeFor(requestedBuyCode, gross, 'buy');
+      const spend = gross + fee.total_cents;
+      const funded = spend <= cash;
+      cashPlan = { ...cashPlanBase, price_milli: price, one_lot_cents: oneLot, one_lot_cost_cents: oneLotCost,
+        affordable_lots: affordableLots, max_quantity: maxQuantity, quantity, spend_cents: gross,
+        fees_cents: fee.total_cents, fee_pct_of_spend: gross > 0 ? r2(fee.total_cents / gross * 100) : null,
+        cash_after_cents: funded ? cash - spend : null, funded,
+        funding_status: funded ? 'FUNDED' : 'INSUFFICIENT_CASH' };
+    }
+  }
+
   // A named stress comparison, never an automatically generated sell instruction.
   defensive.quantity_basis = 'equity_liquidation_stress_only';
   let defensiveCash = cash;
@@ -1121,6 +1237,70 @@ function buildDecisionComparison(input: {
     ],
   });
 
+  // ---- 首选＋备选（WP4）：三件事分开——研究倾向、执行可行性、策略证据。
+  // 执行恒为 NOT_AUTHORIZED（只读研究引擎），不因风险轨门控满足而变成可下单。
+  const executionBlockers = [...new Set([
+    ...input.gateReasons.map(reason => reason.code),
+    ...(input.gateSatisfied ? [] : ['account_gate_unsatisfied']),
+  ])];
+  const planOf = (role: 'PREFERRED' | 'BACKUP', action: RotationScenario, label: string,
+    researchLean: string, strongestCounter: string, conditions: string[]): DecisionComparison['decision_plans'][number] => ({
+    role, action, label, research_lean: researchLean,
+    execution_feasibility: executionBlockers.length ? 'BLOCKED' : 'NOT_AUTHORIZED',
+    execution_blockers: executionBlockers,
+    strategy_evidence: 'UNVERIFIED',
+    strongest_counter: strongestCounter, conditions,
+    invalidation_conditions: ['持仓、现金、行情、费用模型或账户完整性变化后重新比较。',
+      '出现独立复核的优势证据后可改变首选，但必须重新走账户与费用门控。'],
+  });
+  const decisionPlans: DecisionComparison['decision_plans'] = [];
+  const quotesComplete = holdings.every(h => h.bar_quality === 'READY' && h.latest_bar_date === asOf);
+  // 显式轮动请求（同日指定卖出与买入）且两侧资金都成立时，轮动才是首选；
+  // 现金建仓分支只处理“不依赖卖出回款”的加仓，不能反过来盖掉用户明确要求的轮动比较。
+  const rotationRequested = Boolean(scenario?.sellCode && scenario?.buyCode);
+  if (rotationRequested && rotate.funding_status === 'FUNDED') {
+    decisionPlans.push(planOf('PREFERRED', 'ROTATE',
+      `轮动研究：卖出${reduce.sell_plan?.quantity}份${reduce.sell_plan?.ts_code}，买入${rotate.rotation_plan?.quantity}份${rotate.rotation_plan?.buy_code}`,
+      `卖出净回款后现金${reduce.cash_after_cents}分，轮动买入后现金${rotate.cash_after_cents}分；双边费用及滑点估计${rotate.fees_cents}分。`,
+      '换仓候选的相对优势未复核（strategy_evidence=UNVERIFIED）；轮动同时承担两次交易费用与换错方向的风险。',
+      ['成交价、费用或可卖数量变化使任一侧无法成立时，放弃整个轮动情景。',
+        '候选与现有持仓的行业重叠或集中度超出已确认政策时，重算轮动数量。']));
+    decisionPlans.push(planOf('BACKUP', 'HOLD', '继续持有，不做轮动',
+      '同时保留原持仓与现金，避免在优势未复核时支付双边费用。',
+      '继续持有会承担原有集中度与方向暴露，且不响应候选的相对变化。',
+      ['轮动候选的相对优势获得独立复核后重新比较。']));
+  } else if (cashPlan.funded) {
+    decisionPlans.push(planOf('PREFERRED', 'ADD',
+      `现金建仓/加仓研究：${cashPlan.code}（${cashPlan.quantity}份/股）`,
+      `现有现金${cash}分可覆盖${cashPlan.affordable_lots}手；费用及滑点估计占拟投入${cashPlan.fee_pct_of_spend}%。`,
+      '候选相对优势未复核（strategy_evidence=UNVERIFIED），加仓会放大集中度与压力损失。',
+      ['成交价、费用或现金变化使方案不再可负担时放弃。', '候选行业与现有持仓重叠导致集中度上升时优先降低拟投金额。']));
+    decisionPlans.push(planOf('BACKUP', 'HOLD', '继续持有并保留现金',
+      '不交易保留选择权；现金容量在后续交易日仍可复核。',
+      '继续持有会承担现有集中度与下行暴露。', ['每日收盘后按同一口径复核现金容量。']));
+  } else if (reduce.funding_status === 'FUNDED') {
+    decisionPlans.push(planOf('PREFERRED', 'REDUCE',
+      scenario?.sellAll ? `全部退出研究：${reduce.sell_plan?.ts_code}` : `显式数量减仓研究：${reduce.sell_plan?.ts_code}`,
+      `卖出回款后现金${reduce.cash_after_cents}分；费用及滑点估计${reduce.fees_cents}分。`,
+      '减仓数量来自显式研究参数而非经复核的优势证据；卖出放弃后续上涨参与度。',
+      ['可卖数量或行情变化后重算。', '若风险暴露并未实质下降，减仓只是增加费用。']));
+    decisionPlans.push(planOf('BACKUP', 'HOLD', '继续持有',
+      '保留现有暴露与现金，不做未经验证的数量调整。',
+      '集中度与下行暴露保持不变。', ['触发持仓研究中的观察条件时再评估。']));
+  } else {
+    decisionPlans.push(planOf('PREFERRED', 'HOLD', '继续持有，不交易',
+      quotesComplete && input.gateSatisfied
+        ? '没有经复核的相对优势证据，且账户门控满足；持有是当前证据下的默认研究倾向。'
+        : quotesComplete
+          ? '没有经复核的相对优势证据，但账户核对或完整性门控未满足；持有只是研究比较中的暂定方向，不提供可直接使用的数量。'
+          : '目标交易日行情不完整，任何加减仓比较都建立在不可校验价格上，倾向等待。',
+      focus ? `集中度最高持仓${focus.ts_code}占比${(focus.weight * 100).toFixed(2)}%，这是持有方案的主要反证。` : '集中度信息不可用。',
+      ['行情恢复完整后复核相对强弱、压力损失与现金容量。', '账户或持仓事实变化后重新比较。']));
+    decisionPlans.push(planOf('BACKUP', 'NO_ACTION', '明确不操作，等待条件',
+      '在缺少可复核证据时，不操作是可解释的备选，而不是默认敷衍。',
+      '等待可能错过行情，但避免了无证据交易的成本。', ['观察触发条件成立后重新进入比较。']));
+  }
+
   return {
     as_of_trade_date: asOf,
     focus: focus ? { ts_code: focus.ts_code, name: focus.name, weight: focus.weight, market_value_cents: focus.market_value_cents, quantity: focus.quantity } : null,
@@ -1128,6 +1308,8 @@ function buildDecisionComparison(input: {
     concentration_before: { hhi: baseline.concentration_after.hhi, effective_positions: baseline.concentration_after.effective_positions,
       top_weight: focus?.weight ?? null, equity_weight: baseline.exposure_after.equity_weight },
     sellable, options: [hold, reduce, rotate, defensive, noAction],
+    cash_plan: cashPlan,
+    decision_plans: decisionPlans,
     scenario_matrix: scenarioMatrix,
     note: '五方案均为非执行研究比较（executable 恒为 false：研究比较不是下单授权），但风险轨与 Alpha 轨分列披露：'
       + 'risk_track 只列账户/权限/费用/行情门控，alpha_track 只在轮动轨出现。'

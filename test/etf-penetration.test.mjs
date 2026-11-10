@@ -22,6 +22,7 @@ const {
 } = await import('../build/ashare/etfPenetration.js');
 
 const AS_OF = '20261023';
+const { ensureEtfWeightSchema, writeWeightSnapshot } = await import('../build/ashare/etfWeightStore.js');
 
 function baseInput(overrides = {}) {
   const rows = [
@@ -313,7 +314,37 @@ test('缓存回读：文件命中 → collector 组装输入，weight_date/sourc
     assert.equal(summary.constituents.weight_date, '20260930');
     assert.equal(summary.constituents.freshness.status, 'CURRENT');
     assert.equal(summary.constituents.count, 3);
+    assert.equal(summary.constituents.available_from, '20260930');
+    assert.equal(summary.constituents.weight_denominator, 'tracking_index_total_weight_pct');
+    assert.equal(summary.constituents.weight_coverage_pct, 37.68);
     assert.ok(summary.sources.some(s => s.includes('index_weight(931743.CSI@20260930)')));
+  } finally { db.close(); }
+});
+
+test('SQLite PIT 快照优先于 JSON 缓存并保留来源日期', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'etf-wcache-sqlite-'));
+  writeWeightCache(dataDir, '159558.SZ', {
+    as_of: AS_OF, weight_date: '20260930', weight_source: 'index_weight',
+    publication_date: null, index_code: '931743.CSI',
+    weightRows: [{ ts_code: '688012.SH', weight: 15 }], captured_at: '2026-10-20T00:00:00Z',
+  });
+  const db = new DatabaseSync(':memory:');
+  try {
+    ensureEtfWeightSchema(db);
+    writeWeightSnapshot(db, [{
+      etf_code: '159558.SZ', index_code: null, stock_code: '600519.SH', weight: 3,
+      source: 'fund_portfolio', effective_date: '20260630', published_at: '20260826',
+      available_from: '20260826', collected_at: '2026-10-20T00:00:00Z', quality_status: 'OK',
+    }]);
+    const input = collectEtfPenetrationInputs(db, { as_of: AS_OF, etfCode: '159558.SZ', weightDate: '', dataDir });
+    assert.equal(input.weight.source, 'fund_portfolio');
+    assert.equal(input.weight.weight_date, '20260630');
+    assert.equal(input.weight.publication_date, '20260826');
+    assert.equal(input.weight.available_from, '20260826');
+    assert.deepEqual(input.weight.rows.map(row => row.con_code), ['600519.SH']);
+    const summary = buildEtfPenetrationSummary(input);
+    assert.equal(summary.constituents.weight_denominator, 'reported_equity_market_value_pct');
+    assert.equal(summary.constituents.weight_coverage_pct, 3);
   } finally { db.close(); }
 });
 

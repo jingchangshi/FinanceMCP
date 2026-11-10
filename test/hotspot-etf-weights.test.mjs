@@ -128,6 +128,23 @@ test('published_at 缺失的行默认排除并计数，allowUnpublished 才返�
   db.close();
 });
 
+test('同一有效日期的基金披露与指数代理只返回一个完整来源快照', () => {
+  const db = freshDb();
+  writeWeightSnapshot(db, [
+    row({ source: 'index_weight', effective_date: '20260930', stock_code: '688012.SH', weight: 60 }),
+    row({ source: 'index_weight', effective_date: '20260930', stock_code: '002371.SZ', weight: 40 }),
+  ]);
+  writeWeightSnapshot(db, [row({
+    source: 'fund_portfolio', index_code: null, effective_date: '20260930',
+    stock_code: '600519.SH', weight: 3, published_at: '20261015', available_from: '20261015',
+  })]);
+  const result = weightsAvailableAt(db, ETF, AS_OF);
+  assert.equal(result.rows.length, 1);
+  assert.equal(result.rows[0].source, 'fund_portfolio');
+  assert.equal(result.rows[0].stock_code, '600519.SH');
+  db.close();
+});
+
 test('同一 ETF 多期：只返回 ≤ asOf 的最新一期', () => {
   const db = freshDb();
   writeWeightSnapshot(db, [row({ effective_date: '20260630', published_at: '20260630', available_from: '20260630', stock_code: '600519.SH', weight: 10 })]);
