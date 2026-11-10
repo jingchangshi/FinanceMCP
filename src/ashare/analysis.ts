@@ -5,15 +5,16 @@ import { detectSignals, technicalState, TechnicalState } from './signals.js';
 import { recentTradeDays, addDays } from './ingest.js';
 import { Fundamentals, fundamentalRisk, fundamentalsAsOf } from './fundamentals.js';
 
-export const SCORE_VERSION = 'score-1.0.0';
+export const LEGACY_SCORE_VERSION = 'score-1.0.0';
 export const RESEARCH_SCORE_VERSION = 'score-2.0.0';
-export type ScoreVersion = typeof SCORE_VERSION | typeof RESEARCH_SCORE_VERSION;
+export const SCORE_VERSION = 'score-3.0.0';
+export type ScoreVersion = typeof LEGACY_SCORE_VERSION | typeof RESEARCH_SCORE_VERSION | typeof SCORE_VERSION;
 export type ScoreComponents = Record<'technical' | 'liquidity' | 'fundamental' | 'valuation' | 'sector', number>;
 
 export interface ScoreBreakdown {
   /** Observed normalized factors; missing observations remain null. */
   normalized: Record<string, number | null>;
-  /** Values actually used by the legacy-compatible formula, including defaults. */
+  /** Values actually used by the selected versioned formula, including defaults. */
   scoring_factors: Record<string, number>;
   imputations: Record<string, string>;
   components: ScoreComponents;
@@ -21,16 +22,20 @@ export interface ScoreBreakdown {
   factor_contributions: Record<string, number>;
 }
 
-/** Only the cash percentage threshold differs between the two versions. */
+/** Cash-flow scoring is versioned: V1 retains its ratio-scale threshold; V2/V3 use percentages. */
 export function cashScore(value: number | null, version: ScoreVersion = SCORE_VERSION): number {
-  if (version !== SCORE_VERSION && version !== RESEARCH_SCORE_VERSION) throw new Error(`Unsupported score version: ${version}`);
-  return value == null ? 0.5 : value >= (version === SCORE_VERSION ? 0.8 : 80) ? 1 : value > 0 ? 0.5 : 0;
+  if (version !== LEGACY_SCORE_VERSION && version !== RESEARCH_SCORE_VERSION && version !== SCORE_VERSION) throw new Error(`Unsupported score version: ${version}`);
+  const threshold = version === LEGACY_SCORE_VERSION ? 0.8 : 80;
+  return value == null ? 0.5 : value >= threshold ? 1 : value > 0 ? 0.5 : 0;
 }
 
 /**
- * Heuristic score rules (score-1.0.0). The score orders stocks for research
- * attention; it is not a probability of profit and has not been validated as
- * a return forecast.
+ * Heuristic score rules shared by score-1.0.0, score-2.0.0 and score-3.0.0.
+ * V1 uses the legacy cash threshold and ordinal percentile ties; V2 uses the
+ * corrected percentage cash threshold with ordinal ties; V3 uses that same
+ * threshold with average percentile ranks for ties. The score orders stocks
+ * for research attention; it is not a probability of profit and has not been
+ * validated as a return forecast.
  *
  * Eligibility: not ST/*ST/退市整理, listed ≥ 250 calendar days, traded on the
  * as-of day, ≥ 130 bars of history with a complete adjustment factor
@@ -46,7 +51,8 @@ export function cashScore(value: number | null, version: ScoreVersion = SCORE_VE
  *                 volFit = 1 when ATR14/close ≤ 4%, decaying linearly to 0 at 9%
  *   liquidity   = pr(20-day average turnover)
  *   fundamental = mean(pr(ROE), pr(净利润同比, clipped to ±100%), cash, leverage);
- *                 cash = 1 if 经营现金流/净利润 ≥ 0.8, 0.5 if > 0, else 0;
+ *                 cash: V1 uses a raw percentage threshold of 0.8; V2/V3 use 80;
+ *                 all use 0.5 if positive but below threshold, else 0 (missing = 0.5);
  *                 leverage = 1 if 资产负债率 < 60%, 0.5 if < 80%, else 0 (financials = 0.5);
  *                 no report available → 0.3
  *   valuation   = in-industry pr of lower PE(TTM); PE ≤ 0 or missing → 0
@@ -115,27 +121,42 @@ const median = (values: number[]) => {
   return v.length ? v[Math.floor(v.length / 2)] : NaN;
 };
 
-function percentileRanks(values: number[]): number[] {
+function percentileRanks(values: number[], version: ScoreVersion = SCORE_VERSION): number[] {
   const idx = values.map((v, i) => [v, i] as const).filter(([v]) => Number.isFinite(v)).sort((a, b) => a[0] - b[0]);
   const out = new Array(values.length).fill(0);
   const n = idx.length;
-  idx.forEach(([, i], r) => { out[i] = n > 1 ? r / (n - 1) : 0.5; });
+  if (version !== SCORE_VERSION && version !== RESEARCH_SCORE_VERSION && version !== LEGACY_SCORE_VERSION) throw new Error(`Unsupported score version: ${version}`);
+  if (version !== SCORE_VERSION) {
+    idx.forEach(([, i], r) => { out[i] = n > 1 ? r / (n - 1) : 0.5; });
+    return out;
+  }
+  for (let start = 0; start < n;) {
+    let end = start + 1;
+    while (end < n && idx[end][0] === idx[start][0]) end++;
+    const rank = (start + end - 1) / 2;
+    const percentile = n > 1 ? rank / (n - 1) : 0.5;
+    for (let i = start; i < end; i++) out[idx[i][1]] = percentile;
+    start = end;
+  }
   return out;
 }
 
 const isSt = (name: string) => /ST|退/.test(name ?? '');
 
 /**
- * Optional observer for the single full-market pass. The V2 prescreen uses
- * this instead of loading every stock's bars a second time. The callback must
- * only READ bars/indicators and copy numbers out — the arrays are reused for
- * the next stock. It cannot change scan results.
+ * Optional observer and score-version selector for the single full-market
+ * pass. The V2 prescreen uses the callback instead of loading every stock's
+ * bars a second time. The callback must only READ bars/indicators and copy
+ * numbers out — the arrays are reused for the next stock; the callback itself
+ * cannot change scan results.
  */
 export interface MarketScanHooks {
   onStock?: (code: string, bars: Bars, x: IndicatorSet, i: number, row: StockRow) => void;
+  score_version?: ScoreVersion;
 }
 
 export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHooks = {}): MarketScan {
+  const version = hooks.score_version ?? SCORE_VERSION;
   const days = recentTradeDays(db, date, 260);
   const start = days[0];
   const basic = new Map((db.prepare('SELECT ts_code, name, industry, list_date FROM stock_basic').all() as any[]).map(r => [r.ts_code, r]));
@@ -202,8 +223,8 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
     rows.push(row);
   });
 
-  const sectors = sectorRank(rows);
-  scoreRows(rows, sectors);
+  const sectors = sectorRank(rows, version);
+  scoreRows(rows, sectors, version);
   const total = rows.length || 1;
   return {
     trade_date: date,
@@ -216,7 +237,16 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
   };
 }
 
-export function sectorRank(rows: StockRow[]): SectorRow[] {
+function sectorStrengths(sectors: SectorRow[], version: ScoreVersion): Map<string, number> {
+  // Sector strength has its own percentile normalization; apply the selected
+  // version here too so a caller cannot mix V3 ties with V1/V2 factor scores.
+  const p20 = percentileRanks(sectors.map(s => s.ret20_median), version);
+  const p5 = percentileRanks(sectors.map(s => s.ret5_median), version);
+  const pma = percentileRanks(sectors.map(s => s.pct_above_ma20), version);
+  return new Map(sectors.map((s, i) => [s.industry, 0.5 * p20[i] + 0.3 * p5[i] + 0.2 * pma[i]]));
+}
+
+export function sectorRank(rows: StockRow[], version: ScoreVersion = SCORE_VERSION): SectorRow[] {
   const groups = new Map<string, StockRow[]>();
   for (const r of rows) {
     if (r.industry === '未知') continue;
@@ -234,10 +264,7 @@ export function sectorRank(rows: StockRow[]): SectorRow[] {
     rank: 0,
   }));
   // strength = 0.5·pr(20日中位收益) + 0.3·pr(5日中位收益) + 0.2·pr(站上MA20比例)
-  const p20 = percentileRanks(list.map(s => s.ret20_median));
-  const p5 = percentileRanks(list.map(s => s.ret5_median));
-  const pma = percentileRanks(list.map(s => s.pct_above_ma20));
-  list.forEach((s, i) => { s.strength = 0.5 * p20[i] + 0.3 * p5[i] + 0.2 * pma[i]; });
+  for (const [industry, strength] of sectorStrengths(list, version)) list.find(s => s.industry === industry)!.strength = strength;
   list.sort((a, b) => b.strength - a.strength);
   list.forEach((s, i) => { s.rank = i + 1; });
   return list;
@@ -245,18 +272,18 @@ export function sectorRank(rows: StockRow[]): SectorRow[] {
 
 /** Deterministic scoring on an already-computed full-market universe. No persistence. */
 export function scoreRows(rows: StockRow[], sectors: SectorRow[], version: ScoreVersion = SCORE_VERSION): Map<string, ScoreBreakdown> {
-  if (version !== SCORE_VERSION && version !== RESEARCH_SCORE_VERSION) throw new Error(`Unsupported score version: ${version}`);
+  if (version !== SCORE_VERSION && version !== RESEARCH_SCORE_VERSION && version !== LEGACY_SCORE_VERSION) throw new Error(`Unsupported score version: ${version}`);
   const breakdowns = new Map<string, ScoreBreakdown>();
   const eligible = rows.filter(r => r.eligible);
-  const sectorPct = new Map(sectors.map(s => [s.industry, s.strength]));
-  const pr60 = percentileRanks(eligible.map(r => r.state.ret60));
-  const pr20 = percentileRanks(eligible.map(r => r.state.ret20));
-  const prAmt = percentileRanks(eligible.map(r => Math.log(r.amount20_yi)));
-  const prRoe = percentileRanks(eligible.map(r => r.fundamentals?.roe ?? NaN));
+  const sectorPct = sectorStrengths(sectors, version);
+  const pr60 = percentileRanks(eligible.map(r => r.state.ret60), version);
+  const pr20 = percentileRanks(eligible.map(r => r.state.ret20), version);
+  const prAmt = percentileRanks(eligible.map(r => Math.log(r.amount20_yi)), version);
+  const prRoe = percentileRanks(eligible.map(r => r.fundamentals?.roe ?? NaN), version);
   const prGrowth = percentileRanks(eligible.map(r => {
     const g = r.fundamentals?.netprofit_yoy;
     return g == null ? NaN : Math.max(-100, Math.min(100, g));
-  }));
+  }), version);
   // Valuation: percentile of lower positive PE within each industry.
   const prVal = new Array(eligible.length).fill(0);
   const byIndustry = new Map<string, number[]>();
@@ -268,7 +295,7 @@ export function scoreRows(rows: StockRow[], sectors: SectorRow[], version: Score
     const ranks = percentileRanks(idx.map(i => {
       const pe = eligible[i].pe_ttm;
       return pe != null && pe > 0 ? -pe : NaN;
-    }));
+    }), version);
     idx.forEach((i, k) => {
       const pe = eligible[i].pe_ttm;
       prVal[i] = pe != null && pe > 0 ? (idx.length > 1 ? ranks[k] : 0.5) : 0;

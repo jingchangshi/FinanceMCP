@@ -752,11 +752,17 @@ function renderSectionA(r: DailyReportResult, view: RenderView): string {
   const breadth = market.available
     ? market.judgement.map(line => zh(line)).find(line => line.includes('上涨占比')) ?? ''
     : '';
+  const upShare = breadth.match(/上涨占比\s*([\d.]+)%/);
+  const breadthTone = upShare
+    ? Number(upShare[1]) > 50 ? '多数个股上涨'
+      : Number(upShare[1]) < 50 ? '多数个股下跌'
+      : '个股涨跌数量接近'
+    : null;
   const regime = market.available ? (market.regime_label ?? '') : '数据未就绪';
   const change = r.status === 'DATA_INSUFFICIENT' || !market.available
     ? '本期市场数据未就绪，不以旧数据替代当日结论。'
-    : breadth
-      ? `${regime}下当日多数个股上涨：${breadth.slice(0, breadth.indexOf('）') + 1 || undefined)}`
+    : breadth && breadthTone
+      ? `${regime}，${breadthTone}：${breadth.slice(0, breadth.indexOf('）') + 1 || undefined)}`
       : `${regime}，行情日期 ${monthDay(r.as_of_trade_date)}。`;
   const focusHolding = view.focus
     ? r.holdings.find(row => row.ts_code === view.focus!.ts_code)

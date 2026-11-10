@@ -80,14 +80,14 @@ const DATA_NOTE = '数据查询工具：只读本地缓存，返回结构化 JSO
 ashareToolDefinitions.push(
   {
     name: 'ashare_factor_snapshot',
-    description: 'A股只读研究因子快照（RESEARCH_ONLY）：原始/标准化因子、单位、准入与剔除原因、评分组件及逐因子贡献、排名、信号与失效条件、质量限制。单次 1–20 只，按完整市场候选集标准化后筛选返回；缺失保持 null，源 OHLC/成交额异常的技术观测置 null 并在质量中说明。支持正式 V1 与仅修正现金流百分数阈值的研究 V2，不改写正式日报/股票池。',
+    description: 'A股只读研究因子快照（RESEARCH_ONLY）：原始/标准化因子、单位、准入与剔除原因、评分组件及逐因子贡献、排名、信号与质量限制。单次 1–20 只，按完整市场候选集标准化后筛选返回；缺失保持 null，源 OHLC/成交额异常的技术观测置 null 并在质量中说明。默认使用正式 score-3.0.0；可显式选择 score-1.0.0 或研究 score-2.0.0，不改写已生成日报或历史股票池。',
     inputSchema: {
       type: 'object',
       properties: {
         date: dateProp,
         ts_codes: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string' }, description: '1–20 个股票代码，接受 600519.SH、600519 或完整名称' },
         include_components: { type: 'boolean', description: '附带评分组件、逐因子贡献及缺失值评分默认值，默认 true' },
-        score_version: { type: 'string', enum: ['score-1.0.0', 'score-2.0.0'], description: '默认 score-1.0.0；V2 为研究候选，不替换正式评分' },
+        score_version: { type: 'string', enum: ['score-1.0.0', 'score-2.0.0', 'score-3.0.0'], description: '默认正式评分 score-3.0.0；score-1.0.0 保留旧现金流阈值，score-2.0.0 使用百分比现金流阈值和序数并列排名，score-3.0.0 使用相同现金流阈值并对并列值取平均百分位' },
       },
       required: ['ts_codes'],
     },
