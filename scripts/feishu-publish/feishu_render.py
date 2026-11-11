@@ -80,6 +80,14 @@ def check_forbidden(visible_text: str) -> List[str]:
     return [term for term in FORBIDDEN_TERMS if term in visible_text]
 
 
+_INTERNAL_TOKEN = re.compile(r"\b[a-z]+(?:_[a-z0-9]+)+\b|\b[A-Z]{3,}(?:_[A-Z0-9]+)+\b|\bUNVERIFIED\b")
+
+
+def check_internal_tokens(visible_text: str) -> List[str]:
+    """snake_case field names and UPPER_SNAKE enum values never belong in the body."""
+    return sorted(set(_INTERNAL_TOKEN.findall(visible_text)))
+
+
 def check_markdown_leak(visible_text: str) -> List[str]:
     leaks = []
     for pattern in _MARKDOWN_PATTERNS:
@@ -171,6 +179,9 @@ def validate_sections(sections: Dict[str, Any]) -> List[str]:
     forbidden = check_forbidden(visible)
     if forbidden:
         problems.append(f"forbidden internal terms in visible text: {forbidden}")
+    leftovers = check_internal_tokens(visible)
+    if leftovers:
+        problems.append(f"internal field/enum tokens in visible text: {leftovers}")
     leaks = check_markdown_leak(visible)
     if leaks:
         problems.append(f"markdown leak in visible text: {leaks}")
@@ -280,13 +291,14 @@ def render_xml(sections: Dict[str, Any]) -> str:
     options = _section_of(sections, "是否存在更好的选择").get("options") or []
     blocks.append(_heading(5, "是否存在更好的选择"))
     if options:
-        option_lines = []
-        for opt in options:
-            option_lines.append(
-                f"<li><b>{_esc(opt['name'])}：</b>可能改善{_esc(opt.get('upside') or '')}；"
-                f"代价{_esc(opt.get('cost') or '')}；尚不充分{_esc(opt.get('gap') or '')}</li>"
-            )
-        blocks.append("<ul>" + "".join(option_lines) + "</ul>")
+        common = str(_section_of(sections, "是否存在更好的选择").get("common_note") or "").strip()
+        if common:
+            blocks.append(f"<p><b>各方案共同说明：</b>{_esc(common)}</p>")
+        option_rows = [
+            [str(opt["name"]), str(opt.get("upside") or ""), str(opt.get("cost") or ""), str(opt.get("gap") or "")]
+            for opt in options
+        ]
+        blocks.append(_table(["方案", "作用", "代价与账户影响", "暂不可执行的原因"], option_rows, [90, 150, 160, 150]))
     else:
         blocks.append("<p>本日未发现有足够证据支持调整的替代方案，维持当前持仓观察。</p>")
 
@@ -321,6 +333,7 @@ __all__ = [
     "FORBIDDEN_TERMS",
     "check_forbidden",
     "check_markdown_leak",
+    "check_internal_tokens",
     "count_hyperlinks",
     "strip_tags",
     "validate_sections",
