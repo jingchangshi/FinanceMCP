@@ -198,3 +198,48 @@ class TestSectionFiveOptions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HumanizeTests(unittest.TestCase):
+    def test_cents_amount_becomes_yuan(self):
+        from sections_from_bundle import humanize_text
+        self.assertEqual(humanize_text("现有现金154447分"), "现有现金1,544.47 元")
+        self.assertEqual(humanize_text("需 20 分钟，百分点 5分"), "需 20 分钟，百分点 5分")
+
+    def test_internal_tokens_are_translated(self):
+        from sections_from_bundle import humanize_text
+        out = humanize_text("cash_plan:NOT_PROVIDED；unreported_trade_risk: 风险；见 market_judgement.counter_evidence；UNVERIFIED")
+        for bad in ("cash_plan", "unreported", "market_judgement", "UNVERIFIED", "NOT_PROVIDED"):
+            self.assertNotIn(bad, out)
+
+    def test_leftover_snake_case_is_removed(self):
+        from sections_from_bundle import humanize_text
+        self.assertNotIn("some_internal_field", humanize_text("x some_internal_field y"))
+
+    def test_dedupe_lifts_repeated_sentences_but_keeps_numbers(self):
+        from sections_from_bundle import dedupe_option_fragments
+        shared_text = "卖出或换仓可能放弃后续上涨，并产生费用。"
+        opts = [{"name": str(i), "upside": "u", "cost": f"{shared_text}；方案后现金 {i} 元", "gap": "g"} for i in range(4)]
+        out, shared = dedupe_option_fragments(opts)
+        self.assertEqual(shared, [shared_text])
+        for i, o in enumerate(out):
+            self.assertNotIn(shared_text, o["cost"])
+            self.assertIn(f"方案后现金 {i} 元", o["cost"])
+
+    def test_window_drawdown_crossing_is_disclosed(self):
+        bundle = minimal_bundle()
+        bundle["portfolio_risk"] = {
+            "drawdown": {"current_drawdown_pct": 9.17, "max_drawdown_pct": 20.25},
+            "policy": {"tiers": [{"level": "L1", "drawdown_pct": 10}, {"level": "L3", "drawdown_pct": 20}]},
+            "warning": {"triggered": False},
+        }
+        sections = build_sections(bundle)
+        self.assertIn("曾触及 L3 档", sections["sections"]["账户与风险"]["narrative"])
+        self.assertEqual(validate_sections(sections), [])
+
+
+class InternalTokenGuardTests(unittest.TestCase):
+    def test_validator_rejects_snake_case_in_body(self):
+        from feishu_render import check_internal_tokens
+        self.assertEqual(check_internal_tokens("正常文字 cash_plan 与 NOT_PROVIDED"), ["NOT_PROVIDED", "cash_plan"])
+        self.assertEqual(check_internal_tokens("159558.SZ 收盘 0.812 元，L1 档"), [])

@@ -89,6 +89,84 @@ def _extract_number_after(text: str, marker: str) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 
+# --- investor-facing text hygiene (P0 readability) -------------------------
+# Producer-side backstop: the engine's own strings sometimes carry internal
+# field names, enum values or amounts in cents. They are translated here so the
+# document never shows them; feishu_render.validate_sections still rejects any
+# leftover internal token (fail-closed).
+_TOKEN_REWRITES: List[tuple] = [
+    (re.compile(r"cash_plan:NOT_PROVIDED"), "未指定建仓资金方案"),
+    (re.compile(r"cash_plan:\w+"), "建仓资金方案未就绪"),
+    (re.compile(r"见\s*market_judgement\.counter_evidence"), "见市场反证项"),
+    (re.compile(r"market_judgement\.counter_evidence"), "市场反证项"),
+    (re.compile(r"market_judgement\.support_evidence"), "市场支持项"),
+    (re.compile(r"market_judgement\.\w+"), "市场判断依据"),
+    (re.compile(r"strategy_evidence\s*=\s*UNVERIFIED"), "策略证据未经独立验证"),
+    (re.compile(r"unreported_trade_risk\s*[:：]\s*"), ""),
+    (re.compile(r"unreported_trade_risk"), "未上报交易风险"),
+    (re.compile(r"相对优势\s*UNVERIFIED\s*[:：]\s*"), "相对优势未经独立验证："),
+    (re.compile(r"轮动优势证据\s*UNVERIFIED\s*[:：]\s*"), "轮动优势证据未经独立验证："),
+    (re.compile(r"\bUNVERIFIED\b"), "未经独立验证"),
+    (re.compile(r"\bNOT_PROVIDED\b"), "未提供"),
+    (re.compile(r"\bUNCONFIRMED_RISK\b"), "存在未核对风险"),
+]
+# 3+ digit amounts written as "<n>分" (cents) -> yuan. Excludes 分钟/分位/分之/分点.
+_CENTS_RE = re.compile(r"(?<![\d.,])(\d[\d,]{2,})分(?![钟位之点])")
+_LEFTOVER_SNAKE = re.compile(r"\b[a-z]+(?:_[a-z0-9]+)+\b")
+
+
+def humanize_text(text: str) -> str:
+    for pattern, repl in _TOKEN_REWRITES:
+        text = pattern.sub(repl, text)
+    text = _CENTS_RE.sub(lambda m: _fmt_money(int(m.group(1).replace(",", ""))), text)
+    return _LEFTOVER_SNAKE.sub("相关指标", text)
+
+
+def humanize_tree(value: Any) -> Any:
+    if isinstance(value, str):
+        return humanize_text(value)
+    if isinstance(value, list):
+        return [humanize_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: (v if k == "url" else humanize_tree(v)) for k, v in value.items()}
+    return value
+
+
+_KEEP_PER_OPTION = ("方案后现金", "假设费用", "声明式压力情景损失")
+
+
+def dedupe_option_fragments(options: List[Dict[str, str]], min_count: int = 3) -> tuple:
+    """Lift sentences repeated verbatim across options into one shared note.
+
+    Per-option numbers (post-plan cash, assumed fees) always stay with their
+    option; only identical explanatory/stress sentences are shared.
+    """
+    def frags(text: str) -> List[str]:
+        return [f.strip() for f in re.split(r"[；;]", text) if f.strip()]
+
+    counts: Dict[str, int] = {}
+    order: List[str] = []
+    for opt in options:
+        for field in ("cost", "gap"):
+            for f in set(frags(opt.get(field, ""))):
+                if f.startswith(_KEEP_PER_OPTION) or len(f) < 8:
+                    continue
+                if f not in counts:
+                    order.append(f)
+                counts[f] = counts.get(f, 0) + 1
+    shared = [f for f in order if counts[f] >= min_count]
+    if not shared:
+        return options, []
+    out: List[Dict[str, str]] = []
+    for opt in options:
+        new = dict(opt)
+        for field in ("cost", "gap"):
+            kept = [f for f in frags(opt.get(field, "")) if f not in shared]
+            new[field] = "；".join(kept) if kept else "见上方共同说明"
+        out.append(new)
+    return out, shared
+
+
 def holdings_of(bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
     """The five real holdings with weights, from the frozen bundle."""
     portfolio = bundle.get("portfolio") or {}
@@ -293,6 +371,15 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
             gap_txt = f"，距 L1 档（回撤 {l1_pct}% 触发复核）还有 {gap:.2f} 个百分点" if gap is not None else ""
             narrative_parts.append(
                 f"预警未触发（当前回撤 {current_dd:.2f}%{gap_txt}；政策 {_iso(policy_on)} 确认）。")
+    if isinstance(window_max_dd, (int, float)):
+        crossed = [t for t in tiers if isinstance(t, dict) and isinstance(t.get("drawdown_pct"), (int, float))
+                   and window_max_dd >= t["drawdown_pct"]]
+        if crossed:
+            top = max(crossed, key=lambda t: t["drawdown_pct"])
+            narrative_parts.append(
+                f"提示：观察窗口内最大回撤 {window_max_dd:.2f}%，曾触及 {top.get('level')} 档"
+                f"（{top['drawdown_pct']}%）；当前已回到 {current_dd:.2f}%。" if isinstance(current_dd, (int, float))
+                else f"提示：观察窗口内最大回撤 {window_max_dd:.2f}%，曾触及 {top.get('level')} 档（{top['drawdown_pct']}%）。")
     if not verified:
         narrative_parts.append("账户成交未完成核对，资产与持仓为参考重估。")
 
@@ -387,7 +474,7 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
         market_missing.append("涨跌家数")
     if not isinstance(breadth.get("amount_ma20_yi"), (int, float)):
         market_missing.append("前20个交易日成交额均值")
-    market_missing_text = "缺少" + "、".join(market_missing) if market_missing else "本包提供了当日涨跌家数与前20日成交额均值"
+    market_missing_text = "缺少" + "、".join(market_missing) if market_missing else "无关键缺项：当日涨跌家数与前20日成交额均值均已提供"
 
     focus_research = next((h.get("research") or {} for h in holdings if h.get("ts_code") == focus_code), {})
     availability = focus_research.get("availability") or {}
@@ -413,7 +500,7 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
             "label": "① 市场",
             "observation": f"{breadth_txt}；{volume_txt}；{regime_label}。",
             "why": "指数趋势与个股广度来自不同统计口径，应分别观察。",
-            "missing": market_missing_text + "。",
+            "missing": market_missing_text + ("" if market_missing_text.endswith("。") else "。"),
         },
         {
             "label": "② 核心持仓",
@@ -430,6 +517,9 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
     ]
 
     options = _build_options(bundle, focus_name, focus_weight, verified)
+    options, shared_fragments = dedupe_option_fragments([
+        {k: humanize_text(str(v)) for k, v in opt.items()} for opt in options
+    ])
 
     holdings_rows: List[Dict[str, str]] = []
     _STANCE_ZH = {"HOLD": "继续观察", "WATCH": "重点观察", "REDUCE": "可研究降低风险",
@@ -508,7 +598,7 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
         "出现覆盖报告日的新账户核对、重大持仓事实或既有风险政策触发条件时重新评估。"
     )
 
-    return {
+    result = {
         "title": f"A 股账户研究日报｜{_ymd(as_of)}收盘",
         "subtitle": (
             f"生成于 {generated_at}（北京时间）｜市场数据截至交易日 {_iso(as_of)}"
@@ -528,11 +618,12 @@ def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[st
             },
             "三项主要证据": {"items": items},
             "持仓判断": {"holdings": holdings_rows},
-            "是否存在更好的选择": {"options": options},
+            "是否存在更好的选择": {"options": options, "common_note": "；".join(shared_fragments)},
             "下一交易日关注": {"conditions": conditions},
             "数据说明与参考来源": {"notes": notes, "sources": []},
         },
     }
+    return humanize_tree(result)
 
 
 def main() -> int:
