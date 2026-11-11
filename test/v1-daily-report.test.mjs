@@ -358,13 +358,118 @@ test('D1-5 门控满足仍需优势证据：NO_ACTION，显式研究量不升级
   assert.equal(reduce.sell_plan.quantity, 1000);
   assert.equal(reduce.sell_plan.gross_cents, 93500);
   assert.equal(rotate.rotation_plan.quantity, 100);
+  assert.equal(rotate.funding_status, 'FUNDED');
+  // 显式轮动请求两侧都成立时，首选是 ROTATE；现金建仓不能反过来盖掉轮动比较。
+  const preferred = report.decision_comparison.decision_plans.find(item => item.role === 'PREFERRED');
+  assert.equal(preferred.action, 'ROTATE');
+  assert.match(preferred.label, /1000份159558\.SZ/);
+  assert.match(preferred.label, /100份510300\.SH/);
+  assert.equal(preferred.strategy_evidence, 'UNVERIFIED');
+  const backup = report.decision_comparison.decision_plans.find(item => item.role === 'BACKUP');
+  assert.equal(backup.action, 'HOLD');
   assert.equal(reduce.executable, false);
   assert.equal(rotate.executable, false);
   assert.equal(rotate.rotation_plan.advantage_status, 'UNVERIFIED');
   assert.equal(report.data_quality.tiers.trade_plan_executability.status, 'NOT_EXECUTABLE');
 });
 
-// ---------------------------------------------------------------- 6. plan_tracking
+function confirmedPortfolio(file) {
+  const db = openPortfolioDb(join(dir, file), { marketPath: MARKET_MAIN });
+  const snapshotId = `synthetic-${file}`;
+  account.importSnapshot(db, { ...SYNTH, snapshot_id: snapshotId });
+  initBaseline(db, 'confirmed-account', { asOf: LAST, snapshotId });
+  account.markSnapshotCurrent(db, snapshotId, { confirmedBy: 'test-fixture' });
+  confirmRealAccount(db, 'confirmed-account', { confirm: true, note: 'synthetic fixture' });
+  setAccountCompleteness(db, 'confirmed-account', {
+    as_of: LAST, reported_events_through: LAST, unreported_trade_risk: false, note: 'synthetic fixture declaration',
+  }, { confirm: true, recordedBy: 'test-fixture' });
+  return db;
+}
+
+test('D1-5b 全部退出研究：sellAll 取全部持仓并标记 sell_all，仍不可执行', () => {
+  const db = confirmedPortfolio('portfolio-exit.sqlite');
+  const report = buildDailyReport({
+    portfolioDb: db, marketDb: marketMain, accountId: 'confirmed-account', asOfTradeDate: LAST,
+    generatedAt: '2026-10-16T21:55:00+08:00',
+    researchScenario: { sellCode: '159558.SZ', sellAll: true },
+  });
+  const reduce = report.decision_comparison.options.find(option => option.action === 'REDUCE');
+  assert.equal(reduce.funding_status, 'FUNDED');
+  assert.equal(reduce.sell_plan.sell_all, true);
+  assert.equal(reduce.sell_plan.quantity, 58900);
+  assert.equal(reduce.executable, false);
+  assert.equal(reduce.quantity_basis, 'user_research_parameter');
+});
+
+test('D1-5c 现金建仓研究：给出可买手数、费用占比与首选/备选，但不授权执行', () => {
+  const db = confirmedPortfolio('portfolio-cash-add.sqlite');
+  const report = buildDailyReport({
+    portfolioDb: db, marketDb: marketMain, accountId: 'confirmed-account', asOfTradeDate: LAST,
+    generatedAt: '2026-10-16T21:55:00+08:00',
+    researchScenario: { buyCode: '510300.SH', buyQuantity: 100 },
+  });
+  const plan = report.decision_comparison.cash_plan;
+  assert.equal(plan.funding_status, 'FUNDED');
+  assert.equal(plan.quantity, 100);
+  assert.ok(plan.affordable_lots >= 1);
+  assert.ok(plan.one_lot_cost_cents > plan.one_lot_cents, '一手成本必须含买入费用');
+  assert.ok(Number.isFinite(plan.fee_pct_of_spend));
+  const preferred = report.decision_comparison.decision_plans.find(item => item.role === 'PREFERRED');
+  assert.equal(preferred.action, 'ADD');
+  assert.equal(preferred.strategy_evidence, 'UNVERIFIED');
+  assert.equal(preferred.execution_feasibility, 'NOT_AUTHORIZED');
+  assert.equal(report.actionable, false);
+});
+
+test('D1-5d 全部退出的轮动：摘要与首选使用实际卖出数量，不出现 undefined', () => {
+  const db = confirmedPortfolio('portfolio-exit-rotate.sqlite');
+  const report = buildDailyReport({
+    portfolioDb: db, marketDb: marketMain, accountId: 'confirmed-account', asOfTradeDate: LAST,
+    generatedAt: '2026-10-16T21:55:00+08:00',
+    researchScenario: { sellCode: '159558.SZ', sellAll: true, buyCode: '510300.SH', buyQuantity: 100 },
+  });
+  const rotate = report.decision_comparison.options.find(option => option.action === 'ROTATE');
+  assert.equal(rotate.funding_status, 'FUNDED');
+  assert.match(rotate.summary, /58900份159558\.SZ/);
+  assert.doesNotMatch(rotate.summary, /undefined/);
+  const preferred = report.decision_comparison.decision_plans.find(item => item.role === 'PREFERRED');
+  assert.equal(preferred.action, 'ROTATE');
+  assert.match(preferred.label, /58900份159558\.SZ/);
+  assert.doesNotMatch(preferred.label, /undefined/);
+});
+
+test('D1-5e 未指定建仓标的时，现金建仓/加仓比较仍以 QUANTITY_REQUIRED 出现，不自动挑标的', () => {
+  const db = confirmedPortfolio('portfolio-cash-add-default.sqlite');
+  const report = buildDailyReport({
+    portfolioDb: db, marketDb: marketMain, accountId: 'confirmed-account', asOfTradeDate: LAST,
+    generatedAt: '2026-10-16T21:55:00+08:00',
+  });
+  const actions = report.decision_comparison.options.map(option => option.action);
+  assert.deepEqual(actions, ['HOLD', 'REDUCE', 'ADD', 'ROTATE', 'DEFENSIVE', 'NO_ACTION']);
+  const add = report.decision_comparison.options.find(option => option.action === 'ADD');
+  assert.equal(add.funding_status, 'QUANTITY_REQUIRED');
+  assert.equal(add.quantity_basis, 'not_provided');
+  assert.equal(add.executable, false);
+  assert.match(add.summary, /现有现金\d+分/);
+  assert.doesNotMatch(add.summary, /510300|159558/, '未指定候选时不得用候选或持仓代替建仓标的');
+});
+
+test('D1-5f 指定候选取现金建仓时，ADD 方案给出成交后现金、费用与敞口变化', () => {
+  const db = confirmedPortfolio('portfolio-cash-add-option.sqlite');
+  const report = buildDailyReport({
+    portfolioDb: db, marketDb: marketMain, accountId: 'confirmed-account', asOfTradeDate: LAST,
+    generatedAt: '2026-10-16T21:55:00+08:00',
+    researchScenario: { buyCode: '510300.SH', buyQuantity: 100 },
+  });
+  const add = report.decision_comparison.options.find(option => option.action === 'ADD');
+  const hold = report.decision_comparison.options.find(option => option.action === 'HOLD');
+  assert.equal(add.funding_status, 'FUNDED');
+  assert.match(add.summary, /510300\.SH/);
+  assert.ok(add.fees_cents > 0 && add.fee_breakdowns.length === 1);
+  assert.ok(add.cash_after_cents < hold.cash_after_cents, '建仓后现金必须下降');
+  assert.ok(add.exposure_after.equity_weight >= hold.exposure_after.equity_weight, '加仓不降低权益敞口');
+  assert.equal(add.executable, false);
+});
 
 test('D1-6 plan_tracking 缺表 → 明确降级为 not_available，不建表、不补造历史', () => {
   const report = build();

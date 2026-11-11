@@ -13,6 +13,8 @@ import type { ResearchState, ResearchStockView } from '../ashare/technicalFramew
 import type { DataState } from '../ashare/dataReadiness.js';
 import { buildBenchmarkComparison, BENCHMARK_DEFINITION_VERSION } from './benchmarks.js';
 import { buildDailyReport } from './dailyReport.js';
+import { buildResearchCases, RESEARCH_CASE_SCHEMA } from './researchCase.js';
+import { buildInvestorReportModel, REPORT_MODEL_SCHEMA } from './reportModel.js';
 import { resolveAccountId, resolveAccountSnapshot } from './accounts.js';
 import { listResearchJournal, evaluateResearchJournal, journalFeeEstimator } from './researchJournal.js';
 import { loadFeeContext, feeRulesFor, type FeeEvidence } from './fees.js';
@@ -419,14 +421,32 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
   const sync = market && asOf ? safe('sync_times', () => market.prepare(
     'SELECT dataset,key,status,synced_at FROM sync_log WHERE key <= ? ORDER BY synced_at DESC LIMIT 20',
   ).all(asOf)) : null;
-  const historical = market && asOf ? safe('research_tracking', () => ({
-    legacy_plans: readTracking(input.portfolioDb, account.account_id, asOf),
-    records: listResearchJournal(input.portfolioDb, { accountId: account.account_id, asOf, limit: 5 })
-      .map(({ payload, ...record }) => record),
-    evaluations: evaluateResearchJournal({ portfolioDb: input.portfolioDb, marketDb: market, accountId: account.account_id, asOf, limit: 5,
+  const historical = market && asOf ? safe('research_tracking', () => {
+    const evaluations = evaluateResearchJournal({ portfolioDb: input.portfolioDb, marketDb: market, accountId: account.account_id, asOf, limit: 5,
       feeEstimator: journalFeeEstimator(input.portfolioDb, market, account.account_id),
-    }),
-  })) : null;
+    });
+    const count = (status: string) => evaluations.filter(item => item.status === status).length;
+    const evaluated = count('EVALUATED');
+    const pending = count('PENDING');
+    return {
+      legacy_plans: readTracking(input.portfolioDb, account.account_id, asOf),
+      records: listResearchJournal(input.portfolioDb, { accountId: account.account_id, asOf, limit: 5 })
+        .map(({ payload, ...record }) => record),
+      evaluations,
+      // WP6：实际账户、影子组合、固定基准、研究命题是四本独立的账，
+      // 这里只披露前瞻命题样本的成熟度；未成熟时报告“观察中”，
+      // 不把回放结果或待定样本当作业绩。
+      forward_status: {
+        sample_state: evaluated > 0 ? 'MATURED_SAMPLE' : pending > 0 ? 'OBSERVING_NOT_MATURED' : 'NO_PROSPECTIVE_RECORD',
+        evaluated, pending, unavailable: count('UNAVAILABLE'),
+        horizons: [...new Set(evaluations.map(item => item.horizon_trade_days))].sort((a, b) => a - b),
+        note: evaluated > 0
+          ? '已到期样本只作方法观察；没有证明可重复的收益优势。'
+          : '前瞻窗口尚未成熟，本期报告观察中状态；回放结果与待定样本不计为业绩。',
+        separate_ledgers: ['actual_account', 'shadow', 'fixed_benchmark', 'research_thesis'],
+      },
+    };
+  }) : null;
   // `candidates` is the complete canonical screen (fixed limit), and is what the
   // identity hash consumes. `held`/`other` are display projections only: held
   // instruments stay present even if missing or below any screen threshold.
@@ -523,6 +543,17 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     asOf,
     holdings: (portfolio?.holdings ?? snapshot?.snapshot?.positions ?? [])
       .map((h: any) => ({ ts_code: h.ts_code, name: h.name ?? null })),
+  });
+  const overlapCandidateCodes = new Set((hotspotResearch.overlap_with_holdings ?? []).flatMap(row => row.candidates));
+  const researchCases = buildResearchCases({
+    asOf,
+    marketDb: market,
+    holdings: portfolio?.holdings ?? [],
+    highlights: hotspotResearch.daily_highlights,
+    watch: hotspotResearch.watch,
+    deteriorating: hotspotResearch.deteriorating,
+    priorityCandidateCodes: [...overlapCandidateCodes],
+    limitCandidates: 5,
   });
 
   const facts = {
@@ -657,6 +688,23 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     etf_penetration: etfPenetration,
     // §4b 热点行业 × 多策略研究层（goal-1028）：只读 CLI 快照；NOT_READY 不伪造。
     hotspot_research: hotspotResearch,
+    research_cases: { schema: RESEARCH_CASE_SCHEMA, as_of_trade_date: asOf, cases: researchCases,
+      candidate_limit: 5, candidate_scope: 'hotspot snapshot highlights then WATCH, prioritized by explicit sector overlap with holdings' },
+    // WP5：唯一报告模型。所有展示出口（Markdown/飞书/预览）从这里取结论，
+    // 不各自重算数字；派生自 facts，不进入身份哈希。
+    report_model: buildInvestorReportModel({
+      asOf, generatedAt,
+      verification: verification ? {
+        account_id: verification.account_id, snapshot_id: snapshot?.snapshot?.snapshot_id ?? null,
+        summary_status: verification.summary_status,
+        reported_events_through: completeness?.reported_events_through ?? null,
+        last_user_reconciled_at: completeness?.last_user_reconciled_at ?? null,
+      } : null,
+      portfolio, benchmarks, researchCases,
+      gaps: gaps.map(gap => ({ module: gap.module, reason: gap.reason, affected: gap.affected })),
+      marketAsOf: targetReport?.as_of_trade_date ?? quality?.as_of_trade_date ?? null,
+      hotspotAsOf: hotspotResearch.snapshot?.as_of ?? null,
+    }),
     portfolio,
     transaction_fees: { as_of_trade_date: asOf, securities: feeSummary, accounting: 'actual booked fees remain immutable; slippage estimates are separate' },
     benchmarks,
@@ -780,12 +828,9 @@ function buildConclusionRefs(input: {
 // → buildEtfPenetrationSummary（纯函数）。本层只负责挑选持仓中的基金代码、逐只调用、
 // 失败降级；输出挂 bundle 顶层 etf_penetration（facts 之外，不入 report_id 身份哈希）。
 //
-// CollectOptions 的 weightRows/weightSource/indexCode/forecastRows/comparables/driverEvidence
-// 均为调用方上游（联网）取得的数据；日报构建路径禁止联网，本地库也没有 index_weight /
-// fund_portfolio 缓存表，因此这里只传三个必填参数。权重行缺失时**不**产出摘要：
-// buildEtfPenetrationSummary 会把空权重标成 fund_portfolio 口径（误导性来源字符串），
-// 宁可逐只 UNAVAILABLE 并记块内缺口。上游将来把权重入缓存后，只需在此传入
-// weightRows/weightDate/weightSource，块结构不变。
+// CollectOptions 的权重由 collectEtfPenetrationInputs 从 SQLite PIT 快照优先读取，
+// 再回退到本地 JSON 缓存；日报构建路径不联网。来源、报告期、发布时间与权重口径
+// 随摘要输出。缺少可用快照时逐只 UNAVAILABLE，不伪造穿透结果。
 
 export const ETF_PENETRATION_BUNDLE_SCHEMA = 'ashare-etf-penetration-bundle/1.0';
 const PENETRATION_WINDOW_SESSIONS = 20;
@@ -844,7 +889,7 @@ export function buildEtfPenetrationState(input: {
         etfs[code] = { status: 'UNAVAILABLE', reason: 'no_local_constituent_weight_cache', summary: null };
         gaps.push({
           module: 'etf_penetration',
-          reason: `${code}: no_local_constituent_weight_cache (index_weight/fund_portfolio 未入库；日报构建禁止联网采集)`,
+          reason: `${code}: no_local_constituent_weight_cache (SQLite PIT 快照与 JSON 权重缓存均无可用数据；日报构建禁止联网采集)`,
           affected: ['etf_penetration'],
         });
         continue;

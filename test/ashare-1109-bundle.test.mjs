@@ -98,6 +98,17 @@ test('A08: identity consistent across modules (as-of, snapshot identity, hash)',
     const again = build(f);
     assert.equal(again.report_id, bundle.report_id);
     assert.ok('research_tracking' in bundle);
+    // WP6：前瞻样本状态必须显式披露，且四类账本分开列名，不混业绩。
+    const forward = bundle.research_tracking?.forward_status;
+    assert.ok(forward, 'research_tracking must disclose forward sample state');
+    assert.ok(['MATURED_SAMPLE', 'OBSERVING_NOT_MATURED', 'NO_PROSPECTIVE_RECORD'].includes(forward.sample_state));
+    assert.deepEqual(forward.separate_ledgers, ['actual_account', 'shadow', 'fixed_benchmark', 'research_thesis']);
+    assert.ok(forward.note.length > 0);
+    // 状态必须与计数自洽，而不是可以填任意枚举值。
+    assert.equal(forward.evaluated + forward.pending + forward.unavailable, bundle.research_tracking.evaluations.length);
+    if (forward.sample_state === 'MATURED_SAMPLE') assert.ok(forward.evaluated > 0);
+    if (forward.sample_state === 'OBSERVING_NOT_MATURED') assert.ok(forward.pending > 0 && forward.evaluated === 0);
+    if (forward.sample_state === 'NO_PROSPECTIVE_RECORD') assert.equal(forward.evaluated + forward.pending, 0);
     assert.ok('research_stance' in bundle);
     assert.ok('execution_eligibility' in bundle);
     // persistedSnapshotStatus READ_ERROR on DB fault (P0-3 tie-in)
@@ -174,5 +185,40 @@ test('A19: claims traceable to bundle facts; counter-evidence / gaps present', (
     assert.ok(['HOLD_OBSERVE', 'INSUFFICIENT_EVIDENCE', 'RELATIVE_ADVANTAGE'].includes(bundle.research_stance));
     // no fabricated win-rate / target language in markdown
     assert.doesNotMatch(bundle.markdown_summary, /胜率|目标收益|必然/);
+  } finally { f.market.close(); f.p.close(); }
+});
+
+test('W3/W5 research_cases 与唯一 report_model：持仓全覆盖，限制不被合并', () => {
+  const f = fixture({ confirmed: true });
+  try {
+    const bundle = build(f, { accountId: ACCOUNT });
+    const cases = bundle.research_cases.cases;
+    const holdingCases = cases.filter(item => item.role === 'HOLDING');
+    assert.equal(holdingCases.length, DEMO_SNAPSHOT.positions.length, '每个当前持仓必须有一个 ResearchCase');
+    for (const item of holdingCases) {
+      assert.ok(item.case_id.includes(item.ts_code));
+      assert.ok(['AVAILABLE', 'UNAVAILABLE'].includes(item.technical.status));
+      // 反证或缺失证据至少有一项显式存在，且缺失证据不能被写成负面证据。
+      assert.ok(item.counter_thesis.length > 0 || item.evidence_gaps.length > 0, '必须显式列出反证或证据缺口');
+      for (const gap of item.evidence_gaps) assert.doesNotMatch(gap, /^(利空|负面|看空)/);
+      assert.ok(item.invalidation_conditions.length > 0);
+    }
+    const model = bundle.report_model;
+    assert.equal(model.schema, 'ashare-investor-report-model/1.0');
+    assert.equal(model.sections.length, 6);
+    assert.ok(model.conclusion.length > 0);
+    assert.equal(model.account_version.last_user_reconciled_at, null);
+    assert.match(model.account_version.reconciliation_note, /券商实际对账/);
+    assert.ok(model.limitations.some(text => /不提供下单授权/.test(text)));
+    // 展示层可直接渲染的逐持仓判断与首选/备选
+    assert.equal(model.holdings_rows.length, DEMO_SNAPSHOT.positions.length);
+    assert.ok(model.preferred, 'report_model 必须给出首选方案');
+    assert.ok(['HOLD', 'REDUCE', 'ADD', 'ROTATE', 'NO_ACTION'].includes(model.preferred.action));
+    assert.ok(model.backup, 'report_model 必须给出备选方案');
+    // 首选/备选是研究倾向，执行永远不是下单授权。
+    for (const plan of bundle.portfolio.decision_comparison.decision_plans) {
+      assert.ok(['BLOCKED', 'NOT_AUTHORIZED'].includes(plan.execution_feasibility));
+      assert.equal(plan.strategy_evidence, 'UNVERIFIED');
+    }
   } finally { f.market.close(); f.p.close(); }
 });

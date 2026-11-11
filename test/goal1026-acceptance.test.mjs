@@ -760,12 +760,12 @@ test('10.2-10 正反证同时存在 → 两向并列且均不升级为事实', (
 
 const SCENARIO_FULL = { sellCode: '159558.SZ', sellQuantity: 1000, buyCode: '510300.SH', buyQuantity: 100 };
 
-test('10.3-1..5 五方案（HOLD/REDUCE/ROTATE/DEFENSIVE/NO_ACTION）齐备且语义各归其位', () => {
+test('10.3-1..6 六方案（HOLD/REDUCE/ADD/ROTATE/DEFENSIVE/NO_ACTION）齐备且语义各归其位', () => {
   seedMarket('m3-five');
   seedAccount('m3-five');
   const report = build('m3-five', { scenario: SCENARIO_FULL });
   const by = Object.fromEntries(report.decision_comparison.options.map(o => [o.action, o]));
-  assert.deepEqual(Object.keys(by).sort(), ['DEFENSIVE', 'HOLD', 'NO_ACTION', 'REDUCE', 'ROTATE']);
+  assert.deepEqual(Object.keys(by).sort(), ['ADD', 'DEFENSIVE', 'HOLD', 'NO_ACTION', 'REDUCE', 'ROTATE']);
   // HOLD：无交易。
   assert.equal(by.HOLD.funding_status, 'NO_TRADE');
   assert.equal(by.HOLD.sell_plan, null);
@@ -774,6 +774,10 @@ test('10.3-1..5 五方案（HOLD/REDUCE/ROTATE/DEFENSIVE/NO_ACTION）齐备且�
   assert.equal(by.REDUCE.funding_status, 'FUNDED');
   assert.equal(by.REDUCE.sell_plan.quantity, 1000);
   assert.equal(by.REDUCE.executable, false);
+  // ADD：只用现有现金建仓/加仓，资金测算成立但不是执行授权。
+  assert.equal(by.ADD.funding_status, 'FUNDED');
+  assert.equal(by.ADD.quantity_basis, 'not_provided');
+  assert.equal(by.ADD.executable, false);
   // ROTATE：双边测算成立时给出轮动计划，优势仍是 UNVERIFIED。
   assert.equal(by.ROTATE.funding_status, 'FUNDED');
   assert.equal(by.ROTATE.rotation_plan.quantity, 100);
@@ -784,8 +788,8 @@ test('10.3-1..5 五方案（HOLD/REDUCE/ROTATE/DEFENSIVE/NO_ACTION）齐备且�
   // NO_ACTION：明确不操作。
   assert.equal(by.NO_ACTION.funding_status, 'NO_TRADE');
   // 决策依据分布：轮动=主动、减仓/防守=风险控制、持有/不操作=无交易。
-  assert.deepEqual(['HOLD', 'REDUCE', 'ROTATE', 'DEFENSIVE', 'NO_ACTION'].map(a => by[a].decision_basis),
-    ['NO_TRADE', 'RISK_CONTROL', 'ACTIVE_ROTATION', 'RISK_CONTROL', 'NO_TRADE']);
+  assert.deepEqual(['HOLD', 'REDUCE', 'ADD', 'ROTATE', 'DEFENSIVE', 'NO_ACTION'].map(a => by[a].decision_basis),
+    ['NO_TRADE', 'RISK_CONTROL', 'NO_TRADE', 'ACTIVE_ROTATION', 'RISK_CONTROL', 'NO_TRADE']);
   // 未给研究数量时：REDUCE/ROTATE 不得凭空生成计划。
   const noQty = build('m3-five');
   const noBy = Object.fromEntries(noQty.decision_comparison.options.map(o => [o.action, o]));
