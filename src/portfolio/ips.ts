@@ -148,6 +148,7 @@ export function proposeRebalance(input: ProposalInput): Proposal {
     for (const p of sats) {
       if (remaining <= 0) break;
       const lotCents = valueCents(ips.lot_size, p.price_milli);
+      if (remaining < lotCents / 2) { notes.push(`${p.code}：剩余降仓额不足半手，不下碎单`); continue; }
       const lots = Math.min(Math.floor(p.sellable_shares / ips.lot_size), Math.max(1, Math.round(remaining / lotCents)));
       if (lots <= 0) { notes.push(`${p.code} 无可卖整手（T+1 或不足一手）`); continue; }
       const shares = lots * ips.lot_size;
