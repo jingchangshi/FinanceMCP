@@ -183,14 +183,22 @@ export function weightsAvailableAt(
   const candidates = db.prepare(`
     SELECT * FROM etf_weight_snapshot
     WHERE etf_code = ? AND available_from <= ? AND effective_date <= ?
-    ORDER BY effective_date DESC, weight DESC, stock_code ASC
+    ORDER BY effective_date DESC,
+      CASE source WHEN 'fund_portfolio' THEN 0 ELSE 1 END,
+      available_from DESC, collected_at DESC, stock_code ASC
   `).all(etf_code, asOf, asOf) as any[];
   if (!candidates.length) return { rows: [], quality: 'UNAVAILABLE', reason: 'no_snapshot_available_at' };
 
   const unpublished = candidates.filter(r => !isPublished(r.published_at));
   const pool = opts?.allowUnpublished ? candidates : candidates.filter(r => isPublished(r.published_at));
-  const latest = pool.length ? String(pool[0].effective_date) : null;
-  const rows = latest === null ? [] : pool.filter(r => String(r.effective_date) === latest).map(mapRow);
+  // A date can have both an index proxy and a disclosed fund holding snapshot.
+  // Select one complete snapshot version; never merge the two denominators.
+  const latestVersion = pool.length ? String(pool[0].snapshot_version) : null;
+  // 快照内部按权重降序返回（顶层成分语义）；null 权重排在最后，同权重按代码稳定排序。
+  const rows = latestVersion === null ? [] : pool
+    .filter(r => String(r.snapshot_version) === latestVersion)
+    .map(mapRow)
+    .sort((a, b) => (b.weight ?? -Infinity) - (a.weight ?? -Infinity) || a.stock_code.localeCompare(b.stock_code));
   const returnedUnpublished = rows.filter(r => !isPublished(r.published_at)).length;
 
   let quality: DataQuality = 'OK';
