@@ -63,3 +63,8 @@ test('buys only use cash above the cash target and whole lots', () => {
   const sellNet = p.orders.filter(o => o.side === 'SELL').reduce((a, o) => a + o.est_amount_cents - o.est_commission_cents, 0);
   assert.ok(spent <= 154447 + sellNet);
 });
+
+test('no dust orders: remaining reduction below half a lot is skipped', () => {
+  const p = proposeRebalance({ ...base, drawdown_bps: 1520 });
+  for (const o of p.orders.filter(x => x.side === 'SELL')) assert.ok(o.est_amount_cents >= 5000, `dust order ${o.code}`);
+});
