@@ -8,7 +8,7 @@ const dir = mkdtempSync(join(tmpdir(), 'ashare-engine-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'cache.sqlite');
 const { openAshareDb, upsertRows, closeAshareDb } = await import('../build/ashare/db.js');
-const { scanMarket, scoreRows, cashScore, SCORE_VERSION, RESEARCH_SCORE_VERSION } = await import('../build/ashare/analysis.js');
+const { scanMarket, scoreRows, cashScore, LEGACY_SCORE_VERSION, SCORE_VERSION, RESEARCH_SCORE_VERSION } = await import('../build/ashare/analysis.js');
 const { analyzeMarket, factorSnapshot, rawFactors, missingAmount20Codes, sourceQualityForDate, applyObservationQuality, FACTOR_UNITS } = await import('../build/ashare/engine.js');
 const { runAshareTool, ashareToolDefinitions } = await import('../build/ashare/tools.js');
 const { seedMarket, weekdays, STOCKS } = await import('./ashare-fixture.mjs');
@@ -38,7 +38,7 @@ upsertRows(db, 'fina_indicator', finaCols, [
 
 test('cash percent threshold regression: 115.11%, 20%, -10%, zero and missing', () => {
   for (const [cash, v1, v2] of [[115.11, 1, 1], [20, 1, .5], [-10, 0, 0], [0, 0, 0], [null, .5, .5]]) {
-    assert.equal(cashScore(cash, SCORE_VERSION), v1);
+    assert.equal(cashScore(cash, LEGACY_SCORE_VERSION), v1); // V1 = legacy ratio-scale threshold
     assert.equal(cashScore(cash, RESEARCH_SCORE_VERSION), v2);
   }
   assert.throws(() => cashScore(20, 'other'), /Unsupported/);
@@ -46,7 +46,7 @@ test('cash percent threshold regression: 115.11%, 20%, -10%, zero and missing', 
 
 test('V1 exact formula and V2 per-factor attribution preserve all other weights', () => {
   const a = row(20), b = row(20);
-  const v1 = scoreRows([a], [], SCORE_VERSION).get(a.ts_code);
+  const v1 = scoreRows([a], [], LEGACY_SCORE_VERSION).get(a.ts_code);
   const v2 = scoreRows([b], [], RESEARCH_SCORE_VERSION).get(b.ts_code);
   // Singleton PR=.5; technical=.75; fundamental=.75/.625; sector=.5.
   assert.equal(a.score, 66.25);
@@ -58,7 +58,7 @@ test('V1 exact formula and V2 per-factor attribution preserve all other weights'
   for (const factor of Object.keys(v1.factor_contributions)) if (factor !== 'cash') assert.equal(v1.factor_contributions[factor], v2.factor_contributions[factor], factor);
   assert.ok(Math.abs(Object.values(v2.factor_contributions).reduce((a, b) => a + b, 0) - b.score) < 1e-10);
   const again = structuredClone(a);
-  assert.deepEqual(scoreRows([again], []).get(a.ts_code), v1);
+  assert.deepEqual(scoreRows([again], [], LEGACY_SCORE_VERSION).get(a.ts_code), v1);
   assert.deepEqual(again, a);
 });
 
