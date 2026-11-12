@@ -32,6 +32,8 @@
     "start:cache": "node build/cacheGateway.js",
     "start:sse": "npx supergateway --stdio \"node build/index.js\" --port 3100",
     "test": "npm run build && node --test test/*.test.mjs",
+    "test:full": "npm run build && node --test --test-timeout=1500000 --test-reporter=tap test/*.test.mjs > test-full.tap; node -e \"const t=require('fs').readFileSync('test-full.tap','utf8');console.log(t.split('\\n').filter(l=>/^# (tests|pass|fail|skipped)/.test(l)).join(' '));process.exit(/^# fail 0/m.test(t)?0:1)\"",
+    "test:fast": "npm run build && node --test --test-timeout=300000 test/ips-rebalance.test.mjs test/upgrade-fees.test.mjs test/upgrade-fees-calibration.test.mjs test/upgrade-report-correctness.test.mjs test/upgrade-risk-fee-consistency.test.mjs test/report-golden.test.mjs test/v1-daily-report.test.mjs test/ashare-engine.test.mjs test/ashare-champion-check.test.mjs",
     "test:cache": "npm run build && node --test test/cache-gateway.test.mjs",
     "test:ashare": "npm run build && node --test test/ashare-*.test.mjs",
     "ashare": "node build/ashare/cli.js",

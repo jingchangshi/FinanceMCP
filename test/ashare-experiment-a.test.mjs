@@ -5,7 +5,8 @@ import { seedReferenceUniverse, weekdays } from './ashare-fixture.mjs';
 import {
   selectPool, evaluateArm, SELECTION_ARMS, HORIZONS, POOL_SIZE, EXPERIMENT_A_COSTS,
 } from '../build/ashare/experimentA.js';
-import { scanMarket, scoreRows, SCORE_VERSION, SCORE_RULES } from '../build/ashare/analysis.js';
+// V1 = the frozen production Champion = score-1.0.0. SCORE_VERSION moved to score-3.0.0 in 2e318da; these tests pin V1 explicitly.
+import { scanMarket, scoreRows, LEGACY_SCORE_VERSION, SCORE_RULES } from '../build/ashare/analysis.js';
 import { evaluateEvents } from '../build/ashare/evaluation.js';
 
 /** Phase 5 Experiment A — synthetic acceptance for the pool-selection arms.
@@ -68,10 +69,10 @@ test('an ineligible name never enters a pool, even when it scores highest', t =>
   // mechanism: an ST name. `scanMarket` excludes ST before anything else
   // (analysis.ts:180), so these names must vanish from `eligible` entirely —
   // not merely be deprioritised.
-  const scan = scanMarket(db, AS_OF);
+  const scan = scanMarket(db, AS_OF, { score_version: LEGACY_SCORE_VERSION });
   const top = scan.rows.filter(r => r.eligible).slice(0, 5).map(r => r.ts_code);
   for (const code of top) db.prepare('UPDATE stock_basic SET name = ? WHERE ts_code = ?').run('ST测试', code);
-  const after = scanMarket(db, AS_OF);
+  const after = scanMarket(db, AS_OF, { score_version: LEGACY_SCORE_VERSION });
   assert.equal(after.rows.filter(r => !r.eligible).length, 5, 'the ST names must now be ineligible');
   for (const arm of SELECTION_ARMS) {
     if (arm === 'SINGLE_FACTOR_ROE') continue;
@@ -85,7 +86,7 @@ test('an ineligible name never enters a pool, even when it scores highest', t =>
 
 test('INDUSTRY_NEUTRAL ranks by score WITHIN each industry, not by code', t => {
   const db = fixture(t);
-  const scan = scanMarket(db, AS_OF);
+  const scan = scanMarket(db, AS_OF, { score_version: LEGACY_SCORE_VERSION });
   const scoreOf = new Map(scan.rows.map(r => [r.ts_code, r.score]));
   const s = selectPool(db, AS_OF, 'INDUSTRY_NEUTRAL');
   // The round-robin takes the `round`-th best name of each industry in turn, so
@@ -181,7 +182,7 @@ test('the arms are actually different orderings, not six spellings of one', t =>
   const industry = selectPool(db, AS_OF, 'INDUSTRY_NEUTRAL').pool;
   // The whole point of this arm: no industry may hold more than its share.
   // One scan, reused — a scan per code would be 30 whole-market scans.
-  const industryOf = new Map(scanMarket(db, AS_OF).rows.map(r => [r.ts_code, r.industry]));
+  const industryOf = new Map(scanMarket(db, AS_OF, { score_version: LEGACY_SCORE_VERSION }).rows.map(r => [r.ts_code, r.industry]));
   const perIndustry = new Map();
   for (const code of industry) perIndustry.set(industryOf.get(code), (perIndustry.get(industryOf.get(code)) ?? 0) + 1);
   assert.ok(
@@ -204,7 +205,7 @@ test('SINGLE_FACTOR_ROE reports an empty pool when no financials exist, rather t
 
 test('DROP_VALUATION subtracts the frozen valuation contribution; it does not re-weight the rest', t => {
   const db = fixture(t);
-  const scan = scanMarket(db, AS_OF);
+  const scan = scanMarket(db, AS_OF, { score_version: LEGACY_SCORE_VERSION });
   const W = SCORE_RULES.weights;
   const rows = scan.rows.filter(r => r.eligible);
   for (const r of rows) {
@@ -235,14 +236,14 @@ test('DROP_VALUATION subtracts the frozen valuation contribution; it does not re
 
 test('a second scoreRows call is idempotent — the single call is a cost choice, not a correctness one', t => {
   const db = fixture(t);
-  const scan = scanMarket(db, AS_OF);
+  const scan = scanMarket(db, AS_OF, { score_version: LEGACY_SCORE_VERSION });
   const snap = (rows) => rows.map(r => `${r.ts_code}|${r.score}|${r.rank}|${JSON.stringify(r.components)}`).join(';');
   const before = snap(scan.rows);
   const orderBefore = scan.rows.map(r => r.ts_code).join(',');
-  scoreRows(scan.rows, scan.sectors, SCORE_VERSION);
+  scoreRows(scan.rows, scan.sectors, LEGACY_SCORE_VERSION);
   assert.equal(snap(scan.rows), before, 'scoreRows is a pure function of its inputs: a second call must not change any row');
   assert.equal(scan.rows.map(r => r.ts_code).join(','), orderBefore, 'scan.rows order must not be mutated');
-  scoreRows(scan.rows, scan.sectors, SCORE_VERSION);
+  scoreRows(scan.rows, scan.sectors, LEGACY_SCORE_VERSION);
   assert.equal(snap(scan.rows), before, 'a third call must still be idempotent');
 });
 

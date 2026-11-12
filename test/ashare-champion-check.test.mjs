@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openAshareDb } from '../build/ashare/db.js';
 import { seedReferenceUniverse, weekdays } from './ashare-fixture.mjs';
-import { SCORE_VERSION, SCORE_RULES, scanMarket, scoreRows } from '../build/ashare/analysis.js';
+// V1 = the frozen production Champion = score-1.0.0. SCORE_VERSION moved to score-3.0.0 in 2e318da; these tests pin V1 explicitly.
+import { LEGACY_SCORE_VERSION, SCORE_RULES, scanMarket, scoreRows } from '../build/ashare/analysis.js';
 import {
   checkChampionConsistency, checkProductionChampion, FROZEN_CHAMPION,
 } from '../build/ashare/championCheck.js';
@@ -33,7 +34,7 @@ const RULES = FROZEN_CHAMPION.rules;
 
 /** The honest implementation, built from the real module's published constants. */
 const honest = (rows = []) => ({
-  version: SCORE_VERSION,
+  version: LEGACY_SCORE_VERSION,
   weights: { ...SCORE_RULES.weights },
   // Only the eligibility floors. Passing all of SCORE_RULES here would include
   // the nested `weights` object, and the rules check would then be comparing a
@@ -202,7 +203,7 @@ test('the real breakdown implies exactly the frozen weights, leg by leg', t => {
   const dates = weekdays('20240102', 160);
   seedReferenceUniverse(db, dates, { stocks: 40, industries: 5 });
   const scan = scanMarket(db, dates.at(-1));
-  const breakdowns = [...scoreRows(scan.rows, scan.sectors, SCORE_VERSION).values()];
+  const breakdowns = [...scoreRows(scan.rows, scan.sectors, LEGACY_SCORE_VERSION).values()];
   assert.ok(breakdowns.length > 0, 'the fixture must produce scored rows');
   let checked = 0;
   for (const b of breakdowns) {
