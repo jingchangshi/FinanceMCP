@@ -19,6 +19,7 @@ from feishu_publish import (  # noqa: E402
     dry_run,
     load_ledger,
     publish,
+    validate_xml,
     verify_readback,
 )
 
@@ -211,6 +212,33 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual(report["action"], "create")
         self.assertEqual(report["problems"], [])
         self.assertEqual(report["hyperlink_count"], SOURCE_COUNT)
+
+    def test_source_title_passes_publish_and_readback_checks(self):
+        sections = json.loads(SAMPLE.read_text(encoding="utf-8"))
+        sections["sections"]["数据说明与参考来源"]["sources"][0]["title"] = (
+            "AV1 V20 McMCPerson rehash 市场报道：V1 V2 MCP hash"
+        )
+        xml = render_xml(sections)
+        self.assertEqual(validate_xml(xml, SOURCE_COUNT), [])
+        self.assertEqual(verify_readback(xml, TITLE, SOURCE_COUNT), [])
+        self.xml_path.write_text(xml, encoding="utf-8")
+        runner = MockRunner(fetch_content=xml)
+        publish(self.root, self.xml_path, "20261106", TITLE, SOURCE_COUNT, CONFIG, runner=runner)
+        self.assertEqual([call[2] for call in runner.calls], ["+create", "+fetch"])
+
+    def test_short_terms_are_rejected_at_publish_boundaries(self):
+        for term in ("V1", "V2", "MCP", "hash"):
+            with self.subTest(term=term):
+                poisoned = self.xml_text + f"<p>内部{term}字段</p>"
+                self.assertTrue(any("forbidden" in p for p in validate_xml(poisoned, SOURCE_COUNT)))
+                self.assertTrue(any("forbidden" in p for p in verify_readback(poisoned, TITLE, SOURCE_COUNT)))
+
+    def test_short_term_in_non_source_link_is_rejected(self):
+        poisoned = self.xml_text.replace(
+            "<b>结论：</b>", '<b>结论：</b><a href="https://example.com">MCP</a>'
+        )
+        self.assertTrue(any("forbidden" in p for p in validate_xml(poisoned, SOURCE_COUNT + 1)))
+        self.assertTrue(any("forbidden" in p for p in verify_readback(poisoned, TITLE, SOURCE_COUNT + 1)))
 
     def test_verify_readback_rejects_forbidden_term(self):
         problems = verify_readback("<p>ok NOT_READY</p>", TITLE, SOURCE_COUNT)

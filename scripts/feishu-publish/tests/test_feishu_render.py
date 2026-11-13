@@ -85,6 +85,46 @@ class TestHygiene(unittest.TestCase):
                 f"term {term!r} not rejected: {problems}",
             )
 
+    def test_source_titles_with_short_term_substrings_are_allowed(self):
+        for title in ("AV1 视频标准", "V10 车型", "V20 产品", "McMCPerson 报告", "rehash 市场回顾"):
+            with self.subTest(title=title):
+                sections = load_sample()
+                sections["sections"]["数据说明与参考来源"]["sources"][0]["title"] = title
+                self.assertEqual(validate_sections(sections), [])
+                self.assertIn(title, strip_tags(render_xml(sections)))
+
+    def test_source_titles_may_contain_standalone_short_terms(self):
+        for term in ("V1", "V2", "MCP", "hash"):
+            with self.subTest(term=term):
+                sections = load_sample()
+                sections["sections"]["数据说明与参考来源"]["sources"][0]["title"] = f"研究报告：{term}"
+                self.assertEqual(validate_sections(sections), [])
+                xml = render_xml(sections)
+                self.assertIn(f"研究报告：{term}", strip_tags(xml))
+                self.assertEqual(check_forbidden(strip_tags(xml)), [])
+
+    def test_source_fields_other_than_title_are_not_exempt(self):
+        for field in ("publisher", "date"):
+            sections = load_sample()
+            sections["sections"]["数据说明与参考来源"]["sources"][0][field] = "内部MCP"
+            self.assertTrue(any("forbidden" in p for p in validate_sections(sections)))
+
+    def test_short_terms_remain_forbidden_at_boundaries(self):
+        for term in ("V1", "V2", "MCP", "hash"):
+            for text in (term, f"内部{term}字段", f"({term})", f"{term}_value"):
+                with self.subTest(text=text):
+                    self.assertIn(term, check_forbidden(text))
+        self.assertEqual(check_forbidden("AV1 V10 V20 xMCP MCP2 rehash hash3"), [])
+
+    def test_internal_field_tokens_are_still_rejected(self):
+        for token in ("content_hash", "custom_field", "CUSTOM_ENUM"):
+            with self.subTest(token=token):
+                sections = load_sample()
+                sections["sections"]["数据说明与参考来源"]["sources"][0]["title"] = token
+                self.assertTrue(any("internal field/enum" in p for p in validate_sections(sections)))
+                with self.assertRaises(ValueError):
+                    render_xml(sections)
+
     def test_markdown_leak_is_rejected(self):
         for leaky in (
             "# 标题",

@@ -914,7 +914,7 @@ function renderSectionD(r: DailyReportResult, view: RenderView): string {
 function renderSectionE(r: DailyReportResult, annotations: AnnotationIndex = new Map()): string {
   if (!r.holdings.length) return '- 本期没有可展示的持仓。';
   const rows = [...r.holdings].sort((a, b) => b.weight - a.weight);
-  const header = '| 持仓 | 收盘价(元) | 当日涨跌 | 权重 | 20日相对宽基 | 研究结论 |\n|---|---|---|---|---|---|';
+  const header = '| 持仓 | 份额(份) | 摊薄成本(元) | 收盘价(元) | 当日涨跌 | 权重 | 20日相对宽基 | 研究结论 |\n|---|---|---|---|---|---|---|---|';
   const table = rows.map((holding) => {
     const quote = holding.research.quote;
     const trend = holding.research.trend;
@@ -922,11 +922,12 @@ function renderSectionE(r: DailyReportResult, annotations: AnnotationIndex = new
       : holding.stance === 'ROTATE' ? '轮动(研究)' : '等待';
     const fresh = holding.research.data.fresh && holding.bar_quality === 'READY';
     const conclusion = fresh ? `${stance}，判断未变` : `${stance}，行情待补`;
+    const cost = holding.diluted_cost_per_share == null ? '—' : holding.diluted_cost_per_share.toFixed(4);
     const close = quote.close_cny === null ? '—' : quote.close_cny.toFixed(3);
     const chg = quote.pct_chg === null ? '—' : `${quote.pct_chg >= 0 ? '+' : ''}${quote.pct_chg.toFixed(2)}%`;
     const excess = trend.excess_ret20_vs_broad_pct === null ? '—'
       : `${trend.excess_ret20_vs_broad_pct >= 0 ? '+' : ''}${trend.excess_ret20_vs_broad_pct.toFixed(2)}pp`;
-    return `| ${holding.name}(${holding.ts_code}) | ${close} | ${chg} | ${weightPct(holding.weight)} | ${excess} | ${conclusion} |`;
+    return `| ${holding.name}(${holding.ts_code}) | ${holding.quantity.toLocaleString('en-US')} | ${cost} | ${close} | ${chg} | ${weightPct(holding.weight)} | ${excess} | ${conclusion} |`;
   }).join('\n');
   // 展开优先级：权重高且（相对表现分叉大或贴近观察触发位）的持仓，最多两只。
   const expandable = rows.filter((holding) => {
@@ -990,13 +991,18 @@ function renderSectionE(r: DailyReportResult, annotations: AnnotationIndex = new
   const restNote = rows.length > expandable.length
     ? `- 其余 ${rows.length - expandable.length} 只持仓本期无重要变化，判断未变（见上表）。`
     : '';
+  // 成本口径必须显式说明：券商 App 显示摊薄成本，账本按平均成本法记账，有卖出后两者会分叉。
+  const hasDiluted = rows.some(holding => holding.diluted_cost_per_share != null);
+  const costNote = hasDiluted
+    ? '- 成本口径：表中「摊薄成本」是根据账本估算的持仓成本，等于（期初总成本 ＋ 买入成本 − 卖出净所得）÷ 当前份额；卖出后成本价会变化，清仓后新仓重新计算。这与账务侧的平均成本法不同，具体请与券商实际口径核对。'
+    : '- 成本口径：本期无法计算摊薄成本（缺账本基线或账本事件异常），成本列留空，不以其他口径的数字代替。';
   // 未进入展开块但有匹配证据的持仓：在其余持仓注记后逐条给出 8.5 行内来源，
   // 保证每条入选标注都至少在正文出现一次（否则 audit 计数会虚高）。
   const restEvidenceNotes = rows
     .filter(holding => !expandable.includes(holding) && (annotations.get(holding.ts_code)?.length ?? 0) > 0)
     .map(holding => `- ${holding.name}来源：${annotations.get(holding.ts_code)!.map(formatAnnotation).join('；')}。`);
   // 表头与表体之间不能有空行（markdown 表格会被截断），因此合并为一个块。
-  return [[header, table].join('\n'), restNote, ...restEvidenceNotes, ...blocks].filter(Boolean).join('\n\n');
+  return [[header, table].join('\n'), restNote, costNote, ...restEvidenceNotes, ...blocks].filter(Boolean).join('\n\n');
 }
 
 /** F. 是否有更好的选择：六条路的机会成本与资金竞争，不强行推荐。 */
@@ -1237,6 +1243,10 @@ function buildTechnicalSections(
     etf_amount_cny: r.holdings.map(holding => holding.research.quote.amount_cny),
     etf_close_cny: r.holdings.map(holding => holding.research.quote.close_cny),
     etf_pct_chg: r.holdings.map(holding => holding.research.quote.pct_chg),
+    // E 节「份额」与「摊薄成本」列：用户按券商 App 口径核对，正文出现的数字必须可追溯。
+    etf_quantity: r.holdings.map(holding => holding.quantity),
+    etf_diluted_cost_per_share: r.holdings.map(holding => holding.diluted_cost_per_share),
+    etf_diluted_total_cost_cents: r.holdings.map(holding => holding.diluted_total_cost_cents),
   };
   return {
     '0. 报告头': {
