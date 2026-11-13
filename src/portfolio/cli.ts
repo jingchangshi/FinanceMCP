@@ -13,6 +13,7 @@ import {
   type LedgerEventInput, type PriceTable,
 } from './ledger.js';
 import { buildScenarioQuotes, openMarketCache, type ScenarioMode } from './quotes.js';
+import { buildDilutedCostView } from './dilutedCost.js';
 import { buildScenario, type EtfQuoteInput, type ScenarioAction } from './scenario.js';
 import { DEFAULT_FEE_RULES, DEFAULT_STRESS_RULES } from './rules.js';
 import { runDecisionCommand } from './decisionCli.js';
@@ -85,6 +86,8 @@ ${FEE_USAGE}
 ${RISK_POLICY_USAGE}
   portfolio-ledger-replay --account ID [--as-of YYYYMMDD] [--db PATH]
                                                        重放持仓/现金/成本/已实现盈亏
+  portfolio-diluted-cost --account ID [--as-of YYYYMMDD] [--db PATH]
+                                                       摊薄成本估算与账本平均成本法并列对照；只读
   portfolio-ledger-nav --account ID --from YYYYMMDD --to YYYYMMDD [--prices FILE] [--db PATH]
                                                        单位净值序列与基线之后的最大回撤
   portfolio-ledger-validate --account ID [--db PATH]   账本不变量检查（现金/数量/撤销/拆分）
@@ -724,6 +727,22 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       const db = openReadOnly(h.arg('db'));
       try {
         h.print({ ...replayAccount(db, accountId, { asOf: h.arg('as-of') ? h.ymd(h.arg('as-of'), '--as-of') : undefined }), db: portfolioDbPath() });
+      } finally {
+        db.close();
+      }
+      return true;
+    }
+    case 'portfolio-diluted-cost': {
+      // 摊薄成本估算；只读，不改账本。
+      const accountId = requireArg(h, 'account');
+      const db = openReadOnly(h.arg('db'));
+      try {
+        h.print({
+          ...buildDilutedCostView(db, accountId, {
+            asOf: h.arg('as-of') ? h.ymd(h.arg('as-of'), '--as-of') : undefined,
+          }),
+          db: portfolioDbPath(),
+        });
       } finally {
         db.close();
       }

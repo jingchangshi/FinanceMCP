@@ -19,6 +19,7 @@ const { openAshareDb } = await import('../build/ashare/db.js');
 const { openPortfolioDb, assertPortfolioSeparateFromMarket } = await import('../build/portfolio/db.js');
 const { importDemoSnapshot } = await import('../build/portfolio/account.js');
 const ledger = await import('../build/portfolio/ledger.js');
+const { buildDilutedCostView } = await import('../build/portfolio/dilutedCost.js');
 
 const {
   buildNavSeries, confirmRealAccount, importEvents, initBaseline, isEtfCode, nextBusinessDay,
@@ -369,6 +370,119 @@ test('10. 撤销错误买入：状态回到买入前、原记录保留、重复�
     event_id: 'R-BAD', account_id: 'syn-rev', event_type: 'REVERSE', occurred_on: '20261021',
     reverses_event_id: 'NOPE',
   })), /撤销目标 NOPE 不存在/);
+});
+
+test('摊薄成本按历史发生顺序回放撤销、非整数拆分和独立费用', () => {
+  const account = 'syn-diluted';
+  const code = '159999.SZ';
+  openAccount(account, '20261016', 1000000, [position(code, '合成ETF', 5, 1000, 1000)], '2026-10-16');
+  const add = (fields) => recordEvent(db, event({ account_id: account, ...fields }));
+  add({ event_id: 'DC-BUY', event_type: 'TRADE_BUY', occurred_on: '20261019', ts_code: code, quantity: 2, price_milli: 1000 });
+  add({ event_id: 'DC-SELL', event_type: 'TRADE_SELL', occurred_on: '20261020', ts_code: code, quantity: 2, price_milli: 2000 });
+  add({ event_id: 'DC-SPLIT', event_type: 'SPLIT', occurred_on: '20261021', ts_code: code, ratio_num: 3, ratio_den: 2 });
+  add({ event_id: 'DC-BUY2', event_type: 'TRADE_BUY', occurred_on: '20261022', ts_code: code, quantity: 1, price_milli: 1000 });
+  add({ event_id: 'DC-UNSPLIT', event_type: 'REVERSE', occurred_on: '20261023', reverses_event_id: 'DC-SPLIT' });
+  add({ event_id: 'DC-UNSELL', event_type: 'REVERSE', occurred_on: '20261026', reverses_event_id: 'DC-SELL' });
+  add({ event_id: 'DC-FEE', event_type: 'FEE', occurred_on: '20261027', ts_code: code, cash_delta_cents: -200 });
+  add({ event_id: 'DC-UNFEE', event_type: 'REVERSE', occurred_on: '20261028', reverses_event_id: 'DC-FEE' });
+  add({ event_id: 'DC-UNBUY', event_type: 'REVERSE', occurred_on: '20261029', reverses_event_id: 'DC-BUY' });
+
+  const check = (date, quantity, costMilli) => {
+    const row = buildDilutedCostView(db, account, { asOf: date }).positions.find(p => p.ts_code === code);
+    assert.equal(row.quantity, quantity);
+    assert.equal(row.quantity, posOf(replayAccount(db, account, { asOf: date }), code).quantity);
+    assert.equal(row.diluted_total_cost_cents, costMilli / 10);
+    assert.equal(row.events.at(-1).quantity_after, quantity);
+    assert.equal(row.events.at(-1).total_cost_milli_after, costMilli);
+    return row;
+  };
+  check('20261019', 7, 7000);
+  check('20261020', 5, 3000);
+  check('20261021', 7, 3000);
+  check('20261022', 8, 4000);
+  check('20261023', 5, 4000);
+  const reversedSell = check('20261026', 7, 8000);
+  assert.equal(reversedSell.events.at(-1).event_type, 'REVERSE');
+  assert.equal(reversedSell.events.at(-1).cost_milli_delta, 4000);
+  check('20261027', 7, 8000);
+  check('20261028', 7, 8000);
+  check('20261029', 5, 6000);
+});
+
+test('摊薄成本不提前应用排在目标之前的撤销', () => {
+  const account = 'syn-diluted-early-reverse';
+  const code = '159999.SZ';
+  openAccount(account, '20261016', 1000000, [], '2026-10-16');
+  recordEvent(db, event({ event_id: 'DC-LATE', account_id: account, event_type: 'TRADE_BUY', occurred_on: '20261020', ts_code: code, quantity: 10, price_milli: 1000 }));
+  recordEvent(db, event({ event_id: 'DC-EARLY', account_id: account, event_type: 'REVERSE', occurred_on: '20261019', reverses_event_id: 'DC-LATE' }));
+  const row = buildDilutedCostView(db, account).positions.find(p => p.ts_code === code);
+  assert.equal(row.quantity, 10);
+  assert.equal(row.quantity, posOf(replayAccount(db, account), code).quantity);
+  assert.equal(row.diluted_total_cost_cents, 1000);
+});
+
+test('账本和摊薄成本共用基线过滤及同日事件排序', () => {
+  const account = 'syn-diluted-order';
+  const code = '159999.SZ';
+  openAccount(account, '20261016', 1000000, [position(code, '合成ETF', 10, 1000, 1000)], '2026-10-16');
+  const add = fields => recordEvent(db, event({ account_id: account, ts_code: code, ...fields }));
+  add({ event_id: 'DC-OLD', event_type: 'TRADE_BUY', occurred_on: '20261016', quantity: 100, price_milli: 1000, recorded_at: '2026-10-16T00:00:00Z' });
+  db.prepare('UPDATE account_event SET occurred_on = ? WHERE event_id = ?').run('20261015', 'DC-OLD');
+  add({ event_id: 'DC-ORDER-BUY', event_type: 'TRADE_BUY', occurred_on: '20261016', quantity: 3, price_milli: 1000, recorded_at: '2026-10-16T02:00:00Z' });
+  add({ event_id: 'DC-ORDER-SELL', event_type: 'TRADE_SELL', occurred_on: '20261016', quantity: 2, price_milli: 2000, recorded_at: '2026-10-16T01:00:00Z' });
+  const row = buildDilutedCostView(db, account, { asOf: '20261016' }).positions.find(p => p.ts_code === code);
+  const replay = replayAccount(db, account, { asOf: '20261016' });
+  assert.deepEqual(row.events.map(e => e.event_id), ['DC-ORDER-SELL', 'DC-ORDER-BUY']);
+  assert.equal(replay.events_applied, 2);
+  assert.equal(row.quantity, 11);
+  assert.equal(row.quantity, posOf(replay, code).quantity);
+  assert.equal(row.diluted_total_cost_cents, 900);
+});
+
+test('清仓结束成本周期，撤销清仓与后续买入按实际影响回退', () => {
+  const account = 'syn-diluted-cycle';
+  const code = '159999.SZ';
+  openAccount(account, '20261015', 1000000, [position(code, '合成ETF', 10, 1000, 1000)], '2026-10-15');
+  const add = fields => recordEvent(db, event({ account_id: account, ...fields }));
+  add({ event_id: 'CYCLE-SELL', event_type: 'TRADE_SELL', occurred_on: '20261019', ts_code: code, quantity: 10, price_milli: 2000 });
+  add({ event_id: 'CYCLE-BUY', event_type: 'TRADE_BUY', occurred_on: '20261020', ts_code: code, quantity: 4, price_milli: 3000 });
+  add({ event_id: 'CYCLE-UNSELL', event_type: 'REVERSE', occurred_on: '20261021', reverses_event_id: 'CYCLE-SELL' });
+  add({ event_id: 'CYCLE-UNBUY', event_type: 'REVERSE', occurred_on: '20261022', reverses_event_id: 'CYCLE-BUY' });
+  const row = date => buildDilutedCostView(db, account, { asOf: date }).positions.find(p => p.ts_code === code);
+  const closed = row('20261019');
+  assert.equal(closed.quantity, 0);
+  assert.equal(closed.diluted_total_cost_cents, 0);
+  assert.equal(closed.diluted_cost_per_share, null);
+  assert.equal(closed.events.at(-1).cost_milli_delta, -10000);
+  const reopened = row('20261020');
+  assert.equal(reopened.quantity, 4);
+  assert.equal(reopened.diluted_total_cost_cents, 1200);
+  assert.equal(reopened.diluted_cost_per_share, 3);
+  const unsold = row('20261021');
+  assert.equal(unsold.quantity, 14);
+  assert.equal(unsold.diluted_total_cost_cents, 2200);
+  assert.equal(unsold.events.at(-1).cost_milli_delta, 10000);
+  const unbought = row('20261022');
+  assert.equal(unbought.quantity, 10);
+  assert.equal(unbought.diluted_total_cost_cents, 1000);
+  assert.match(unbought.events.at(-1).event_type, /REVERSE/);
+});
+
+test('拆分归零重置成本且撤销拆分恢复原成本', () => {
+  const account = 'syn-diluted-split-zero';
+  const code = '159999.SZ';
+  openAccount(account, '20261015', 1000000, [position(code, '合成ETF', 1, 1000, 1000)], '2026-10-15');
+  const add = fields => recordEvent(db, event({ account_id: account, ...fields }));
+  add({ event_id: 'ZERO-SPLIT', event_type: 'SPLIT', occurred_on: '20261019', ts_code: code, ratio_num: 1, ratio_den: 2 });
+  add({ event_id: 'ZERO-BUY', event_type: 'TRADE_BUY', occurred_on: '20261020', ts_code: code, quantity: 1, price_milli: 2000 });
+  add({ event_id: 'ZERO-UNSPLIT', event_type: 'REVERSE', occurred_on: '20261021', reverses_event_id: 'ZERO-SPLIT' });
+  const row = date => buildDilutedCostView(db, account, { asOf: date }).positions.find(p => p.ts_code === code);
+  assert.equal(row('20261019').diluted_total_cost_cents, 0);
+  assert.equal(row('20261020').diluted_total_cost_cents, 200);
+  const restored = row('20261021');
+  assert.equal(restored.quantity, 2);
+  assert.equal(restored.diluted_total_cost_cents, 300);
+  assert.equal(restored.quantity, posOf(replayAccount(db, account, { asOf: '20261021' }), code).quantity);
 });
 
 // ---------------------------------------------------------------- 13 T+1

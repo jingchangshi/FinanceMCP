@@ -7,6 +7,7 @@ import { ASSET_CLASSES, DEFAULT_ASSET_CLASS_STRESS, INDUSTRY_BY_CODE, classifyAs
 import { calculateFees, resolveFeeRules, type FeeBreakdown } from './fees.js';
 import { loadServerQuote } from './quotes.js';
 import { resolveInstrument, normalizeSecurityCode } from './instrument.js';
+import { buildDilutedCostView } from './dilutedCost.js';
 import { buildResearchSummary } from './researchSummary.js';
 import { buildScenarioMatrix, type ScenarioMatrix, type ScenarioOptionState, type ScenarioPosition } from './scenarios.js';
 import { evaluateAccountStatus, type AccountStatusEvaluation } from './decision.js';
@@ -160,6 +161,17 @@ export interface HoldingAssessment {
   stance: 'HOLD' | 'REDUCE' | 'ROTATE' | 'WAIT';
   reasons: string[];
   counter_evidence: string[];
+  /**
+   * 摊薄成本估算（元/份）；具体口径需与券商核对。
+   * 账本的 ledger.cost_milli_avg 用的是平均成本法，卖出按份额比例扣成本，
+   * 有卖出后两者会分叉；正文优先展示摊薄成本估算。
+   * 无法计算（缺基线/事件异常）时为 null，绝不回填账本值冒充摊薄值。
+   */
+  diluted_cost_per_share: number | null;
+  /** 券商摊薄口径总成本（分）；null 同上。 */
+  diluted_total_cost_cents: number | null;
+  /** 摊薄口径成本来源说明；null 表示成本不可得。 */
+  cost_basis: 'broker_diluted' | 'ledger_average' | null;
   /** 单只 ETF 的研究切片（D3）：当日行情、趋势/相对强弱/风险、条件与失效。 */
   research: HoldingResearch;
   fact_meta: FactMeta;
@@ -1629,7 +1641,9 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   // 候选池：缓存缺 fund_* 表时返回 DEGRADED 行，而不是空列表。
   let screening: EtfCandidateScreenResult | null = null;
   try {
-    screening = screenEtfCandidates(marketDb, { asOf, categories: input.categories });
+    screening = screenEtfCandidates(marketDb, {
+      asOf, categories: input.categories, heldCodes: snapshot?.positions.map(position => position.ts_code) ?? [],
+    });
   } catch {
     screening = null;
   }
@@ -1694,11 +1708,28 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
 
   const market = summary.market_context ?? {};
   const evidence = summary.market_evidence ?? { support: [], contradiction: [] };
+  // 券商摊薄成本映射：只读，失败不影响日报主流程（成本列降级为空并标注口径）。
+  const costByCode = new Map<string, { diluted_cost_per_share: number | null; diluted_total_cost_cents: number | null }>();
+  const costDiagnostics: string[] = [];
+  try {
+    const dilutedView = buildDilutedCostView(portfolioDb, accountId, { asOf });
+    costDiagnostics.push(...dilutedView.warnings);
+    for (const row of dilutedView.positions) {
+      costByCode.set(row.ts_code, {
+        diluted_cost_per_share: row.diluted_cost_per_share,
+        diluted_total_cost_cents: row.diluted_total_cost_cents,
+      });
+    }
+  } catch (error) {
+    costDiagnostics.push(`摊薄成本不可用：${error instanceof Error ? error.message : String(error)}`);
+  }
+
   const holdings: HoldingAssessment[] = (summary.holdings ?? []).map((holding: any) => {
     const stance: HoldingAssessment['stance'] = holding.bar_quality !== 'READY' ? 'WAIT' : 'HOLD';
     const themeEvidence = evidence.contradiction.find((item: any) => item.id === `theme_relative_strength:${holding.theme}`);
     const supportEvidence = evidence.support.find((item: any) => item.id === `theme_relative_strength:${holding.theme}`);
     const research = buildHoldingResearch(marketDb, holding, asOf, market, lots);
+    const cost = costByCode.get(holding.ts_code);
     return {
       ts_code: holding.ts_code,
       name: holding.name,
@@ -1710,6 +1741,10 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       latest_bar_date: holding.latest_bar_date,
       bar_quality: holding.bar_quality,
       stance,
+      diluted_cost_per_share: cost?.diluted_cost_per_share ?? null,
+      diluted_total_cost_cents: cost?.diluted_total_cost_cents ?? null,
+      cost_basis: cost?.diluted_cost_per_share != null ? 'broker_diluted'
+        : (cost ? 'ledger_average' : null),
       reasons: [
         `权重 ${(holding.weight * 100).toFixed(2)}%，市值 ${(holding.market_value_cents / 100).toFixed(2)} 元`,
         `价格来源 ${holding.price_source}，bar 日期 ${holding.latest_bar_date ?? '缺失'}`,
@@ -1729,7 +1764,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   // 独立数据质量维度（D1）：在持仓与门控都算完之后统一生成。
   const qualityTiers = buildQualityTiers(summary, screening, gateSatisfied, accountStatus, gateReasons, holdings.length, accountEvaluation);
 
-  const dataQualityNotes: string[] = [];
+  const dataQualityNotes: string[] = [...costDiagnostics];
   if (!screening) dataQualityNotes.push('候选池筛选不可用（缓存缺少 fund_* 表或未提供市场缓存）');
   else if (screening.data_coverage.status !== 'READY') {
     dataQualityNotes.push(`候选池数据覆盖 ${screening.data_coverage.status}：${screening.data_coverage.reasons.join('; ')}`);
@@ -1798,7 +1833,9 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         by_asset_class: holdOption?.by_asset_class_after ?? null },
       stress: holdOption?.stress_after ?? null,
     }) : null;
-  } catch { portfolioRisk = null; }
+  } catch (error) {
+    dataQualityNotes.push(`组合风险政策计算失败：${error instanceof Error ? error.message : String(error)}`);
+  }
 
   // 已批准政策存在时，各情景/回撤/假设字段统一引用同一份政策状态；report_id 在此之前已定，故不受影响。
   // 注意：scenario_matrix **不注入**政策数据——它是确定性的研究矩阵，必须在政策记录前后
