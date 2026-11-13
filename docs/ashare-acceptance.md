@@ -143,7 +143,7 @@ systemctl --user start finance-ashare-daily.service（20261017 周六）→ {"tr
 
 | 条件 | 含义 |
 |---|---|
-| `scheduled_runs` | 当日（北京时间）至少 2 份 `run_mode=live` 报告，即 18:40 与 21:10 两次定时运行都触发并完成 |
+| `scheduled_runs` | 当日（北京时间）至少 2 份 `run_mode=live` 报告；这本身不能证明生成时间属于两个窗口，也不能证明由 timer 触发 |
 | `data_rechecked` | `sync_history` 中当日 `daily` 至少有 2 次 `refresh_status=REFRESH_OK` 的请求（第二次运行确实复查当日行情）；失败或不完整的请求不计入 |
 | `final_status` | 最后一份 live 报告为 **READY**。DEGRADED（非核心缺口：涨跌停价覆盖率或非核心指数缺失）默认**不通过**；仅在 `--allow-degraded` 时记为 `PASS_DEGRADED`，不会显示为 PASS。NOT_READY 一律不通过 |
 | `mcp_consistent` | MCP 工具对该日返回的报告 ID 等于最后一份 live 报告 |
@@ -153,10 +153,11 @@ systemctl --user start finance-ashare-daily.service（20261017 周六）→ {"tr
 
 **两类证据分开核验**：`acceptance` 只证明*流水线执行*（数据库里的 live 报告与有效 Tushare 请求），不能证明这些运行由 systemd timer 触发
 （手动 `systemctl start` 或 `docker exec … daily` 也会留下同样的记录）。*调度证据*由 `deploy/ashare/check-schedule.sh <YYYYMMDD>` 从
-systemd journal 读取：只有北京时间 18:40–18:45 与 21:10–21:15 窗口内的 `Starting` 记为计划运行（timer `RandomizedDelaySec=120`），
-并要求两次都 `Finished`、无失败。两者都通过，当日才算 PASS。
-2026-10-17 实测（无计划运行的周六）：`check-schedule.sh 20261017` → 列出 00:35（上一轮部署调试）与 07:45（手动触发）的启动，
-`run_1840=no run_2110=no`，`schedule=FAIL`，退出码 1，即手动启动不会被误计为计划运行。整体 `passed` 要求最近 N 个交易日全部 PASS（或允许时 PASS_DEGRADED）。
+systemd 用户 journal 读取：分别报告北京时间 18:40:00–18:45:59 与 21:10:00–21:15:59 内是否观察到 `Starting`，并按日志顺序将结束记录关联到启动。`outcome` 为 `success`、`failed`、`unknown` 或 `ambiguous`；窗口无启动、日志不完整或结束记录无法关联时不能声称成功。窗口外运行的结束记录不计入窗口内运行。`run=no` 只表示查询结果中未观察到启动，不能证明日志完整。journal 查询失败时各状态为 `unknown`。
+
+窗口内手动启动与 timer 启动在这些服务日志中无法区分；timer 的 `LastTriggerUSec` 也不能证明某次服务启动的来源。脚本因此始终输出 `trigger_source=unknown schedule=UNKNOWN` 并以 1 退出，不会声称调度通过；timer 状态查询失败另标为 `timer_status=unavailable`。即使两个窗口均观察到成功，也仍需独立的、能关联具体调用和 timer 的证据才能判定自动调度通过。流水线和调度证据均满足要求，当日才算 PASS；整体 `passed` 要求最近 N 个交易日全部 PASS（或允许时 PASS_DEGRADED）。
+
+2026-10-17 的历史查询曾观察到窗口外 00:35 和 07:45 的启动；旧脚本输出的 `schedule=FAIL` 不应被视为当前脚本的结论。
 修复前的版本把 DEGRADED 计为通过、只要求一份非 NOT_READY 报告，且无法证明第二次运行重新拉取了数据。
 
 部署后基线（2026-10-17 周六）：`acceptance --days 3` → `passed: false`；20261014/15 无 live 报告，20261016 仅一次补发、
@@ -178,7 +179,7 @@ systemd journal 读取：只有北京时间 18:40–18:45 与 21:10–21:15 窗�
 每个交易日 21:20 CST 之后在 VPS 上执行并把输出存入 `docs/ashare-samples/acceptance-<日期>.txt`：
 
 ```bash
-# 1. 调度证据：两次计划运行（journal，应输出 run_1840=yes run_2110=yes schedule=PASS）
+# 1. 窗口启动与结束证据（journal；触发来源和 schedule 均为 UNKNOWN，需独立核验）
 deploy/ashare/check-schedule.sh <YYYYMMDD>
 ls -la ~/.local/share/finance-mcp-ashare/logs/ | grep daily-<YYYYMMDD>
 # 2. 流水线证据：当日判定（逐项 failed 列表、live_runs、daily_fetches[].refresh_status、final、mcp_report_id、watchlist）
@@ -190,7 +191,7 @@ docker inspect -f '{{.State.StartedAt}} restarts={{.RestartCount}} health={{.Sta
 df -h ~ ; ls -la ~/.local/share/finance-mcp-ashare/reports/<YYYYMMDD>/
 ```
 
-10-21 21:20 之后执行 `docker exec finance-mcp-ashare node build/ashare/cli.js acceptance --days 3`，`passed: true` 才可把
+10-21 21:20 之后执行 `docker exec finance-mcp-ashare node build/ashare/cli.js acceptance --days 3`；`passed: true` 只满足流水线部分，还须独立证明每天两次 timer 触发及成功，才可把
 “连续 3 个真实交易日”改为 ✅。任何一天 FAIL：记录 `failed` 列表与日志，不得用手动补跑替代（手动 `report` 为 `run_mode=manual`，不计入）。
 
 ### 8.3 ChatGPT 侧（用户账号操作，PENDING）
@@ -208,7 +209,7 @@ df -h ~ ; ls -la ~/.local/share/finance-mcp-ashare/reports/<YYYYMMDD>/
 （`timers.target.wants/` 中的符号链接指向同一文件），用户 `jcshi` 的 linger 已启用（`loginctl show-user jcshi -p Linger` → `yes`），
 因此用户管理器在未登录时也会启动 timer。`deploy/ashare/verify-production-untouched.mjs` 的旧版本只执行 `systemctl`
 （系统级），由此得出“不存在 A 股 timer”的结论是**错误的**：系统级确实为零，但用户级有一个且已启用。
-`check-schedule.sh` 一直使用 `journalctl --user`，所以调度证据本身没有受这个错误影响。
+`check-schedule.sh` 使用 `journalctl --user`，但旧版对窗口内启动与结束、timer 触发来源的判定有误；其输出不能单独证明调度通过（见 §8.1）。
 
 核验方式已改为分别记录两个作用域（`systemctl --user` 与 `systemctl`），并断言同一 timer 仍存在于同一作用域、仍为 `enabled`、
 `OnCalendar` 与 `ExecStart` 未变；timer 消失是 FAIL，不会静默通过。2026-10-18 实测：

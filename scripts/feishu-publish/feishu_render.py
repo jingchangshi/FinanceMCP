@@ -38,7 +38,8 @@ SOURCES_SECTION = "数据说明与参考来源"
 ALL_HEADINGS: List[str] = REQUIRED_SECTIONS + [SOURCES_SECTION]
 
 # Internal vocabulary that must never appear in the investor-facing text.
-# Matched as substrings against the *visible* text only (never hrefs).
+# Checked against *visible* text only (never hrefs). Short terms use ASCII
+# alphanumeric boundaries, so adjacent Chinese text still separates them.
 FORBIDDEN_TERMS: List[str] = [
     "DEGRADED",
     "NOT_READY",
@@ -76,8 +77,28 @@ def _section_of(sections: Dict[str, Any], name: str) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+_SHORT_TERM_PATTERNS = {
+    term: re.compile(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])")
+    for term in ("MCP", "hash", "V1", "V2")
+}
+
+
+class _VisibleText(str):
+    """Visible text with source titles excluded from short-term checks only."""
+
+    def __new__(cls, text: str, without_source_titles: str):
+        result = super().__new__(cls, text)
+        result.without_source_titles = without_source_titles
+        return result
+
+
 def check_forbidden(visible_text: str) -> List[str]:
-    return [term for term in FORBIDDEN_TERMS if term in visible_text]
+    short_text = getattr(visible_text, "without_source_titles", visible_text)
+    return [
+        term for term in FORBIDDEN_TERMS
+        if (_SHORT_TERM_PATTERNS[term].search(short_text)
+            if term in _SHORT_TERM_PATTERNS else term in visible_text)
+    ]
 
 
 _INTERNAL_TOKEN = re.compile(r"\b[a-z]+(?:_[a-z0-9]+)+\b|\b[A-Z]{3,}(?:_[A-Z0-9]+)+\b|\bUNVERIFIED\b")
@@ -101,8 +122,22 @@ def count_hyperlinks(xml: str) -> int:
 
 
 def strip_tags(xml: str) -> str:
-    text = re.sub(r"<[^>]+>", "", xml)
-    return html.unescape(text)
+    def visible(value: str) -> str:
+        return html.unescape(re.sub(r"<[^>]+>", "", value))
+
+    # Only links in the sources section carry original source titles. Preserve
+    # the full text for every other check, including internal field detection.
+    headings = list(re.finditer(r"<h1(?:\s[^>]*)?>.*?</h1\s*>", xml, re.S))
+    masked = xml
+    for index in range(len(headings) - 1, -1, -1):
+        heading = headings[index]
+        if visible(heading.group()) != SOURCES_SECTION:
+            continue
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(xml)
+        body = xml[heading.end():end]
+        body = re.sub(r"<a\s+[^>]*>.*?</a\s*>", " ", body, flags=re.S)
+        masked = masked[:heading.end()] + body + masked[end:]
+    return _VisibleText(visible(xml), visible(masked))
 
 
 def validate_sections(sections: Dict[str, Any]) -> List[str]:
@@ -191,24 +226,29 @@ def validate_sections(sections: Dict[str, Any]) -> List[str]:
 def _all_visible_text(sections: Dict[str, Any]) -> str:
     """Flatten every human-visible string in the sections object."""
     parts: List[str] = []
+    without_source_titles: List[str] = []
 
-    def walk(value: Any) -> None:
+    def walk(value: Any, path: tuple = ()) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
                 if key == "url":
                     continue  # href values are not visible text
-                walk(item)
+                walk(item, path + (key,))
         elif isinstance(value, list):
             for item in value:
-                walk(item)
+                walk(item, path)
         elif value is not None:
             parts.append(str(value))
+            if path == ("sections", SOURCES_SECTION, "sources", "title"):
+                without_source_titles.append(" ")
+            else:
+                without_source_titles.append(str(value))
 
     for key, value in sections.items():
         if key == "url":
             continue
-        walk(value)
-    return "\n".join(parts)
+        walk(value, (key,))
+    return _VisibleText("\n".join(parts), "\n".join(without_source_titles))
 
 
 def _table(headers: List[str], rows: List[List[str]], widths: List[int]) -> str:

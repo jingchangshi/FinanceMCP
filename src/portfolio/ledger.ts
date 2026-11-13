@@ -750,7 +750,7 @@ export function initBaseline(db: DatabaseSync, accountId: string, options: InitB
 
 // ---------------------------------------------------------------- 记录事件
 
-interface EventRow {
+export interface EventRow {
   event_id: string; account_id: string; event_type: LedgerEventType; occurred_on: string;
   settled_on: string | null; ts_code: string | null; quantity: number | null; price_milli: number | null;
   gross_cents: number | null; fee_cents: number; tax_cents: number; cash_delta_cents: number;
@@ -1254,7 +1254,7 @@ class LedgerRunner {
             this.violation('split_non_integer_quantity', `${code} ${p.quantity}×${num}/${den} 不是整数份，按向下取整处理`, date, row.event_id);
           }
           // 总成本不变，均价随数量变化：拆分不产生盈亏，也不影响现金。
-          const scaled = Math.floor(exact);
+          const scaled = splitQuantity(p.quantity, num, den);
           // 批次按比例缩放，持有日保持不变（拆分不改变"哪天买的"）。
           for (const lot of p.lots) lot.quantity = Math.floor((lot.quantity * num) / den);
           p.quantity = scaled;
@@ -1281,7 +1281,7 @@ class LedgerRunner {
         }
         if (eff.split) {
           const p = this.pos(eff.ts_code!);
-          const restored = Math.floor((p.quantity * eff.split.den) / eff.split.num);
+          const restored = splitQuantity(p.quantity, eff.split.num, eff.split.den, true);
           // 批次按倒数比例还原；取整误差并入最后一批，保证批次合计等于持仓。
           for (const lot of p.lots) lot.quantity = Math.floor((lot.quantity * eff.split.den) / eff.split.num);
           p.quantity = restored;
@@ -1394,6 +1394,11 @@ function requireBaseline(db: DatabaseSync, accountId: string): BaselineRow {
   return baseline;
 }
 
+export function splitQuantity(quantity: number, num: number, den: number, reverse = false): number {
+  if (reverse) return Math.floor((quantity * den) / num);
+  return num > 0 && den > 0 && quantity > 0 ? Math.floor((quantity * num) / den) : quantity;
+}
+
 /** 按 (occurred_on, recorded_at, event_id) 升序取事件；串行化保证重放唯一。 */
 function loadEvents(db: DatabaseSync, accountId: string, asOf?: string): EventRow[] {
   const rows = (asOf
@@ -1402,6 +1407,11 @@ function loadEvents(db: DatabaseSync, accountId: string, asOf?: string): EventRo
     : db.prepare(`SELECT * FROM account_event WHERE account_id = ?
         ORDER BY occurred_on ASC, recorded_at ASC, event_id ASC`).all(accountId)) as any[];
   return rows.map(rowFromDb);
+}
+
+/** 账本及其只读映射共用的基线后事件序列。 */
+export function loadReplayEvents(db: DatabaseSync, accountId: string, baselineAsOf: string, asOf?: string): EventRow[] {
+  return loadEvents(db, accountId, asOf).filter(row => row.occurred_on >= baselineAsOf);
 }
 
 function seedRunner(db: DatabaseSync, baseline: BaselineRow, options: RunnerOptions = { asOf: null }): LedgerRunner {
@@ -1440,10 +1450,7 @@ export function replayAccount(
   const baseline = requireBaseline(db, id);
   const asOf = options.asOf ? assertYmd(options.asOf, 'as_of') : null;
 
-  const rows = loadEvents(db, id, asOf ?? undefined).filter(row => {
-    // 基线之前的事件已包含在基线里；再次计入会重复计算。重放时排除（validate 会报出）。
-    return row.occurred_on >= baseline.as_of;
-  });
+  const rows = loadReplayEvents(db, id, baseline.as_of, asOf ?? undefined);
 
   const runner = seedRunner(db, baseline, { asOf, calendar: options.calendar });
   let currentDate: string | null = null;
@@ -1564,7 +1571,7 @@ export function validateLedger(db: DatabaseSync, accountId: string): ValidateRes
   }
 
   // 行为层检查：完整重放一遍，收集运行期违规。
-  const rows = loadEvents(db, id).filter(r => r.occurred_on >= baseline.as_of);
+  const rows = loadReplayEvents(db, id, baseline.as_of);
   const runner = seedRunner(db, baseline);
   let currentDate: string | null = null;
   for (const row of rows) {
@@ -1646,7 +1653,7 @@ export function buildNavSeries(
   const to = assertYmd(options.to, 'to');
   const from = options.from ? assertYmd(options.from, 'from') : baseline.as_of;
   const prices = options.prices ?? {};
-  const rows = loadEvents(db, id, to).filter(r => r.occurred_on >= baseline.as_of);
+  const rows = loadReplayEvents(db, id, baseline.as_of, to);
 
   const dateSet = new Set<string>([baseline.as_of, from, to]);
   for (const row of rows) dateSet.add(row.occurred_on);

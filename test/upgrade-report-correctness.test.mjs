@@ -16,6 +16,7 @@ const { openPortfolioDb } = await load('portfolio/db.js');
 const account = await load('portfolio/account.js');
 const ledger = await load('portfolio/ledger.js');
 const { buildDailyReport } = await load('portfolio/dailyReport.js');
+const { renderDailyReport } = await load('portfolio/reportRenderer.js');
 const { calculateFees, resolveFeeRules, saveFeeProfile } = await load('portfolio/fees.js');
 const zeroFees = { commission_rate: 0, commission_min_cents: 0, transfer_fee_rate: 0, stamp_duty_rate: 0, slippage_rate_per_side: 0 };
 const days = Array.from({ length: 61 }, (_, i) => {
@@ -61,6 +62,28 @@ function fixture({ quantity = 8000, cash = 200000, wealth = 0, missingFactor = f
 }
 const option = (report, action) => report.decision_comparison.options.find(row => row.action === action);
 const rounded = n => Math.round(n * 1e6) / 1e6;
+
+test('older reports without diluted cost fields remain renderable', () => {
+  const f = fixture();
+  try {
+    const report = f.build();
+    for (const holding of report.holdings) {
+      delete holding.diluted_cost_per_share;
+      delete holding.diluted_total_cost_cents;
+    }
+    assert.match(renderDailyReport(report).user, /本期无法计算摊薄成本/);
+  } finally { f.close(); }
+});
+
+test('candidate screening uses the actual account holdings', () => {
+  const f = fixture({ bond: true });
+  try {
+    const report = f.build();
+    const rows = report.candidate_vs_cash.screening.candidates;
+    assert.equal(rows.find(row => row.ts_code === '511010.SH')?.held, true);
+    assert.equal(rows.find(row => row.ts_code === '159241.SZ')?.held, false);
+  } finally { f.close(); }
+});
 
 test('HOLD/NO_ACTION preserve securities-only HHI, including cash and wealth denominators', () => {
   for (const wealth of [0, 100000]) {
