@@ -4,6 +4,8 @@ Description=FinanceMCP real-account close-of-day research report and forward rec
 # declared here too — the account research record binds itself to a snapshot
 # VERSION, and recording before that version exists would bind nothing.
 After=docker.service network-online.target finance-ashare-daily.service finance-ashare-hotspot.service
+# After= only orders jobs already queued; the record command checks target-date
+# market and hotspot readiness itself, even if either upstream unit failed or did not run.
 # No Wants=: the daily unit already queues hotspot through OnSuccess/OnFailure.
 # Pulling it in here as well would run a second (network-bound) catalog sync.
 

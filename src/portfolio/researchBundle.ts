@@ -393,7 +393,7 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
         first_section: { ...portfolio.first_section, count: 0, actions: [], no_action_reason: 'DATA_INSUFFICIENT: target market data unavailable' },
       };
     }
-    screening = safe('etf_candidates', () => screenEtfCandidates(market, {
+    screening = portfolio?.candidate_vs_cash?.screening ?? safe('etf_candidates', () => screenEtfCandidates(market, {
       asOf, limit: canonicalCandidateLimit, heldCodes: (portfolio?.holdings ?? snapshot.snapshot.positions).map((holding: any) => holding.ts_code),
     }));
     etf = safe('etf_quality', () => etfStatus(market, { date: asOf }));

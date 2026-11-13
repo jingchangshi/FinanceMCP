@@ -55,8 +55,7 @@ const DATASET_TIME_COLUMN: Record<ExportDatasetName, string | null> = Object.fre
   gap_check: 'trade_date',
   // data_audit 没有 trade_date：它记录的是**一次审计运行**
   // （audit_id/created_at/start_date/end_date/status/summary/path）。
-  // 按 end_date 过滤——审计窗口覆盖到 as-of 之后的运行不得导出，
-  // 否则等于把"未来已经发现过这个缺口"泄漏给历史。
+  // 按 end_date 过滤只限制审计窗口，不代表审计在 as-of 日已经产生；见非 PIT 标记。
   data_audit: 'end_date',
   quality_check: 'trade_date',
 });
@@ -68,7 +67,7 @@ const DATASET_TIME_COLUMN: Record<ExportDatasetName, string | null> = Object.fre
 const AS_OF_FILTER_NOTE: Partial<Record<ExportDatasetName, string>> = Object.freeze({
   trade_calendar: 'cal_date is the session itself, not an observation time',
   financial_indicator: 'filtered on ann_date (announcement day); a row announced after as-of is not exported',
-  data_audit: 'filtered on end_date (the audited window end), not on created_at',
+  data_audit: 'filtered on end_date only; created_at may be after as-of, so this dataset is NOT PIT-qualified',
 });
 
 /**
@@ -86,6 +85,7 @@ const AS_OF_FILTER_NOTE: Partial<Record<ExportDatasetName, string>> = Object.fre
 export const AVAILABILITY_SEMANTICS = Object.freeze({
   price_like: 'as_of_trade_date_is_real_availability',
   financial_indicator: 'ann_date_is_real_announcement_date; empty ann_date means UNKNOWN and is not PIT-qualified',
+  data_audit: 'NOT_PIT: end_date filters the audit window, not created_at; the audit may not have existed at as-of',
   identity_classification: 'CURRENT_SNAPSHOT_NOT_PIT: fund_type/market/status have no historical vintage and must not be backfilled',
   industry_membership: 'NOT_EXPORTED_MISSING: no historical industry composition is exported',
   unknown_values: 'unknown stays null and is never coerced to zero',
@@ -98,7 +98,7 @@ export interface ResearchExportOptions {
   outputDir: string;
   /** 只导出这些数据集；省略导出全部。 */
   datasets?: readonly string[];
-  /** 是否允许 as-of 日没有行情（仍会检查 as-of 不晚于 data_cutoff）。 */
+  /** 是否允许 as-of 日没有行情（快照将标为 DEGRADED，包括晚于 data_cutoff 时）。 */
   allowMissingBars?: boolean;
   /** 注入时钟，便于测试。 */
   now?: Date;
@@ -124,6 +124,7 @@ export interface DatasetExport {
 
 export interface ResearchExportManifest {
   snapshot_id: string;
+  snapshot_id_algorithm: 'dataset-manifest-v2';
   schema_version: string;
   as_of_trade_date: string;
   created_at: string;
@@ -238,6 +239,31 @@ export function runResearchExport(
   liveDb: DatabaseSync,
   options: ResearchExportOptions,
 ): ResearchExportManifest {
+  // BEGIN is available in all supported node:sqlite versions. An existing caller
+  // transaction must remain owned by the caller, including on failure.
+  let ownsTransaction = false;
+  try {
+    liveDb.exec('BEGIN');
+    ownsTransaction = true;
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes('cannot start a transaction within a transaction')) throw error;
+  }
+  try {
+    const result = runResearchExportInTransaction(liveDb, options);
+    if (ownsTransaction) liveDb.exec('COMMIT');
+    return result;
+  } catch (error) {
+    if (ownsTransaction) {
+      try { liveDb.exec('ROLLBACK'); } catch { /* Preserve the original error. */ }
+    }
+    throw error;
+  }
+}
+
+function runResearchExportInTransaction(
+  liveDb: DatabaseSync,
+  options: ResearchExportOptions,
+): ResearchExportManifest {
   const now = options.now ?? new Date();
   const outputDir = resolve(options.outputDir);
   const requested = options.asOfTradeDate;
@@ -250,6 +276,10 @@ export function runResearchExport(
     );
   }
   const asOf = session.as_of_trade_date;
+  const wanted = new Set<string>(options.datasets ?? Object.keys(EXPORT_DATASETS));
+  const unknown = [...wanted].filter(name => !(name in EXPORT_DATASETS));
+  if (unknown.length) throw new Error(`research_export_unknown_datasets: ${unknown.join(', ')}`);
+  const priceDatasets = (['daily_bars', 'fund_daily_bars'] as const).filter(name => wanted.has(name));
 
   // data_cutoff 是生产库价格的最新交易日。as-of 晚于它即拒绝，而不是静默导出一个
   // 不包含请求日的快照——那会让下游以为自己拿到了当天的数据。
@@ -263,18 +293,25 @@ export function runResearchExport(
     ).get() as any)?.d ?? 0,
   );
   const dataCutoff = cutoff ? String(cutoff) : null;
-  if (dataCutoff && asOf > dataCutoff && !options.allowMissingBars) {
+  if (priceDatasets.length && dataCutoff && asOf > dataCutoff && !options.allowMissingBars) {
     throw new Error(
       `research_export_as_of_after_data_cutoff: as_of=${asOf} data_cutoff=${cutoff}; `
       + 'refusing to export a snapshot that does not contain the requested date',
     );
   }
 
-  assertSeparateFromLive(outputDir, (liveDb as any).name ?? '');
+  // A different asset class cannot establish that this exported dataset has prices.
+  // A missing table is recorded separately in missing_datasets below.
+  const missingAsOfBars = priceDatasets.filter(name => {
+    const table = EXPORT_DATASETS[name];
+    return tableExists(liveDb, table)
+      && !liveDb.prepare(`SELECT 1 FROM "${table}" WHERE trade_date = ? AND close IS NOT NULL LIMIT 1`).get(asOf);
+  });
+  if (priceDatasets.length && missingAsOfBars.length === priceDatasets.length && !options.allowMissingBars) {
+    throw new Error(`research_export_as_of_missing_bars: as_of=${asOf} datasets=${missingAsOfBars.join(',')}; refusing to export without prices on the requested date`);
+  }
 
-  const wanted = new Set<string>(options.datasets ?? Object.keys(EXPORT_DATASETS));
-  const unknown = [...wanted].filter(name => !(name in EXPORT_DATASETS));
-  if (unknown.length) throw new Error(`research_export_unknown_datasets: ${unknown.join(', ')}`);
+  assertSeparateFromLive(outputDir, (liveDb as any).name ?? '');
 
   // A dataset whose declared time column does not exist in the live table must be
   // reported, not allowed to crash the export mid-run: the manifest would otherwise
@@ -313,6 +350,7 @@ export function runResearchExport(
     const written = writeDatasetCsv(liveDb, name, table, asOf, outputDir);
     const availability: keyof typeof AVAILABILITY_SEMANTICS =
       name === 'financial_indicator' ? 'financial_indicator'
+        : name === 'data_audit' ? 'data_audit'
         : name === 'stock_basic' || name === 'fund_basic' ? 'identity_classification'
         : 'price_like';
     datasetManifest.push({
@@ -338,33 +376,46 @@ export function runResearchExport(
   }
   // 显式允许 as-of 缺行是**降级**：调用方必须自己承担"这天没有行情"的后果，
   // 并且这个决定必须出现在 manifest 里，不能只在命令行参数里。
-  if (dataCutoff && asOf > dataCutoff && options.allowMissingBars) {
-    reasons.push(`allow_missing_bars: as_of=${asOf} is after data_cutoff=${dataCutoff}; `
-      + 'this snapshot has no prices on the requested date');
+  for (const name of missingAsOfBars) {
+    reasons.push(`missing_as_of_bars:${name}: as_of=${asOf} has no close price`);
+  }
+  if (missingAsOfBars.length && options.allowMissingBars) {
+    reasons.push(`allow_missing_bars: as_of=${asOf}; data_cutoff=${dataCutoff ?? 'unknown'}`);
   }
 
+  const source = sourceFingerprint(liveDb, asOf);
+  const sortedHashes = Object.fromEntries(Object.entries(contentHashes).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+  const quality: ResearchExportManifest['data_quality'] = {
+    status: missingDatasets.length || missingAsOfBars.length ? 'DEGRADED' : 'READY',
+    missing_datasets: [...missingDatasets].sort(),
+    reasons: [...reasons].sort(),
+    as_of_requested: requested ?? null,
+    as_of_resolved: asOf,
+    data_cutoff: dataCutoff,
+  };
+  const datasets = [...datasetManifest].sort((a, b) => a.dataset < b.dataset ? -1 : a.dataset > b.dataset ? 1 : 0)
+    .map(d => [d.dataset, d.table, d.file, d.sha256, d.rows, d.columns, d.time_column,
+      d.as_of_filtered, d.availability, d.as_of_filter_note, d.missing_note ?? null]);
+  const adjustmentPolicy: ResearchExportManifest['adjustment_policy'] = {
+    policy: 'raw_and_adjustment_factor_exported_separately',
+    note: 'Raw OHLCV and adjustment factors are separate datasets. A missing factor series must be '
+      + 'disclosed as raw_close_no_adj_factor and never silently mixed with adjusted prices.',
+  };
+  const semanticFields = (value: Record<string, string>) => Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   const manifest: ResearchExportManifest = {
-    snapshot_id: hash({ schema_version: RESEARCH_EXPORT_SCHEMA_VERSION, as_of: asOf, source: sourceFingerprint(liveDb, asOf) }),
+    snapshot_id: hash({ schema_version: RESEARCH_EXPORT_SCHEMA_VERSION, as_of: asOf, source,
+      content_hashes: sortedHashes, datasets, quality, code_mapping_version: 'ts-code-v1',
+      adjustment_policy: semanticFields(adjustmentPolicy), availability_semantics: semanticFields(AVAILABILITY_SEMANTICS) }),
+    snapshot_id_algorithm: 'dataset-manifest-v2',
     schema_version: RESEARCH_EXPORT_SCHEMA_VERSION,
     as_of_trade_date: asOf,
     created_at: now.toISOString(),
-    source_db_fingerprint: sourceFingerprint(liveDb, asOf),
+    source_db_fingerprint: source,
     dataset_manifest: datasetManifest,
-    data_quality: {
-      status: missingDatasets.length ? 'DEGRADED' : 'READY',
-      missing_datasets: missingDatasets,
-      reasons,
-      as_of_requested: requested ?? null,
-      as_of_resolved: asOf,
-      data_cutoff: dataCutoff,
-    },
+    data_quality: quality,
     availability_semantics: AVAILABILITY_SEMANTICS,
     code_mapping_version: 'ts-code-v1',
-    adjustment_policy: {
-      policy: 'raw_and_adjustment_factor_exported_separately',
-      note: 'Raw OHLCV and adjustment factors are separate datasets. A missing factor series must be '
-        + 'disclosed as raw_close_no_adj_factor and never silently mixed with adjusted prices.',
-    },
+    adjustment_policy: adjustmentPolicy,
     content_hashes: contentHashes,
   };
 

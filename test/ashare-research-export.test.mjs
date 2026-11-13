@@ -217,7 +217,7 @@ test('RE-09 suspension and price limits are exported so gaps are marked, not int
 });
 
 test('RE-10 timestamps resolve against the Shanghai trading-day boundary', () => {
-  const fix = buildDb('shanghai', {});
+  const fix = buildDb('shanghai', { asOf: '20260105' });
   const out = tempDir('out-shanghai');
   try {
     // A clock inside the Shanghai session but still before the 15:00 close must not
@@ -368,4 +368,109 @@ test('RE-17 a dataset whose rows tie on the time column still exports in a state
       }
     } finally { first.cleanup(); second.cleanup(); }
   } finally { fix.db.close(); fix.dir.cleanup(); }
+});
+
+test('snapshot identity binds exported bytes and dataset selection even when source counts are unchanged', () => {
+  const fix = buildDb('content-identity', {});
+  const out = tempDir('content-identity-out');
+  try {
+    const opts = { asOfTradeDate: fix.asOfDay, outputDir: out.dir, now: new Date('2026-01-10T00:00:00Z') };
+    const first = runResearchExport(fix.db, opts);
+    fix.db.prepare('UPDATE daily SET close = 10.6 WHERE trade_date = ?').run(fix.asOfDay);
+    const changed = runResearchExport(fix.db, opts);
+    assert.equal(first.source_db_fingerprint, changed.source_db_fingerprint);
+    assert.equal(first.snapshot_id_algorithm, 'dataset-manifest-v2');
+    assert.notEqual(first.snapshot_id, changed.snapshot_id);
+    const subset = runResearchExport(fix.db, { ...opts, datasets: ['daily_bars'] });
+    assert.notEqual(changed.snapshot_id, subset.snapshot_id);
+  } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
+});
+
+test('audit metadata declares end-date filtering does not make it PIT', () => {
+  const fix = buildDb('audit-pit', {});
+  const out = tempDir('audit-pit-out');
+  try {
+    const m = runResearchExport(fix.db, { asOfTradeDate: fix.asOfDay, outputDir: out.dir });
+    const audit = m.dataset_manifest.find(d => d.dataset === 'data_audit');
+    assert.equal(audit.availability, 'data_audit');
+    assert.match(m.availability_semantics[audit.availability], /NOT_PIT.*created_at/);
+    assert.match(audit.as_of_filter_note, /created_at.*NOT PIT/);
+  } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
+});
+
+test('export owns only its own transaction and reads a consistent WAL snapshot', () => {
+  const fix = buildDb('transaction', {});
+  const out = tempDir('transaction-out');
+  let ro;
+  try {
+    fix.db.exec('PRAGMA journal_mode=WAL');
+    ro = new DatabaseSync(process.env.ASHARE_DB_PATH, { readOnly: true });
+    const prepare = ro.prepare.bind(ro);
+    let changed = false;
+    ro.prepare = sql => {
+      if (!changed && sql.startsWith('SELECT ') && sql.includes(' FROM "stock_basic"')) {
+        changed = true;
+        fix.db.prepare("UPDATE stock_basic SET name = 'changed' WHERE ts_code = '600000.SH'").run();
+      }
+      return prepare(sql);
+    };
+    const opts = { asOfTradeDate: fix.asOfDay, outputDir: out.dir };
+    runResearchExport(ro, opts);
+    assert.ok(changed);
+    assert.match(readFileSync(join(out.dir, 'stock_basic.csv'), 'utf8'), /测试/);
+    ro.exec('BEGIN');
+    ro.exec('ROLLBACK');
+    assert.throws(() => runResearchExport(ro, { ...opts, datasets: ['unknown'] }), /unknown_datasets/);
+    ro.exec('BEGIN');
+    ro.exec('ROLLBACK');
+    ro.exec('BEGIN');
+    runResearchExport(ro, opts);
+    assert.throws(() => ro.exec('BEGIN'), /cannot start a transaction/);
+    assert.throws(() => runResearchExport(ro, { ...opts, datasets: ['unknown'] }), /unknown_datasets/);
+    assert.throws(() => ro.exec('BEGIN'), /cannot start a transaction/);
+    ro.exec('ROLLBACK');
+  } finally { ro?.close(); out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
+});
+
+test('as-of price quality is assessed independently for requested equity and ETF datasets', () => {
+  const fix = buildDb('per-price-dataset', {});
+  const out = tempDir('per-price-dataset-out');
+  try {
+    const opts = { asOfTradeDate: fix.asOfDay, outputDir: out.dir, now: new Date('2026-01-20T00:00:00Z') };
+    const equityOnly = runResearchExport(fix.db, opts);
+    assert.equal(equityOnly.data_quality.status, 'DEGRADED');
+    assert.ok(equityOnly.data_quality.reasons.some(r => r.startsWith('missing_as_of_bars:fund_daily_bars:')));
+    const equitySubset = runResearchExport(fix.db, { ...opts, datasets: ['daily_bars'] });
+    assert.equal(equitySubset.data_quality.status, 'READY');
+    assert.throws(() => runResearchExport(fix.db, { ...opts, datasets: ['fund_daily_bars'] }), /missing_bars/);
+    const missingSubset = runResearchExport(fix.db, { ...opts, datasets: ['fund_daily_bars'], allowMissingBars: true });
+    assert.equal(missingSubset.data_quality.status, 'DEGRADED');
+    assert.ok(missingSubset.data_quality.reasons.some(r => r.startsWith('missing_as_of_bars:fund_daily_bars:')));
+    fix.db.prepare('INSERT INTO fund_daily (ts_code,trade_date,close) VALUES (?,?,?)').run('510300.SH', fix.asOfDay, 4.2);
+    assert.equal(runResearchExport(fix.db, opts).data_quality.status, 'READY');
+    fix.db.prepare('DELETE FROM daily WHERE trade_date = ?').run(fix.asOfDay);
+    const fundOnly = runResearchExport(fix.db, opts);
+    assert.equal(fundOnly.data_quality.status, 'DEGRADED');
+    assert.ok(fundOnly.data_quality.reasons.some(r => r.startsWith('missing_as_of_bars:daily_bars:')));
+    assert.equal(runResearchExport(fix.db, { ...opts, datasets: ['fund_daily_bars'] }).data_quality.status, 'READY');
+    assert.throws(() => runResearchExport(fix.db, { ...opts, datasets: ['daily_bars'] }), /missing_bars/);
+    assert.equal(runResearchExport(fix.db, { ...opts, datasets: ['stock_basic'] }).data_quality.status, 'READY');
+  } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
+});
+
+test('missing as-of bars are rejected or explicitly degraded even within cutoff or without any prices', () => {
+  const fix = buildDb('missing-asof', {});
+  const out = tempDir('missing-asof-out');
+  try {
+    const opts = { asOfTradeDate: fix.days[5], outputDir: out.dir, now: new Date('2026-01-20T00:00:00Z') };
+    assert.throws(() => runResearchExport(fix.db, opts), /research_export_as_of_missing_bars/);
+    const degraded = runResearchExport(fix.db, { ...opts, allowMissingBars: true });
+    assert.equal(degraded.data_quality.status, 'DEGRADED');
+    assert.ok(degraded.data_quality.reasons.some(r => r.startsWith('allow_missing_bars:')));
+    fix.db.exec('DELETE FROM daily; DELETE FROM fund_daily');
+    assert.throws(() => runResearchExport(fix.db, opts), /research_export_as_of_missing_bars/);
+    const empty = runResearchExport(fix.db, { ...opts, allowMissingBars: true });
+    assert.equal(empty.data_quality.status, 'DEGRADED');
+    assert.equal(empty.data_quality.data_cutoff, null);
+  } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
 });

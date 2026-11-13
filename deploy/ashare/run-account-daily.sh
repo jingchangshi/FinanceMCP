@@ -21,7 +21,7 @@ fi
 REVIEW_OUT="$LOG_DIR/forward-review-$STAMP.json"
 REVIEW_ERR="$LOG_DIR/forward-review-$STAMP.log"
 record_code=0
-if docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record >"$OUT" 2>"$ERR"; then
+if docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record --require-current-snapshots >"$OUT" 2>"$ERR"; then
   printf 'finance-ashare account-daily ok (private log: %s)\n' "$OUT"
 else
   record_code=$?
