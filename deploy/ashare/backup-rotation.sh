@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Back up all databases and rotate the backup directory.
 #
 #   backup-rotation.sh [--dry-run] [--backup-only]
@@ -31,11 +31,9 @@ umask 077
 say() { echo "[backup-rotation] $1"; }
 free_before="$(df --output=avail "$BACKUP_DIR" | tail -1 | tr -d ' ')K"
 
-if [ "$BACKUP_ONLY" -eq 0 ] && [ "$DRY" -eq 0 ]; then :; fi
-
 # --- 1. fresh online backups ---
-if [ "$BACKUP_ONLY" -eq 1 ] || [ "$DRY" -eq 1 ]; then
-  say "dry-run/backup-only: would back up market/private/OAuth/research/validation databases"
+if [ "$DRY" -eq 1 ]; then
+  say "dry-run: would back up market/private/OAuth/research/validation databases"
 else
   say "backing up databases ($STAMP)"
   ashare_target="$BACKUP_DIR/ashare.$STAMP.sqlite"
@@ -58,30 +56,25 @@ fi
 # and the pre-V1.0 baseline are never deletion candidates.
 if [ "$BACKUP_ONLY" -eq 0 ]; then
 for label in ashare portfolio oauth research validation; do
-  files=""
-  for f in "$BACKUP_DIR/$label."*.sqlite; do
-    [ -f "$f" ] || continue
-    case "$f" in */*.restore-check.*) continue ;; esac
-    # ashare.latest.sqlite is a symlink; -f follows it, so exclude explicitly
-    [ -L "$f" ] && continue
-    files="$files $f"
-  done
-  # Sort newest first by mtime (ls -t).
-  sorted="$(ls -1t $files 2>/dev/null || true)"
-  i=0; seen=0
-  for f in $sorted; do
-    i=$((i + 1)); seen=1
+  # NUL-delimited records preserve spaces and newlines in backup paths.
+  mapfile -d '' -t files < <(
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name "$label.*.sqlite" \
+      ! -name '*.restore-check.*' ! -name 'ashare.pre-v1.0.sqlite' \
+      -printf '%T@ %p\0' | sort -z -nr
+  )
+  if [ "${#files[@]}" -eq 0 ]; then
+    say "$label: no backups found"
+    continue
+  fi
+  i=0
+  for record in "${files[@]}"; do
+    f="${record#* }"
+    i=$((i + 1))
     if [ "$i" -gt "$KEEP" ]; then
-      case "$f" in
-        */ashare.pre-v1.0.sqlite) say "KEEP (baseline): $f" ;;
-        *)
-          if [ "$DRY" -eq 1 ]; then say "would delete: $f ($(du -h "$f" | cut -f1))"
-          else rm -f "$f"; say "deleted: $f"; fi
-          ;;
-      esac
+      if [ "$DRY" -eq 1 ]; then say "would delete: $f ($(du -h "$f" | cut -f1))"
+      else rm -f -- "$f"; say "deleted: $f"; fi
     fi
   done
-  [ "$seen" -eq 0 ] && say "$label: no backups found"
 done
 fi
 

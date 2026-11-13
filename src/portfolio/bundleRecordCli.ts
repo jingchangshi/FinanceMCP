@@ -8,6 +8,19 @@ import { openMarketCache } from './quotes.js';
 import { buildInvestmentResearchBundle } from './researchBundle.js';
 import { recordResearchJournal, readResearchJournal, canonicalJson, JOURNAL_VERSION, resolveHotspotBinding } from './researchJournal.js';
 
+export function currentSnapshotReadiness(bundle: any): { marketReady: boolean; hotspotReady: boolean } {
+  const date = bundle.as_of_trade_date;
+  const hotspot = bundle.hotspot_research;
+  const marketReady = ['READY', 'DEGRADED'].includes(bundle.data_quality?.market?.status)
+    && bundle.data_quality?.market?.as_of_trade_date === date
+    && bundle.data_lineage?.market_report_freshness === 'same_day'
+    && bundle.market?.reason !== 'target_market_data_unavailable';
+  const hotspotReady = hotspot?.status === 'OK' && hotspot.as_of_trade_date === date
+    && hotspot.snapshot?.as_of === date && hotspot.snapshot?.market_data_as_of === date
+    && ['READY', 'DEGRADED'].includes(hotspot.data_state?.readiness);
+  return { marketReady, hotspotReady };
+}
+
 /** Explicit scheduled write path. Stores only authentic VPS output in the private account volume. */
 export function runBundleRecordCommand(h: CliHelpers): void {
   const path = h.arg('db') ?? portfolioDbPath();
@@ -21,6 +34,18 @@ export function runBundleRecordCommand(h: CliHelpers): void {
       h.print({ status: 'NOT_READY', recorded: false, session: bundle.session });
       process.exitCode = 1;
       return;
+    }
+    // The scheduled account run must not journal a stale or missing upstream snapshot.
+    // Check the same bundle that will be recorded, before any journal/file write.
+    if (h.flag('require-current-snapshots')) {
+      const date = bundle.as_of_trade_date;
+      const { marketReady, hotspotReady } = currentSnapshotReadiness(bundle);
+      if (!marketReady || !hotspotReady) {
+        h.print({ status: 'NOT_READY', recorded: false, as_of_trade_date: date,
+          reason: 'target_snapshots_not_ready', market_ready: marketReady, hotspot_ready: hotspotReady });
+        process.exitCode = 1;
+        return;
+      }
     }
     // Only acquisition time is excluded; prices, facts and all rule versions participate in identity.
     // The bundle ID binds semantic facts and versions, excluding acquisition clocks and prior history.

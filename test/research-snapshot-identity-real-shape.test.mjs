@@ -16,7 +16,8 @@ const { openPortfolioDb } = await import('../build/portfolio/db.js');
 const { DEMO_SNAPSHOT, importSnapshot, markSnapshotCurrent } = await import('../build/portfolio/account.js');
 const { initBaseline, confirmRealAccount } = await import('../build/portfolio/ledger.js');
 const { buildInvestmentResearchBundle } = await import('../build/portfolio/researchBundle.js');
-const { runBundleRecordCommand } = await import('../build/portfolio/bundleRecordCli.js');
+const { runBundleRecordCommand, currentSnapshotReadiness } = await import('../build/portfolio/bundleRecordCli.js');
+const { saveHotspotSnapshot } = await import('../build/ashare/hotspotSnapshots.js');
 const { appendChatgptResearchRecord } = await import('../build/portfolio/chatgptIntake.js');
 const { readResearchJournal } = await import('../build/portfolio/researchJournal.js');
 
@@ -78,6 +79,49 @@ const judgement = (reportId, extra = {}) => ({
   report_id: reportId, as_of_trade_date: AS_OF, independent_judgement: '独立判断：维持观察。', final_conclusion: '维持观察，不构成交易建议。',
   additional_evidence: [{ claim: '央行公开市场操作净投放', kind: 'macro', source_url: 'https://example.com/a', published_at: '2026-10-22' }],
   counter_evidence: [], ...extra,
+});
+
+test('a persisted target-date hotspot in a real bundle passes the scheduled gate', () => {
+  const f = fixture();
+  const previousExitCode = process.exitCode;
+  try {
+    saveHotspotSnapshot(f.market, {
+      as_of: AS_OF, framework: 'V2_ONLY', framework_version: 'technical-v2.0.0',
+      implementation_fingerprint: 'sha256:test', config_version: 'hotspot-config-1.0.0', content_hash: '',
+      data_quality: 'READY', market_data_as_of: AS_OF, generated_at: '2026-10-23T13:00:00Z',
+      sectors: { as_of: AS_OF, config_version: 'hotspot-config-1.0.0', sectors: [], selected: [], coverage: [] },
+      technical_view: { status: 'OK', as_of: AS_OF, framework_version: 'technical-v2.0.0',
+        implementation_fingerprint: 'sha256:test', market_regime: 'range', families: [], contexts: [], coverage: {},
+        evidence_level: 'UNVERIFIED', research_only: true,
+        research_universe: { as_of: AS_OF, counts: { FOCUS: 0, WATCH: 0, EXTENDED: 0, DETERIORATING: 0, BLOCKED: 0, INVALIDATED: 0, total: 0 }, stocks: [], daily_highlights: [] } },
+      coverage: [], data_state: { version: 'data-readiness-1.0.0', as_of: AS_OF, fingerprint: { bars: { daily: 1 } }, readiness: 'READY' }, research_only: true,
+    });
+    const bundle = build(f);
+    assert.equal(bundle.hotspot_research.snapshot.as_of, AS_OF);
+    assert.equal(bundle.hotspot_research.snapshot.market_data_as_of, AS_OF);
+    assert.equal(bundle.hotspot_research.data_state.readiness, 'READY');
+    assert.deepEqual(currentSnapshotReadiness(bundle), { marketReady: true, hotspotReady: true });
+    const output = [];
+    const args = { db: f.portfolioPath, 'market-db': f.marketPath, date: AS_OF, 'output-dir': mkdtempSync(join(dir, 'gate-out-')) };
+    runBundleRecordCommand({ arg: key => args[key], flag: key => key === 'require-current-snapshots', ymd: () => undefined, print: value => output.push(value) });
+    assert.equal(output[0].recorded, true);
+    assert.ok(readResearchJournal(f.p, output[0].record_id));
+  } finally { process.exitCode = previousExitCode; f.market.close(); f.p.close(); }
+});
+
+test('scheduled gate refuses missing hotspot before journaling', () => {
+  const f = fixture();
+  const previousExitCode = process.exitCode;
+  try {
+    const output = [];
+    const args = { db: f.portfolioPath, 'market-db': f.marketPath, date: AS_OF, 'output-dir': join(dir, 'should-not-exist') };
+    runBundleRecordCommand({ arg: key => args[key], flag: key => key === 'require-current-snapshots', ymd: () => undefined, print: value => output.push(value) });
+    assert.equal(process.exitCode, 1);
+    assert.equal(output[0].reason, 'target_snapshots_not_ready');
+    assert.equal(output[0].hotspot_ready, false);
+    const table = f.p.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='research_journal'").get();
+    if (table) assert.equal(f.p.prepare('SELECT COUNT(*) AS n FROM research_journal').get().n, 0);
+  } finally { process.exitCode = previousExitCode; f.market.close(); f.p.close(); }
 });
 
 test('the live explicit read and the scheduled default read report the same 20261023 identity', () => {
