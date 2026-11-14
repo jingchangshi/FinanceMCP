@@ -23,6 +23,7 @@ import { evaluateAccountStatus } from './decision.js';
 import { buildDailyReport } from './dailyReport.js';
 import { renderDailyReport } from './reportRenderer.js';
 import { screenEtfCandidates } from '../ashare/etfUniverse.js';
+import { buildLayeredScreen } from '../ashare/layeredScreen.js';
 import { buildBenchmarkComparison } from './benchmarks.js';
 import { runFeeCommand, FEE_USAGE } from './feeCli.js';
 import { runRiskPolicyCommand, RISK_POLICY_USAGE } from './riskPolicyCli.js';
@@ -116,6 +117,7 @@ ${RISK_POLICY_USAGE}
         [--market-db PATH] [--db PATH] [--format json|user|technical|both]
                                                       缺省 json=原始日报 JSON（向后兼容）；user/technical=双层
                                                       渲染正文；both={user,technical} JSON 信封
+  portfolio-layered-screen --date YYYYMMDD [--market-db PATH]  股票与 ETF 独立的只读研究分层
   portfolio-etf-candidates --date YYYYMMDD [--categories broad,industry,bond,gold,cross_border]
         [--limit N] [--market-db PATH]                 适格 ETF 动态候选筛选（数据缺失显式 DEGRADED）
   portfolio-benchmarks [--start YYYYMMDD] [--end YYYYMMDD] [--market-db PATH]
@@ -592,6 +594,17 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       } finally {
         market?.close();
         db.close();
+      }
+      return true;
+    }
+    case 'portfolio-layered-screen': {
+      const asOf = h.ymd(requireArg(h, 'date'), '--date');
+      const market = openMarketCache(h.arg('market-db') ?? ashareDbPath());
+      if (!market) throw new Error(`市场缓存不存在（${h.arg('market-db') ?? ashareDbPath()}）`);
+      try {
+        h.print(buildLayeredScreen(market, asOf));
+      } finally {
+        market.close();
       }
       return true;
     }
