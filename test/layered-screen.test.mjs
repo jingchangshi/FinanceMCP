@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { stockLayers, etfLayers, buildLayeredScreen } from '../build/ashare/layeredScreen.js';
 import { screenEtfCandidates } from '../build/ashare/etfUniverse.js';
+import { openAshareDb } from '../build/ashare/db.js';
+import { analyzeTechnicalDay } from '../build/ashare/technicalCandidatesV2.js';
+import { forEachStockBars } from '../build/ashare/bars.js';
+import { recentTradeDays } from '../build/ashare/ingest.js';
+import { computeRps } from '../build/ashare/rps.js';
+import { seedReferenceUniverse, weekdays } from './ashare-fixture.mjs';
 
 test('stock tiers retain other research states and the actual detailed denominator', () => {
   const stocks = [{ ts_code: 'A', research_state: 'FOCUS' }, { ts_code: 'B', research_state: 'WATCH' }, { ts_code: 'C', research_state: 'BLOCKED' }];
@@ -36,5 +42,47 @@ test('one screen failing does not mask the other screen', () => {
     assert.equal(result.etf.status, 'NOT_READY');
     assert.equal(result.etf.investable_scope.count, null);
     assert.ok(result.etf.candidates.rows.every(row => !row.held));
+  } finally { db.close(); }
+});
+
+test('empty eligible set never falls back to all stocks, but forced names remain eligible for review', () => {
+  const db = openAshareDb(':memory:');
+  try {
+    const dates = weekdays('20250101', 160);
+    seedReferenceUniverse(db, dates, { stocks: 3 });
+    const asOf = dates.at(-1);
+    db.prepare('UPDATE daily SET amount = 100').run();
+    let visited = 0;
+    assert.equal(forEachStockBars(db, dates[0], asOf, () => visited++, []), 0);
+    assert.equal(visited, 0);
+    const view = analyzeTechnicalDay(db, asOf);
+    assert.equal(view.coverage.universe, 3);
+    assert.equal(view.coverage.preselected, 0);
+    assert.equal(view.coverage.analyzed, 0);
+    assert.equal(view.research_universe.stocks.length, 0);
+    db.prepare('INSERT INTO suspend_d (ts_code, trade_date, suspend_timing) VALUES (?, ?, ?)').run('600000.SH', asOf, 'S');
+    const forced = analyzeTechnicalDay(db, asOf);
+    assert.equal(forced.coverage.preselected, 1);
+    assert.equal(forced.coverage.analyzed, 1);
+    assert.deepEqual(forced.contexts.map(row => row.ts_code), ['600000.SH']);
+  } finally { db.close(); }
+});
+
+test('layered stock RPS matches preview window and preserves quality denominators', () => {
+  const db = openAshareDb(':memory:');
+  try {
+    const dates = weekdays('20250101', 160);
+    seedReferenceUniverse(db, dates, { stocks: 5 });
+    const asOf = dates.at(-1);
+    const days = recentTradeDays(db, asOf, 260);
+    const rps = computeRps(db, days[0], asOf);
+    const preview = analyzeTechnicalDay(db, asOf, rps);
+    const stock = buildLayeredScreen(db, asOf).stock;
+    assert.equal(stock.status, 'OK');
+    assert.ok(preview.research_universe.stocks.some(row => row.rps120 !== null));
+    assert.deepEqual(stock.candidates.rows, preview.research_universe.stocks);
+    assert.deepEqual(stock.rps_quality.denominators, rps.denominators);
+    assert.deepEqual(stock.rps_quality.input, rps.quality);
+    assert.equal(stock.rps_quality.start, days[0]);
   } finally { db.close(); }
 });
