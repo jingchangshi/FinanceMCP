@@ -20,7 +20,7 @@ const { runAshareTool } = await import('../build/ashare/tools.js');
 const { analyzeMarket, ENGINE_VERSION, FACTOR_VERSION, SCORING_POLICY, FACTOR_UNITS, FACTOR_SNAPSHOT_MAX_CODES } = await import('../build/ashare/engine.js');
 const { INDICATOR_VERSION } = await import('../build/ashare/indicators.js');
 const { SIGNAL_VERSION } = await import('../build/ashare/signals.js');
-const { SCORE_VERSION, RESEARCH_SCORE_VERSION } = await import('../build/ashare/analysis.js');
+const { LEGACY_SCORE_VERSION, SCORE_VERSION, RESEARCH_SCORE_VERSION } = await import('../build/ashare/analysis.js');
 const { seedMarket, weekdays, STOCKS } = await import('./ashare-fixture.mjs');
 
 const EXPECTED_TOOLS = [
@@ -57,15 +57,15 @@ test('the research surface is the documented read-only tools, and the snapshot i
   for (const tool of ashareToolDefinitions) assert.equal(tool.annotations.readOnlyHint, true, tool.name);
   const snapshot = ashareToolDefinitions.find(t => t.name === 'ashare_factor_snapshot');
   assert.match(snapshot.description, /RESEARCH_ONLY/);
-  assert.deepEqual(snapshot.inputSchema.properties.score_version.enum, [SCORE_VERSION, RESEARCH_SCORE_VERSION]);
+  assert.deepEqual(snapshot.inputSchema.properties.score_version.enum, [LEGACY_SCORE_VERSION, RESEARCH_SCORE_VERSION, SCORE_VERSION]);
   assert.equal(snapshot.inputSchema.properties.ts_codes.maxItems, FACTOR_SNAPSHOT_MAX_CODES);
   // The factor snapshot is the only tool that computes scores; it is not exposed
   // through the daily-report path and has no write argument.
   assert.deepEqual(Object.keys(snapshot.inputSchema.properties).sort(), ['date', 'include_components', 'score_version', 'ts_codes']);
 });
 
-test('the response names its score version and every computation version for both versions', async () => {
-  for (const version of [SCORE_VERSION, RESEARCH_SCORE_VERSION]) {
+test('the response names its score version and every computation version for all versions', async () => {
+  for (const version of [LEGACY_SCORE_VERSION, RESEARCH_SCORE_VERSION, SCORE_VERSION]) {
     const body = await call({ date, ts_codes: [STOCKS[1].ts_code], score_version: version });
     assert.equal(body.status, 'RESEARCH_ONLY');
     assert.equal(body.trade_date, date);

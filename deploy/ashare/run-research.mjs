@@ -8,7 +8,7 @@ import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 console.log = () => {};
-const { scoreRows, SCORE_VERSION, RESEARCH_SCORE_VERSION, SCORE_RULES } = await import('../../build/ashare/analysis.js');
+const { scoreRows, LEGACY_SCORE_VERSION, RESEARCH_SCORE_VERSION, SCORE_RULES } = await import('../../build/ashare/analysis.js');
 const { rawFactors, sourceQualityForDate, applyObservationQuality, FACTOR_VERSION, ENGINE_VERSION, SCORING_POLICY, FACTOR_UNITS } = await import('../../build/ashare/engine.js');
 const { updateWatchlist, WATCHLIST_VERSION, WATCHLIST_RULES } = await import('../../build/ashare/watchlist.js');
 const { checkQuality } = await import('../../build/ashare/ingest.js');
@@ -34,7 +34,7 @@ const split = arg('split', '20260331');
 if (split !== '20260331') throw new Error('This experiment fixes split=20260331; create a new explicit protocol for another split');
 const options = { asOf: manifest.data_cutoff, horizon: Number(arg('horizon', '10')), buyFeeBps: Number(arg('buy-fee-bps', '3')),
   sellFeeBps: Number(arg('sell-fee-bps', '8')), slippageBps: Number(arg('slippage-bps', '5')), maxExitDelay: Number(arg('max-exit-delay', '5')) };
-const versions = [SCORE_VERSION, RESEARCH_SCORE_VERSION];
+const versions = [LEGACY_SCORE_VERSION, RESEARCH_SCORE_VERSION];
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const implementationFiles = ['src/ashare/analysis.ts', 'src/ashare/engine.ts', 'src/ashare/evaluation.ts', 'src/ashare/watchlist.ts', 'src/ashare/ingest.ts',
   'deploy/ashare/harvest-research.mjs', 'deploy/ashare/run-research.mjs'];

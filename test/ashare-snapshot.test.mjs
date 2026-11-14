@@ -15,6 +15,7 @@ process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
 
 const { openAshareDb, upsertRows } = await import('../build/ashare/db.js');
 const { generateReport } = await import('../build/ashare/report.js');
+const { scanMarket, scoreRows, SCORE_VERSION, RESEARCH_SCORE_VERSION } = await import('../build/ashare/analysis.js');
 const { runResearchSnapshot, runResearchEvaluate, researchSnapshotDbPath } = await import('../build/ashare/snapshot.js');
 const { seedMarket, weekdays, STOCKS } = await import('./ashare-fixture.mjs');
 
@@ -129,7 +130,7 @@ test('d. a successful snapshot records V1 parity and leaves the live database un
   assert.equal(first.v1_parity.ok, true);
   assert.equal(first.v1_pool.source, 'formal_live_watchlist');
   assert.equal(first.v2_pool.source, 'research_v2_sequential');
-  assert.ok(first.changed_scores > 0, 'V2 cash threshold changes some scores');
+  assert.ok(first.changed_scores > 0, 'the ordinal and average tie rules change some scores');
 
   assert.equal(fileHash(process.env.ASHARE_DB_PATH), bytesBefore, 'live database bytes unchanged');
   assert.deepEqual(liveState(), before, 'report/watchlist/stock_score rows unchanged');
@@ -144,8 +145,11 @@ test('d. a successful snapshot records V1 parity and leaves the live database un
     assert.equal(content.report.report_id, first.report_id);
     assert.equal(content.quality.checked_at, undefined, 'wall-clock checked_at excluded');
     assert.ok(content.data_snapshot.written_at);
-    assert.equal(content.versions.score_v1, 'score-1.0.0');
-    assert.equal(content.versions.score_v2, 'score-2.0.0');
+    assert.equal(content.versions.score_v1, SCORE_VERSION);
+    assert.equal(content.versions.score_v2, RESEARCH_SCORE_VERSION);
+    assert.match(content.v1_v2.note, /相同现金流阈值/);
+    assert.match(content.v1_v2.note, /并列值使用平均百分位/);
+    assert.ok(content.v1_v2.diffs.every(diff => Math.abs(diff.cash_contribution_delta) < 1e-10));
     assert.equal(content.versions.watchlist, 'wl-1.0.0');
     assert.match(content.build_sha256, /^[0-9a-f]{64}$/);
     assert.equal(content.parameters.horizon, 10);
@@ -157,8 +161,8 @@ test('d. a successful snapshot records V1 parity and leaves the live database un
     assert.equal(content.future_returns.horizon, 10);
     assert.ok(content.future_returns.planned_exit_date);
     assert.equal(content.universe.eligible, first.v1_parity.eligible);
-    assert.equal(content.v1_pool.count, snap.prepare("SELECT COUNT(*) n FROM snapshot_member WHERE snapshot_id = ? AND version = 'score-1.0.0'").get(first.snapshot_id).n);
-    assert.equal(content.v2_pool.count, snap.prepare("SELECT COUNT(*) n FROM snapshot_member WHERE snapshot_id = ? AND version = 'score-2.0.0'").get(first.snapshot_id).n);
+    assert.equal(content.v1_pool.count, snap.prepare('SELECT COUNT(*) n FROM snapshot_member WHERE snapshot_id = ? AND version = ?').get(first.snapshot_id, SCORE_VERSION).n);
+    assert.equal(content.v2_pool.count, snap.prepare('SELECT COUNT(*) n FROM snapshot_member WHERE snapshot_id = ? AND version = ?').get(first.snapshot_id, RESEARCH_SCORE_VERSION).n);
     // V1 pool equals the formal live watchlist, member for member.
     const formal = live.prepare('SELECT ts_code, score, rank, entered_on FROM watchlist WHERE trade_date = ? ORDER BY ts_code').all(DATE);
     assert.deepEqual(content.v1_pool.members.map(m => ({ ts_code: m.ts_code, score: m.score, rank: m.rank, entered_on: m.entered_on })).sort((a, b) => a.ts_code.localeCompare(b.ts_code)),
@@ -167,6 +171,19 @@ test('d. a successful snapshot records V1 parity and leaves the live database un
     assert.equal(snap.prepare('SELECT COUNT(*) n FROM snapshot_factor WHERE snapshot_id = ?').get(first.snapshot_id).n, content.universe.eligible);
     const factor = JSON.parse(snap.prepare('SELECT * FROM snapshot_factor WHERE snapshot_id = ? ORDER BY ts_code LIMIT 1').get(first.snapshot_id).v1);
     assert.ok('components' in factor && 'normalized' in factor && 'factor_contributions' in factor);
+    // Both stored versions must match independent scoring of the same universe.
+    const scan = scanMarket(live, DATE);
+    const v2Rows = structuredClone(scan.rows);
+    scoreRows(v2Rows, scan.sectors, RESEARCH_SCORE_VERSION);
+    const rowsByVersion = [scan.rows, v2Rows].map(rows => new Map(rows.map(row => [row.ts_code, row])));
+    for (const stored of snap.prepare('SELECT ts_code, v1, v2 FROM snapshot_factor WHERE snapshot_id = ?').all(first.snapshot_id)) {
+      for (const [index, key] of ['v1', 'v2'].entries()) {
+        const expected = rowsByVersion[index].get(stored.ts_code);
+        const actual = JSON.parse(stored[key]);
+        assert.equal(actual.score, expected.score, `${key} ${stored.ts_code} score`);
+        assert.equal(actual.rank, expected.rank, `${key} ${stored.ts_code} rank`);
+      }
+    }
     // V2 pool state was persisted for the date.
     assert.equal(snap.prepare("SELECT COUNT(*) n FROM pool_state WHERE version = 'score-2.0.0' AND trade_date = ?").get(DATE).n, content.v2_pool.count);
   } finally {
@@ -255,7 +272,7 @@ test('g. immature horizons stay PENDING; mature ones produce completed returns f
   try {
     const rows = db.prepare('SELECT version, as_of, horizon, status FROM snapshot_evaluation WHERE snapshot_id = ? ORDER BY as_of, version').all(first.snapshot_id);
     assert.ok(rows.every(r => r.horizon === 10));
-    assert.deepEqual(rows.map(r => r.version), ['score-1.0.0', 'score-2.0.0', 'score-1.0.0', 'score-2.0.0']);
+    assert.deepEqual(rows.map(r => r.version), [RESEARCH_SCORE_VERSION, SCORE_VERSION, RESEARCH_SCORE_VERSION, SCORE_VERSION]);
     assert.deepEqual([...new Set(rows.map(r => r.as_of))].sort(), [DATE, ALL[exitIndex + 5]].sort());
   } finally { db.close(); }
   assert.deepEqual(snapshotRow(), stored, 'original snapshot still unchanged');
