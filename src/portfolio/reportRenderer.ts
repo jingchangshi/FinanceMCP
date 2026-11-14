@@ -739,6 +739,24 @@ function buildBundleSection(bundle: ResearchBundleLike, audit: AnnotationAudit):
 
 // ---------------------------------------------------------------- 用户版 A–H
 
+/** 市场日报允许回退到旧日；旧事实不能作为目标日的市场环境。 */
+function hasCurrentMarket(r: DailyReportResult): boolean {
+  return r.status !== 'DATA_INSUFFICIENT' && r.market_judgement.available
+    && r.market_judgement.fact_meta?.as_of === r.as_of_trade_date;
+}
+
+/** 只有分母和涨跌家数齐全且一致时，才能判断是否超过全部股票的一半。 */
+function breadthMajority(line: string): string | null {
+  const total = /有日线记录的\s*(\d+)\s*只股票/.exec(line);
+  const counts = /上涨\s*(\d+)\s*家\s*\/\s*下跌\s*(\d+)\s*家/.exec(line);
+  if (!total || !counts) return null;
+  const [stocks, up, down] = [Number(total[1]), Number(counts[1]), Number(counts[2])];
+  if (![stocks, up, down].every(Number.isSafeInteger) || stocks <= 0 || up + down > stocks) return null;
+  if (up > stocks / 2) return '多数个股上涨';
+  if (down > stocks / 2) return '多数个股下跌';
+  return null;
+}
+
 function renderTitle(r: DailyReportResult, weekend: boolean): string {
   const label = monthDay(r.as_of_trade_date);
   return weekend
@@ -749,20 +767,15 @@ function renderTitle(r: DailyReportResult, weekend: boolean): string {
 /** A. 今日结论：四问（最大变化/账户影响/是否行动/最重要风险），正文 ≤200 字。 */
 function renderSectionA(r: DailyReportResult, view: RenderView): string {
   const market = r.market_judgement;
-  const breadth = market.available
+  const breadth = hasCurrentMarket(r)
     ? market.judgement.map(line => zh(line)).find(line => line.includes('上涨占比')) ?? ''
     : '';
-  const upShare = breadth.match(/上涨占比\s*([\d.]+)%/);
-  const breadthTone = upShare
-    ? Number(upShare[1]) > 50 ? '多数个股上涨'
-      : Number(upShare[1]) < 50 ? '多数个股下跌'
-      : '个股涨跌数量接近'
-    : null;
-  const regime = market.available ? (market.regime_label ?? '') : '数据未就绪';
-  const change = r.status === 'DATA_INSUFFICIENT' || !market.available
+  const breadthTone = breadthMajority(breadth);
+  const regime = market.regime_label ?? '未分类';
+  const change = !hasCurrentMarket(r)
     ? '本期市场数据未就绪，不以旧数据替代当日结论。'
-    : breadth && breadthTone
-      ? `${regime}，${breadthTone}：${breadth.slice(0, breadth.indexOf('）') + 1 || undefined)}`
+    : breadth
+      ? `${regime}，${breadthTone ? `${breadthTone}：` : ''}${breadth.slice(0, breadth.indexOf('）') + 1 || undefined)}`
       : `${regime}，行情日期 ${monthDay(r.as_of_trade_date)}。`;
   const focusHolding = view.focus
     ? r.holdings.find(row => row.ts_code === view.focus!.ts_code)
@@ -886,7 +899,7 @@ function renderSectionC(r: DailyReportResult, view: RenderView): string {
 /** D. 市场发生了什么：状态/广度量能风格/主要驱动/反证；不罗列全部宽基 20 日收益。 */
 function renderSectionD(r: DailyReportResult, view: RenderView): string {
   const market = r.market_judgement;
-  if (!market.available || r.status === 'DATA_INSUFFICIENT') {
+  if (!hasCurrentMarket(r)) {
     return '- 本期市场数据未就绪：不以任何旧日期数据替代当日行情，市场判断暂停一期。';
   }
   const lines: string[] = [];
@@ -896,13 +909,13 @@ function renderSectionD(r: DailyReportResult, view: RenderView): string {
     .filter(line => /上涨|成交额|站上|相对/.test(line))
     .slice(0, 4);
   for (const metric of metrics) lines.push(`- ${metric}。`);
-  const support = market.support_evidence.filter(item => /上涨家数|成交额|中位数/.test(item.statement)).slice(0, 2);
-  const counter = market.counter_evidence.filter(item => /站上|近 20 日|近 5 日/.test(item.statement)).slice(0, 3);
+  const support = market.support_evidence.filter(item => item.as_of === r.as_of_trade_date && /上涨家数|成交额|中位数/.test(item.statement)).slice(0, 2);
+  const counter = market.counter_evidence.filter(item => item.as_of === r.as_of_trade_date && /站上|近 20 日|近 5 日/.test(item.statement)).slice(0, 3);
   if (support.length) {
     lines.push(`- **主要支撑**：${support.map(item => `${zh(item.statement)}（${ymd(item.as_of)}）`).join('；')}。`);
   }
   if (counter.length) {
-    lines.push(`- **不支持当前判断的证据**：${counter.map(item => `${zh(item.statement)}（${ymd(item.as_of)}）`).join('；')}——反证项共 ${market.counter_evidence.length} 条、支撑项 ${market.support_evidence.length} 条，反证明显占优。`);
+    lines.push(`- **不支持当前判断的证据**：${counter.map(item => `${zh(item.statement)}（${ymd(item.as_of)}）`).join('；')}。`);
   }
   if (!view.hasPreviousDayDelta) {
     lines.push('- **与前一日对比**：本报告按单一交易日事实生成，未内嵌昨日对照；判断层面最需要盯的是上述反证/支撑数量差。');
