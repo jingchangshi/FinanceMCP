@@ -17,17 +17,17 @@ const { DEMO_SNAPSHOT, importSnapshot, markSnapshotCurrent } = await import('../
 const { initBaseline, confirmRealAccount } = await import('../build/portfolio/ledger.js');
 const { buildInvestmentResearchBundle, persistedSnapshotStatus } = await import('../build/portfolio/researchBundle.js');
 const { runBundleRecordCommand } = await import('../build/portfolio/bundleRecordCli.js');
-const { readResearchJournal } = await import('../build/portfolio/researchJournal.js');
+const { readResearchJournal, recordResearchJournal } = await import('../build/portfolio/researchJournal.js');
 
 const ACCOUNT = 'synthetic-1109-bundle';
 const AS_OF = '20261020';
 let seq = 0;
 
-function fixture({ confirmed = true } = {}) {
+function fixture({ confirmed = true, asOf = AS_OF } = {}) {
   seq += 1;
   const marketPath = join(dir, `market-${seq}.sqlite`);
   const market = openAshareDb(marketPath);
-  const dates = weekdays('20260701', 80).filter(d => d <= '20261020');
+  const dates = weekdays('20260701', 100).filter(d => d <= asOf);
   seedMarket(market, dates);
   for (const [d, o] of [['20261020', 1], ['20261021', 1], ['20261024', 0], ['20261025', 0]]) market.prepare('INSERT OR REPLACE INTO trade_cal(cal_date,is_open) VALUES(?,?)').run(d, o);
   for (const position of DEMO_SNAPSHOT.positions) {
@@ -49,11 +49,11 @@ function fixture({ confirmed = true } = {}) {
   markSnapshotCurrent(p, id, { confirmedBy: 'fixture' });
   if (confirmed) confirmRealAccount(p, ACCOUNT, { confirm: true });
   const reportPath = join(dir, `report-${seq}.json`);
-  const writeReport = watchlistCount => writeFileSync(reportPath, JSON.stringify({ report_id: `synthetic-market-report-${seq}`, as_of_trade_date: AS_OF, status: 'READY', versions: { score: 'frozen-test' },
+  const writeReport = watchlistCount => writeFileSync(reportPath, JSON.stringify({ report_id: `synthetic-market-report-${seq}`, as_of_trade_date: asOf, status: 'READY', versions: { score: 'frozen-test' },
     market: { regime: 'range', regime_label: 'synthetic', breadth: {}, indices: [], judgement: [] }, sectors: { top: [], bottom: [], all: [] },
     watchlist: { count: watchlistCount, members: [], added: [], removed: [], track_record: { mean_excess_pct: -1.68, hit_rate: 0.217 } }, signals: { market_summary: [] } }));
   writeReport(40);
-  market.prepare('INSERT INTO report(report_id,trade_date,status,generated_at,path,run_mode) VALUES(?,?,?,?,?,?)').run(`synthetic-market-report-${seq}`, AS_OF, 'READY', '2026-10-20T13:10:00Z', reportPath, 'live');
+  market.prepare('INSERT INTO report(report_id,trade_date,status,generated_at,path,run_mode) VALUES(?,?,?,?,?,?)').run(`synthetic-market-report-${seq}`, asOf, 'READY', '2026-10-20T13:10:00Z', reportPath, 'live');
   return { market, p, marketPath, portfolioPath, writeReport };
 }
 
@@ -101,14 +101,15 @@ test('A08: identity consistent across modules (as-of, snapshot identity, hash)',
     // WP6：前瞻样本状态必须显式披露，且四类账本分开列名，不混业绩。
     const forward = bundle.research_tracking?.forward_status;
     assert.ok(forward, 'research_tracking must disclose forward sample state');
-    assert.ok(['MATURED_SAMPLE', 'OBSERVING_NOT_MATURED', 'NO_PROSPECTIVE_RECORD'].includes(forward.sample_state));
+    assert.ok(['MATURED_SAMPLE', 'OBSERVING_NOT_MATURED', 'PROSPECTIVE_UNAVAILABLE', 'NO_PROSPECTIVE_RECORD'].includes(forward.sample_state));
     assert.deepEqual(forward.separate_ledgers, ['actual_account', 'shadow', 'fixed_benchmark', 'research_thesis']);
     assert.ok(forward.note.length > 0);
     // 状态必须与计数自洽，而不是可以填任意枚举值。
-    assert.equal(forward.evaluated + forward.pending + forward.unavailable, bundle.research_tracking.evaluations.length);
+    assert.equal(forward.evaluated + forward.pending + forward.unavailable + forward.excluded_evaluations, bundle.research_tracking.evaluations.length);
     if (forward.sample_state === 'MATURED_SAMPLE') assert.ok(forward.evaluated > 0);
     if (forward.sample_state === 'OBSERVING_NOT_MATURED') assert.ok(forward.pending > 0 && forward.evaluated === 0);
-    if (forward.sample_state === 'NO_PROSPECTIVE_RECORD') assert.equal(forward.evaluated + forward.pending, 0);
+    if (forward.sample_state === 'PROSPECTIVE_UNAVAILABLE') assert.ok(forward.unavailable > 0 && forward.pending === 0 && forward.evaluated === 0);
+    if (forward.sample_state === 'NO_PROSPECTIVE_RECORD') assert.equal(forward.evaluated + forward.pending + forward.unavailable, 0);
     assert.ok('research_stance' in bundle);
     assert.ok('execution_eligibility' in bundle);
     // persistedSnapshotStatus READ_ERROR on DB fault (P0-3 tie-in)
@@ -116,6 +117,69 @@ test('A08: identity consistent across modules (as-of, snapshot identity, hash)',
     assert.equal(bad.status, 'READ_ERROR');
     assert.equal(bad.error_code, 'SQLITE_FULL');
   } finally { f.market.close(); f.p.close(); }
+});
+
+test('前瞻状态只统计冻结后及时记录，历史与补录评价仍保留', () => {
+  const f = fixture({ asOf: '20261102' });
+  const asOf = '20261102';
+  const render = () => build(f, { asOfTradeDate: asOf, now: new Date('2026-11-03T01:00:00Z') }).research_tracking;
+  const record = (id, date, recordedAt) => {
+    const ActualDate = globalThis.Date;
+    globalThis.Date = class extends ActualDate {
+      constructor(...args) { super(...(args.length ? args : [recordedAt])); }
+      static now() { return ActualDate.parse(recordedAt); }
+    };
+    try {
+      recordResearchJournal(f.p, {
+        record_id: id, account_id: ACCOUNT, source: 'vps', as_of_trade_date: date, bundle_id: `bundle-${id}`,
+        generated_at: `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6)}T21:00:00+08:00`,
+        versions: { rules: 'v1' }, judgement: {}, candidates: [], evidence: [],
+        observations: [{ ts_code: DEMO_SNAPSHOT.positions[0].ts_code, quantity: 10000, direction: 'observe', benchmark_code: DEMO_SNAPSHOT.positions[0].ts_code }],
+      });
+    } finally { globalThis.Date = ActualDate; }
+  };
+  try {
+    record('historical', '20261019', '2026-10-19T21:10:00+08:00');
+    record('backfilled', '20261022', '2026-10-30T21:10:00+08:00');
+    let tracking = render();
+    assert.ok(tracking.evaluations.some(e => e.record_id === 'historical' && e.status === 'EVALUATED'), JSON.stringify(tracking.evaluations));
+    assert.equal(tracking.forward_status.sample_state, 'NO_PROSPECTIVE_RECORD');
+    assert.equal(tracking.forward_status.excluded_evaluations, tracking.evaluations.length);
+    record('pending', '20261030', '2026-10-30T21:10:00+08:00');
+    tracking = render();
+    assert.equal(tracking.forward_status.sample_state, 'OBSERVING_NOT_MATURED');
+    assert.ok(tracking.forward_status.pending > 0);
+    record('forward', '20261022', '2026-10-22T21:10:00+08:00');
+    tracking = render();
+    assert.equal(tracking.forward_status.sample_state, 'MATURED_SAMPLE');
+    assert.ok(tracking.forward_status.evaluated > 0);
+    assert.ok(tracking.forward_status.excluded_evaluations > 0);
+    assert.equal(tracking.records.length, 4);
+  } finally { f.market.close(); f.p.close(); }
+});
+
+test('真实前瞻记录的评价全部不可用时不称作没有记录', () => {
+  const f = fixture({ asOf: '20261102' });
+  const ActualDate = globalThis.Date;
+  try {
+    globalThis.Date = class extends ActualDate {
+      constructor(...args) { super(...(args.length ? args : ['2026-10-24T21:10:00+08:00'])); }
+      static now() { return ActualDate.parse('2026-10-24T21:10:00+08:00'); }
+    };
+    recordResearchJournal(f.p, {
+      record_id: 'unavailable-forward', account_id: ACCOUNT, source: 'vps', as_of_trade_date: '20261024',
+      bundle_id: 'bundle-unavailable', generated_at: '2026-10-24T21:00:00+08:00',
+      versions: { rules: 'v1' }, judgement: {}, candidates: [], evidence: [], observations: [],
+    });
+    globalThis.Date = ActualDate;
+    const tracking = build(f, { asOfTradeDate: '20261102', now: new Date('2026-11-03T01:00:00Z') }).research_tracking;
+    assert.ok(tracking.evaluations.length > 0);
+    assert.ok(tracking.evaluations.every(e => e.status === 'UNAVAILABLE' && e.reason === 'research_date_not_open_in_calendar'));
+    assert.equal(tracking.forward_status.sample_state, 'PROSPECTIVE_UNAVAILABLE');
+    assert.equal(tracking.forward_status.unavailable, tracking.evaluations.length);
+    assert.equal(tracking.forward_status.excluded_evaluations, 0);
+    assert.match(tracking.forward_status.note, /存在真实前瞻记录/);
+  } finally { globalThis.Date = ActualDate; f.market.close(); f.p.close(); }
 });
 
 test('A09: unreconciled (unconfirmed) account: reference conclusions only, can_quote_quantity false', () => {

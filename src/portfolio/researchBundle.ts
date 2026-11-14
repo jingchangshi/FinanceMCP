@@ -17,6 +17,7 @@ import { buildResearchCases, RESEARCH_CASE_SCHEMA } from './researchCase.js';
 import { buildInvestorReportModel, REPORT_MODEL_SCHEMA } from './reportModel.js';
 import { resolveAccountId, resolveAccountSnapshot } from './accounts.js';
 import { listResearchJournal, evaluateResearchJournal, journalFeeEstimator } from './researchJournal.js';
+import { classifyRecord } from './forwardReview.js';
 import { loadFeeContext, feeRulesFor, type FeeEvidence } from './fees.js';
 import { resolveInstrument } from './instrument.js';
 import { loadValidationSummary } from '../ashare/validation.js';
@@ -425,24 +426,32 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     const evaluations = evaluateResearchJournal({ portfolioDb: input.portfolioDb, marketDb: market, accountId: account.account_id, asOf, limit: 5,
       feeEstimator: journalFeeEstimator(input.portfolioDb, market, account.account_id),
     });
-    const count = (status: string) => evaluations.filter(item => item.status === status).length;
+    const records = listResearchJournal(input.portfolioDb, { accountId: account.account_id, asOf, limit: 5 });
+    const forwardIds = new Set(records.filter(record => classifyRecord(record) === 'TRUE_FORWARD').map(record => record.record_id));
+    const forwardEvaluations = evaluations.filter(item => forwardIds.has(item.record_id));
+    const count = (status: string) => forwardEvaluations.filter(item => item.status === status).length;
     const evaluated = count('EVALUATED');
     const pending = count('PENDING');
     return {
       legacy_plans: readTracking(input.portfolioDb, account.account_id, asOf),
-      records: listResearchJournal(input.portfolioDb, { accountId: account.account_id, asOf, limit: 5 })
-        .map(({ payload, ...record }) => record),
+      records: records.map(({ payload, ...record }) => record),
       evaluations,
       // WP6：实际账户、影子组合、固定基准、研究命题是四本独立的账，
       // 这里只披露前瞻命题样本的成熟度；未成熟时报告“观察中”，
       // 不把回放结果或待定样本当作业绩。
       forward_status: {
-        sample_state: evaluated > 0 ? 'MATURED_SAMPLE' : pending > 0 ? 'OBSERVING_NOT_MATURED' : 'NO_PROSPECTIVE_RECORD',
+        sample_state: evaluated > 0 ? 'MATURED_SAMPLE' : pending > 0 ? 'OBSERVING_NOT_MATURED'
+          : forwardEvaluations.length > 0 ? 'PROSPECTIVE_UNAVAILABLE' : 'NO_PROSPECTIVE_RECORD',
         evaluated, pending, unavailable: count('UNAVAILABLE'),
-        horizons: [...new Set(evaluations.map(item => item.horizon_trade_days))].sort((a, b) => a - b),
+        horizons: [...new Set(forwardEvaluations.map(item => item.horizon_trade_days))].sort((a, b) => a - b),
+        excluded_evaluations: evaluations.length - forwardEvaluations.length,
         note: evaluated > 0
-          ? '已到期样本只作方法观察；没有证明可重复的收益优势。'
-          : '前瞻窗口尚未成熟，本期报告观察中状态；回放结果与待定样本不计为业绩。',
+          ? '最近五条日志中的真实前瞻已到期样本只作方法观察；没有证明可重复的收益优势。'
+          : pending > 0
+            ? '最近五条日志中的真实前瞻窗口尚未成熟；回放结果与待定样本不计为业绩。'
+            : forwardEvaluations.length > 0
+              ? '最近五条日志中存在真实前瞻记录，但评价不可用；原因详见评价明细。'
+              : '最近五条日志中没有真实前瞻记录；冻结前与补录记录不计入前瞻统计。',
         separate_ledgers: ['actual_account', 'shadow', 'fixed_benchmark', 'research_thesis'],
       },
     };

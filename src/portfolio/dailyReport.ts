@@ -1297,38 +1297,39 @@ function buildDecisionComparison(input: {
   });
   const decisionPlans: DecisionComparison['decision_plans'] = [];
   const quotesComplete = holdings.every(h => h.bar_quality === 'READY' && h.latest_bar_date === asOf);
-  // 显式轮动请求（同日指定卖出与买入）且两侧资金都成立时，轮动才是首选；
-  // 现金建仓分支只处理“不依赖卖出回款”的加仓，不能反过来盖掉用户明确要求的轮动比较。
+  // 用户指定与资金可行只支持情景计算，不构成轮动相对优势证据。
   const rotationRequested = Boolean(scenario?.sellCode && scenario?.buyCode);
   if (rotationRequested && rotate.funding_status === 'FUNDED') {
-    decisionPlans.push(planOf('PREFERRED', 'ROTATE',
-      `轮动研究：卖出${reduce.sell_plan?.quantity}份${reduce.sell_plan?.ts_code}，买入${rotate.rotation_plan?.quantity}份${rotate.rotation_plan?.buy_code}`,
-      `卖出净回款后现金${reduce.cash_after_cents}分，轮动买入后现金${rotate.cash_after_cents}分；双边费用及滑点估计${rotate.fees_cents}分。`,
+    decisionPlans.push(planOf('PREFERRED', 'HOLD', '继续持有，不做轮动',
+      '轮动相对优势尚未独立复核，持有避免为未经验证的换仓支付双边费用。',
+      '继续持有会承担原有集中度与方向暴露，且可能错过候选的相对表现。',
+      ['轮动候选的相对优势获得独立复核后重新比较。']));
+    decisionPlans.push(planOf('BACKUP', 'ROTATE',
+      `用户指定轮动情景：卖出${reduce.sell_plan?.quantity}份${reduce.sell_plan?.ts_code}，买入${rotate.rotation_plan?.quantity}份${rotate.rotation_plan?.buy_code}`,
+      `卖出净回款后现金${reduce.cash_after_cents}分，轮动买入后现金${rotate.cash_after_cents}分；双边费用及滑点估计${rotate.fees_cents}分。资金可行不代表相对优势。`,
       '换仓候选的相对优势未复核（strategy_evidence=UNVERIFIED）；轮动同时承担两次交易费用与换错方向的风险。',
       ['成交价、费用或可卖数量变化使任一侧无法成立时，放弃整个轮动情景。',
         '候选与现有持仓的行业重叠或集中度超出已确认政策时，重算轮动数量。']));
-    decisionPlans.push(planOf('BACKUP', 'HOLD', '继续持有，不做轮动',
-      '同时保留原持仓与现金，避免在优势未复核时支付双边费用。',
-      '继续持有会承担原有集中度与方向暴露，且不响应候选的相对变化。',
-      ['轮动候选的相对优势获得独立复核后重新比较。']));
   } else if (cashPlan.funded) {
-    decisionPlans.push(planOf('PREFERRED', 'ADD',
+    decisionPlans.push(planOf('PREFERRED', 'HOLD', '继续持有并保留现金',
+      '候选相对优势尚未独立复核，保留现金以便后续比较。',
+      '继续持有会承担现有集中度与下行暴露，也可能错过候选表现。',
+      ['候选优势获得独立复核后重新比较。']));
+    decisionPlans.push(planOf('BACKUP', 'ADD',
       `现金建仓/加仓研究：${cashPlan.code}（${cashPlan.quantity}份/股）`,
-      `现有现金${cash}分可覆盖${cashPlan.affordable_lots}手；费用及滑点估计占拟投入${cashPlan.fee_pct_of_spend}%。`,
+      `现有现金${cash}分可覆盖${cashPlan.affordable_lots}手；费用及滑点估计占拟投入${cashPlan.fee_pct_of_spend}%。资金可行不代表相对优势。`,
       '候选相对优势未复核（strategy_evidence=UNVERIFIED），加仓会放大集中度与压力损失。',
       ['成交价、费用或现金变化使方案不再可负担时放弃。', '候选行业与现有持仓重叠导致集中度上升时优先降低拟投金额。']));
-    decisionPlans.push(planOf('BACKUP', 'HOLD', '继续持有并保留现金',
-      '不交易保留选择权；现金容量在后续交易日仍可复核。',
-      '继续持有会承担现有集中度与下行暴露。', ['每日收盘后按同一口径复核现金容量。']));
   } else if (reduce.funding_status === 'FUNDED') {
-    decisionPlans.push(planOf('PREFERRED', 'REDUCE',
+    decisionPlans.push(planOf('PREFERRED', 'HOLD', '继续持有',
+      '显式卖出数量与资金计算本身不能证明减仓符合已确认的风险约束。',
+      '继续持有会保留现有集中度与下行暴露，也可能错过降低风险的机会。',
+      ['结合已确认的风险约束和持仓暴露重新评估。']));
+    decisionPlans.push(planOf('BACKUP', 'REDUCE',
       scenario?.sellAll ? `全部退出研究：${reduce.sell_plan?.ts_code}` : `显式数量减仓研究：${reduce.sell_plan?.ts_code}`,
       `卖出回款后现金${reduce.cash_after_cents}分；费用及滑点估计${reduce.fees_cents}分。`,
-      '减仓数量来自显式研究参数而非经复核的优势证据；卖出放弃后续上涨参与度。',
+      '减仓数量来自显式研究参数而非经确认的风险约束；卖出放弃后续上涨参与度。',
       ['可卖数量或行情变化后重算。', '若风险暴露并未实质下降，减仓只是增加费用。']));
-    decisionPlans.push(planOf('BACKUP', 'HOLD', '继续持有',
-      '保留现有暴露与现金，不做未经验证的数量调整。',
-      '集中度与下行暴露保持不变。', ['触发持仓研究中的观察条件时再评估。']));
   } else {
     decisionPlans.push(planOf('PREFERRED', 'HOLD', '继续持有，不交易',
       quotesComplete && input.gateSatisfied

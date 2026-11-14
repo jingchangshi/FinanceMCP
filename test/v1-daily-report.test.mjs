@@ -359,14 +359,15 @@ test('D1-5 门控满足仍需优势证据：NO_ACTION，显式研究量不升级
   assert.equal(reduce.sell_plan.gross_cents, 93500);
   assert.equal(rotate.rotation_plan.quantity, 100);
   assert.equal(rotate.funding_status, 'FUNDED');
-  // 显式轮动请求两侧都成立时，首选是 ROTATE；现金建仓不能反过来盖掉轮动比较。
+  // 指定轮动且资金可行不等于具备相对优势，仍保留完整情景供比较。
   const preferred = report.decision_comparison.decision_plans.find(item => item.role === 'PREFERRED');
-  assert.equal(preferred.action, 'ROTATE');
-  assert.match(preferred.label, /1000份159558\.SZ/);
-  assert.match(preferred.label, /100份510300\.SH/);
-  assert.equal(preferred.strategy_evidence, 'UNVERIFIED');
+  assert.equal(preferred.action, 'HOLD');
   const backup = report.decision_comparison.decision_plans.find(item => item.role === 'BACKUP');
-  assert.equal(backup.action, 'HOLD');
+  assert.equal(backup.action, 'ROTATE');
+  assert.match(backup.label, /1000份159558\.SZ/);
+  assert.match(backup.label, /100份510300\.SH/);
+  assert.match(backup.research_lean, /资金可行不代表相对优势/);
+  assert.equal(backup.strategy_evidence, 'UNVERIFIED');
   assert.equal(reduce.executable, false);
   assert.equal(rotate.executable, false);
   assert.equal(rotate.rotation_plan.advantage_status, 'UNVERIFIED');
@@ -399,6 +400,9 @@ test('D1-5b 全部退出研究：sellAll 取全部持仓并标记 sell_all，仍
   assert.equal(reduce.sell_plan.quantity, 58900);
   assert.equal(reduce.executable, false);
   assert.equal(reduce.quantity_basis, 'user_research_parameter');
+  const plans = report.decision_comparison.decision_plans;
+  assert.equal(plans.find(item => item.role === 'PREFERRED').action, 'HOLD');
+  assert.equal(plans.find(item => item.role === 'BACKUP').action, 'REDUCE');
 });
 
 test('D1-5c 现金建仓研究：给出可买手数、费用占比与首选/备选，但不授权执行', () => {
@@ -415,9 +419,13 @@ test('D1-5c 现金建仓研究：给出可买手数、费用占比与首选/备�
   assert.ok(plan.one_lot_cost_cents > plan.one_lot_cents, '一手成本必须含买入费用');
   assert.ok(Number.isFinite(plan.fee_pct_of_spend));
   const preferred = report.decision_comparison.decision_plans.find(item => item.role === 'PREFERRED');
-  assert.equal(preferred.action, 'ADD');
-  assert.equal(preferred.strategy_evidence, 'UNVERIFIED');
-  assert.equal(preferred.execution_feasibility, 'NOT_AUTHORIZED');
+  assert.equal(preferred.action, 'HOLD');
+  const backup = report.decision_comparison.decision_plans.find(item => item.role === 'BACKUP');
+  assert.equal(backup.action, 'ADD');
+  assert.equal(backup.strategy_evidence, 'UNVERIFIED');
+  assert.equal(backup.execution_feasibility, 'NOT_AUTHORIZED');
+  assert.match(backup.research_lean, /资金可行不代表相对优势/);
+  assert.match(backup.label, /510300\.SH/);
   assert.equal(report.actionable, false);
 });
 
@@ -432,10 +440,10 @@ test('D1-5d 全部退出的轮动：摘要与首选使用实际卖出数量，�
   assert.equal(rotate.funding_status, 'FUNDED');
   assert.match(rotate.summary, /58900份159558\.SZ/);
   assert.doesNotMatch(rotate.summary, /undefined/);
-  const preferred = report.decision_comparison.decision_plans.find(item => item.role === 'PREFERRED');
-  assert.equal(preferred.action, 'ROTATE');
-  assert.match(preferred.label, /58900份159558\.SZ/);
-  assert.doesNotMatch(preferred.label, /undefined/);
+  const backup = report.decision_comparison.decision_plans.find(item => item.role === 'BACKUP');
+  assert.equal(backup.action, 'ROTATE');
+  assert.match(backup.label, /58900份159558\.SZ/);
+  assert.doesNotMatch(backup.label, /undefined/);
 });
 
 test('D1-5e 未指定建仓标的时，现金建仓/加仓比较仍以 QUANTITY_REQUIRED 出现，不自动挑标的', () => {
