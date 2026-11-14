@@ -288,6 +288,35 @@ function barsBehind(lastBar: string, asOf: string, index: Map<string, number>): 
 }
 
 /**
+ * Start of the last contiguous OHLC-valid suffix. Strict bars use NaN for a
+ * missing price or adjustment factor, so this is the first index after the
+ * most recent bad bar (including the as-of bar). Detectors must never see the
+ * invalid prefix: excluding bad bars in the middle would bridge the gap.
+ */
+function validSuffixStart(bars: Bars): number {
+  for (let k = bars.dates.length - 1; k >= 0; k--) {
+    if (!finite(bars.open[k]) || !finite(bars.high[k]) || !finite(bars.low[k]) || !finite(bars.close[k])) return k + 1;
+  }
+  return 0;
+}
+
+function sliceBars(bars: Bars, from: number): Bars {
+  const out: Bars = {
+    dates: bars.dates.slice(from),
+    open: bars.open.slice(from), high: bars.high.slice(from),
+    low: bars.low.slice(from), close: bars.close.slice(from),
+    vol: bars.vol.slice(from), amount: bars.amount.slice(from),
+    rawOpen: bars.rawOpen.slice(from), rawClose: bars.rawClose.slice(from),
+    upLimit: bars.upLimit.slice(from),
+    adjMissing: 0,
+  };
+  if (bars.rawHigh) out.rawHigh = bars.rawHigh.slice(from);
+  if (bars.rawLow) out.rawLow = bars.rawLow.slice(from);
+  if (bars.downLimit) out.downLimit = bars.downLimit.slice(from);
+  return out;
+}
+
+/**
  * Run the detailed V2 analysis for one as-of day over every eligible stock
  * (plus suspended / one-price-limit names the prescreen cannot observe).
  * Only bars with `trade_date <= asOf` are read (forEachStockBars guarantees
@@ -342,9 +371,19 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
     capacity_limited: 0,
   };
 
-  forEachStockBars(db, HISTORY_START, asOf, (code, bars) => {
-    if ((bars.adjMissing ?? 0) > 0) { coverage.skipped_adj_missing++; return; }
-    if (bars.dates.length < TECHNICAL_CAPACITY.minBars) { coverage.skipped_insufficient++; return; }
+  forEachStockBars(db, HISTORY_START, asOf, (code, fullBars) => {
+    // Missing prices/factors are NaN in strict mode. A very old gap must not
+    // disqualify a stock whose most recent window is complete: analyse the
+    // last contiguous valid suffix instead of skipping the whole history.
+    // When the newest bar itself is invalid the suffix is empty and the stock
+    // is skipped, so a damaged as-of bar is never papered over.
+    const from = validSuffixStart(fullBars);
+    const bars = from === 0 ? fullBars : sliceBars(fullBars, from);
+    if (bars.dates.length < TECHNICAL_CAPACITY.minBars) {
+      if ((fullBars.adjMissing ?? 0) > 0) coverage.skipped_adj_missing++;
+      else coverage.skipped_insufficient++;
+      return;
+    }
     const i = bars.dates.length - 1;
     const x = computeIndicators(bars);
     const lastBar = bars.dates[i];
@@ -405,7 +444,7 @@ export function analyzeTechnicalV2(db: DatabaseSync, opts: TechnicalAnalysisOpti
         evidence_level: 'UNVERIFIED',
       });
     }
-  }, codes);
+  }, codes, { strictMissing: true });
 
   const families: TechnicalFamilyView[] = TECHNICAL_FAMILIES.map(family => {
     const list = candidates.filter(c => c.family === family).sort(compareCandidates);
