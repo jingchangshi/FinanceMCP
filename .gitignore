@@ -59,3 +59,7 @@ Thumbs.db
 /devtools/
 /docs/qveris-finance-capabilities.json
 /docs/qveris-interface-coverage.md
+
+# worktrees symlink node_modules; never track it
+/node_modules
+test-full.tap
