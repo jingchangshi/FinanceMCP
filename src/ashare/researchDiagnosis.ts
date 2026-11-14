@@ -471,8 +471,11 @@ function cohortExcessByModel(db: DatabaseSync, date: string, horizon: number, ca
   const byCode = new Map(priced.map(r => [r.ts_code, r.r!]));
   const benchmark = mean(priced.map(r => r.r!));
   if (benchmark === null || priced.length < 1000) return out;
+  // All models share this cohort's scan. Do not retain scans for other dates:
+  // a diagnosis can cover many full-market cohorts on a long-lived database.
+  const cohortScan = scanMarket(db, date);
   for (const model of CONTROL_MODEL_LIST) {
-    const scan = controlScan(cachedScan(db, date), model);
+    const scan = controlScan(cohortScan, model);
     // Select by the control's own RANK, not by array position.
     //
     // `controlScan` computes the reordered scores on a `structuredClone` of the
@@ -496,29 +499,6 @@ function cohortExcessByModel(db: DatabaseSync, date: string, horizon: number, ca
     out.set(model, mean(returns)! - benchmark);
   }
   return out;
-}
-
-/** Per-database, per-date scan cache. A diagnosis touches the same date once
- * per control model, and rebuilding the scan each time would multiply the SQL
- * cost by the family size for no analytical gain.
- *
- * The cache is keyed on the *database instance* as well as the date. Keying on
- * the date alone is a correctness bug, not a performance choice: two open
- * caches with the same as-of date would share one scan, and the second
- * database's rows would be silently replaced by the first's. A WeakMap keeps
- * the entry for exactly as long as the caller holds the database, so nothing
- * outlives its source. */
-const scanCache = new WeakMap<DatabaseSync, Map<string, { at: number; scan: MarketScan }>>();
-const SCAN_CACHE_MS = 60_000;
-function cachedScan(db: DatabaseSync, date: string): MarketScan {
-  const byDate = scanCache.get(db) ?? new Map<string, { at: number; scan: MarketScan }>();
-  scanCache.set(db, byDate);
-  const hit = byDate.get(date);
-  const now = Date.now();
-  if (hit && now - hit.at < SCAN_CACHE_MS) return hit.scan;
-  const scan = scanMarket(db, date);
-  byDate.set(date, { at: now, scan });
-  return scan;
 }
 
 /** Run a full diagnosis as of `asOf`.
@@ -580,7 +560,7 @@ export function diagnoseWatchlist(db: DatabaseSync, options: { asOf: string; obs
     };
   }
 
-  const scan = cachedScan(db, asOf);
+  const scan = scanMarket(db, asOf);
   const controls = compareControls(db, asOf, horizon, usable.map(c => c.date));
   // ONE unit convention inside this module: every excess/return is a FRACTION.
   // `auditWatchlist` is the single exception — it reports percent — so the

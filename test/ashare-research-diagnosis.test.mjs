@@ -54,6 +54,9 @@ function diagnose(db, options = {}) {
   return diagnoseWatchlist(db, { asOf: DAYS.at(-1), horizon: HORIZON, observationDates: DAYS.length, ...options });
 }
 
+// These two read-only percentage checks use the same fixture and options.
+let percentageReport;
+
 test('the reported excess is not inflated by a double percent conversion', () => {
   // `auditWatchlist.mean_excess_pct` is already in percent. Applying the
   // display helper again multiplies by 100, turning a 1.13% excess into 113%
@@ -62,7 +65,7 @@ test('the reported excess is not inflated by a double percent conversion', () =>
   const drift = Object.fromEntries(Array.from({ length: 15 }, (_, i) => [`行业${i}`, i === 0 ? 0.004 : 0]));
   const { db } = fixture({ driftByIndustry: drift });
   try {
-    const report = diagnose(db);
+    const report = percentageReport = diagnose(db);
     if (report.verdict === 'INSUFFICIENT_DATA' || report.verdict === 'DATA_QUALITY_BLOCKED') return;
     const audit = auditWatchlist(db, DAYS.at(-1), DAYS.length, HORIZON);
     if (audit.mean_excess_pct === null) return;
@@ -87,21 +90,21 @@ test('no rendered percentage anywhere is inflated by a factor of 100', () => {
   // or index value is bounded by ~100 too. Anything at 1000+ is either a real
   // quantity (a count, printed without a % sign) or an inflation. So the rule
   // is narrow on purpose: a percent sign next to a value >= 1000 is a defect.
-  const drift = Object.fromEntries(Array.from({ length: 15 }, (_, i) => [`行业${i}`, i === 0 ? 0.004 : 0]));
-  const { db } = fixture({ driftByIndustry: drift });
-  try {
-    const report = diagnose(db);
-    const rendered = [
-      report.verdict_reason,
-      ...report.claims.map(c => c.statement),
-      renderDiagnosisMarkdown(report),
-    ].join('\n');
-    const offenders = [...rendered.matchAll(/(\d+(?:\.\d+)?)\s*%/g)]
-      .map(m => Number(m[1]))
-      .filter(v => v >= 1000);
-    assert.deepEqual(offenders, [],
-      `出现 >=1000 的百分比，几乎必然是 100 倍单位错误: ${offenders.join(', ')}`);
-  } finally { db.close(); }
+  const report = percentageReport ?? (() => {
+    const drift = Object.fromEntries(Array.from({ length: 15 }, (_, i) => [`行业${i}`, i === 0 ? 0.004 : 0]));
+    const { db } = fixture({ driftByIndustry: drift });
+    try { return diagnose(db); } finally { db.close(); }
+  })();
+  const rendered = [
+    report.verdict_reason,
+    ...report.claims.map(c => c.statement),
+    renderDiagnosisMarkdown(report),
+  ].join('\n');
+  const offenders = [...rendered.matchAll(/(\d+(?:\.\d+)?)\s*%/g)]
+    .map(m => Number(m[1]))
+    .filter(v => v >= 1000);
+  assert.deepEqual(offenders, [],
+    `出现 >=1000 的百分比，几乎必然是 100 倍单位错误: ${offenders.join(', ')}`);
 });
 
 test('the control comparison reports a percent, not a 100x percent', () => {
@@ -454,6 +457,21 @@ test('two open caches with the same as-of date never share a scan', () => {
       '两个不同数据库不得共享同一次扫描结果');
     assert.notEqual(first.verdict_reason, second.verdict_reason, '相反方向的漂移必须给出不同结论');
   } finally { a.db.close(); b.db.close(); }
+});
+
+test('a subsequent diagnosis observes changes on the same database connection', t => {
+  const days = weekdays('20250106', 25);
+  const db = openAshareDb(':memory:');
+  t.after(() => db.close());
+  seedReferenceUniverse(db, days, { stocks: 1000 });
+  const insert = db.prepare('INSERT INTO watchlist(trade_date,ts_code,score,rank,status,reason,entered_on) VALUES(?,?,50,1,?,?,?)');
+  for (const day of days.slice(0, -5)) insert.run(day, '600000.SH', 'new', 'synthetic', day);
+  const run = () => diagnoseWatchlist(db, { asOf: days.at(-1), horizon: 5, observationDates: 20 });
+  const before = run();
+  assert.equal(before.claims[0].evidence.stocks_scanned, 1000);
+  db.prepare('DELETE FROM stock_basic WHERE ts_code = ?').run('600999.SH');
+  const after = run();
+  assert.equal(after.claims[0].evidence.stocks_scanned, 999);
 });
 
 test('the diagnosis is deterministic for the same database state', () => {
