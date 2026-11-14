@@ -602,8 +602,8 @@ function computeSnapshot(live: DatabaseSync, date: string, horizon: number, repo
     return !row || qualityOf(code).technical_invalid ? [] : [...row.signals];
   };
 
-  // V2 is scored on an identical clone of the V1 universe, so the normalization
-  // and eligibility set are exactly the same. V1 rows are then re-scored with
+  // V2 is scored on an identical clone of the V1 universe. The eligibility set
+  // is the same, while each version applies its own tie normalization. V1 rows are re-scored with
   // the same deterministic function to obtain its breakdown map; the parity
   // check below proves the formal values did not move.
   const v2Rows = structuredClone(scan.rows);
@@ -758,7 +758,7 @@ function computeSnapshot(live: DatabaseSync, date: string, horizon: number, repo
       score_delta: distribution(diffs.map(d => d.score_delta)),
       rank_correlation: correlation(allDiffs.map(d => [d.v1_rank, d.v2_rank])),
       diffs,
-      note: '两版使用同一可评分集合与同一归一化，仅现金流项阈值不同；逐股差异见 diffs 与 snapshot_factor。',
+      note: '两版使用同一可评分集合与相同现金流阈值；正式 score-3.0.0 对并列值使用平均百分位，研究 score-2.0.0 使用序数排名。逐股差异见 diffs 与 snapshot_factor。',
     },
     v1_parity: parity,
     future_returns: {

@@ -7,7 +7,7 @@ import test from 'node:test';
 // D4：主动轮动与风险比较。
 //
 // 这一组用例锁定的是**研究比较的边界**，不是收益预测：
-// - 五个候选方案（HOLD / REDUCE / ROTATE / DEFENSIVE / NO_ACTION）在日报里
+// - 六个候选方案（HOLD / REDUCE / ADD / ROTATE / DEFENSIVE / NO_ACTION）在日报里
 //   必须同时出现，并且各自说明“为什么不是可执行”；
 // - 卖出资金来源、可卖数量、一手金额与现金、费用、交易前后集中度必须被计算；
 // - 没有 RESEARCH_VERIFIED 证据时，任何方案都不得变成可执行；
@@ -63,10 +63,10 @@ const researchReport = build({ researchScenario: {
   sellCode: '159558.SZ', sellQuantity: 1000, buyCode: '510300.SH', buyQuantity: 100,
 } });
 
-test('D4-1 五个方案同时出现，且都明确标注当前是否可执行', () => {
+test('D4-1 六个方案同时出现，且都明确标注当前是否可执行', () => {
   const options = report.decision_comparison?.options ?? [];
   assert.deepEqual(options.map(option => option.action).sort(),
-    ['DEFENSIVE', 'HOLD', 'NO_ACTION', 'REDUCE', 'ROTATE'].sort(), JSON.stringify(options.map(o => o.action)));
+    ['ADD', 'DEFENSIVE', 'HOLD', 'NO_ACTION', 'REDUCE', 'ROTATE'].sort(), JSON.stringify(options.map(o => o.action)));
   for (const option of options) {
     assert.equal(typeof option.summary, 'string');
     assert.ok(option.summary.length > 0, `${option.action} 必须说明研究含义`);

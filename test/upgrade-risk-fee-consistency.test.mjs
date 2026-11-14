@@ -89,7 +89,7 @@ test('the approved policy and its tier appear identically in every scenario; per
   try {
     const r = f.build();
     const state = r.portfolio_risk;
-    assert.deepEqual(r.decision_comparison.options.map(o => o.action).sort(), ['DEFENSIVE', 'HOLD', 'NO_ACTION', 'REDUCE', 'ROTATE']);
+    assert.deepEqual(r.decision_comparison.options.map(o => o.action).sort(), ['ADD', 'DEFENSIVE', 'HOLD', 'NO_ACTION', 'REDUCE', 'ROTATE']);
     for (const o of r.decision_comparison.options) {
       const b = o.risk_budget;
       assert.equal(b.status, 'PORTFOLIO_RISK_POLICY_APPROVED', o.action);

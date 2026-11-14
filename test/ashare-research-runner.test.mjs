@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { openAshareDb, upsertRows } from '../build/ashare/db.js';
-import { scanMarket } from '../build/ashare/analysis.js';
+import { scanMarket, LEGACY_SCORE_VERSION } from '../build/ashare/analysis.js';
 import { seedMarket, weekdays, STOCKS } from './ashare-fixture.mjs';
 
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -24,7 +24,7 @@ test('paired research runner persists both versions, keeps source bytes unchange
     ts_code:s.ts_code,end_date:'20251231',ann_date:'20260130',roe:10,netprofit_yoy:12,ocf_to_profit:i%2?20:115.11,debt_to_assets:30,eps:1,
   })));
   const dates = ['20260331', '20260407', '20260414'];
-  for (const date of dates) writeFileSync(join(output, 'scans', `${date}.json`), JSON.stringify(scanMarket(db, date)));
+  for (const date of dates) writeFileSync(join(output, 'scans', `${date}.json`), JSON.stringify(scanMarket(db, date, { score_version: LEGACY_SCORE_VERSION })));
   db.close();
   const before = sha(readFileSync(source));
   writeFileSync(join(output, 'inputs.json'), JSON.stringify({ source, source_sha256:before,data_cutoff:days.at(-1),stride:5,warmup_trade_days:130,dates }));
