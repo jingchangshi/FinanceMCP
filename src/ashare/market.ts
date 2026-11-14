@@ -30,6 +30,14 @@ export interface MarketBreadth {
   amount_prev_yi: number | null;
   amount_chg_pct: number | null;
   amount_ma20_yi: number | null;
+  sentiment_facts: {
+    as_of: string;
+    source: string;
+    quality: { status: 'complete' | 'partial' | 'missing'; rows: number; limit_rows: number; pct_chg_rows: number; amount_rows: number; prior_amount_days: number };
+    limit_up: number | null; limit_down: number | null;
+    limit_up_ratio: number | null; limit_down_ratio: number | null;
+    median_pct_chg: number | null; amount_vs_ma20: number | null;
+  };
   /** Descriptive observations; incomplete inputs are not interpreted as zero. */
   environment_facts: {
     as_of: string;
@@ -91,6 +99,13 @@ export function marketBreadth(db: DatabaseSync, date: string): MarketBreadth {
     };
   const pctComplete = coverage.rows > 0 && coverage.pct_chg_rows === coverage.rows;
   const amountComplete = coverage.rows > 0 && coverage.amount_rows === coverage.rows;
+  const limits = db.prepare(`SELECT COUNT(CASE WHEN d.close IS NOT NULL AND l.up_limit IS NOT NULL AND l.down_limit IS NOT NULL THEN 1 END) AS n
+    FROM daily d LEFT JOIN stk_limit l ON l.trade_date = d.trade_date AND l.ts_code = d.ts_code WHERE d.trade_date = ?`).get(date) as { n: number };
+  const limitsComplete = coverage.rows > 0 && limits.n === coverage.rows;
+  const priorDays = days.filter(d => d < date).slice(-20);
+  const completePriorAmounts = priorDays.map(d => db.prepare('SELECT COUNT(*) AS n, COUNT(amount) AS valid, SUM(amount) AS amount FROM daily WHERE trade_date = ?').get(d) as { n: number; valid: number; amount: number | null });
+  const priorComplete = completePriorAmounts.length === 20 && completePriorAmounts.every(r => r.n > 0 && r.n === r.valid && r.amount !== null);
+  const priorMean = priorComplete ? completePriorAmounts.reduce((sum, r) => sum + r.amount!, 0) / 20 : null;
   return {
     stocks: row.stocks,
     up: row.up ?? 0,
@@ -105,6 +120,18 @@ export function marketBreadth(db: DatabaseSync, date: string): MarketBreadth {
     amount_prev_yi: Number.isFinite(prev) ? round(prev / 1e5) : null,
     amount_chg_pct: Number.isFinite(prev) && prev > 0 ? round((amount / prev - 1) * 100) : null,
     amount_ma20_yi: Number.isFinite(ma20) ? round(ma20 / 1e5) : null,
+    sentiment_facts: {
+      as_of: date,
+      source: 'daily, stk_limit; amount baseline: prior 20 trading days',
+      quality: { status: !coverage.rows ? 'missing' : pctComplete && amountComplete && limitsComplete && priorComplete ? 'complete' : 'partial',
+        ...coverage, limit_rows: limits.n, prior_amount_days: completePriorAmounts.filter(r => r.n > 0 && r.n === r.valid && r.amount !== null).length },
+      limit_up: limitsComplete ? row.limit_up : null,
+      limit_down: limitsComplete ? row.limit_down : null,
+      limit_up_ratio: limitsComplete ? round(row.limit_up / coverage.rows, 4) : null,
+      limit_down_ratio: limitsComplete ? round(row.limit_down / coverage.rows, 4) : null,
+      median_pct_chg: pctComplete ? round((pcts[Math.floor((pcts.length - 1) / 2)] + pcts[Math.floor(pcts.length / 2)]) / 2) : null,
+      amount_vs_ma20: amountComplete && priorMean !== null && priorMean > 0 ? round(amount / priorMean, 4) : null,
+    },
     environment_facts: {
       as_of: date,
       source: 'daily',

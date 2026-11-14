@@ -909,6 +909,18 @@ function renderSectionD(r: DailyReportResult, view: RenderView): string {
     .filter(line => /上涨|成交额|站上|相对/.test(line))
     .slice(0, 4);
   for (const metric of metrics) lines.push(`- ${metric}。`);
+  const sentiment = market.sentiment;
+  const sentimentCurrent = sentiment && sentiment.status === 'complete'
+    && sentiment.as_of === r.as_of_trade_date;
+  if (sentimentCurrent) {
+    const ratio = sentiment.amount_vs_ma20 === null ? '—' : `${sentiment.amount_vs_ma20.toFixed(2)} 倍`;
+    const upShare = sentiment.limit_up_ratio === null ? '—' : pct(sentiment.limit_up_ratio * 100);
+    const downShare = sentiment.limit_down_ratio === null ? '—' : pct(sentiment.limit_down_ratio * 100);
+    lines.push(`- **情绪与参与**：涨停 ${sentiment.limit_up ?? '—'} 家（${upShare}）、跌停 ${sentiment.limit_down ?? '—'} 家（${downShare}），成交额为前 20 个交易日均值的 ${ratio}；这是当日事实，不是情绪结论。`);
+  } else {
+    lines.push('- **情绪与参与**：本期涨跌停或成交参与数据不完整/不可用，不推断情绪状态。');
+  }
+  lines.push('- **消息面**：本期未接入可核验的公告/新闻来源；消息缺失不解释为负面事实。');
   const support = market.support_evidence.filter(item => item.as_of === r.as_of_trade_date && /上涨家数|成交额|中位数/.test(item.statement)).slice(0, 2);
   const counter = market.counter_evidence.filter(item => item.as_of === r.as_of_trade_date && /站上|近 20 日|近 5 日/.test(item.statement)).slice(0, 3);
   if (support.length) {
