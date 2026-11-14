@@ -30,6 +30,17 @@ export interface MarketBreadth {
   amount_prev_yi: number | null;
   amount_chg_pct: number | null;
   amount_ma20_yi: number | null;
+  /** Descriptive observations; incomplete inputs are not interpreted as zero. */
+  environment_facts: {
+    as_of: string;
+    source: 'daily';
+    scope: string;
+    research_status: 'unvalidated';
+    quality: { status: 'complete' | 'partial' | 'missing'; rows: number; pct_chg_rows: number; amount_rows: number };
+    up_ratio: number | null;
+    median_pct_chg: number | null;
+    amount_yi: number | null;
+  };
 }
 
 const round = (v: number, d = 2) => (Number.isFinite(v) ? Math.round(v * 10 ** d) / 10 ** d : NaN);
@@ -74,6 +85,12 @@ export function marketBreadth(db: DatabaseSync, date: string): MarketBreadth {
   const prev = amounts.length >= 2 ? amounts[amounts.length - 2] : NaN;
   const ma20 = amounts.length >= 21 ? sma(amounts.slice(0, 20), 20)[19] : NaN;
   const amount = row.amount ?? 0;
+  const coverage = db.prepare(`SELECT COUNT(*) AS rows, COUNT(pct_chg) AS pct_chg_rows,
+    COUNT(amount) AS amount_rows FROM daily WHERE trade_date = ?`).get(date) as {
+      rows: number; pct_chg_rows: number; amount_rows: number;
+    };
+  const pctComplete = coverage.rows > 0 && coverage.pct_chg_rows === coverage.rows;
+  const amountComplete = coverage.rows > 0 && coverage.amount_rows === coverage.rows;
   return {
     stocks: row.stocks,
     up: row.up ?? 0,
@@ -88,6 +105,21 @@ export function marketBreadth(db: DatabaseSync, date: string): MarketBreadth {
     amount_prev_yi: Number.isFinite(prev) ? round(prev / 1e5) : null,
     amount_chg_pct: Number.isFinite(prev) && prev > 0 ? round((amount / prev - 1) * 100) : null,
     amount_ma20_yi: Number.isFinite(ma20) ? round(ma20 / 1e5) : null,
+    environment_facts: {
+      as_of: date,
+      source: 'daily',
+      scope: '当日 daily 行；不含停牌或缺失行情的股票，不能代表全部上市股票。',
+      research_status: 'unvalidated',
+      quality: {
+        status: !coverage.rows ? 'missing' : pctComplete && amountComplete ? 'complete' : 'partial',
+        ...coverage,
+      },
+      up_ratio: pctComplete ? round(row.up / coverage.rows, 4) : null,
+      median_pct_chg: pctComplete
+        ? round((pcts[Math.floor((pcts.length - 1) / 2)] + pcts[Math.floor(pcts.length / 2)]) / 2)
+        : null,
+      amount_yi: amountComplete ? round(amount / 1e5) : null,
+    },
   };
 }
 
