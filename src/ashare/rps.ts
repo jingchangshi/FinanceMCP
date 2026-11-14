@@ -13,10 +13,9 @@ import { forEachStockBars } from './bars.js';
  * opensource-reuse.md), reimplemented here on FinanceMCP's own qfq bars —
  * no third-party code copied.
  *
- * Time semantics: every return ends at `end` (the caller's as-of bar) and is
- * computed from qfq closes that never depend on data after `end`
- * (forEachStockBars guarantees this). RPS for a stock with fewer bars than
- * the window is `null`, never a stale carry.
+ * Time semantics: every return ends at `end` and uses qfq closes that never
+ * depend on data after `end`. Stocks without an end-date bar or sufficient
+ * history have unavailable returns and do not enter the cross-section.
  */
 
 export const RPS_VERSION = 'rps-1.0.0';
@@ -41,6 +40,10 @@ export interface RpsResult {
   /** Universe size that entered the cross-section (rows with a finite ret for a window vary per window). */
   universe: number;
   rows: Map<string, RpsRow>;
+  /** Exact number of finite returns used in each percentile cross-section. */
+  denominators: Record<RpsWindow, number>;
+  /** Input coverage; null for the undated pure builder. Categories are exclusive. */
+  quality: { requested: number; no_bars: number; stale: number; adj_missing: number } | null;
 }
 
 /** Percentile rank, same ordinal semantics as analysis.ts `percentileRanks`: ascending rank/(n-1), 0..1. NaN inputs are excluded from the ranking entirely. */
@@ -69,13 +72,14 @@ export function trailingReturn(closes: number[], window: number): number | null 
   const base = closes[closes.length - 1 - window];
   const last = closes[closes.length - 1];
   if (!Number.isFinite(base) || !Number.isFinite(last) || base === 0) return null;
-  return last / base - 1;
+  const result = last / base - 1;
+  return Number.isFinite(result) ? result : null;
 }
 
 /**
  * Pure builder: cross-sectional RPS from per-stock close series.
- * Each series must be aligned to the SAME `end` (forEachStockBars guarantees
- * alignment when called with one end date).
+ * Each series must be aligned to the SAME `end`; callers are responsible
+ * for checking its last date before passing it here.
  */
 export function rpsFromCloses(closes: Map<string, number[]>): RpsResult {
   const rows = new Map<string, RpsRow>();
@@ -105,7 +109,11 @@ export function rpsFromCloses(closes: Map<string, number[]>): RpsResult {
   }
   let universe = 0;
   for (const r of rows.values()) if (Number.isFinite(r.ret[120]) || Number.isFinite(r.ret[60])) universe++;
-  return { version: RPS_VERSION, end: '', universe, rows };
+  return {
+    version: RPS_VERSION, end: '', universe, rows,
+    denominators: { 60: returns[60].size, 120: returns[120].size, 250: returns[250].size },
+    quality: null,
+  };
 }
 
 /**
@@ -122,12 +130,18 @@ export function computeRps(
   codes?: string[],
 ): RpsResult {
   const closes = new Map<string, number[]>();
+  const universe = [...new Set(codes?.length ? codes :
+    (db.prepare('SELECT ts_code FROM stock_basic ORDER BY ts_code').all() as Array<{ ts_code: string }>).map(r => r.ts_code))];
+  const quality = { requested: universe.length, no_bars: universe.length, stale: 0, adj_missing: 0 };
   forEachStockBars(db, start, end, (ts, bars) => {
-    if (bars.adjMissing && bars.adjMissing > 0) return; // incomplete adjustment ⇒ no RPS (honest gap, not a stale value)
-    closes.set(ts, bars.close.slice());
-  }, codes);
+    quality.no_bars--;
+    if (bars.dates[bars.dates.length - 1] !== end) { quality.stale++; return; }
+    if (bars.adjMissing && bars.adjMissing > 0) { quality.adj_missing++; return; }
+    closes.set(ts, bars.close.map((v, i) => Number.isFinite(bars.rawClose[i]) ? v : NaN));
+  }, universe.length ? universe : codes);
   const result = rpsFromCloses(closes);
   result.end = end;
+  result.quality = quality;
   return result;
 }
 

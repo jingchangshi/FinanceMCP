@@ -84,7 +84,7 @@ function loadIndexBars(db: DatabaseSync, table: 'sw_index_daily' | 'ths_index_da
     WHERE ts_code = ? AND trade_date <= ? AND close IS NOT NULL
     ORDER BY trade_date DESC LIMIT ?`;
   const rows = db.prepare(sql).all(tsCode, asOf, count) as Array<{ trade_date: string; close: number; amount: number; pct: number | null }>;
-  return rows.reverse().map(r => ({ date: r.trade_date, close: r.close, amount: r.amount ?? 0, pctChg: r.pct ?? 0 }));
+  return rows.reverse().map(r => ({ date: r.trade_date, close: r.close, amount: r.amount ?? NaN, pctChg: r.pct ?? NaN }));
 }
 
 function ret(bars: IndexBar[], endIdx: number, window: number): number | null {
@@ -105,21 +105,22 @@ function indexFactors(bars: IndexBar[], csi: IndexBar[], i: number): Record<stri
   const csiIdxAlign = (d: string): number => { // csi panel index of the same date
     let lo = 0, hi = csi.length - 1, best = -1;
     while (lo <= hi) { const m = (lo + hi) >> 1; if (csi[m].date <= d) { best = m; lo = m + 1; } else hi = m - 1; }
-    return best;
+    return best >= 0 && csi[best].date === d ? best : -1;
   };
   const j = csiIdxAlign(bars[i].date);
   const excess = (window: number): number | null => {
     const a = ret(bars, i, window);
-    const b = j >= window ? ret(csi, j, window) : null;
+    const b = j >= window && i >= window && csi[j - window].date === bars[i - window].date ? ret(csi, j, window) : null;
     return a !== null && b !== null ? a - b : null;
   };
   const r20 = ret(bars, i, 20);
-  let streak = 0;
+  let streak: number | null = 0;
   for (let k = i; k >= 1; k--) {
     const jj = csiIdxAlign(bars[k].date);
-    if (jj < 1) break;
+    if (jj < 1) { streak = null; break; }
     const a = bars[k].pctChg, b = csi[jj].pctChg;
-    if (!Number.isFinite(a) || !Number.isFinite(b) || a - b <= 0) break;
+    if (!Number.isFinite(a) || !Number.isFinite(b)) { streak = null; break; }
+    if (a - b <= 0) break;
     streak++;
   }
   const dd = (() => {
@@ -143,10 +144,10 @@ function indexFactors(bars: IndexBar[], csi: IndexBar[], i: number): Record<stri
       let recent = 0, prior = 0;
       for (let k = i - 4; k <= i; k++) recent += bars[k].amount;
       for (let k = i - 24; k <= i - 5; k++) prior += bars[k].amount;
-      return prior > 0 ? recent / 5 / (prior / 20) - 1 : null;
+      return Number.isFinite(recent) && Number.isFinite(prior) && prior > 0 ? recent / 5 / (prior / 20) - 1 : null;
     })(),
     excess_streak: streak,
-    vol_dd: dd, // inverted below: closer to 0 is better
+    vol_dd: dd, // negative drawdown; closer to 0 is better
   };
 }
 
@@ -154,7 +155,7 @@ function indexFactors(bars: IndexBar[], csi: IndexBar[], i: number): Record<stri
 
 interface MemberMetrics {
   /** ts_code → { pctUp (as-of day breadth), above20, above60 } */
-  perStock: Map<string, { pctUp: boolean; above20: boolean; above60: boolean }>;
+  perStock: Map<string, { pctUp: boolean | null; above20: boolean | null; above60: boolean | null }>;
   rps80: Set<string>;
   rps120Available: Set<string>;
   quality: DataQuality;
@@ -192,16 +193,22 @@ function loadMemberMetrics(db: DatabaseSync, asOf: string, tradeDays: string[]):
   // One batched pass per member for MA20/MA60 at asOf (70 bars is enough for MA60).
   const maStart = tradeDays[Math.max(0, tradeDays.length - 70)];
   const memberCodes = [...new Set(members.map(m => m.ts_code))];
-  const perStock = new Map<string, { pctUp: boolean; above20: boolean; above60: boolean }>();
+  const perStock: MemberMetrics['perStock'] = new Map();
   forEachStockBars(db, maStart, asOf, (ts, b) => {
     const n = b.dates.length;
-    if (n < 61) return;
+    if (!n || b.dates[n - 1] !== asOf || (b.adjMissing ?? 0) > 0) return;
     const last = n - 1;
-    const sma = (w: number): number => { let s = 0; for (let k = last - w + 1; k <= last; k++) s += b.close[k]; return s / w; };
-    const ma20 = sma(20), ma60 = sma(60);
-    const pctUp = b.dates.length >= 2 && Number.isFinite(b.close[last]) && Number.isFinite(b.close[last - 1]) && b.close[last - 1] > 0
-      ? b.close[last] / b.close[last - 1] - 1 > 0 : false;
-    perStock.set(ts, { pctUp, above20: b.close[last] > ma20, above60: b.close[last] > ma60 });
+    const lastClose = b.close[last];
+    const above = (w: number): boolean | null => {
+      const values = b.close.slice(-w);
+      if (values.length < w || values.some(v => !Number.isFinite(v)) || b.rawClose.slice(-w).some(v => !Number.isFinite(v))) return null;
+      return lastClose > values.reduce((sum, v) => sum + v, 0) / w;
+    };
+    const pctUp = n >= 2 && b.dates[last - 1] === tradeDays[tradeDays.length - 2]
+      && Number.isFinite(b.rawClose[last]) && Number.isFinite(b.rawClose[last - 1])
+      && Number.isFinite(lastClose) && Number.isFinite(b.close[last - 1]) && b.close[last - 1] > 0
+      ? lastClose / b.close[last - 1] - 1 > 0 : null;
+    perStock.set(ts, { pctUp, above20: above(20), above60: above(60) });
   }, memberCodes);
 
   const rps80 = new Set<string>();
@@ -242,9 +249,11 @@ function evaluateAt(db: DatabaseSync, asOf: string, tradeDays: string[],
     const bars = loadIndexBars(db, table, s.indexCode, asOf, 70);
     const qualityNotes: SectorRow['qualityNotes'] = [];
     let quality: DataQuality = 'OK';
-    if (bars.length < cfg.minIndexBars) {
+    if (bars.length < cfg.minIndexBars || bars[bars.length - 1]?.date !== asOf) {
       quality = 'UNAVAILABLE';
-      qualityNotes.push({ quality: 'UNAVAILABLE', reason: 'insufficient_index_bars', detail: `${bars.length}<${cfg.minIndexBars}` });
+      qualityNotes.push(bars.length < cfg.minIndexBars
+        ? { quality: 'UNAVAILABLE', reason: 'insufficient_index_bars', detail: `${bars.length}<${cfg.minIndexBars}` }
+        : { quality: 'UNAVAILABLE', reason: 'stale_index_bar', detail: `last=${bars[bars.length - 1]?.date ?? 'none'}, as_of=${asOf}` });
       rows.push({ key: s.key, name: s.name, source: s.source, indexCode: s.indexCode, raw: {}, quality, qualityNotes, memberAgg: null, rankNow: null, rank5: null, rank20: null, strength: null, barsAvailable: bars.length });
       continue;
     }
@@ -257,23 +266,28 @@ function evaluateAt(db: DatabaseSync, asOf: string, tradeDays: string[],
       // Deduped by ts_code: one stock with several L3 rows counts once.
       const ms = swMemberIndex(swRows, s.indexCode, asOf);
       if (ms.size >= cfg.minMembers) {
-        let up = 0, a20 = 0, a60 = 0, counted = 0;
+        const counts = { pctUp: 0, above20: 0, above60: 0, rps: 0 };
+        const yes = { pctUp: 0, above20: 0, above60: 0 };
         for (const ts of ms.keys()) {
           const pm = memberMetrics.perStock.get(ts);
-          if (!pm) continue;
-          counted++;
-          if (pm.pctUp) up++;
-          if (pm.above20) a20++;
-          if (pm.above60) a60++;
+          for (const key of ['pctUp', 'above20', 'above60'] as const) {
+            if (pm?.[key] == null) continue;
+            counts[key]++;
+            if (pm[key]) yes[key]++;
+          }
+          if (memberMetrics.rps120Available.has(ts)) counts.rps++;
         }
-        if (counted >= cfg.minMembers) {
-          memberAgg = {
-            breadth: up / counted, above20: a20 / counted, above60: a60 / counted,
-            rps80Density: rps80Density(ms.keys(), memberMetrics.rps120Available, memberMetrics.rps80, cfg.minMembers),
-          };
-        } else {
+        const ratio = (key: keyof typeof yes): number | null => counts[key] >= cfg.minMembers ? yes[key] / counts[key] : null;
+        memberAgg = {
+          breadth: ratio('pctUp'), above20: ratio('above20'), above60: ratio('above60'),
+          rps80Density: rps80Density(ms.keys(), memberMetrics.rps120Available, memberMetrics.rps80, cfg.minMembers),
+        };
+        const detail = `members=${ms.size}, breadth=${counts.pctUp}, ma20=${counts.above20}, ma60=${counts.above60}, rps120=${counts.rps}`;
+        if (Object.values(counts).some(n => n < ms.size)) {
           quality = quality === 'OK' ? 'DEGRADED' : quality;
-          qualityNotes.push({ quality: 'DEGRADED', reason: 'member_metrics_thin', detail: `${counted}<${cfg.minMembers}` });
+          qualityNotes.push({ quality: 'DEGRADED', reason: 'member_metrics_coverage', detail });
+        } else {
+          qualityNotes.push({ quality: 'OK', reason: 'member_metrics_coverage', detail });
         }
       } else {
         quality = quality === 'OK' ? 'DEGRADED' : quality;
@@ -301,7 +315,7 @@ function evaluateAt(db: DatabaseSync, asOf: string, tradeDays: string[],
 
 /** Cross-sectional percentile (0..1) of each raw factor across `rows`; sets `.strength`. */
 function standardizeAndRank(rows: SectorRow[], cfg: HotspotConfig, factorSubset?: Set<string>): void {
-  const active = rows.filter(r => r.barsAvailable >= cfg.minIndexBars);
+  const active = rows.filter(r => r.barsAvailable >= cfg.minIndexBars && r.quality !== 'UNAVAILABLE');
   const factorIds = Object.keys(cfg.weights).filter(id => !factorSubset || factorSubset.has(id));
   for (const id of factorIds) {
     const vals = active.map(r => r.raw[id]).filter((v): v is number => v !== null && Number.isFinite(v));
@@ -319,8 +333,8 @@ function standardizeAndRank(rows: SectorRow[], cfg: HotspotConfig, factorSubset?
       const p = (r as any)[`p_${id}`] as number | undefined;
       if (p === undefined) continue;
       const w = cfg.weights[id];
-      // vol_dd is inverted: drawdown closer to 0 is better.
-      acc += w * (id === 'vol_dd' ? 1 - p : p);
+      // vol_dd is negative, so its ascending percentile already rewards shallower drawdowns.
+      acc += w * p;
       wsum += w;
     }
     r.strength = wsum > 0 ? acc / wsum : null;
@@ -468,7 +482,12 @@ export function evaluateHotspotSectors(
       reason: `SW2021 L1全量(${swSectors.length})${thsSectors.length ? ` + THS N/I 当前目录按成分数取前30且要求至少 ${config.minIndexBars} 根指数行情(${thsSectors.length})` : ''}；历史与当日排名均在此固定横截面内计算`
         + `；回看日的排名只含该日有足够历史的行业，缺历史的行业在该日截面中缺位（不补零、不沿用当日顺序），因此 rank_5d_ago/rank_20d_ago 的分母与当日 rank 不完全相同`,
     },
-    { dataset: 'csi300_daily', rows: (db.prepare("SELECT COUNT(*) n FROM index_daily WHERE ts_code = ? AND trade_date <= ?").get(CSI300_CODE, asOf) as { n: number }).n, quality: 'OK' },
+    { dataset: 'sector_rank_eligible', rows: rows.filter(r => r.rankNow !== null).length,
+      quality: rows.some(r => r.rankNow === null) ? 'DEGRADED' : 'OK',
+      reason: `目标日有效排名行业数 / 候选行业数=${rows.filter(r => r.rankNow !== null).length}/${sectors.length}` },
+    { dataset: 'csi300_daily', rows: (db.prepare("SELECT COUNT(*) n FROM index_daily WHERE ts_code = ? AND trade_date <= ?").get(CSI300_CODE, asOf) as { n: number }).n,
+      quality: db.prepare('SELECT 1 FROM index_daily WHERE ts_code = ? AND trade_date = ? AND close IS NOT NULL').get(CSI300_CODE, asOf) ? 'OK' : 'UNAVAILABLE',
+      reason: '目标日基准行情缺失时不沿用旧行情计算超额' },
   ];
 
   return { as_of: asOf, config_version: HOTSPOT_CONFIG_VERSION, sectors: outSectors, selected, coverage };
