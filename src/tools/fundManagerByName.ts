@@ -363,6 +363,9 @@ export async function runFundManagerByName(args: {
   try {
     const TUSHARE_API_KEY = TUSHARE_CONFIG.API_TOKEN;
     const TUSHARE_API_URL = TUSHARE_CONFIG.API_URL;
+    if (!TUSHARE_API_KEY) {
+      return { content: [{ type: "text", text: "错误: 未设置 Tushare 凭证" }] };
+    }
 
     const data = await fetchFundManagerData(
       args.name,

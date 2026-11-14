@@ -210,13 +210,3 @@ export const TWINGLY_CONFIG = {
   TIMEOUT: 30000,
   MAX_RESPONSE_BYTES: 4 * 1024 * 1024,
 };
-
-// 开发态输出便于确认来源（不打印实际 Token 值）
-if (process.env.NODE_ENV !== 'production') {
-  const fromTs = requestContext.getStore()?.tushareToken
-    ? 'request-header'
-    : (process.env.TUSHARE_TOKEN ? 'env' : 'none');
-  const fromCg = getCoinGeckoProApiKey() ? 'request-pro-header/env' : (getCoinGeckoApiKey() ? 'request-std-header/env' : 'none');
-  console.log('Tushare token source:', fromTs);
-  console.log('CoinGecko key source:', fromCg);
-}
