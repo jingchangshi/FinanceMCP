@@ -1,0 +1,197 @@
+[
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "sig1",
+      "event_type": "SIGNAL_EVALUATED",
+      "payload": {
+        "signal_id": "TEST_SIGNAL",
+        "result": "NOT_TRIGGERED"
+      }
+    },
+    "sha256": "6f2fc35904e8575b6f196691f63f791d39da68d3b7b470f7e3748bd445b6ad73"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "sig2",
+      "event_type": "SIGNAL_EVALUATED",
+      "payload": {
+        "signal_id": "TEST_SIGNAL",
+        "result": "TRIGGERED"
+      }
+    },
+    "sha256": "cb3ce344e8c6299fe01df9ddd6b580ae5e7b623a14f380847db7f786e27208dd"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "dec1",
+      "event_type": "DECISION",
+      "payload": {
+        "signal_event_id": "sig1",
+        "result": "NO_ACTION",
+        "reason_code": "NO_TRIGGER"
+      }
+    },
+    "sha256": "ab5c5cdff6fbd10229288f379ab4529914dd33af8de8aef977326015ef15bf1b"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "dec2",
+      "event_type": "DECISION",
+      "payload": {
+        "signal_event_id": "sig2",
+        "result": "REJECTED",
+        "reason_code": "RISK_GATE"
+      }
+    },
+    "sha256": "72aab237acc8e5fa979477c64c67ee5cd74fb7f38a5eaeea754bea00b77e9685"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "out1",
+      "event_type": "OUTCOME",
+      "payload": {
+        "decision_event_id": "dec2",
+        "result": "PENDING",
+        "reason_code": "WAITING"
+      }
+    },
+    "sha256": "4d86c94c2417fa2e39d90e48dcc585f028752d5e06678d6a73179ab5d153a998"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "out2",
+      "event_type": "OUTCOME",
+      "payload": {
+        "decision_event_id": "dec2",
+        "result": "UNAVAILABLE",
+        "reason_code": "MISSING_DATA"
+      }
+    },
+    "sha256": "1eff851f9ee0073f32152acf06836fc8d2a6cea9c66ab71bdb91cacf65f7ae49"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "out3",
+      "event_type": "OUTCOME",
+      "payload": {
+        "decision_event_id": "dec2",
+        "result": "OBSERVED",
+        "reason_code": "SYNTHETIC_TEST"
+      }
+    },
+    "sha256": "66197842ee0eb7e2a58e75ebcd7c90d605fdc4be5556c21787811a331bf46342"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "out4",
+      "event_type": "OUTCOME",
+      "payload": {
+        "decision_event_id": "dec2",
+        "result": "ACTUAL_FILL",
+        "reason_code": "SYNTHETIC_TEST"
+      }
+    },
+    "sha256": "45f6a9a5c0dae6c16ec728756eaf49d430d35762d90afe3e25665ffcab5b8a1d"
+  },
+  {
+    "event": {
+      "schema_version": "strategy-feedback-1",
+      "release_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "occurred_at": "2026-01-02T12:00:00Z",
+      "recorded_at": "2026-01-02T12:01:00Z",
+      "coverage": {
+        "universe_id": "SYNTHETIC_UNIVERSE",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-02"
+      },
+      "event_id": "fix1",
+      "event_type": "CORRECTION",
+      "payload": {
+        "corrects_event_id": "out2",
+        "reason_code": "SYNTHETIC_TEST"
+      }
+    },
+    "sha256": "82561017bd633c0ce5148c6be4f7b93aed8f08c12553cb38e76a490c32d6239e"
+  }
+]
