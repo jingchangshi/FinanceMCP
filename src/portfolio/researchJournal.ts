@@ -253,8 +253,11 @@ export function recordResearchJournal(db: DatabaseSync, input: ResearchJournalIn
 export function listResearchJournal(db: DatabaseSync, input: { accountId: string; asOf?: string; limit?: number }): JournalRecord[] {
   if (!table(db, 'research_journal')) return [];
   const limit = Math.min(1000, Math.max(1, Math.trunc(input.limit ?? 100)));
-  return (db.prepare('SELECT * FROM research_journal WHERE account_id=? AND as_of_trade_date<=? ORDER BY as_of_trade_date DESC,record_id LIMIT ?').all(input.accountId, input.asOf ?? '99991231', limit) as any[])
-    .map(checkedJournalRow);
+  // Sort only identifiers: content_json can be tens of MiB per row, and SQLite
+  // may spill the right-hand side of ORDER BY to a size-limited tmpfs.
+  const ids = db.prepare('SELECT record_id FROM research_journal WHERE account_id=? AND as_of_trade_date<=? ORDER BY as_of_trade_date DESC,record_id LIMIT ?').all(input.accountId, input.asOf ?? '9'.repeat(8), limit) as any[];
+  const get = db.prepare('SELECT * FROM research_journal WHERE record_id=?');
+  return ids.map(({ record_id }) => checkedJournalRow(get.get(record_id)));
 }
 
 export type JournalFeeEstimator = (input: { ts_code: string; side: 'BUY' | 'SELL'; quantity: number; price_milli: number; trade_date: string }) => { total_cents: number; estimated: boolean; version: string } | null;

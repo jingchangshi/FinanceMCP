@@ -55,6 +55,22 @@ test('journal imports are canonical, immutable, account isolated and corrections
     assert.throws(() => journal.recordResearchJournal(db, record('r3', { account_id: 'other', correction_of: 'r1' })), /same account/);
   } finally { db.close(); }
 });
+test('journal list sorts narrow keys before fetching large records and preserves filters and limits', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    const payload = 'x'.repeat(1024 * 1024);
+    recordAt(db, record('b', { payload }));
+    recordAt(db, record('a', { payload }));
+    recordAt(db, record('newer', { as_of_trade_date: '20261002', payload }));
+    recordAt(db, record('other', { account_id: 'other', payload }));
+    const queries = [];
+    const observedDb = { prepare(sql) { queries.push(sql); return db.prepare(sql); } };
+    assert.deepEqual(journal.listResearchJournal(observedDb, { accountId: 'synthetic', limit: 2 }).map(row => row.record_id), ['newer', 'a']);
+    assert.deepEqual(journal.listResearchJournal(observedDb, { accountId: 'synthetic', asOf: '20261001' }).map(row => row.record_id), ['a', 'b']);
+    assert.ok(queries.some(sql => /^SELECT record_id FROM research_journal WHERE/.test(sql)));
+    assert.ok(!queries.some(sql => /^SELECT \* FROM research_journal WHERE account_id=/.test(sql)));
+  } finally { db.close(); }
+});
 test('journal reads fail closed on an earlier database whose content was replaced without updating its digest', () => {
   const db = new DatabaseSync(':memory:');
   try {
