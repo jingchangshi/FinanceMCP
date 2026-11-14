@@ -89,7 +89,7 @@ const BASIC = Object.entries(BASE_CLOSE).map(([ts_code]) => ({
 function reportFixture({
   judgment = ['合成测试日报：结构与口径检查，不构成投资建议'],
   upRatio = 0.30, medianPct = -0.40, amountYi = 9000, amountMa20 = 12000,
-  indexRet5 = -1.20, indexRet20 = -4.00, crash = false, rebound = false,
+  indexRet5 = -1.20, indexRet20 = -4.00, crash = false, rebound = false, breadthPatch = {},
 } = {}) {
   return {
     report_id: null, // 写入时按场景填
@@ -116,6 +116,7 @@ function reportFixture({
         up_ratio: upRatio, median_pct_chg: medianPct,
         amount_yi: amountYi, amount_ma20_yi: amountMa20,
         pct_above_ma20: crash ? 6 : 18, pct_above_ma60: crash ? 12 : 30,
+        ...breadthPatch,
       },
     },
     sectors: {
@@ -870,4 +871,57 @@ test('G12 NO_ACTION 不忽略已确认风险约束：政策触发/未触发都�
     assertNumbersConsistent(rendered.user, rendered.attachment, 'G12');
     assert.match(rendered.user, /风险|回撤/, '已确认风险约束必须出现在正文');
   }
+});
+
+test('市场广度正文只在计数证明过半时使用多数表述', () => {
+  assert.ok(renderer, '渲染器必须可用');
+  const cases = [
+    { name: 'flat-majority', up: 40, down: 10, flat: 50, ratio: .4, tone: null },
+    { name: 'down-majority', up: 20, down: 60, flat: 20, ratio: .2, tone: '多数个股下跌' },
+    { name: 'up-majority', up: 60, down: 20, flat: 20, ratio: .6, tone: '多数个股上涨' },
+    { name: 'half', up: 50, down: 50, flat: 0, ratio: .5, tone: null },
+    { name: 'missing-down', up: 40, down: null, flat: null, ratio: .4, tone: null },
+  ];
+  for (const row of cases) {
+    const down = row.down == null ? '—' : String(row.down);
+    const line = `全市场当日有日线记录的 100 只股票中，上涨 ${row.up} 家 / 下跌 ${down} 家（上涨占比 ${row.ratio * 100}%）`;
+    seedMarket(row.name, { reportPatch: {
+      judgment: [line], upRatio: row.ratio,
+      breadthPatch: { stocks: 100, up: row.up, down: row.down, flat: row.flat },
+    } });
+    seedAccount(row.name);
+    const result = build(row.name);
+    const text = render(result).user;
+    const sectionA = text.split('## B.')[0];
+    assert.ok(sectionA.includes(line), `${row.name} 应保留原始广度事实`);
+    if (row.tone) assert.ok(sectionA.includes(row.tone), row.name);
+    else assert.doesNotMatch(sectionA, /多数个股|个股涨跌数量接近/, row.name);
+    if (row.down == null) {
+      assert.doesNotMatch(text, /下跌 0 家/);
+      assert.match(text, /下跌 — 家/);
+    }
+  }
+});
+
+test('旧市场日报和不同日期证据不能冒充当日市场环境', () => {
+  assert.ok(renderer, '渲染器必须可用');
+  const name = 'market-prior';
+  seedMarket(name, { reportPatch: { judgment: ['上涨占比 12.3% 的旧行情'] } });
+  seedAccount(name);
+  const market = openAshareDb(join(dir, `market-${name}.sqlite`));
+  try { market.prepare('UPDATE report SET trade_date = ?').run(PREV); } finally { market.close(); }
+  const result = build(name);
+  assert.equal(result.market_judgement.available, true);
+  assert.equal(result.market_judgement.fact_meta.as_of, PREV);
+  assert.notEqual(result.status, 'DATA_INSUFFICIENT');
+  const text = render(result).user;
+  assert.match(text, /不以旧数据替代当日结论/);
+  assert.doesNotMatch(text, /上涨占比 12\.3% 的旧行情/);
+
+  const freshName = 'market-mixed-dates';
+  seedMarket(freshName);
+  seedAccount(freshName);
+  const fresh = build(freshName);
+  fresh.market_judgement.support_evidence.push({ id: 'old', statement: '上涨家数旧证据 12.3%', as_of: PREV, source: 'test' });
+  assert.doesNotMatch(render(fresh).user, /上涨家数旧证据 12\.3%/);
 });
