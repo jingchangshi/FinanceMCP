@@ -52,7 +52,7 @@ export const ETF_SCREEN_MIN_SIZE_WAN_CNY = 20000;
 export const ETF_SCREEN_MAX_VOL_PCT = 60;
 /** 最大回撤下限（负百分数；−55 表示回撤不超过 55%）。 */
 export const ETF_SCREEN_MAX_DRAWDOWN_PCT = -55;
-/** 评估波动/回撤所需的最少行情根数。 */
+/** 评估波动/回撤所需的最少连续行情根数（窗口最多 60 根，不要求满 60）。 */
 export const ETF_SCREEN_MIN_RISK_BARS = 21;
 /** 年化跟踪误差上限（%）。 */
 export const ETF_SCREEN_MAX_TRACKING_ERROR_PCT = 8;
@@ -159,7 +159,13 @@ export interface EtfCandidateRow {
   name_source: 'fund_basic' | 'declared_hint' | 'unavailable';
   /** true = 用户真实持仓；永远入选、永远不被流动性/规模过滤。 */
   held: boolean;
+  /**
+   * 兼容标志：持仓或无排除原因即为 true，与旧版语义一致。
+   * 它不表示已通过身份/报价核验；是否可视为验证候选请看 eligibility。
+   */
   included: boolean;
+  /** eligible = 身份、报价及筛选证据齐全；research_only = 仅研究与观察；excluded = 有排除原因。 */
+  eligibility: 'eligible' | 'research_only' | 'excluded';
   status: CandidateStatus;
   status_reasons: string[];
   as_of_trade_date: string;
@@ -317,9 +323,14 @@ export function screenEtfCandidates(
       return null;
     }
   };
-  const expectedTradeDate = db && tables.trade_cal
-    ? ((db.prepare('SELECT cal_date FROM trade_cal WHERE is_open = 1 AND cal_date <= ? ORDER BY cal_date DESC LIMIT 1').get(asOf) as any)?.cal_date ?? null)
-    : null;
+  // 日历必须覆盖查询日，不能将已过期日历中的最后开市日冒充最近交易日。
+  const calendarCovered = !!(db && tables.trade_cal &&
+    (db.prepare('SELECT 1 FROM trade_cal WHERE cal_date = ? LIMIT 1').get(asOf)));
+  const tradeDates: string[] = calendarCovered && db
+    ? (db.prepare('SELECT cal_date FROM trade_cal WHERE is_open = 1 AND cal_date <= ? ORDER BY cal_date DESC LIMIT ?')
+      .all(asOf, ETF_SCREEN_RISK_WINDOW) as { cal_date: string }[]).map(row => row.cal_date).reverse()
+    : [];
+  const expectedTradeDate = tradeDates.at(-1) ?? null;
 
   const coverageReasons: string[] = [];
   if (!db) coverageReasons.push('market_cache_unavailable: 没有提供只读市场缓存');
@@ -343,7 +354,7 @@ export function screenEtfCandidates(
 
   // limit 只作用于**排名**：先给全部行排名，再截断展示；入选与否与 limit 无关，
   // 因此 `included` / `excluded` 的统计不会被展示上限改变。
-  const allRows: EtfCandidateRow[] = ordered.map(declaration => evaluateCandidate(db, declaration, asOf, tables, heldSet));
+  const allRows: EtfCandidateRow[] = ordered.map(declaration => evaluateCandidate(db, declaration, asOf, tables, heldSet, tradeDates));
   if (allRows.some(row => row.status_reasons.includes('fund_daily_stale'))) coverageReasons.push('candidate_price_stale: 部分候选缺少目标交易日行情');
   const rankedAll = allRows.slice().sort((a, b) => {
     if (a.score === null && b.score === null) return a.ts_code < b.ts_code ? -1 : 1;
@@ -358,10 +369,14 @@ export function screenEtfCandidates(
   const excluded = rankedAll.filter(row => !row.included);
   // limit 只截断“OK 的非持仓行”：持仓永远保留；DEGRADED 行也不因展示上限被丢弃，
   // 否则缺数据的候选会从结果里静默消失（任务要求“不静默丢弃”）。
-  const mustKeep = includedRows.filter(row => row.held || row.status !== 'OK');
+  // 先给持仓和 OK 排名行分配展示名额，再追加 DEGRADED 观察行：缺数据的观察行
+  // 不能把已通过筛选的候选挤出 `candidates`，否则 limit 会造成候选遗漏。
+  const heldRows = includedRows.filter(row => row.held);
+  const degradedRows = includedRows.filter(row => !row.held && row.status !== 'OK');
   const optional = includedRows.filter(row => !row.held && row.status === 'OK');
-  const capped = mustKeep
-    .concat(optional.slice(0, Math.max(0, limit - mustKeep.length)))
+  const capped = heldRows
+    .concat(optional.slice(0, Math.max(0, limit - heldRows.length)))
+    .concat(degradedRows)
     .sort((a, b) => a.rank - b.rank);
   // 被排除的行也保留在结果末尾（included:false + exclusions），便于复核“为什么没入选”，
   // 不因展示上限消失。
@@ -418,6 +433,7 @@ function evaluateCandidate(
   asOf: string,
   tables: { fund_basic: boolean; fund_daily: boolean; fund_adj: boolean; fund_share: boolean; index_daily: boolean; trade_cal: boolean },
   heldSet: ReadonlySet<string>,
+  tradeDates: readonly string[],
 ): EtfCandidateRow {
   const code = declaration.ts_code;
   const held = heldSet.has(code);
@@ -464,7 +480,8 @@ function evaluateCandidate(
   const priceBasis: EtfCandidateData['price_basis'] = adjBase ? 'qfq_adjusted' : 'raw_close_no_adj_factor';
   let adjMissingBars = 0;
   // bars 是倒序：先翻正序，再逐根换算复权价（基准 = asOf 之前最后一个因子）。
-  const series: { trade_date: string; close: number; vol: number | null; amount: number | null }[] = [];
+  // 缺因子的 bar 不进入 adjustedByDate；它组成缺口，后面的连续区间到此为止。
+  const adjustedByDate = new Map<string, number>();
   for (const bar of bars.slice().reverse()) {
     const close = num(bar.close);
     if (close === null || close <= 0) continue;
@@ -476,18 +493,36 @@ function evaluateCandidate(
       if (!Number.isFinite(ratio)) { adjMissingBars += 1; continue; }
       adjusted = close * ratio;
     }
-    series.push({
-      trade_date: String(bar.trade_date),
-      close: r4(adjusted),
-      vol: num(bar.vol),
-      amount: num(bar.amount),
-    });
+    adjustedByDate.set(String(bar.trade_date), r4(adjusted));
   }
   if (!adjBase) statusReasons.push('fund_adj_unavailable_price_basis_raw');
   if (adjMissingBars > 0) statusReasons.push(`fund_adj_missing_bars:${adjMissingBars}`);
 
-  const latest = series.at(-1) ?? null;
-  if (latest && latest.trade_date !== asOf) statusReasons.push('fund_daily_stale');
+  const latestBar = bars[0] ?? null;
+  const latestRawClose = num(latestBar?.close);
+  const latestBarDate = latestBar ? String(latestBar.trade_date) : null;
+  const expectedTradeDate = tradeDates.at(-1) ?? null;
+  if (!expectedTradeDate) statusReasons.push('trade_calendar_unavailable');
+  else if (latestBar && latestBar.trade_date < expectedTradeDate) statusReasons.push('fund_daily_stale');
+  if (latestBar && (latestRawClose === null || latestRawClose <= 0)) statusReasons.push('fund_daily_close_missing');
+
+  // 只取“截至最新 bar 的最近连续交易日”这一段：逐日有行情和复权价，且日历
+  // 证明相邻日期之间没有跳过的交易日。缺口之前的历史不拼接进来，避免跨缺口桥接。
+  let calendarAligned = false;
+  let series: { trade_date: string; close: number }[] = [];
+  if (db && tables.trade_cal && latestBarDate) {
+    const spine = (db.prepare(`
+      SELECT cal_date FROM trade_cal
+      WHERE is_open = 1 AND cal_date <= ?
+      ORDER BY cal_date DESC LIMIT ?`).all(latestBarDate, ETF_SCREEN_RISK_WINDOW) as any[])
+      .map(row => String(row.cal_date)).reverse();
+    if (spine.at(-1) === latestBarDate) {
+      calendarAligned = true;
+      let start = spine.length;
+      while (start > 0 && adjustedByDate.has(spine[start - 1])) start -= 1;
+      series = spine.slice(start).map(date => ({ trade_date: date, close: adjustedByDate.get(date)! }));
+    }
+  }
 
   // ---- fund_share（时点存量，万份）
   const shareRow = db && tables.fund_share
@@ -496,20 +531,20 @@ function evaluateCandidate(
   if (!tables.fund_share) statusReasons.push('fund_share_table_missing');
   else if (!shareRow) statusReasons.push('fund_share_row_missing');
   const fdShareWan = num(shareRow?.fd_share);
-  const latestCloseMilli = latest ? Math.round(latest.close * 1000) : null;
+  const latestCloseMilli = latestRawClose !== null && latestRawClose > 0 ? Math.round(latestRawClose * 1000) : null;
   // 万份 × 元/份 = 万元。
   const sizeWan = fdShareWan !== null && latestCloseMilli !== null && fdShareWan > 0
     ? r4(fdShareWan * (latestCloseMilli / 1000))
     : null;
 
   // ---- 流动性（最近 20 根，单位千元）
-  const liquidityBars = series.slice(-ETF_SCREEN_LIQUIDITY_WINDOW);
+  const liquidityBars = bars.slice(0, ETF_SCREEN_LIQUIDITY_WINDOW);
   const amounts = liquidityBars
     .map(bar => bar.amount)
     .filter((value): value is number => value !== null && Number.isFinite(value) && value >= 0);
   const medianAmountKcy = amounts.length > 0 ? median(amounts) : null;
   const meanAmountKcy = amounts.length > 0 ? amounts.reduce((a, b) => a + b, 0) / amounts.length : null;
-  const zeroVolumeDays = liquidityBars.filter(bar => bar.vol === null || bar.vol === 0).length;
+  const zeroVolumeDays = liquidityBars.filter(bar => num(bar.vol) === 0).length;
   const liquidityFilter: EtfCandidateFilters['liquidity'] = {
     ...((): FilterOutcome => {
       if (!tables.fund_daily) return unavailable('fund_daily_table_missing', '缓存没有 fund_daily 表，无法计算成交额中位数/均值');
@@ -565,8 +600,10 @@ function evaluateCandidate(
     value_pct: null,
   };
 
-  // ---- 风险：年化实现波动率 + 最大回撤（复权口径，缺因子时用原始收盘并已标注）
-  const closes = series.map(bar => bar.close);
+  // 风险只用最近一段连续完整区间：最多 60 根，至少 21 根；不要求满 60 根。
+  // 缺口之前的 bar 不拼进来，收益和回撤都不会跨缺口。
+  const closes = calendarAligned && series.length >= ETF_SCREEN_MIN_RISK_BARS
+    ? series.map(bar => bar.close) : [];
   const returns: number[] = [];
   for (let i = 1; i < closes.length; i += 1) returns.push(closes[i] / closes[i - 1] - 1);
   const dailyVol = stdev(returns);
@@ -575,9 +612,17 @@ function evaluateCandidate(
   const riskFilter: EtfCandidateFilters['risk'] = {
     ...((): FilterOutcome => {
       if (!tables.fund_daily) return unavailable('fund_daily_table_missing', '缓存没有 fund_daily 表，无法计算波动与回撤');
-      if (closes.length < ETF_SCREEN_MIN_RISK_BARS) {
+      if (!latestBar) return unavailable('fund_daily_row_missing', '缓存中没有该代码的行情，波动与回撤不可评估');
+      if (latestRawClose === null || latestRawClose <= 0) {
+        return unavailable('fund_daily_close_missing', '最新行情收盘价缺失或非正，无法建立最近连续区间');
+      }
+      if (!calendarAligned) {
+        return unavailable('risk_calendar_unavailable',
+          '交易日历未覆盖最新行情日，无法确认最近连续交易日，波动与回撤不可评估');
+      }
+      if (series.length < ETF_SCREEN_MIN_RISK_BARS) {
         return unavailable('risk_bars_insufficient',
-          `窗口内只有 ${closes.length} 根可比收盘，低于 ${ETF_SCREEN_MIN_RISK_BARS} 根，波动与回撤不可评估（不因缺数据而排除）`);
+          `最近连续完整区间只有 ${series.length} 根行情，低于 ${ETF_SCREEN_MIN_RISK_BARS} 根，波动与回撤不可评估（不因缺数据而排除）`);
       }
       if (realizedVolPct !== null && realizedVolPct > ETF_SCREEN_MAX_VOL_PCT) {
         return fail('vol_above_max', `年化实现波动率 ${realizedVolPct}% 高于上限 ${ETF_SCREEN_MAX_VOL_PCT}%`);
@@ -585,10 +630,10 @@ function evaluateCandidate(
       if (maxDrawdownPct !== null && maxDrawdownPct < ETF_SCREEN_MAX_DRAWDOWN_PCT) {
         return fail('drawdown_below_max', `最大回撤 ${maxDrawdownPct}% 低于下限 ${ETF_SCREEN_MAX_DRAWDOWN_PCT}%`);
       }
-      return ok(`年化实现波动率 ${realizedVolPct}%，最大回撤 ${maxDrawdownPct}%（区间 ${closes.length} 根）`);
+      return ok(`年化实现波动率 ${realizedVolPct}%，最大回撤 ${maxDrawdownPct}%（最近连续 ${closes.length} 根）`);
     })(),
     window: ETF_SCREEN_RISK_WINDOW,
-    bars_used: closes.length,
+    bars_used: series.length,
     realized_vol_pct: realizedVolPct,
     max_drawdown_pct: maxDrawdownPct,
     threshold: {
@@ -619,7 +664,7 @@ function evaluateCandidate(
 
   const data: EtfCandidateData = {
     bars_used: series.length,
-    latest_bar_date: latest?.trade_date ?? null,
+    latest_bar_date: latestBar?.trade_date ?? null,
     latest_close_milli: latestCloseMilli,
     price_basis: priceBasis,
     adj_base: adjBase,
@@ -631,7 +676,7 @@ function evaluateCandidate(
       fund_daily: tables.fund_daily && bars.length > 0,
       fund_adj: !!(tables.fund_adj && adjBase),
       fund_share: !!(tables.fund_share && shareRow),
-      latest_trade_date: latest?.trade_date ?? null,
+      latest_trade_date: latestBar?.trade_date ?? null,
     },
   };
 
@@ -641,6 +686,9 @@ function evaluateCandidate(
   const included = held || exclusions.length === 0;
   // 缺表/缺行/缺因子/缺份额一律 DEGRADED，并保留 status_reasons；只有全部来源齐全才是 OK。
   const status: CandidateStatus = exclusions.length === 0 && statusReasons.length === 0 ? 'OK' : 'DEGRADED';
+  const eligibility: EtfCandidateRow['eligibility'] = exclusions.length > 0 ? 'excluded'
+    : status === 'OK' && filters.liquidity.state === 'pass' && filters.size.state === 'pass' && filters.risk.state === 'pass'
+      ? 'eligible' : 'research_only';
 
   return {
     rank: 0,
@@ -651,6 +699,7 @@ function evaluateCandidate(
     name_source: nameSource,
     held,
     included,
+    eligibility,
     status,
     status_reasons: [...new Set(statusReasons)].sort(),
     as_of_trade_date: asOf,
