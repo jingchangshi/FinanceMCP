@@ -280,9 +280,14 @@ test('D1-3b 候选 vs 现金：现金不足一手时显式标注，不臆造买�
   assert.equal(report.candidate_vs_cash.available, true);
   assert.equal(typeof report.candidate_vs_cash.cash_cents, 'number');
   assert.ok(report.candidate_vs_cash.entries.length > 0);
+  const screeningRows = new Map(report.candidate_vs_cash.screening.candidates.map(row => [row.ts_code, row]));
   for (const entry of report.candidate_vs_cash.entries) {
     assert.ok(entry.fact_meta, `${entry.ts_code} 缺少事实元数据`);
     assert.ok(entry.fact_meta.as_of || entry.fact_meta.quality === 'DEGRADED');
+    // 资格直接复用 etfUniverse 的筛选结论，不在这里重新筛选。
+    assert.equal(entry.eligibility, screeningRows.get(entry.ts_code)?.eligibility, `${entry.ts_code} 资格不一致`);
+    if (entry.eligibility === 'research_only') assert.match(entry.note, /仅研究观察/);
+    if (entry.eligibility === 'excluded') assert.match(entry.note, /有排除原因/);
     if (entry.price_milli === null) {
       assert.equal(entry.one_lot_cents, null);
       assert.equal(entry.cash_sufficient_for_one_lot, null);
@@ -290,6 +295,9 @@ test('D1-3b 候选 vs 现金：现金不足一手时显式标注，不臆造买�
       assert.equal(entry.one_lot_cents, Math.round((100 * entry.price_milli) / 10));
     }
   }
+  // 该 fixture 只有 10 根行情，低于 21 根风险窗口：所有候选都只能是研究观察，
+  // 不能因为进入日报就冒充完整资格候选。
+  assert.ok(report.candidate_vs_cash.entries.every(entry => entry.eligibility === 'research_only'));
 });
 
 // ---------------------------------------------------------------- 4. 行情过期

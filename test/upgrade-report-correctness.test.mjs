@@ -85,6 +85,83 @@ test('candidate screening uses the actual account holdings', () => {
   } finally { f.close(); }
 });
 
+test('candidate cash competition reuses screening eligibility and shows eligible rows first', () => {
+  const f = fixture({ bond: true });
+  try {
+    const report = f.build();
+    const entries = report.candidate_vs_cash.entries;
+    const rows = report.candidate_vs_cash.screening.candidates;
+    assert.ok(entries.length > 0);
+    for (const entry of entries) {
+      const row = rows.find(item => item.ts_code === entry.ts_code);
+      assert.ok(row, `${entry.ts_code} 必须来自同一份筛选结果`);
+      assert.equal(entry.eligibility, row.eligibility, `${entry.ts_code} 应复用筛选资格，不重新筛选`);
+    }
+    // 展示顺序：eligible 优先，research_only 随后；组内保持筛选原始排名。
+    const priority = { eligible: 0, research_only: 1, excluded: 2 };
+    const order = entries.map(entry => priority[entry.eligibility]);
+    assert.deepEqual(order, [...order].sort((a, b) => a - b));
+    // 该 fixture 中 510300.SH 证据齐全，应为 eligible；159558/511010 未声明可比基准，
+    // 只能是研究观察。两者同分，原始排名按代码把 159558 排在 510300 之前。
+    assert.equal(rows.find(row => row.ts_code === '510300.SH').eligibility, 'eligible');
+    assert.ok(rows.findIndex(row => row.ts_code === '159558.SZ') < rows.findIndex(row => row.ts_code === '510300.SH'));
+    assert.equal(entries[0].ts_code, '510300.SH', 'eligible 应优先于原始排名更高的 research_only');
+    const observation = entries.find(entry => entry.ts_code === '159558.SZ');
+    assert.equal(observation.eligibility, 'research_only');
+    assert.match(observation.note, /仅研究观察/);
+    // 资格标注不改变资金/费用计算：100 份 × 1 元 = 10000 分，另加买入费用。
+    assert.equal(observation.one_lot_cents, 10000);
+    assert.ok(observation.one_lot_total_cents > observation.one_lot_cents);
+  } finally { f.close(); }
+});
+
+test('section F qualifies funding claims by screening eligibility', () => {
+  const f = fixture({ bond: true });
+  try {
+    const report = f.build();
+    const user = renderDailyReport(report, { now: '2026-08-30T15:00:00Z' }).user;
+    const section = user.split('## F. 是否有更好的选择')[1].split('## G. 风险与情景')[0];
+    assert.match(section, /1 项候选通过完整筛选资格/);
+    // 资金比较只算 eligible；159558 的一手也买得起，但它是 research_only，不得计数。
+    assert.match(section, /其中 1 项现金买得起一手/);
+    assert.match(section, /仅有研究资格、只作研究观察/);
+    assert.match(section, /均不参与资金比较/);
+    assert.doesNotMatch(section, /候选高分项集中于债券\/货币类/);
+    // 511010 是债券类但仅为研究观察，不能作为“完整资格防御候选”的资金门槛。
+    assert.match(section, /本期没有完整资格的债券\/货币类候选/);
+  } finally { f.close(); }
+});
+
+test('section F does not treat research-only candidates as funding candidates', () => {
+  const f = fixture();
+  try {
+    const report = f.build();
+    // 模拟没有任何候选通过完整资格：510300 退为研究观察。
+    const onlyEligible = report.candidate_vs_cash.entries.find(entry => entry.eligibility === 'eligible');
+    assert.ok(onlyEligible);
+    onlyEligible.eligibility = 'research_only';
+    const user = renderDailyReport(report, { now: '2026-08-30T15:00:00Z' }).user;
+    const section = user.split('## F. 是否有更好的选择')[1].split('## G. 风险与情景')[0];
+    assert.match(section, /本期没有通过完整筛选资格的 ETF 候选/);
+    assert.match(section, /只作研究观察/);
+    assert.doesNotMatch(section, /现金买得起一手/);
+    assert.doesNotMatch(section, /完整资格候选中一手含费最低/);
+  } finally { f.close(); }
+});
+
+test('older reports without candidate eligibility keep the legacy section F wording', () => {
+  const f = fixture({ bond: true });
+  try {
+    const report = f.build();
+    for (const entry of report.candidate_vs_cash.entries) delete entry.eligibility;
+    const user = renderDailyReport(report, { now: '2026-08-30T15:00:00Z' }).user;
+    const section = user.split('## F. 是否有更好的选择')[1].split('## G. 风险与情景')[0];
+    assert.match(section, /候选高分项集中于债券\/货币类/);
+    assert.doesNotMatch(section, /完整筛选资格/);
+    assert.doesNotMatch(section, /研究观察/);
+  } finally { f.close(); }
+});
+
 test('HOLD/NO_ACTION preserve securities-only HHI, including cash and wealth denominators', () => {
   for (const wealth of [0, 100000]) {
     const f = fixture({ wealth });
