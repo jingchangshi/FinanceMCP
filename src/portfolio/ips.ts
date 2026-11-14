@@ -163,7 +163,7 @@ export function proposeRebalance(input: ProposalInput): Proposal {
   } else {
     notes.push(input.drawdown_bps >= ips.drawdown_steps[0].at_bps
       ? '已进入研究复核档：按假设冻结卫星加仓；未到研究降仓档。'
-      : '未触发研究回撤档：继续观察，不因集中度本身产生卖出提案。');
+      : '未触发研究回撤档：继续持有并观察，不因集中度本身产生卖出提案。');
   }
 
   // 买入：只用现金超出现金目标的部分 + 降仓回款；永不为买入而卖出核心品种。
