@@ -22,7 +22,7 @@ export function forEachStockBars(
     LEFT JOIN stk_limit l ON l.trade_date = d.trade_date AND l.ts_code = d.ts_code
     WHERE d.ts_code = ? AND d.trade_date BETWEEN ? AND ?
     ORDER BY d.trade_date`);
-  const universe = codes?.length
+  const universe = codes !== undefined
     ? codes
     : (db.prepare('SELECT ts_code FROM stock_basic ORDER BY ts_code').all() as any[]).map(r => r.ts_code as string);
 
@@ -31,30 +31,31 @@ export function forEachStockBars(
   let stocks = 0;
   const flush = () => {
     if (!current || rows.length === 0) return;
+    const validFactor = (factor: unknown): factor is number =>
+      typeof factor === 'number' && Number.isFinite(factor) && factor > 0;
+    const price = (value: unknown): number =>
+      typeof value === 'number' && Number.isFinite(value) ? value : NaN;
     let lastFactor = NaN;
     for (let k = rows.length - 1; k >= 0; k--) {
-      if (Number.isFinite(rows[k].adj_factor)) { lastFactor = rows[k].adj_factor; break; }
+      if (validFactor(rows[k].adj_factor)) { lastFactor = rows[k].adj_factor; break; }
     }
-    // A missing factor is carried forward from the previous bar so the series can still be
-    // displayed, but `adjMissing` marks it: callers must not derive signals or scores from it.
-    let carry = Number.isFinite(lastFactor) ? lastFactor : 1;
     const bars: Bars = { dates: [], open: [], high: [], low: [], close: [], vol: [], amount: [], rawOpen: [], rawClose: [], rawHigh: [], rawLow: [], upLimit: [], downLimit: [], adjMissing: 0 };
     for (const r of rows) {
-      if (Number.isFinite(r.adj_factor)) carry = r.adj_factor;
-      else bars.adjMissing!++;
-      // Same qfq definition as the data tools (data.ts), based on the last factor ≤ end.
-      const ratio = Number.isFinite(lastFactor) ? adjustmentRatio('qfq', carry, lastFactor) : 1;
+      if (!validFactor(r.adj_factor)) bars.adjMissing!++;
+      // Never carry a factor over a gap: its adjusted prices are unknown.
+      const ratio = adjustmentRatio('qfq', validFactor(r.adj_factor) ? r.adj_factor : NaN, lastFactor);
+      const open = price(r.open), high = price(r.high), low = price(r.low), close = price(r.close);
       bars.dates.push(r.trade_date);
-      bars.open.push(r.open * ratio);
-      bars.high.push(r.high * ratio);
-      bars.low.push(r.low * ratio);
-      bars.close.push(r.close * ratio);
+      bars.open.push(open * ratio);
+      bars.high.push(high * ratio);
+      bars.low.push(low * ratio);
+      bars.close.push(close * ratio);
       bars.vol.push(r.vol ?? 0);
       bars.amount.push(r.amount ?? 0);
-      bars.rawOpen.push(r.open);
-      bars.rawClose.push(r.close);
-      bars.rawHigh!.push(r.high);
-      bars.rawLow!.push(r.low);
+      bars.rawOpen.push(open);
+      bars.rawClose.push(close);
+      bars.rawHigh!.push(high);
+      bars.rawLow!.push(low);
       bars.upLimit.push(r.up_limit ?? NaN);
       bars.downLimit!.push(r.down_limit ?? NaN);
     }
