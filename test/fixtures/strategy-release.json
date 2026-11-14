@@ -1,0 +1,45 @@
+{
+  "schema_version": "strategy-release-1",
+  "research_status": "RESEARCH_PUBLISHED",
+  "production_admission": "NOT_APPROVED",
+  "strategy": {
+    "id": "EXAMPLE_ONLY",
+    "version": "v1",
+    "implementation_sha256": "UNKNOWN"
+  },
+  "inputs": {
+    "source": "synthetic research snapshot",
+    "snapshot": "example-snapshot-v1",
+    "start_date": "2020-01-01",
+    "end_date": "2020-12-31",
+    "assets": [
+      "EXAMPLE.A",
+      "EXAMPLE.B"
+    ]
+  },
+  "rules": [
+    "示例：仅使用当时可用的数据"
+  ],
+  "parameters": {
+    "lookback": "200",
+    "rebalance": "monthly"
+  },
+  "evidence": [
+    {
+      "reference": "synthetic/example-report",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "applicability": {
+    "market": "UNKNOWN",
+    "environment": "UNKNOWN"
+  },
+  "execution_assumptions": {
+    "signal_timing": "UNKNOWN",
+    "earliest_execution": "UNKNOWN",
+    "exit": "UNKNOWN",
+    "fees": "UNKNOWN",
+    "lot_size": "UNKNOWN"
+  },
+  "content_hash": "f174eb2c37e1451d444ac1ea5e0962f39934e3b675ae2b374fc723bf10441555"
+}
