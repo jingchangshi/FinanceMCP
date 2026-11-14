@@ -2,6 +2,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import { analyzeTechnicalDay } from './technicalCandidatesV2.js';
 import type { TechnicalViewV2 } from './technicalFrameworkV2.js';
 import { screenEtfCandidates, type EtfCandidateScreenResult } from './etfUniverse.js';
+import { recentTradeDays } from './ingest.js';
+import { computeRps } from './rps.js';
 
 /** A disclosure adapter over the existing research screens, not a trading strategy. */
 export function stockLayers(view: TechnicalViewV2) {
@@ -59,7 +61,16 @@ export function buildLayeredScreen(db: DatabaseSync, asOf: string) {
   return {
     schema: 'ashare-layered-research-screen/1.0', as_of: asOf, research_only: true,
     disclaimer: '研究筛选并非生产策略、收益预测或交易建议；缺失数据不作零值。',
-    stock: attempt(() => stockLayers(analyzeTechnicalDay(db, asOf))),
+    stock: attempt(() => {
+      // Match technical-preview: RPS uses up to 260 trading days ending at asOf.
+      const days = recentTradeDays(db, asOf, 260);
+      const rps = days.length > 1 ? computeRps(db, days[0], asOf) : null;
+      return {
+        ...stockLayers(analyzeTechnicalDay(db, asOf, rps)),
+        rps_quality: rps ? { start: days[0], end: rps.end, version: rps.version, universe: rps.universe, denominators: rps.denominators, input: rps.quality }
+          : { status: 'UNAVAILABLE', reason: '交易日不足以计算 RPS', trading_days: days.length },
+      };
+    }),
     etf: attempt(() => etfLayers(screenEtfCandidates(db, { asOf, heldCodes: [], limit: Number.MAX_SAFE_INTEGER }))),
   };
 }
