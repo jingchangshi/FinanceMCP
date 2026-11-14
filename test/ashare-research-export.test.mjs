@@ -8,8 +8,9 @@
 // writes only into a temporary directory; the production cache is never touched.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdirSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -20,8 +21,9 @@ const { openAshareDb } = await import('../build/ashare/db.js');
 const { weekdays } = await import('./ashare-fixture.mjs');
 
 function tempDir(label) {
-  const dir = join(tmpdir(), `research-export-${label}-${Math.random().toString(36).slice(2)}`);
-  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  const root = mkdtempSync(join(tmpdir(), `research-export-${label}-`));
+  const dir = join(root, 'data');
+  return { dir, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 /** A synthetic market with an explicit as-of boundary and deliberate gaps. */
@@ -374,14 +376,14 @@ test('snapshot identity binds exported bytes and dataset selection even when sou
   const fix = buildDb('content-identity', {});
   const out = tempDir('content-identity-out');
   try {
-    const opts = { asOfTradeDate: fix.asOfDay, outputDir: out.dir, now: new Date('2026-01-10T00:00:00Z') };
+    const opts = { asOfTradeDate: fix.asOfDay, outputDir: join(out.dir, 'first'), now: new Date('2026-01-10T00:00:00Z') };
     const first = runResearchExport(fix.db, opts);
     fix.db.prepare('UPDATE daily SET close = 10.6 WHERE trade_date = ?').run(fix.asOfDay);
-    const changed = runResearchExport(fix.db, opts);
+    const changed = runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'changed') });
     assert.equal(first.source_db_fingerprint, changed.source_db_fingerprint);
     assert.equal(first.snapshot_id_algorithm, 'dataset-manifest-v2');
     assert.notEqual(first.snapshot_id, changed.snapshot_id);
-    const subset = runResearchExport(fix.db, { ...opts, datasets: ['daily_bars'] });
+    const subset = runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'subset'), datasets: ['daily_bars'] });
     assert.notEqual(changed.snapshot_id, subset.snapshot_id);
   } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
 });
@@ -414,19 +416,19 @@ test('export owns only its own transaction and reads a consistent WAL snapshot',
       }
       return prepare(sql);
     };
-    const opts = { asOfTradeDate: fix.asOfDay, outputDir: out.dir };
+    const opts = { asOfTradeDate: fix.asOfDay, outputDir: join(out.dir, 'first') };
     runResearchExport(ro, opts);
     assert.ok(changed);
-    assert.match(readFileSync(join(out.dir, 'stock_basic.csv'), 'utf8'), /测试/);
+    assert.match(readFileSync(join(opts.outputDir, 'stock_basic.csv'), 'utf8'), /测试/);
     ro.exec('BEGIN');
     ro.exec('ROLLBACK');
     assert.throws(() => runResearchExport(ro, { ...opts, datasets: ['unknown'] }), /unknown_datasets/);
     ro.exec('BEGIN');
     ro.exec('ROLLBACK');
     ro.exec('BEGIN');
-    runResearchExport(ro, opts);
+    assert.throws(() => runResearchExport(ro, { ...opts, outputDir: join(out.dir, 'caller-transaction') }), /research_export_existing_transaction/);
     assert.throws(() => ro.exec('BEGIN'), /cannot start a transaction/);
-    assert.throws(() => runResearchExport(ro, { ...opts, datasets: ['unknown'] }), /unknown_datasets/);
+    assert.throws(() => runResearchExport(ro, { ...opts, datasets: ['unknown'] }), /research_export_existing_transaction/);
     assert.throws(() => ro.exec('BEGIN'), /cannot start a transaction/);
     ro.exec('ROLLBACK');
   } finally { ro?.close(); out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
@@ -436,25 +438,88 @@ test('as-of price quality is assessed independently for requested equity and ETF
   const fix = buildDb('per-price-dataset', {});
   const out = tempDir('per-price-dataset-out');
   try {
-    const opts = { asOfTradeDate: fix.asOfDay, outputDir: out.dir, now: new Date('2026-01-20T00:00:00Z') };
+    const opts = { asOfTradeDate: fix.asOfDay, outputDir: join(out.dir, 'equity-only'), now: new Date('2026-01-20T00:00:00Z') };
     const equityOnly = runResearchExport(fix.db, opts);
     assert.equal(equityOnly.data_quality.status, 'DEGRADED');
     assert.ok(equityOnly.data_quality.reasons.some(r => r.startsWith('missing_as_of_bars:fund_daily_bars:')));
-    const equitySubset = runResearchExport(fix.db, { ...opts, datasets: ['daily_bars'] });
+    const equitySubset = runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'equity-subset'), datasets: ['daily_bars'] });
     assert.equal(equitySubset.data_quality.status, 'READY');
     assert.throws(() => runResearchExport(fix.db, { ...opts, datasets: ['fund_daily_bars'] }), /missing_bars/);
-    const missingSubset = runResearchExport(fix.db, { ...opts, datasets: ['fund_daily_bars'], allowMissingBars: true });
+    const missingSubset = runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'missing-subset'), datasets: ['fund_daily_bars'], allowMissingBars: true });
     assert.equal(missingSubset.data_quality.status, 'DEGRADED');
     assert.ok(missingSubset.data_quality.reasons.some(r => r.startsWith('missing_as_of_bars:fund_daily_bars:')));
     fix.db.prepare('INSERT INTO fund_daily (ts_code,trade_date,close) VALUES (?,?,?)').run('510300.SH', fix.asOfDay, 4.2);
-    assert.equal(runResearchExport(fix.db, opts).data_quality.status, 'READY');
+    assert.equal(runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'both') }).data_quality.status, 'READY');
     fix.db.prepare('DELETE FROM daily WHERE trade_date = ?').run(fix.asOfDay);
-    const fundOnly = runResearchExport(fix.db, opts);
+    const fundOnly = runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'fund-only') });
     assert.equal(fundOnly.data_quality.status, 'DEGRADED');
     assert.ok(fundOnly.data_quality.reasons.some(r => r.startsWith('missing_as_of_bars:daily_bars:')));
-    assert.equal(runResearchExport(fix.db, { ...opts, datasets: ['fund_daily_bars'] }).data_quality.status, 'READY');
+    assert.equal(runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'fund-subset'), datasets: ['fund_daily_bars'] }).data_quality.status, 'READY');
     assert.throws(() => runResearchExport(fix.db, { ...opts, datasets: ['daily_bars'] }), /missing_bars/);
-    assert.equal(runResearchExport(fix.db, { ...opts, datasets: ['stock_basic'] }).data_quality.status, 'READY');
+    assert.equal(runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'stock-basic'), datasets: ['stock_basic'] }).data_quality.status, 'READY');
+  } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
+});
+
+test('financial announcement-date mode validates both dates and keeps legacy selection by default', () => {
+  const fix = buildDb('financial-dates', {});
+  const out = tempDir('financial-dates-out');
+  try {
+    // Exercise historical schemas that permitted NULL as well as the current NOT NULL schema.
+    fix.db.exec('DROP TABLE fina_indicator; CREATE TABLE fina_indicator (ts_code TEXT, end_date TEXT, ann_date TEXT, roe REAL, PRIMARY KEY (ts_code,end_date,ann_date))');
+    const insert = fix.db.prepare('INSERT INTO fina_indicator (ts_code,end_date,ann_date,roe) VALUES (?,?,?,?)');
+    const cases = [
+      ['valid', '20251231', '20260109'], ['leap', '20240229', '20240301'],
+      ['empty', '20251231', ''], ['null', '20251231', null],
+      ['badann', '20251231', '20250229'], ['badend', '20250229', '20250301'],
+      ['reverse', '20260109', '20260108'], ['future', '20251231', '20260110'],
+      ['format', '20251231', '2025-01-01'], ['zero', '00000101', '20200101'],
+      ['century', '19000229', '19000301'], ['leap400', '20000229', '20000301'],
+    ];
+    for (const [id, end, ann] of cases) insert.run(id, end, ann, 12);
+    const opts = { asOfTradeDate: fix.asOfDay, outputDir: join(out.dir, 'legacy'), datasets: ['financial_indicator'], now: new Date('2026-01-10T00:00:00Z') };
+    const legacy = runResearchExport(fix.db, opts);
+    const legacyCsv = readFileSync(join(opts.outputDir, 'financial_indicator.csv'), 'utf8');
+    assert.match(legacyCsv, /empty,/);
+    assert.match(legacyCsv, /badann,/);
+    assert.doesNotMatch(legacyCsv, /null,/); // SQL's historical NULL comparison
+    assert.doesNotMatch(legacyCsv, /future,/);
+    assert.match(legacy.availability_semantics.financial_indicator, /financial_availability=legacy/);
+    const strictDir = join(out.dir, 'strict');
+    const strict = runResearchExport(fix.db, { ...opts, outputDir: strictDir, financialAvailability: 'announcement-date-v1' });
+    const csv = readFileSync(join(strictDir, 'financial_indicator.csv'), 'utf8');
+    const ids = csv.trim().split('\n').slice(1).map(row => row.split(',')[0]).sort();
+    assert.deepEqual(ids, ['leap', 'leap400', 'valid']);
+    assert.match(strict.availability_semantics.financial_indicator, /financial_availability=announcement-date-v1/);
+    assert.match(strict.dataset_manifest[0].as_of_filter_note, /vendor revisions unknown/);
+    assert.notEqual(strict.snapshot_id, legacy.snapshot_id);
+    assert.throws(() => runResearchExport(fix.db, { ...opts, financialAvailability: 'invalid' }), /invalid_financial_availability/);
+    // Identity binds the mode even when there is no financial dataset or byte difference.
+    const noFinancial = { ...opts, datasets: ['stock_basic'] };
+    const a = runResearchExport(fix.db, { ...noFinancial, outputDir: join(out.dir, 'no-financial-legacy') });
+    const b = runResearchExport(fix.db, { ...noFinancial, outputDir: join(out.dir, 'no-financial-strict'), financialAvailability: 'announcement-date-v1' });
+    assert.deepEqual(a.content_hashes, b.content_hashes);
+    assert.notEqual(a.snapshot_id, b.snapshot_id);
+  } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
+});
+
+test('Python can independently reconstruct the existing v2 identity for both modes', () => {
+  const fix = buildDb('python-identity', { finaAnnDates: { '20251231': '20260109' } });
+  const out = tempDir('python-identity-out');
+  try {
+    for (const financialAvailability of ['legacy', 'announcement-date-v1']) {
+      const outputDir = join(out.dir, financialAvailability);
+      const m = runResearchExport(fix.db, { asOfTradeDate: fix.asOfDay, outputDir, financialAvailability, now: new Date('2026-01-10T00:00:00Z') });
+      const python = `import sys,json,hashlib\nm=json.load(sys.stdin)\nds=sorted(m['dataset_manifest'],key=lambda d:d['dataset'])\ndatasets=[[d['dataset'],d['table'],d['file'],d['sha256'],d['rows'],d['columns'],d['time_column'],d['as_of_filtered'],d['availability'],d['as_of_filter_note'],d.get('missing_note')] for d in ds]\np={'schema_version':m['schema_version'],'as_of':m['as_of_trade_date'],'source':m['source_db_fingerprint'],'content_hashes':dict(sorted(m['content_hashes'].items())),'datasets':datasets,'quality':m['data_quality'],'code_mapping_version':m['code_mapping_version'],'adjustment_policy':sorted(m['adjustment_policy'].items()),'availability_semantics':sorted(m['availability_semantics'].items())}\nprint(hashlib.sha256(json.dumps(p,ensure_ascii=False,separators=(',',':')).encode()).hexdigest())`;
+      const result = spawnSync('python3', ['-I', '-c', python], { input: JSON.stringify(m), encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout.trim(), m.snapshot_id);
+      if (process.env.TACTICORE_ROOT && process.env.TACTICORE_PYTHON) {
+        const consumer = `import sys\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nfrom research.ashare.data.contract import load_snapshot_manifest, verify_snapshot_content\nm=load_snapshot_manifest(Path(sys.argv[2]))\nverify_snapshot_content(m)\nprint(m.snapshot_id)`;
+        const checked = spawnSync(process.env.TACTICORE_PYTHON, ['-I', '-c', consumer, process.env.TACTICORE_ROOT, outputDir], { encoding: 'utf8' });
+        assert.equal(checked.status, 0, checked.stderr);
+        assert.equal(checked.stdout.trim(), m.snapshot_id);
+      }
+    }
   } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
 });
 
@@ -462,14 +527,14 @@ test('missing as-of bars are rejected or explicitly degraded even within cutoff 
   const fix = buildDb('missing-asof', {});
   const out = tempDir('missing-asof-out');
   try {
-    const opts = { asOfTradeDate: fix.days[5], outputDir: out.dir, now: new Date('2026-01-20T00:00:00Z') };
+    const opts = { asOfTradeDate: fix.days[5], outputDir: join(out.dir, 'degraded'), now: new Date('2026-01-20T00:00:00Z') };
     assert.throws(() => runResearchExport(fix.db, opts), /research_export_as_of_missing_bars/);
     const degraded = runResearchExport(fix.db, { ...opts, allowMissingBars: true });
     assert.equal(degraded.data_quality.status, 'DEGRADED');
     assert.ok(degraded.data_quality.reasons.some(r => r.startsWith('allow_missing_bars:')));
     fix.db.exec('DELETE FROM daily; DELETE FROM fund_daily');
     assert.throws(() => runResearchExport(fix.db, opts), /research_export_as_of_missing_bars/);
-    const empty = runResearchExport(fix.db, { ...opts, allowMissingBars: true });
+    const empty = runResearchExport(fix.db, { ...opts, outputDir: join(out.dir, 'empty'), allowMissingBars: true });
     assert.equal(empty.data_quality.status, 'DEGRADED');
     assert.equal(empty.data_quality.data_cutoff, null);
   } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
