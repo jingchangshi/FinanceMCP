@@ -43,6 +43,15 @@ tests
 # CI/CD
 .github
 
+# Local data and generated research artifacts
+/.v2-work
+/reports
+/data
+/artifacts
+/.claude
+/.pytest_cache
+/.ruff_cache
+
 # Docker
 Dockerfile
 .dockerignore
