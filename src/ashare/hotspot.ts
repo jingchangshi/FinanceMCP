@@ -410,8 +410,9 @@ function counterEvidence(r: SectorRow): string[] {
 
 export function evaluateHotspotSectors(
   db: DatabaseSync, asOf: string, config: HotspotConfig = DEFAULT_HOTSPOT_CONFIG,
+  options: { readOnly?: boolean } = {},
 ): HotspotSectorSnapshot {
-  ensureHotspotSchema(db);
+  if (!options.readOnly) ensureHotspotSchema(db);
   const tradeDays = recentTradeDays(db, asOf, 70);
   const l1Rows = hotspotTableExists(db, 'sw_classify')
     ? (db.prepare("SELECT index_code, name FROM sw_classify WHERE level = 'L1'").all() as Array<{ index_code: string; name: string }>)

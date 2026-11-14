@@ -4,6 +4,9 @@ import type { TechnicalViewV2 } from './technicalFrameworkV2.js';
 import { screenEtfCandidates, type EtfCandidateScreenResult } from './etfUniverse.js';
 import { recentTradeDays } from './ingest.js';
 import { computeRps } from './rps.js';
+import { qualityCore } from './qualityCore.js';
+import { evaluateHotspotSectors, DEFAULT_HOTSPOT_CONFIG } from './hotspot.js';
+import type { HotspotSectorSnapshot } from './hotspotTypes.js';
 
 /** A disclosure adapter over the existing research screens, not a trading strategy. */
 export function stockLayers(view: TechnicalViewV2) {
@@ -54,6 +57,33 @@ export function etfLayers(screen: EtfCandidateScreenResult) {
   };
 }
 
+export function industryFacts(snapshot: HotspotSectorSnapshot) {
+  const sectors = snapshot.sectors;
+  const factorIds = Object.keys(DEFAULT_HOTSPOT_CONFIG.weights);
+  return {
+    as_of: snapshot.as_of,
+    source: 'evaluateHotspotSectors',
+    research_status: 'unvalidated' as const,
+    disclaimer: '行业环境事实仅供研究，不构成任何策略适用性结论。',
+    config_version: snapshot.config_version,
+    status: sectors.length === 0 ? 'UNAVAILABLE' : sectors.every(s => s.data_quality === 'UNAVAILABLE') ? 'UNAVAILABLE'
+      : sectors.some(s => s.data_quality !== 'OK' || s.factors.some(f => f.raw === null)) ? 'DEGRADED' : 'OK',
+    coverage: {
+      datasets: snapshot.coverage,
+      sectors: sectors.length,
+      ranked: sectors.filter(s => s.rank !== null).length,
+      factor_available: Object.fromEntries(factorIds.map(id => [id, sectors.filter(s => s.factors.some(f => f.id === id && f.raw !== null)).length])),
+      definition: '因子可用数的分母为本次评价行业数；各因子截面百分位使用该因子可用的行业，至少需要3个。成分指标分母见各行业 quality_notes；未提供时为未知。',
+    },
+    sectors: sectors.map(s => ({
+      key: s.key, name: s.name, source: s.source, kind: s.kind,
+      strength: s.strength, rank: s.rank,
+      factors: s.factors.map(f => ({ ...f, quality: f.raw === null ? 'UNAVAILABLE' : f.quality })),
+      data_quality: s.data_quality, quality_notes: s.quality_notes,
+    })),
+  };
+}
+
 export function buildLayeredScreen(db: DatabaseSync, asOf: string) {
   const attempt = <T>(fn: () => T): T | { status: 'UNAVAILABLE'; reason: string } => {
     try { return fn(); } catch (error) { return { status: 'UNAVAILABLE', reason: error instanceof Error ? error.message : String(error) }; }
@@ -71,6 +101,20 @@ export function buildLayeredScreen(db: DatabaseSync, asOf: string) {
           : { status: 'UNAVAILABLE', reason: '交易日不足以计算 RPS', trading_days: days.length },
       };
     }),
+    quality_core: (() => {
+      try { return qualityCore(db, asOf); }
+      catch (error) { return { status: 'UNAVAILABLE' as const, research_status: 'unvalidated' as const,
+        reason: error instanceof Error ? error.message : String(error) }; }
+    })(),
     etf: attempt(() => etfLayers(screenEtfCandidates(db, { asOf, heldCodes: [], limit: Number.MAX_SAFE_INTEGER }))),
+    industry: (() => {
+      try {
+        return industryFacts(evaluateHotspotSectors(db, asOf, DEFAULT_HOTSPOT_CONFIG, { readOnly: true }));
+      } catch (error) {
+        return { as_of: asOf, source: 'evaluateHotspotSectors', research_status: 'unvalidated' as const,
+          disclaimer: '行业环境事实仅供研究，不构成任何策略适用性结论。', status: 'UNAVAILABLE' as const,
+          reason: error instanceof Error ? error.message : String(error), coverage: null, sectors: null };
+      }
+    })(),
   };
 }
