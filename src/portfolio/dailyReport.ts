@@ -384,6 +384,13 @@ export interface CandidateCashCompetition {
     one_lot_total_cents: number | null;
     fees_cents: number | null;
     cash_sufficient_for_one_lot: boolean | null;
+    /**
+     * 直接复用 etfUniverse 的筛选资格，不在这里重新筛选：
+     * eligible = 身份、报价及筛选证据齐全；research_only = 仅研究观察；
+     * excluded = 有排除原因（真实持仓仍可能作为行展示）。
+     * 旧报告没有该字段，渲染层按“资格未知”保持原有口径。
+     */
+    eligibility?: EtfCandidateRow['eligibility'];
     note: string;
     /** 每个候选事实都带 as_of / 来源 / 质量状态。 */
     fact_meta: FactMeta;
@@ -1539,7 +1546,15 @@ function buildCandidateCashCompetition(
       note: '没有候选池筛选结果（缓存缺少 fund_* 表或未提供市场缓存）；不臆造候选。',
     };
   }
-  const entries = screening.candidates.slice(0, 8).map((candidate: EtfCandidateRow) => {
+  // 展示优先级：完整资格候选先展示（组内保持 etfUniverse 的原始排名），
+  // research_only 随后并明确标注为仅研究观察；有排除原因的行排在最后。
+  // 这里只调整展示顺序，不改变任何候选的资金/费用计算。
+  const shown = [
+    ...screening.candidates.filter(candidate => candidate.eligibility === 'eligible'),
+    ...screening.candidates.filter(candidate => candidate.eligibility === 'research_only'),
+    ...screening.candidates.filter(candidate => candidate.eligibility !== 'eligible' && candidate.eligibility !== 'research_only'),
+  ].slice(0, 8);
+  const entries = shown.map((candidate: EtfCandidateRow) => {
     const priceMilli = candidate.data.latest_close_milli;
     const lotCost = oneLotCents(priceMilli, lots.etf_lot_size);
     const fees = lotCost === null ? null : calculateFees(lotCost, 'buy', context.feeOverride ?? resolveFeeRules({
@@ -1547,6 +1562,15 @@ function buildCandidateCashCompetition(
     })).total_cents;
     const totalCost = lotCost === null || fees === null ? null : lotCost + fees;
     const fresh = candidate.data.latest_bar_date === context.asOf;
+    const baselineNote = candidate.status === 'DEGRADED'
+      ? `候选数据降级：${candidate.status_reasons.join('; ') || '缓存缺表或字段'}`
+      : `一手 ${lots.etf_lot_size} 份；价格为 ${candidate.data.latest_bar_date ?? '缺失'} 的缓存收盘`;
+    // 资格标注只影响展示与文案，不改变上面的资金/费用计算。
+    const eligibilityNote = candidate.eligibility === 'research_only'
+      ? '仅研究观察（筛选资格未完整），不参与资金竞争；'
+      : candidate.eligibility === 'excluded'
+        ? '筛选未通过（有排除原因），不构成换入候选；'
+        : '';
     return {
       ts_code: candidate.ts_code,
       name: candidate.name,
@@ -1558,9 +1582,8 @@ function buildCandidateCashCompetition(
       one_lot_total_cents: totalCost,
       fees_cents: fees,
       cash_sufficient_for_one_lot: !fresh || totalCost === null || cashCents === null ? null : cashCents >= totalCost,
-      note: candidate.status === 'DEGRADED'
-        ? `候选数据降级：${candidate.status_reasons.join('; ') || '缓存缺表或字段'}`
-        : `一手 ${lots.etf_lot_size} 份；价格为 ${candidate.data.latest_bar_date ?? '缺失'} 的缓存收盘`,
+      eligibility: candidate.eligibility,
+      note: `${eligibilityNote}${baselineNote}`,
       fact_meta: {
         as_of: candidate.data.latest_bar_date,
         source: 'fund_daily + fund_share（候选池筛选）',

@@ -1018,6 +1018,29 @@ function renderSectionE(r: DailyReportResult, annotations: AnnotationIndex = new
   return [[header, table].join('\n'), restNote, costNote, ...restEvidenceNotes, ...blocks].filter(Boolean).join('\n\n');
 }
 
+/** ETF 筛选资格：eligible / research_only / excluded，来自 etfUniverse 的既有结论。 */
+type EtfScreeningEligibility = 'eligible' | 'research_only' | 'excluded';
+
+/**
+ * 读取候选行的资格字段。旧报告（P5 之前生成）没有该字段；此时返回 null，
+ * 渲染层回退到“全部候选参与资金比较”的旧口径，不猜测资格。
+ */
+function candidateEligibility(entry: { eligibility?: EtfScreeningEligibility }): EtfScreeningEligibility | null {
+  const value = entry?.eligibility;
+  return value === 'eligible' || value === 'research_only' || value === 'excluded' ? value : null;
+}
+
+/**
+ * 资金竞争口径：新报告只让完整资格（eligible）候选参与“买得起/一手门槛”比较；
+ * research_only 只作研究观察，excluded 不构成换入候选。旧报告没有资格字段时
+ * 保持原有口径（全部 entries），保证历史报告重渲染的文案与数字不变。
+ */
+function candidateFundingEntries(entries: DailyReportResult['candidate_vs_cash']['entries']) {
+  return entries.some(entry => candidateEligibility(entry) !== null)
+    ? entries.filter(entry => candidateEligibility(entry) === 'eligible')
+    : entries;
+}
+
 /** F. 是否有更好的选择：六条路的机会成本与资金竞争，不强行推荐。 */
 function renderSectionF(r: DailyReportResult, view: RenderView, annotations: AnnotationIndex = new Map()): string {
   const lines: string[] = [];
@@ -1038,16 +1061,47 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
   }
   const cash = r.candidate_vs_cash.cash_cents ?? 0;
   const candidates = r.candidate_vs_cash.entries;
-  const affordable = candidates.filter(entry => entry.cash_sufficient_for_one_lot === true);
-  const cheapest = candidates.length
-    ? Math.min(...candidates.map(entry => entry.one_lot_total_cents ?? Number.POSITIVE_INFINITY))
+  // 资格字段是 P5 新增；旧报告没有该字段时，下面的文案与资金口径保持原样。
+  const eligibilityKnown = candidates.some(entry => candidateEligibility(entry) !== null);
+  const eligible = candidates.filter(entry => candidateEligibility(entry) === 'eligible');
+  const researchOnly = candidates.filter(entry => candidateEligibility(entry) === 'research_only');
+  const excludedEntries = candidates.filter(entry => candidateEligibility(entry) === 'excluded');
+  // 资金门槛只按完整资格候选比较；research_only 只作研究观察，不参与资金竞争。
+  const funding = candidateFundingEntries(candidates);
+  const affordable = funding.filter(entry => entry.cash_sufficient_for_one_lot === true);
+  const cheapest = funding.length
+    ? Math.min(...funding.map(entry => entry.one_lot_total_cents ?? Number.POSITIVE_INFINITY))
     : Number.POSITIVE_INFINITY;
-  lines.push(`3. **换入其他 ETF**：候选高分项集中于债券/货币类${affordable.length ? `，其中 ${affordable.length} 项现金买得起一手` : Number.isFinite(cheapest) ? `，但一手含费最低约 ${yuan(cheapest)} 元、高于现金 ${yuan(cash)} 元` : '，本期缺少可比报价'}；换入需要先卖出，构成两步决策，目前没有经过检验的优势证据支持换入。候选数据带有降级标记（基准指数未声明），只作资金门槛参考。`);
+  const defensiveEligible = eligible.filter(entry => entry.category === 'bond' || entry.category === 'cash');
+  const defensiveCheapest = defensiveEligible.length
+    ? Math.min(...defensiveEligible.map(entry => entry.one_lot_total_cents ?? Number.POSITIVE_INFINITY))
+    : Number.POSITIVE_INFINITY;
+  const observationClause = [
+    researchOnly.length ? `${researchOnly.length} 项仅有研究资格、只作研究观察` : '',
+    excludedEntries.length ? `${excludedEntries.length} 项有排除原因` : '',
+  ].filter(Boolean).join('，');
+  if (!eligibilityKnown) {
+    // 兼容旧报告：没有资格字段，沿用原来的资金比较与措辞。
+    lines.push(`3. **换入其他 ETF**：候选高分项集中于债券/货币类${affordable.length ? `，其中 ${affordable.length} 项现金买得起一手` : Number.isFinite(cheapest) ? `，但一手含费最低约 ${yuan(cheapest)} 元、高于现金 ${yuan(cash)} 元` : '，本期缺少可比报价'}；换入需要先卖出，构成两步决策，目前没有经过检验的优势证据支持换入。候选数据带有降级标记（基准指数未声明），只作资金门槛参考。`);
+  } else if (eligible.length) {
+    lines.push(`3. **换入其他 ETF**：${eligible.length} 项候选通过完整筛选资格${defensiveEligible.length ? `（其中债券/货币类 ${defensiveEligible.length} 项）` : ''}${affordable.length ? `，其中 ${affordable.length} 项现金买得起一手` : Number.isFinite(cheapest) ? `，但一手含费最低约 ${yuan(cheapest)} 元、高于现金 ${yuan(cash)} 元` : '，但缺少可比报价'}${observationClause ? `；本次展示的候选中另有 ${observationClause}，均不参与资金比较` : ''}；换入需要先卖出，构成两步决策，目前没有经过检验的优势证据支持换入。`);
+  } else {
+    lines.push(`3. **换入其他 ETF**：本期没有通过完整筛选资格的 ETF 候选${observationClause ? `；本次展示的候选中有 ${observationClause}，均不参与资金比较` : ''}，也不构成换入依据。换入需要先卖出，构成两步决策，目前没有经过检验的优势证据支持换入。`);
+  }
   lines.push('4. **沪深主板个股**：本期候选池只覆盖 ETF，没有个股比较数据——这是覆盖缺口，不等于"没有更好的股票"。');
-  lines.push(`5. **保留现金**：现金仅占 ${weightPct(view.cashRatio)}，一手门槛普遍高于现金；"多留现金"实际意味着卖出持仓，回到方案 2 的决策。`);
-  lines.push(Number.isFinite(cheapest)
-    ? `6. **债券、货币等防御工具**：最便宜一手含费约 ${yuan(cheapest)} 元，现金缺口约 ${yuan(Math.max(0, cheapest - cash))} 元；防御的现实路径是卖出部分持仓换取，而不是用现有现金买入。`
-    : '6. **债券、货币等防御工具**：本期缺少可比报价，无法量化资金门槛；防御配置的现实路径是卖出部分持仓换取。');
+  if (!eligibilityKnown) {
+    lines.push(`5. **保留现金**：现金仅占 ${weightPct(view.cashRatio)}，一手门槛普遍高于现金；"多留现金"实际意味着卖出持仓，回到方案 2 的决策。`);
+    lines.push(Number.isFinite(cheapest)
+      ? `6. **债券、货币等防御工具**：最便宜一手含费约 ${yuan(cheapest)} 元，现金缺口约 ${yuan(Math.max(0, cheapest - cash))} 元；防御的现实路径是卖出部分持仓换取，而不是用现有现金买入。`
+      : '6. **债券、货币等防御工具**：本期缺少可比报价，无法量化资金门槛；防御配置的现实路径是卖出部分持仓换取。');
+  } else {
+    lines.push(eligible.length
+      ? `5. **保留现金**：现金仅占 ${weightPct(view.cashRatio)}，${Number.isFinite(cheapest) ? `完整资格候选中一手含费最低约 ${yuan(cheapest)} 元${cheapest > cash ? '、高于现金' : ''}` : '完整资格候选缺少可比报价'}；"多留现金"实际意味着卖出持仓，回到方案 2 的决策。`
+      : `5. **保留现金**：现金仅占 ${weightPct(view.cashRatio)}；本期没有完整资格候选，无法比较一手门槛；"多留现金"实际意味着卖出持仓，回到方案 2 的决策。`);
+    lines.push(Number.isFinite(defensiveCheapest)
+      ? `6. **债券、货币等防御工具**：完整资格防御候选中最低一手含费约 ${yuan(defensiveCheapest)} 元，现金缺口约 ${yuan(Math.max(0, defensiveCheapest - cash))} 元；防御的现实路径是卖出部分持仓换取，而不是用现有现金买入。`
+      : '6. **债券、货币等防御工具**：本期没有完整资格的债券/货币类候选，无法量化资金门槛；防御配置的现实路径是卖出部分持仓换取。');
+  }
   lines.push('');
   lines.push('**结论**：没有可靠优势支持换仓或新增交易；唯一有数据支撑的比较是"集中度 vs 反弹参与度"，它属于风险管理决策，依据是你的风险政策，而不是新的行情信息。');
   return lines.join('\n');
@@ -1213,6 +1267,15 @@ function buildTechnicalSections(
   const l1GapPct = view.l1DrawdownPct !== null && view.drawdown?.current !== null && view.drawdown?.current !== undefined
     ? r6(view.l1DrawdownPct - view.drawdown.current)
     : null;
+  const minOneLot = (entries: DailyReportResult['candidate_vs_cash']['entries']): number | null => {
+    if (!entries.length) return null;
+    const cheapest = Math.min(...entries.map(entry => entry.one_lot_total_cents ?? Number.POSITIVE_INFINITY));
+    return Number.isFinite(cheapest) ? cheapest : null;
+  };
+  // F 节新报告只引用完整资格候选的价格；这两个值保证正文数字可在附件中对上。
+  const eligibleEntries = r.candidate_vs_cash.entries.filter(entry => candidateEligibility(entry) === 'eligible');
+  const eligibleCheapest = minOneLot(eligibleEntries);
+  const defensiveEligibleCheapest = minOneLot(eligibleEntries.filter(entry => entry.category === 'bond' || entry.category === 'cash'));
   const embeddedNumbers = {
     focus_weight_pct: view.focus ? r6(view.focus.weight * 100) : null,
     focus_excess_20d_pp: focusHolding?.research.trend.excess_ret20_vs_broad_pct ?? null,
@@ -1249,6 +1312,11 @@ function buildTechnicalSections(
         return Number.isFinite(cheapest) ? Math.max(0, cheapest - (r.candidate_vs_cash.cash_cents ?? 0)) : null;
       })()
       : null,
+    eligible_cheapest_one_lot_total_cents: eligibleCheapest,
+    eligible_defensive_cheapest_one_lot_total_cents: defensiveEligibleCheapest,
+    eligible_defensive_one_lot_cash_gap_cents: defensiveEligibleCheapest === null
+      ? null
+      : Math.max(0, defensiveEligibleCheapest - (r.candidate_vs_cash.cash_cents ?? 0)),
     etf_quote_ready_count: r.data_quality.tiers.etf_price.ready.length,
     etf_quote_stale_count: r.data_quality.tiers.etf_price.not_ready.length,
     watch_trigger_prices_cny: watchPrices,
