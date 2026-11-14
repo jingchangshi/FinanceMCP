@@ -170,6 +170,14 @@ interface MarketContext {
     median_pct_chg: number | null; amount_yi: number | null; amount_ma20_yi: number | null;
     amount_vs_ma20: number | null; pct_above_ma20: number | null; pct_above_ma60: number | null;
   };
+  /** 当日涨跌停/成交参与事实；仅当报告携带该区块时可用。 */
+  sentiment: {
+    status: 'complete' | 'partial' | 'missing' | 'unavailable';
+    as_of: string | null;
+    limit_up: number | null; limit_down: number | null;
+    limit_up_ratio: number | null; limit_down_ratio: number | null;
+    amount_vs_ma20: number | null;
+  } | null;
   sectors: {
     top: { industry: string; rank: number | null; strength: number | null; ret5_median_pct: number | null; ret20_median_pct: number | null; pct_above_ma20: number | null }[];
     bottom: { industry: string; rank: number | null; strength: number | null; ret5_median_pct: number | null; ret20_median_pct: number | null; pct_above_ma20: number | null }[];
@@ -201,7 +209,7 @@ function loadMarketContext(marketDb: DatabaseSync | null | undefined, asOf: stri
   const unavailable = (reason: string, detail: string, meta: ReportMeta | null = null): MarketContext => ({
     available: false, reason, detail,
     report_id: meta?.report_id ?? null, as_of_trade_date: meta?.trade_date ?? null, status: meta?.status ?? null,
-    freshness: 'missing', regime: null, index_returns: [], breadth: { ...EMPTY_BREADTH },
+    freshness: 'missing', regime: null, index_returns: [], breadth: { ...EMPTY_BREADTH }, sentiment: null,
     sectors: { top: [], bottom: [], all: [] }, judgement: [],
   });
 
@@ -272,6 +280,20 @@ function loadMarketContext(marketDb: DatabaseSync | null | undefined, asOf: stri
       pct_above_ma20: numOf(breadth.pct_above_ma20),
       pct_above_ma60: numOf(breadth.pct_above_ma60),
     },
+    sentiment: (() => {
+      const facts = breadth.sentiment_facts;
+      if (!facts || typeof facts !== 'object') return null;
+      const status = ['complete', 'partial', 'missing'].includes(facts.quality?.status) ? facts.quality.status : 'unavailable';
+      return {
+        status,
+        as_of: strOf(facts.as_of) ?? null,
+        limit_up: numOf(facts.limit_up),
+        limit_down: numOf(facts.limit_down),
+        limit_up_ratio: numOf(facts.limit_up_ratio),
+        limit_down_ratio: numOf(facts.limit_down_ratio),
+        amount_vs_ma20: numOf(facts.amount_vs_ma20),
+      };
+    })(),
     sectors: { top, bottom, all },
     judgement: Array.isArray(market.judgement) ? market.judgement.map((line: unknown) => String(line)) : [],
   };

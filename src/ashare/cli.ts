@@ -43,7 +43,10 @@ const USAGE = `用法: finance-ashare <command> [options]
   portfolio-scenario --action hold|sell-buy [--sell CODE --buy CODE --shares N ...]
                                                                  静态换仓情景（确定性，不下单）
   portfolio-decision --account ID --action hold|reduce|sell-buy|no-action [--sell CODE --shares N]
-        [--buy CODE] [--market-db PATH]                          条件化配置比较（候选行情只来自服务端缓存）`;
+        [--buy CODE] [--market-db PATH]                          条件化配置比较（候选行情只来自服务端缓存）
+  portfolio-strategy-admission <grant|pause|resume|revoke|status>  本地策略准入记录
+  portfolio-strategy-feedback <import|list>                      本地策略反馈事件
+  portfolio-news-evidence <import|list>                          本地可核验消息/公告证据`;
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -117,6 +120,26 @@ async function main() {
   if (command === 'technical-study') {
     const { runTechnicalStudyCommand } = await import('./technicalStudy.js');
     print(runTechnicalStudyCommand(process.argv.slice(3)));
+    return;
+  }
+  if (command === 'portfolio-strategy-admission') {
+    const { handleStrategyAdmission } = await import('./strategyAdmissionCli.js');
+    const result = handleStrategyAdmission(process.argv.slice(3));
+    print(result);
+    if (typeof result === 'object' && result !== null && 'admitted' in result && !result.admitted) process.exitCode = 1;
+    return;
+  }
+  if (command === 'portfolio-strategy-feedback') {
+    const { runStrategyFeedbackCli } = await import('../portfolio/strategyFeedbackCli.js');
+    print(runStrategyFeedbackCli(process.argv.slice(3)));
+    return;
+  }
+  if (command === 'portfolio-news-evidence') {
+    const { runNewsEvidenceCommand } = await import('../portfolio/newsEvidenceCli.js');
+    const sub = process.argv[3] === 'import' ? 'news-evidence-import'
+      : process.argv[3] === 'list' ? 'news-evidence-list' : null;
+    if (!sub) throw new Error('usage: portfolio-news-evidence <import|list> ...');
+    if (!runNewsEvidenceCommand(sub, { arg, flag, ymd, print })) process.exitCode = 2;
     return;
   }
   // Account commands only touch the separate portfolio database. They must not

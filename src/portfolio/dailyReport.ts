@@ -472,6 +472,16 @@ export interface DailyReportResult {
     regime_label: string | null;
     tone: string | null;
     judgement: string[];
+    /** 当日涨跌停/成交参与事实；无该区块或数据不完整时为 null。 */
+    sentiment: {
+      status: 'complete' | 'partial' | 'missing' | 'unavailable';
+      as_of: string | null;
+      limit_up: number | null;
+      limit_down: number | null;
+      limit_up_ratio: number | null;
+      limit_down_ratio: number | null;
+      amount_vs_ma20: number | null;
+    } | null;
     counter_evidence: { id: string; statement: string; as_of: string; source: string }[];
     support_evidence: { id: string; statement: string; as_of: string; source: string }[];
     research_status: 'UNVERIFIED';
@@ -1954,6 +1964,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       regime_label: market.regime?.label ?? null,
       tone: market.regime?.tone ?? null,
       judgement: market.judgement ?? [],
+      sentiment: summary.market_context?.sentiment ?? null,
       counter_evidence: (evidence.contradiction ?? []).map((item: any) => ({
         id: item.id, statement: item.statement, as_of: item.as_of, source: item.source,
       })),
