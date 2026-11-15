@@ -2,8 +2,15 @@
   "enabled": true,
   "identity": "bot",
   "format": "docx",
-  "name_prefix": "A股账户研究日报",
+  "name_prefix": "A股攻防实战日报",
   "folder_token_env": "FEISHU_ACCOUNT_FOLDER_TOKEN",
   "folder_token": "",
+  "fallback_to_bot_root_on_permission_error": true,
+  "fallback_to_create_on_update_permission_error": true,
+  "notify_enabled": true,
+  "notify_user_id_env": "FEISHU_NOTIFY_USER_ID",
+  "notify_user_id": "",
+  "notify_chat_id_env": "FEISHU_NOTIFY_CHAT_ID",
+  "notify_fallback_chat_id": "",
   "image_width_px": 780
 }

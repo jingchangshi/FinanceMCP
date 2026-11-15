@@ -1,13 +1,13 @@
 [Unit]
-Description=Run the FinanceMCP A-share daily pipeline after the close (Asia/Shanghai)
+Description=Run the FinanceMCP unified A-share V3 daily pipeline after close (Asia/Shanghai)
 
 [Timer]
-# First run after Tushare publishes daily/daily_basic; the second run fills in
-# anything that was still missing (the report is regenerated, NOT_READY → READY).
-OnCalendar=Mon..Fri *-*-* 18:40:00 Asia/Shanghai
-OnCalendar=Mon..Fri *-*-* 21:10:00 Asia/Shanghai
+# Start early once Tushare begins publishing daily/ETF/NAV; run-daily-unified.sh
+# polls every 10 minutes up to 21:15 CST only when data is not yet READY, then
+# runs hotspot snapshot, account research bundle, Feishu Docx publish, and IM notify.
+OnCalendar=Mon..Fri *-*-* 17:20:00 Asia/Shanghai
 Persistent=true
-RandomizedDelaySec=120
+RandomizedDelaySec=60
 
 [Install]
 WantedBy=timers.target

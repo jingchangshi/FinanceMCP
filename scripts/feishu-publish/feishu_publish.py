@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -80,23 +81,58 @@ def normalized_hash(xml_text: str) -> str:
     return hashlib.sha256(xml_text.replace("\r\n", "\n").encode()).hexdigest()
 
 
+def normalize_trade_date(trade_date: Any) -> str:
+    return str(trade_date or "").replace("-", "").strip()
+
+
+def resolve_lark_bin() -> str:
+    """Resolve lark-cli binary path even under systemd minimal PATH."""
+    env_bin = str(os.environ.get("LARK_CLI_BIN") or "").strip()
+    if env_bin:
+        return env_bin
+    which_bin = shutil.which("lark-cli")
+    if which_bin:
+        return which_bin
+    home_candidate = Path.home() / "Software" / "node" / "bin" / "lark-cli"
+    if home_candidate.exists():
+        return str(home_candidate)
+    return "lark-cli"
+
+
 def run_lark(argv: list[str], cwd: Path) -> dict[str, Any]:
     """Run ``lark-cli`` and parse its JSON envelope (duplicated pattern)."""
+    cmd = [resolve_lark_bin(), *argv[1:]] if argv and argv[0] == "lark-cli" else list(argv)
     completed = subprocess.run(
-        argv, cwd=cwd, capture_output=True, text=True, timeout=180
+        cmd, cwd=cwd, capture_output=True, text=True, timeout=180
     )
-    payload = completed.stdout if completed.returncode == 0 else completed.stderr
-    try:
-        result = json.loads(payload)
-    except json.JSONDecodeError as exc:
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    result = None
+    for payload in ((stderr, stdout) if completed.returncode != 0 else (stdout, stderr)):
+        if not payload:
+            continue
+        try:
+            result = json.loads(payload)
+            break
+        except json.JSONDecodeError:
+            continue
+    if result is None:
         raise RuntimeError(
             f"lark-cli returned non-JSON output (exit={completed.returncode})"
-        ) from exc
+        )
     if completed.returncode != 0 or not result.get("ok"):
         error = result.get("error") or {}
+        err_msg = str(error.get("message") or "").strip()
+        if not err_msg:
+            data_obj = result.get("data") or {}
+            warnings = data_obj.get("warnings")
+            if isinstance(warnings, list) and warnings:
+                err_msg = "; ".join(str(item) for item in warnings if str(item).strip())
+            elif data_obj.get("result"):
+                err_msg = str(data_obj.get("result"))
         raise RuntimeError(
-            f"Lark publish failed: {error.get('type', 'unknown')}: "
-            f"{error.get('message', 'no message')}"
+            f"Lark publish failed: {error.get('type') or 'unknown'}: "
+            f"{err_msg or 'no message'}"
         )
     return result
 
@@ -148,8 +184,9 @@ def load_ledger(path: Path) -> list[dict[str, Any]]:
 
 
 def ledger_entry_for_date(entries: list[dict[str, Any]], trade_date: str) -> dict[str, Any] | None:
-    for entry in entries:
-        if str(entry.get("trade_date")) == str(trade_date):
+    target = normalize_trade_date(trade_date)
+    for entry in reversed(entries):
+        if normalize_trade_date(entry.get("trade_date")) == target:
             return entry
     return None
 
@@ -165,16 +202,19 @@ def write_ledger(path: Path, entries: list[dict[str, Any]]) -> None:
 
 def upsert_ledger(path: Path, entry: dict[str, Any]) -> None:
     entries = load_ledger(path)
-    trade_date = str(entry["trade_date"])
+    target = normalize_trade_date(entry["trade_date"])
+    kept: list[dict[str, Any]] = []
     replaced = False
-    for index, existing in enumerate(entries):
-        if str(existing.get("trade_date")) == trade_date:
-            entries[index] = entry
-            replaced = True
-            break
+    for existing in entries:
+        if normalize_trade_date(existing.get("trade_date")) == target:
+            if not replaced:
+                kept.append(entry)
+                replaced = True
+        else:
+            kept.append(existing)
     if not replaced:
-        entries.append(entry)
-    write_ledger(path, entries)
+        kept.append(entry)
+    write_ledger(path, kept)
 
 
 def write_incident(path: Path, incident: dict[str, Any]) -> None:
@@ -251,42 +291,97 @@ def publish(
         document_url = None
     relative_xml = _relative_to_root(root, xml_path)
 
+    parent_fallback: str | None = None
+    update_fallback: str | None = None
+    previous_document_id: str | None = None
+    recreated = False
     if document_id:
-        result = runner(
-            [
-                "lark-cli", "docs", "+update", "--as", identity,
-                "--doc", str(document_id), "--command", "overwrite",
-                "--doc-format", "xml", "--content", f"@./{relative_xml}",
-                "--format", "json",
-            ],
-            root,
-        )
-    else:
-        result = runner(
-            [
-                "lark-cli", "docs", "+create", "--as", identity,
-                "--doc-format", "xml", "--content", f"@./{relative_xml}",
-                "--parent-token", str(folder_token),
-                "--format", "json",
-            ],
-            root,
-        )
+        try:
+            result = runner(
+                [
+                    "lark-cli", "docs", "+update", "--as", identity,
+                    "--doc", str(document_id), "--command", "overwrite",
+                    "--doc-format", "xml", "--content", f"@./{relative_xml}",
+                    "--format", "json",
+                ],
+                root,
+            )
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            perm_tokens = (
+                "permission",
+                "lacks view or edit access",
+                "4030004",
+                "981004",
+                "forbidden",
+            )
+            can_recreate = bool(
+                config.get("fallback_to_create_on_update_permission_error", True)
+            ) and any(tok in msg for tok in perm_tokens)
+            if not can_recreate:
+                raise
+            previous_document_id = document_id
+            update_fallback = "recreated_on_update_permission_error"
+            recreated = True
+            document_id = None
+            document_url = None
+    if not document_id:
+        try:
+            result = runner(
+                [
+                    "lark-cli", "docs", "+create", "--as", identity,
+                    "--doc-format", "xml", "--content", f"@./{relative_xml}",
+                    "--parent-token", str(folder_token),
+                    "--format", "json",
+                ],
+                root,
+            )
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            can_fallback = (
+                identity == "bot"
+                and bool(config.get("fallback_to_bot_root_on_permission_error", True))
+                and ("permission" in msg or "parent location" in msg)
+            )
+            if not can_fallback:
+                raise
+            parent_fallback = "bot_root_permission_denied"
+            result = runner(
+                [
+                    "lark-cli", "docs", "+create", "--as", identity,
+                    "--doc-format", "xml", "--content", f"@./{relative_xml}",
+                    "--format", "json",
+                ],
+                root,
+            )
         document = (result.get("data") or {}).get("document") or {}
         document_id = document.get("document_id")
         document_url = document.get("url")
     if not document_id:
         raise RuntimeError("Lark publish did not return a document_id")
+    if not document_url:
+        document_url = f"https://my.feishu.cn/docx/{document_id}"
 
-    fetched = runner(
-        [
-            "lark-cli", "docs", "+fetch", "--as", identity,
-            "--doc", str(document_id), "--doc-format", "xml",
-            "--detail", "simple", "--format", "json",
-        ],
-        root,
-    )
+    fetch_cmd = [
+        "lark-cli", "docs", "+fetch", "--as", identity,
+        "--doc", str(document_id), "--doc-format", "xml",
+        "--detail", "simple", "--format", "json",
+    ]
+    fetched = runner(fetch_cmd, root)
     remote_document = (fetched.get("data") or {}).get("document") or {}
     problems = verify_readback(remote_document.get("content"), title, source_count)
+    if existing and not recreated and any("title mismatch" in p for p in problems):
+        runner(
+            [
+                "lark-cli", "drive", "+update-title", "--as", identity,
+                "--token", str(document_id), "--type", "docx",
+                "--title", title, "--format", "json",
+            ],
+            root,
+        )
+        fetched = runner(fetch_cmd, root)
+        remote_document = (fetched.get("data") or {}).get("document") or {}
+        problems = verify_readback(remote_document.get("content"), title, source_count)
     if problems:
         incident_path = root / LEDGER_DIR / INCIDENT_NAME
         write_incident(
@@ -317,6 +412,15 @@ def publish(
         "renderer_version": RENDERER_VERSION,
         "identity": identity,
         "format": "docx",
+        **({"parent_fallback": parent_fallback} if parent_fallback else {}),
+        **(
+            {
+                "update_fallback": update_fallback,
+                "previous_document_id": previous_document_id,
+            }
+            if update_fallback
+            else {}
+        ),
     }
     upsert_ledger(ledger_path, entry)
     return entry
