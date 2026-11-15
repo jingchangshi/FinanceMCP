@@ -89,6 +89,10 @@ function seed(file, { fundTables = true, shareTable = true, illiquidCodes = [], 
         DAYS.map(date => ({ ts_code: code, trade_date: date, fd_share: 1e6 })));
     }
   }
+  db.exec(`
+    INSERT OR REPLACE INTO fund_nav (ts_code, ann_date, nav_date, unit_nav, accum_nav, adj_nav)
+    SELECT ts_code, trade_date, trade_date, close, close, close FROM fund_daily WHERE close > 0;
+  `);
   return db;
 }
 

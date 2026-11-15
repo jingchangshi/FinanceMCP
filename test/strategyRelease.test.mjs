@@ -81,3 +81,11 @@ test('tampering, missing fields and unknown states fail closed', () => {
     assert.throws(() => validateStrategyRelease(copy));
   }
 });
+
+test('APPROVED_FOR_ACCOUNT validates and hashes deterministically', () => {
+  const release = structuredClone(fixture);
+  release.research_status = 'FROZEN';
+  release.production_admission = 'APPROVED_FOR_ACCOUNT';
+  rehash(release);
+  assert.equal(validateStrategyRelease(release), release.content_hash);
+});

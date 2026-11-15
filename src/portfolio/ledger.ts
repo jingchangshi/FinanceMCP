@@ -300,7 +300,7 @@ const YMD = /^\d{8}$/;
 export function isEtfCode(tsCode: string): boolean {
   const digits = tsCode.split('.')[0].replace(/[^0-9]/g, '');
   if (digits.length !== 6) return false;
-  return /^(15|16|18|50|51|52|56|58)/.test(digits);
+  return /^(15|16|18|50|51|52|53|56|58)/.test(digits);
 }
 
 /**

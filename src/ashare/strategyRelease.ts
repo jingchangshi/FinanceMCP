@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 
-/** Offline interchange only; no production admission or execution authority. */
+/** Offline & account-admitted strategy release interchange contract. */
 export type StrategyRelease = {
   schema_version: 'strategy-release-1';
   research_status: 'DRAFT' | 'RESEARCH_PUBLISHED' | 'FROZEN' | 'PROSPECTIVE_SHADOW_ACTIVE' | 'REJECTED';
-  production_admission: 'NOT_APPROVED';
+  production_admission: 'NOT_APPROVED' | 'APPROVED_FOR_ACCOUNT';
   strategy: { id: string; version: string; implementation_sha256: string };
   applicability: { market: string; environment: string };
   execution_assumptions: { signal_timing: string; earliest_execution: string; exit: string; fees: string; lot_size: string };
@@ -18,6 +18,7 @@ export type StrategyRelease = {
 const SHA = /^[0-9a-f]{64}$/;
 const KEY = /^[A-Za-z][A-Za-z0-9_]*$/;
 const statuses = new Set(['DRAFT', 'RESEARCH_PUBLISHED', 'FROZEN', 'PROSPECTIVE_SHADOW_ACTIVE', 'REJECTED']);
+const admissions = new Set(['NOT_APPROVED', 'APPROVED_FOR_ACCOUNT']);
 const fail = (): never => { throw new Error('invalid_strategy_release'); };
 function object(value: unknown, keys: string[]): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return fail();
@@ -49,7 +50,7 @@ function canonical(value: unknown): string {
 /** Validate the entire contract and return its verified content hash. */
 export function validateStrategyRelease(value: unknown): string {
   const root = object(value, ['schema_version', 'research_status', 'production_admission', 'strategy', 'applicability', 'execution_assumptions', 'inputs', 'rules', 'parameters', 'evidence', 'content_hash']);
-  if (root.schema_version !== 'strategy-release-1' || typeof root.research_status !== 'string' || !statuses.has(root.research_status) || root.production_admission !== 'NOT_APPROVED') fail();
+  if (root.schema_version !== 'strategy-release-1' || typeof root.research_status !== 'string' || !statuses.has(root.research_status) || typeof root.production_admission !== 'string' || !admissions.has(root.production_admission)) fail();
   const strategy = object(root.strategy, ['id', 'version', 'implementation_sha256']);
   text(strategy.id); text(strategy.version); text(strategy.implementation_sha256);
   if (strategy.implementation_sha256 !== 'UNKNOWN' && !SHA.test(strategy.implementation_sha256)) fail();

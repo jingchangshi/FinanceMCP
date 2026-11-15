@@ -243,3 +243,200 @@ class InternalTokenGuardTests(unittest.TestCase):
         from feishu_render import check_internal_tokens
         self.assertEqual(check_internal_tokens("正常文字 cash_plan 与 NOT_PROVIDED"), ["NOT_PROVIDED", "cash_plan"])
         self.assertEqual(check_internal_tokens("159558.SZ 收盘 0.812 元，L1 档"), [])
+
+
+class TestV3CockpitSections(unittest.TestCase):
+    def _v3_bundle(self, *, actionable: bool = False):
+        bundle = minimal_bundle()
+        bundle["as_of_trade_date"] = "20261113"
+        bundle["portfolio"]["expected_next_trade_date"] = "20261116"
+        bundle["portfolio"]["gate"] = {
+            "satisfied": True,
+            "reported_events_through": "20261103",
+            "last_user_reconciled_at": "2026-10-16T15:00:00+08:00",
+            "unreported_trade_risk": True,
+        }
+        actions = []
+        if actionable:
+            actions = [{
+                "priority": "P2",
+                "code": "P2-DECONCENTRATE-159558",
+                "kind": "REDUCE",
+                "title": "执行 159558.SZ 四批换马（第1批）：卖出 11000 份",
+                "reasons": ["收盘 0.885 元已达到自基准价反弹 +8% 目标（0.885 元），按计划减持 11000 份。"],
+                "legs": [{
+                    "side": "SELL",
+                    "ts_code": "159558.SZ",
+                    "name": "半导体设备ETF易方达",
+                    "quantity": 11000,
+                    "lot_size": 100,
+                    "lots": 110,
+                    "price_milli": 885,
+                    "gross_cents": 973500,
+                    "fees_cents": 500,
+                    "net_cents": 973000,
+                    "quote_trade_date": "20261113",
+                    "executable": True,
+                    "reason": "P2_REBOUND_8PCT",
+                }],
+                "fees_cents": 500,
+            }]
+        bundle["portfolio"]["actionable"] = bool(actions)
+        bundle["portfolio"]["first_section"] = {"actions": actions, "observation_triggers": []}
+        bundle["portfolio"]["v3_cockpit"] = {
+            "schema": "v3-offensive-cockpit/1.0",
+            "as_of_trade_date": "20261113",
+            "principal": {
+                "initial_principal_cents": 10000000,
+                "current_nav_cents": 6860690,
+                "to_principal_gap_cents": 3139310,
+                "to_principal_return_needed_pct": 45.76,
+                "loss_from_principal_pct": 31.39,
+            },
+            "market_regime": {
+                "regime": "OFFENSIVE",
+                "regime_label_zh": "进攻档（85%目标权益）",
+                "raw_regime": "OFFENSIVE",
+                "hysteresis_held": False,
+                "crash_override": False,
+                "style": "GROWTH_LEADING",
+                "style_label_zh": "成长占优",
+                "style_spread_20d_pp": 3.45,
+                "target_equity_bps": 8500,
+                "defensive_cash_bps": 1500,
+                "target_equity_pct": 85,
+                "defensive_cash_pct": 15,
+                "pct_above_ma60": 0.62,
+                "amount_vs_ma20": 1.15,
+                "limit_down": 12,
+                "hs300_above_ma60": True,
+                "zz500_above_ma60": True,
+                "cyb_above_ma60": True,
+            },
+            "router": {
+                "effective_regime": "OFFENSIVE",
+                "circuit_breaker_status": "NORMAL",
+                "circuit_breaker_label_zh": "正常运作",
+                "locked_until_trade_date": None,
+                "hwm_nav_cents": 6860690,
+                "hwm_date": "20261113",
+                "hwm_drawdown_pct": 0.0,
+                "lifeline_nav_cents": 5831587,
+                "lifeline_buffer_cents": 1029103,
+                "lifeline_buffer_pct": 15.0,
+                "sub_strategies": {
+                    "s_deconcentrate": "ACTIVE",
+                    "s_base_super_etf": "ACTIVE",
+                    "s_stock_swing": "LOCKED_PENDING_VALIDATION",
+                },
+                "sub_strategies_zh": {
+                    "deconcentrate_label": "四批换马进行中",
+                    "base_etf_label": "超级ETF配置运行中",
+                    "stock_swing_label": "待第二阶段回测实验验证解锁",
+                },
+            },
+            "deconcentration": {
+                "plan_present": True,
+                "ts_code": "159558.SZ",
+                "plan_status": "ACTIVE",
+                "initial_shares": 58900,
+                "current_shares": 58900,
+                "target_keep_bps": 1800,
+                "target_keep_shares": 15000,
+                "reference_price_cny": 0.819,
+                "rebound_trigger_cny": 0.885,
+                "ma60_cny": 0.84,
+                "ma60_protect_cny": 0.827,
+                "breakdown_ma60_2d": False,
+                "next_monthly_trigger_date": "20261201",
+                "recommended_sell_shares": 11000 if actionable else 0,
+                "active_trigger_reason": "REBOUND_8PCT" if actionable else None,
+                "tranches": [
+                    {"tranche_no": 1, "planned_shares": 11000, "status": "TRIGGERED" if actionable else "PENDING"},
+                    {"tranche_no": 2, "planned_shares": 11000, "status": "PENDING"},
+                    {"tranche_no": 3, "planned_shares": 11000, "status": "PENDING"},
+                    {"tranche_no": 4, "planned_shares": 10900, "status": "PENDING"},
+                ],
+                "status_summary_zh": "159558.SZ 四批换马已执行 0/4 批；下一观察条件：月度窗口 20261201 或反弹至 0.885 元。",
+            },
+            "reconciliation_reminder": {
+                "lag_trade_days": 8,
+                "needs_reminder": True,
+                "message_zh": "提示：距离最近一次账本流水声明（20261103）已过 8 个交易日，若期间有手工成交请先补录再核对委托份数。",
+            },
+            "super_etf_candidates": [
+                {
+                    "ts_code": "159205.SZ",
+                    "name": "科创创业50ETF",
+                    "close_cny": 1.125,
+                    "premium_pct": 0.12,
+                    "fee_label_zh": "东财超级ETF（万分之0.5佣金，免5元低消）",
+                    "style_match_zh": "契合当前成长占优风格",
+                }
+            ],
+            "cross_border_monitor": [
+                {
+                    "ts_code": "513100.SH",
+                    "name": "纳指ETF",
+                    "unit_nav": 1.600,
+                    "premium_pct": 3.12,
+                    "buy_blocked": True,
+                    "status_zh": "已拦截禁买（溢价 3.12% 高于 +2.5% 红线）",
+                }
+            ],
+            "actions_summary": actions,
+        }
+        return bundle
+
+    def test_v3_cockpit_actionable_and_hold_render_clean_xml(self):
+        from feishu_render import check_forbidden, check_internal_tokens, check_markdown_leak, render_xml, strip_tags
+
+        for actionable in (False, True):
+            sections = build_sections(self._v3_bundle(actionable=actionable), generated_at="2026-11-13 18:00")
+            self.assertEqual(validate_sections(sections), [], f"actionable={actionable}")
+            xml = render_xml(sections)
+            vis = strip_tags(xml)
+            self.assertEqual(check_forbidden(vis), [])
+            self.assertEqual(check_internal_tokens(vis), [])
+            self.assertEqual(check_markdown_leak(vis), [])
+            self.assertIn("100,000.00 元", vis)
+            self.assertIn("159558.SZ", vis)
+            self.assertIn("纳指ETF", vis)
+            self.assertIn("已拦截禁买", vis)
+            if actionable:
+                self.assertIn("11000 份", vis)
+                self.assertIn("已按规则生成可执行份数", sections["sections"]["今日判断"]["execution_note"])
+            else:
+                self.assertIn("已过 8 个交易日", sections["sections"]["账户与风险"]["narrative"])
+
+    def test_v3_cockpit_phase3_stock_swing_and_preemptive_l2(self):
+        from feishu_render import check_forbidden, check_internal_tokens, check_markdown_leak, render_xml, strip_tags
+
+        bundle = self._v3_bundle(actionable=False)
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["router"]["deconcentration_preemptive_active"] = True
+        cockpit["router"]["l2_trigger_drawdown_bps"] = 1200
+        cockpit["router"]["sub_strategies"]["s_stock_swing"] = "ACTIVE"
+        cockpit["router"]["sub_strategies_zh"]["stock_swing_label"] = "先锋主板强势股波段：强势股缩量回踩20日线买点已解锁运行"
+        cockpit["stock_swing_candidates"] = [
+            {
+                "ts_code": "601001.SH",
+                "name": "优质主板回踩",
+                "industry": "电子化学品",
+                "entry_ref_price_cny": 20.35,
+                "max_chase_price_cny": 20.76,
+                "hard_stop_price_cny": 19.33,
+                "stop_loss_pct": -5.01,
+                "reasons_zh": ["相对强度百分位达 92.5", "缩量回踩 20 日均线企稳收阳"],
+            }
+        ]
+        sections = build_sections(bundle, generated_at="2026-11-15 16:30")
+        self.assertEqual(validate_sections(sections), [])
+        xml = render_xml(sections)
+        vis = strip_tags(xml)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertEqual(check_markdown_leak(vis), [])
+        self.assertIn("优质主板回踩", vis)
+        self.assertIn("601001.SH", vis)
+        self.assertIn("12% 前置熔断清零高波动权益", vis)

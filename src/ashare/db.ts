@@ -154,6 +154,16 @@ CREATE TABLE IF NOT EXISTS fund_share (
   ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, fd_share REAL, fund_type TEXT, market TEXT,
   PRIMARY KEY (ts_code, trade_date)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS fund_nav (
+  ts_code TEXT NOT NULL,
+  ann_date TEXT,
+  nav_date TEXT NOT NULL,
+  unit_nav REAL,
+  accum_nav REAL,
+  adj_nav REAL,
+  PRIMARY KEY (ts_code, nav_date)
+);
+CREATE INDEX IF NOT EXISTS idx_fund_nav_date ON fund_nav(nav_date);
 CREATE TABLE IF NOT EXISTS fund_sync_log (
   dataset TEXT NOT NULL, key TEXT NOT NULL,
   rows INTEGER NOT NULL, status TEXT NOT NULL, message TEXT,

@@ -303,8 +303,296 @@ def _top_etf_alternative(bundle: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _build_v3_cockpit_sections(
+    bundle: Dict[str, Any],
+    cockpit: Dict[str, Any],
+    *,
+    generated_at: str = "",
+) -> Dict[str, Any]:
+    """V3 进取型低频攻防系统专用的飞书六节输出（非 Markdown 纯文本，免内部枚举泄漏）。"""
+    as_of = str(bundle.get("as_of_trade_date") or cockpit.get("as_of_trade_date") or "")
+    portfolio = bundle.get("portfolio") or {}
+    revalued = _get(portfolio, "account_view", "revalued_basis") or {}
+    gate = portfolio.get("gate") or {}
+    gate_satisfied = bool(gate.get("satisfied"))
+    total_cents = revalued.get("total_assets_cents")
+    cash_cents = revalued.get("cash_cents")
+    wealth_cents = revalued.get("wealth_cents")
+    securities_cents = revalued.get("securities_mv_cents")
+    if wealth_cents is None and all(isinstance(v, int) for v in (total_cents, cash_cents, securities_cents)):
+        wealth_cents = total_cents - securities_cents - cash_cents
+
+    principal = cockpit.get("principal") or {}
+    mr = cockpit.get("market_regime") or {}
+    router = cockpit.get("router") or {}
+    deconc = cockpit.get("deconcentration") or {}
+    rem = cockpit.get("reconciliation_reminder") or {}
+    sub_zh = router.get("sub_strategies_zh") or {}
+    focus = judgment_of(bundle)["focus"]
+    focus_weight = focus.get("weight")
+    focus_name = focus.get("name") or focus.get("ts_code") or "最大持仓"
+    focus_code = focus.get("ts_code") or ""
+
+    # 1. 今日判断
+    first_section = portfolio.get("first_section") or {}
+    actions = first_section.get("actions") or []
+    is_actionable = bool(portfolio.get("actionable")) and bool(actions)
+    report_model = bundle.get("report_model") if isinstance(bundle.get("report_model"), dict) else {}
+    conclusion = str(report_model.get("conclusion") or "").strip()
+
+    action_lines: List[str] = []
+    if actions:
+        for act in actions[:3]:
+            if not isinstance(act, dict):
+                continue
+            legs_txt: List[str] = []
+            for leg in (act.get("legs") or []):
+                if not isinstance(leg, dict):
+                    continue
+                side_zh = "卖出" if leg.get("side") == "SELL" else "买入"
+                qty = leg.get("quantity") or 0
+                px = (leg.get("price_milli") or 0) / 1000.0
+                fee = _fmt_money(leg.get("fees_cents"))
+                legs_txt.append(f"{side_zh} {leg.get('ts_code')} {qty} 份（参考收盘 {px:.3f} 元，估算费用 {fee}）")
+            action_lines.append(f"{act.get('title', '交易指令')}：{'；'.join(legs_txt)}")
+
+    if not conclusion:
+        if is_actionable and action_lines:
+            conclusion = "本期可执行规则指令：" + "；".join(action_lines) + "。"
+        else:
+            conclusion = (
+                f"本期处于{mr.get('regime_label_zh', '结构震荡档')}（{mr.get('style_label_zh', '风格均衡')}），"
+                f"未触发新的规则调仓阈值；{deconc.get('status_summary_zh', '维持当前配置观察。')}"
+            )
+
+    regime_desc = (
+        f"双锚攻防档位：{mr.get('regime_label_zh', '未知')}（目标权益上限 {_fmt_pct(mr.get('target_equity_pct'), 0)}，"
+        f"防御现金下限 {_fmt_pct(mr.get('defensive_cash_pct'), 0)}）；风格：{mr.get('style_label_zh', '均衡')}。"
+    )
+    spread = mr.get("style_spread_20d_pp")
+    if isinstance(spread, (int, float)):
+        regime_desc += f"近20日大小盘相对收益差 {spread:+.2f} 个百分点。"
+
+    deconc_next = []
+    if deconc.get("rebound_trigger_cny") is not None:
+        deconc_next.append(f"反弹 +8% 目标价 {_tick_price(deconc['rebound_trigger_cny'])} 元")
+    if deconc.get("next_monthly_trigger_date"):
+        deconc_next.append(f"下个保底月度窗口 {_ymd(deconc['next_monthly_trigger_date'])}")
+    if deconc.get("ma60_protect_cny") is not None:
+        deconc_next.append(f"60日均线防守位 {_tick_price(deconc['ma60_protect_cny'])} 元")
+    deconc_line = str(deconc.get("status_summary_zh") or "集中度换马状态未初始化。")
+
+    reasons: List[str] = [regime_desc]
+    if action_lines:
+        reasons.append("可执行动作：" + "；".join(action_lines))
+    else:
+        reasons.append(deconc_line)
+    if rem.get("needs_reminder") and rem.get("message_zh"):
+        reasons.append(str(rem["message_zh"]))
+
+    hwm_dd = router.get("hwm_drawdown_pct")
+    max_risk = (
+        f"第一风险源：{focus_name}（{focus_code}）占比 {_fmt_pct((focus_weight or 0) * 100)}；"
+        f"动态高水位 {_fmt_money(router.get('hwm_nav_cents'))} 对应 15% 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}"
+        f"（当前自高水位回撤 {_fmt_pct(hwm_dd)}，距离生命线安全缓冲 {_fmt_pct(router.get('lifeline_buffer_pct'))}）。"
+    )
+    change_condition = (
+        "触发任意以下条件即更新动作："
+        + ("；".join(deconc_next) if deconc_next else "159558.SZ 达到分批减仓条件")
+        + "，或账户自动态高水位回撤达到 15% 生命线。"
+    )
+    if is_actionable and action_lines:
+        execution_note = "已按规则生成可执行份数，请核对委托价格与券商端余额后手动下单。"
+    elif gate_satisfied:
+        execution_note = "本日未触发买卖条件，继续按既定止损线与四批换马条件跟踪，不因对账间隔天数盲目清空策略输出。"
+    else:
+        execution_note = "账户基础核验或快照未确认为当日有效状态，本报告仅作只读观察参考，不授权直接下单。"
+
+    # 2. 账户与风险
+    ref = "" if gate_satisfied else "（参考）"
+    account_status_note = "已完成基础确认（可执行规则已启用）" if gate_satisfied else "待确认（仅作研究参考）"
+    metrics: List[List[str]] = [
+        [f"总资产{ref}", _fmt_money(total_cents)],
+        [f"现金{ref}", _fmt_money(cash_cents)],
+        [f"证券市值{ref}", _fmt_money(securities_cents)],
+        [f"理财/其他资产{ref}", _fmt_money(wealth_cents)],
+        ["初始投入本金", _fmt_money(principal.get("initial_principal_cents"))],
+        [
+            "距本金回本差额",
+            f"{_fmt_money(principal.get('to_principal_gap_cents'))}（需涨 {_fmt_pct(principal.get('to_principal_return_needed_pct'))}）",
+        ],
+        [
+            "动态高水位及日期",
+            f"{_fmt_money(router.get('hwm_nav_cents'))}（{_ymd(router.get('hwm_date'))}）",
+        ],
+        [
+            "15% 熔断生命线与缓冲",
+            f"{_fmt_money(router.get('lifeline_nav_cents'))}（缓冲 {_fmt_pct(router.get('lifeline_buffer_pct'))}）",
+        ],
+        [
+            "档位目标权益占比",
+            f"{mr.get('regime_label_zh', '')}｜目标 {_fmt_pct(mr.get('target_equity_pct'), 0)}（当前最大持仓占比 {_fmt_pct((focus_weight or 0) * 100)}）",
+        ],
+    ]
+    narrative = (
+        f"账户安全状态：{router.get('circuit_breaker_label_zh', '正常运作')}，"
+        f"当前较动态高水位回撤 {_fmt_pct(hwm_dd)}，单笔新建仓位严格执行 -8% 硬止损与 +15% 保本上移规则。"
+    )
+    if rem.get("needs_reminder") and rem.get("message_zh"):
+        narrative += " " + str(rem["message_zh"])
+
+    # 3. 三项主要证据
+    market = bundle.get("market") or {}
+    breadth = market.get("breadth") or {}
+    up, down = breadth.get("up"), breadth.get("down")
+    amt = breadth.get("amount_yi")
+    tranches = deconc.get("tranches") or []
+    exec_cnt = sum(1 for t in tranches if isinstance(t, dict) and t.get("status") == "EXECUTED")
+    tranche_desc = "、".join(
+        f"第{t.get('tranche_no')}批{t.get('planned_shares')}份({ '已执行' if t.get('status')=='EXECUTED' else '已触发' if t.get('status')=='TRIGGERED' else '待触发' })"
+        for t in tranches if isinstance(t, dict)
+    ) or "暂无分批记录"
+    cb_rows = cockpit.get("cross_border_monitor") or []
+    cb_text = "；".join(
+        f"{c.get('name')}({c.get('ts_code')})：净值 {_tick_price(c.get('unit_nav')) if c.get('unit_nav') is not None else '缺失'}，"
+        f"折溢价 {c.get('premium_pct'):+.2f}%（{c.get('status_zh')}）"
+        if isinstance(c.get("premium_pct"), (int, float))
+        else f"{c.get('name')}({c.get('ts_code')})：{c.get('status_zh')}"
+        for c in cb_rows[:5] if isinstance(c, dict)
+    ) or "本期未检出待购跨境基金超溢价风险。"
+
+    items = [
+        {
+            "label": "① 市场双锚档位与风格广度",
+            "observation": (
+                f"{mr.get('regime_label_zh', '未知')}｜{mr.get('style_label_zh', '均衡')}；"
+                f"上涨 {up if up is not None else '—'} 家 / 下跌 {down if down is not None else '—'} 家，"
+                f"两市成交额 {f'{amt:.0f} 亿' if isinstance(amt, (int, float)) else '—'}。"
+            ),
+            "why": "进攻85%/结构60%/防守15%仓位切换由双锚均线、60日站上占比与放量过滤（含连续两日确认与单日急跌熔断）共同决定。",
+            "missing": "已提供本地双锚指数与市场广度缓存。",
+        },
+        {
+            "label": "② 159558.SZ 四批换马状态机",
+            "observation": (
+                f"当前执行进度 {exec_cnt}/{len(tranches) or 4} 批，目标留存 {deconc.get('target_keep_shares', 15000)} 份；"
+                f"拆分计划：{tranche_desc}。"
+            ),
+            "why": "锁定既有份数拆分避免每日重复卖出；仅当月度保底窗口、反弹+8%加速或空头防守跌破60日线才触发单批委托。",
+            "missing": "触发条件明确： " + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
+        },
+        {
+            "label": "③ 跨境基金净值折溢价红线（> +2.5% 或滞后超 3 日禁买）",
+            "observation": cb_text,
+            "why": "直接读取基金单位净值核算溢价率，从源头拦截高溢价追高与净值滞后盲买。",
+            "missing": "若期间存在场外未录入手工成交，请结合券商 App 核对最新可用现金与份数。",
+        },
+    ]
+
+    # 4. 持仓判断
+    holdings_rows: List[Dict[str, str]] = []
+    for h in holdings_of(bundle):
+        ts_code = str(h.get("ts_code") or "")
+        name = str(h.get("name") or ts_code)
+        quote = _get(h, "research", "quote") or {}
+        close_px = _tick_price(quote.get("close_cny")) if quote.get("close_cny") is not None else "—"
+        chg = quote.get("pct_chg")
+        chg_txt = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "—"
+        if ts_code == "159558.SZ":
+            judgment = "执行减仓" if is_actionable and any("159558.SZ" in l for l in action_lines) else "按四批换马持有观察"
+            basis = f"收盘 {close_px} 元（{chg_txt}），权重 {_fmt_pct((h.get('weight') or 0) * 100)}；{deconc_line}"
+        else:
+            judgment = "继续持有并随组合跟踪"
+            basis = f"收盘 {close_px} 元（{chg_txt}），权重 {_fmt_pct((h.get('weight') or 0) * 100)}。"
+        holdings_rows.append({"symbol": f"{ts_code}（{name}）", "judgment": judgment, "basis": basis})
+
+    # 5. 是否存在更好的选择
+    options: List[Dict[str, str]] = []
+    super_cands = cockpit.get("super_etf_candidates") or []
+    for cand in super_cands[:3]:
+        if not isinstance(cand, dict):
+            continue
+        prem = f"折溢价 {cand['premium_pct']:+.2f}%" if isinstance(cand.get("premium_pct"), (int, float)) else "场内折溢价正常"
+        options.append({
+            "name": f"东财免五超级基金｜{cand.get('name')}（{cand.get('ts_code')}）",
+            "upside": f"收盘 {_tick_price(cand.get('close_cny'))} 元，{cand.get('style_match_zh', '匹配当前风格')}。",
+            "cost": f"{cand.get('fee_label_zh', '万分之0.5佣金免5元')}，{prem}。",
+            "gap": "当前无可用增量买入预算时先进入备选池，待减仓回款释放后按档位分配。" if not is_actionable else "资金已按规则优先级路由评估。",
+        })
+    stock_cands = cockpit.get("stock_swing_candidates") or []
+    s_stock_status = (router.get("sub_strategies") or {}).get("s_stock_swing")
+    for s_cand in stock_cands[:2]:
+        if not isinstance(s_cand, dict):
+            continue
+        reason_snippet = "；".join(str(r) for r in (s_cand.get("reasons_zh") or [])[:2] if r)
+        options.append({
+            "name": f"个股波段先锋候选｜{s_cand.get('name')}（{s_cand.get('ts_code')}，{s_cand.get('industry', '主板')}）",
+            "upside": f"强势股缩量回踩20日线企稳，参考买价 {_tick_price(s_cand.get('entry_ref_price_cny'))} 元（最高不追过 {_tick_price(s_cand.get('max_chase_price_cny'))} 元）；{reason_snippet}。",
+            "cost": f"东财个股佣金万分之 2.5（最低 5 元），单笔至少 8,000 元、单股上限 18%、硬止损 {_tick_price(s_cand.get('hard_stop_price_cny'))} 元（{s_cand.get('stop_loss_pct', -8):+.2f}%）。",
+            "gap": "当前子策略已放行；若预算与市场挡位满足将自动生成开仓动作，否则暂作候选储备。" if s_stock_status == "ACTIVE" else f"当前状态：{sub_zh.get('stock_swing_label', '警戒或防守期暂停新开仓')}。",
+        })
+    if not stock_cands:
+        options.append({
+            "name": f"个股波段先锋子策略｜{sub_zh.get('stock_swing_label', '强势股缩量回踩20日线买点已解锁运行')}",
+            "upside": "仅放行强势股缩量回踩20日均线买点（平台突破买点已按样本外实证剔除），严格执行单笔风险不超过总资产 1.3% 与 18% 单股上限。",
+            "cost": "东财个股佣金万分之 2.5（最低 5 元），需 8,000 元以上单笔资金门槛且严守 -8% 硬止损。",
+            "gap": "当日无同时满足缩量回踩20日线与财务质量门槛的主板标的，不勉强凑单。" if s_stock_status == "ACTIVE" else "当前处于高水位警戒、熔断或防守期，暂停新开个股仓位，仅执行存量止损或移动止盈。",
+        })
+
+    # 6. 下一交易日关注
+    next_date = str(portfolio.get("expected_next_trade_date") or "")
+    preemptive_active = bool(router.get("deconcentration_preemptive_active"))
+    lifeline_text = (
+        f"{_ymd(next_date)}：重仓换马未完成期间启用 12% 前置熔断清零高波动权益（国债与货基豁免），同时盯防 15% 硬生命线 {_fmt_money(router.get('lifeline_nav_cents'))}。"
+        if preemptive_active
+        else f"{_ymd(next_date)}：盯防动态高水位 15% 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}，破线无条件压仓至 15% 以下。"
+    )
+    conditions: List[str] = [
+        f"{_ymd(next_date)}：159558.SZ 四批换马触发位——" + ("；".join(deconc_next) if deconc_next else "待触发") + "。",
+        lifeline_text,
+        f"{_ymd(next_date)}：新建个股统一遵循单笔 -8% 硬止损、+15% 提至保本及 20 日均线移动止盈，跨境买入严禁超过 +2.5% 溢价。",
+    ]
+
+    notes: List[str] = [
+        "本报告由 V3 进取型低频攻防引擎与固定账户账本状态机生成，行情来自本地只读收盘缓存。",
+        f"账本最近事件记录截止 {_ymd(gate.get('reported_events_through'))}；{rem.get('message_zh') or '保持定期同步券商交割流水。'}",
+    ]
+    notes.extend(str(trigger) for trigger in (first_section.get("observation_triggers") or [])[:2] if trigger)
+
+    result = {
+        "title": f"A 股攻防实战日报｜{_ymd(as_of)}收盘",
+        "subtitle": f"生成于 {generated_at}（北京时间）｜市场数据截至交易日 {_iso(as_of)}",
+        "account_status": f"账户数据：{account_status_note}",
+        "sections": {
+            "今日判断": {
+                "conclusion": conclusion,
+                "reasons": reasons[:3],
+                "max_risk": max_risk,
+                "change_condition": change_condition,
+                "execution_note": execution_note,
+            },
+            "账户与风险": {
+                "metrics": metrics,
+                "narrative": narrative,
+            },
+            "三项主要证据": {"items": items},
+            "持仓判断": {"holdings": holdings_rows},
+            "是否存在更好的选择": {
+                "options": options,
+                "common_note": "东财超级白名单享万分之 0.5 佣金且免 5 元低消；其余非白名单基金与主板个股按万分之 2.5、最低 5 元核算。",
+            },
+            "下一交易日关注": {"conditions": conditions},
+            "数据说明与参考来源": {"notes": notes, "sources": []},
+        },
+    }
+    return humanize_tree(result)
+
+
 def build_sections(bundle: Dict[str, Any], *, generated_at: str = "") -> Dict[str, Any]:
     """Bundle payload -> the sections object feishu_render/render_xml consumes."""
+    cockpit = _get(bundle, "portfolio", "v3_cockpit")
+    if isinstance(cockpit, dict) and cockpit.get("schema") == "v3-offensive-cockpit/1.0":
+        return _build_v3_cockpit_sections(bundle, cockpit, generated_at=generated_at)
     as_of = str(bundle.get("as_of_trade_date") or "")
     account_view = _get(bundle, "portfolio", "account_view") or {}
     revalued = account_view.get("revalued_basis") or {}
