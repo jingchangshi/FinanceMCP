@@ -7,7 +7,9 @@
 | 文件 | 作用 |
 |---|---|
 | `feishu_render.py` | §2 六节模板 → 确定性原生块 XML（`<title>/<h1>/<h2>/<p>/<b>/<table>/<ul>/<li>/<a>/<blockquote>`）。`RENDERER_VERSION = "feishu-account-v1"`。只接受已计算好的事实，永不重算价格/账户/权重/风险；禁止词与 Markdown 泄漏在渲染前拦截 |
-| `feishu_publish.py` | `lark-cli +create/+update(overwrite)/+fetch` 发布 + 回读验收 + 每日回执台账。`--dry-run` 只校验不发 API |
+| `feishu_publish.py` | `lark-cli +create/+update(overwrite)/+fetch` 发布 + 回读验收 + 每日回执台账（若 `--parent-token` 对 bot 报权限不足，自动回退 bot 根目录 `+create` 并回读验证）。`--dry-run` 只校验不发 API |
+| `feishu_notify.py` | 基于已发布 Docx 链接与 V3 事实包发送确定性飞书 IM 摘要通知（先直推个人 `open_id`，失败时回退指定群聊 `chat_id`），按 `(trade_date, notify_sha256)` 写入 `account_notify_ledger.jsonl` 去重 |
+| `publish_and_notify.py` | 统一盘后流水线末尾入口：`bundle JSON -> sections_from_bundle.py -> feishu_render.py -> feishu_publish.py -> feishu_notify.py` |
 | `config.example.json` | 配置模板（无任何真实 token）。复制为 `config.json` 或用 `$FEISHU_ACCOUNT_FOLDER_TOKEN` 环境变量提供 |
 | `samples/sections-20261106.example.json` | 2026-11-06 结构示例（值为占位/示例事实），供测试与真实发布前的渲染复核 |
 | `tests/` | `python3 -m unittest discover -s scripts/feishu-publish/tests -v` |
