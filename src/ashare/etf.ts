@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { fetchAll } from './fetch.js';
+import { callWithRetry, fetchAll } from './fetch.js';
 import { upsertRows } from './db.js';
 import { addDays, isTradeDay, latestTradeDay, previousTradeDay, shanghaiToday, syncTradeCal, tradeDaysBetween } from './ingest.js';
 import { adjustmentRatio, AdjustMode, DataQueryError, parseYmd } from './data.js';
@@ -62,6 +62,10 @@ const FUND_BASIC_FIELDS = 'ts_code,name,management,custodian,fund_type,found_dat
 const FUND_DAILY_FIELDS = 'ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount';
 const FUND_ADJ_FIELDS = 'ts_code,trade_date,adj_factor';
 const FUND_SHARE_FIELDS = 'ts_code,trade_date,fd_share,fund_type,market';
+const FUND_NAV_FIELDS = 'ts_code,ann_date,nav_date,unit_nav,accum_nav,adj_nav';
+
+export const FUND_NAV_MAX_LAG_TRADE_DAYS = 3;
+export const CROSS_BORDER_MAX_PREMIUM_BPS = 250;
 
 export type EtfQualityStatus = 'READY' | 'DEGRADED' | 'NOT_READY';
 
@@ -329,6 +333,218 @@ export async function syncFundShare(
   return out;
 }
 
+const FUND_NAV_COLS = FUND_NAV_FIELDS.split(',');
+const FUND_NAV_DEFAULT_INIT_DAYS = 15;
+const FUND_NAV_DEFAULT_DAILY_DAYS = 5;
+
+function ensureFundNavTable(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fund_nav (
+      ts_code TEXT NOT NULL,
+      ann_date TEXT,
+      nav_date TEXT NOT NULL,
+      unit_nav REAL,
+      accum_nav REAL,
+      adj_nav REAL,
+      PRIMARY KEY (ts_code, nav_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fund_nav_date ON fund_nav(nav_date);
+  `);
+}
+
+function hasFundNavTable(db: DatabaseSync): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fund_nav'").get();
+}
+
+function ymdToUtcMs(ymd: string): number | null {
+  if (!/^\d{8}$/.test(ymd)) return null;
+  const ms = Date.UTC(+ymd.slice(0, 4), +ymd.slice(4, 6) - 1, +ymd.slice(6, 8));
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export interface FundNavSync {
+  dates: string[];
+  rows: number;
+  per_date: Record<string, number>;
+  fallback_codes: string[];
+  errors: string[];
+}
+
+export interface FundNavPremium {
+  unit_nav: number | null;
+  nav_date: string | null;
+  lag_trade_days: number | null;
+  nav_stale: boolean;
+  premium_bps: number | null;
+  premium_pct: number | null;
+  buy_blocked: boolean;
+  block_reason: 'cross_border_nav_stale' | 'cross_border_premium_above_250bps' | null;
+}
+
+/**
+ * 同步场内基金单位净值（Tushare `fund_nav`）。
+ * 首次冷启动（表为空）拉取最近 15 个交易日，常规日频拉取最近 5 个交易日，
+ * 并对最新净值仍落后或缺失的跨境 ETF 与重点持仓代码做单页 `callWithRetry(..., { limit: 20 })` 兜底。
+ */
+export async function syncFundNav(
+  db: DatabaseSync,
+  opts: { end?: string; days?: number; fallbackCodes?: readonly string[] } = {},
+): Promise<FundNavSync> {
+  assertEtfSchema(db);
+  ensureFundNavTable(db);
+  const end = opts.end ?? latestTradeDay(db, shanghaiToday()) ?? shanghaiToday();
+  const existingCount = Number((db.prepare('SELECT COUNT(*) n FROM fund_nav').get() as any)?.n ?? 0);
+  const days = Math.max(1, opts.days ?? (existingCount === 0 ? FUND_NAV_DEFAULT_INIT_DAYS : FUND_NAV_DEFAULT_DAILY_DAYS));
+  let dates = tradeDaysBetween(db, addDays(end, -Math.max(45, days * 3)), end).slice(-days);
+  if (!dates.length) dates = [end];
+
+  const per_date: Record<string, number> = {};
+  const fallback_codes: string[] = [];
+  const errors: string[] = [];
+  let rows = 0;
+
+  for (const navDate of dates) {
+    try {
+      const fetched = (await fetchAll('fund_nav', { nav_date: navDate, market: 'E' }, FUND_NAV_FIELDS, 6000))
+        .filter(r => r.ts_code && r.nav_date && r.unit_nav != null && Number(r.unit_nav) > 0);
+      const written = upsertRows(db, 'fund_nav', FUND_NAV_COLS, fetched);
+      logFundSync(db, 'fund_nav', navDate, written, written ? 'ok' : 'empty');
+      per_date[navDate] = written;
+      rows += written;
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      logFundSync(db, 'fund_nav', navDate, 0, 'failed', msg);
+      per_date[navDate] = 0;
+      errors.push(`fund_nav ${navDate}: ${msg}`);
+    }
+  }
+
+  const crossBorderCodes = ETF_CANDIDATE_DECLARATIONS
+    .filter(d => d.category === 'cross_border')
+    .map(d => d.ts_code);
+  const checkCodes = [...new Set([...crossBorderCodes, ...ETF_UNIVERSE, ...(opts.fallbackCodes ?? [])])];
+  const latestNeeded = dates[dates.length - 1];
+  const latestStmt = db.prepare('SELECT MAX(nav_date) d FROM fund_nav WHERE ts_code = ? AND nav_date <= ? AND unit_nav > 0');
+
+  for (const code of checkCodes) {
+    const latestRow = latestStmt.get(code, end) as { d?: string | null } | undefined;
+    const isCrossBorder = crossBorderCodes.includes(code);
+    const isHeld = (ETF_UNIVERSE as readonly string[]).includes(code);
+    if (!isCrossBorder && !isHeld) continue;
+    if (latestRow?.d && latestRow.d >= latestNeeded) continue;
+    try {
+      const res = await callWithRetry('fund_nav', { ts_code: code, end_date: end, limit: 20 }, FUND_NAV_FIELDS);
+      const fetched = (res?.data ?? []).filter(
+        r => r.ts_code === code && r.nav_date && r.nav_date <= end && r.unit_nav != null && Number(r.unit_nav) > 0,
+      );
+      const written = upsertRows(db, 'fund_nav', FUND_NAV_COLS, fetched);
+      logFundSync(db, 'fund_nav_code', `${code}:${end}`, written, written ? 'ok' : 'empty');
+      if (written > 0) {
+        rows += written;
+        fallback_codes.push(code);
+      }
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      logFundSync(db, 'fund_nav_code', `${code}:${end}`, 0, 'failed', msg);
+      errors.push(`fund_nav ${code}: ${msg}`);
+    }
+  }
+
+  return { dates, rows, per_date, fallback_codes, errors };
+}
+
+/**
+ * 基于 `fund_nav` 计算目标交易日 `asOf` 的单位净值滞后与二级市场折溢价，并实施跨境 ETF 禁买判定。
+ * 规则：对跨境 ETF（`category === 'cross_border'`），若最新净值滞后超过 3 个交易日（含缺失）或溢价率 `> 250 bps (+2.5%)`，则标记 `buy_blocked = true`。
+ */
+export function resolveFundNavPremium(
+  db: DatabaseSync,
+  tsCode: string,
+  closePrice: number | null,
+  asOf: string,
+  category?: string,
+): FundNavPremium {
+  const isCrossBorder = category === 'cross_border';
+  if (!hasFundNavTable(db)) {
+    return {
+      unit_nav: null,
+      nav_date: null,
+      lag_trade_days: null,
+      nav_stale: true,
+      premium_bps: null,
+      premium_pct: null,
+      buy_blocked: isCrossBorder,
+      block_reason: isCrossBorder ? 'cross_border_nav_stale' : null,
+    };
+  }
+  const row = db.prepare(
+    'SELECT unit_nav, nav_date FROM fund_nav WHERE ts_code = ? AND nav_date <= ? AND unit_nav > 0 ORDER BY nav_date DESC LIMIT 1',
+  ).get(tsCode, asOf) as { unit_nav: number; nav_date: string } | undefined;
+
+  if (!row || !(Number(row.unit_nav) > 0) || !row.nav_date) {
+    return {
+      unit_nav: null,
+      nav_date: null,
+      lag_trade_days: null,
+      nav_stale: true,
+      premium_bps: null,
+      premium_pct: null,
+      buy_blocked: isCrossBorder,
+      block_reason: isCrossBorder ? 'cross_border_nav_stale' : null,
+    };
+  }
+
+  const unitNav = Number(row.unit_nav);
+  const navDate = String(row.nav_date);
+  let lagTradeDays: number | null = null;
+  const hasCal = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trade_cal'").get();
+  if (hasCal) {
+    const span = Number((db.prepare(
+      'SELECT COUNT(*) n FROM trade_cal WHERE is_open = 1 AND cal_date >= ? AND cal_date <= ?',
+    ).get(navDate, asOf) as any)?.n ?? 0);
+    if (span > 0) {
+      lagTradeDays = Number((db.prepare(
+        'SELECT COUNT(*) n FROM trade_cal WHERE is_open = 1 AND cal_date > ? AND cal_date <= ?',
+      ).get(navDate, asOf) as any)?.n ?? 0);
+    }
+  }
+  if (lagTradeDays === null) {
+    const msA = ymdToUtcMs(navDate);
+    const msB = ymdToUtcMs(asOf);
+    if (msA != null && msB != null) {
+      lagTradeDays = Math.max(0, Math.round((msB - msA) / 86400_000));
+    }
+  }
+
+  const navStale = lagTradeDays === null || lagTradeDays > FUND_NAV_MAX_LAG_TRADE_DAYS;
+  const validClose = closePrice != null && Number.isFinite(closePrice) && closePrice > 0 ? Number(closePrice) : null;
+  const premiumBps = validClose !== null ? Math.round(((validClose - unitNav) / unitNav) * 10000) : null;
+  const premiumPct = premiumBps !== null ? premiumBps / 100 : null;
+
+  let buyBlocked = false;
+  let blockReason: FundNavPremium['block_reason'] = null;
+  if (isCrossBorder) {
+    if (navStale) {
+      buyBlocked = true;
+      blockReason = 'cross_border_nav_stale';
+    } else if (premiumBps !== null && premiumBps > CROSS_BORDER_MAX_PREMIUM_BPS) {
+      buyBlocked = true;
+      blockReason = 'cross_border_premium_above_250bps';
+    }
+  }
+
+  return {
+    unit_nav: unitNav,
+    nav_date: navDate,
+    lag_trade_days: lagTradeDays,
+    nav_stale: navStale,
+    premium_bps: premiumBps,
+    premium_pct: premiumPct,
+    buy_blocked: buyBlocked,
+    block_reason: blockReason,
+  };
+}
+
 export interface EtfSyncSummary {
   start: string;
   end: string;
@@ -337,11 +553,12 @@ export interface EtfSyncSummary {
   fund_daily: Record<string, FundDateSync>;
   fund_adj: Record<string, number>;
   fund_share: Record<string, number>;
+  fund_nav?: FundNavSync;
   errors: string[];
   seconds: number;
 }
 
-/** 五只 ETF 的完整同步：基础信息 → 逐交易日全市场日线 → 逐代码复权/份额。 */
+/** 五只 ETF 的完整同步：基础信息 → 逐交易日全市场日线 → 逐代码复权/份额 → 单位净值。 */
 export async function syncEtf(db: DatabaseSync, start: string, end: string, opts: { refresh?: boolean } = {}): Promise<EtfSyncSummary> {
   const t0 = Date.now();
   const errors: string[] = [];
@@ -361,12 +578,19 @@ export async function syncEtf(db: DatabaseSync, start: string, end: string, opts
   const benchmarkCodes = [...new Set([...ETF_UNIVERSE, ...BASKET_CODES])];
   const adj = await syncFundAdj(db, start, end, { codes: benchmarkCodes });
   const share = await syncFundShare(db, start, end, { codes: benchmarkCodes });
+  let fund_nav: FundNavSync | undefined;
+  try {
+    fund_nav = await syncFundNav(db, { end, fallbackCodes: benchmarkCodes });
+  } catch (e: any) {
+    errors.push(`fund_nav: ${String(e?.message ?? e)}`);
+  }
   for (const [code, n] of Object.entries(adj)) if (!n) errors.push(`fund_adj ${code}: 无数据或请求失败`);
   for (const [code, n] of Object.entries(share)) if (!n) errors.push(`fund_share ${code}: 无数据或请求失败`);
   return {
     start, end,
     trade_days: Object.keys(daily).length,
     fund_basic: basic, fund_daily: daily, fund_adj: adj, fund_share: share,
+    ...(fund_nav ? { fund_nav } : {}),
     errors, seconds: Math.round((Date.now() - t0) / 1000),
   };
 }
@@ -538,6 +762,7 @@ export interface EtfDailySyncSummary {
   fund_basic: { refreshed: boolean; rows: number; error?: string; permission_denied?: boolean };
   fund_adj: Record<string, number>;
   fund_share: Record<string, number>;
+  fund_nav?: FundNavSync;
   /** 按代码区间的复权/份额同步只覆盖最近窗口（候选池历史回看）。 */
   window: { adj_share_start: string; end: string };
   errors: string[];
@@ -653,6 +878,15 @@ export async function syncEtfForDaily(
     summary.fund_share = await syncFundShare(db, summary.window.adj_share_start, end, { codes: pipelineCodes });
   } catch (e: any) {
     errors.push(`fund_share: ${String(e?.message ?? e)}`);
+  }
+  try {
+    summary.fund_nav = await syncFundNav(db, {
+      end,
+      days: opts.days,
+      fallbackCodes: pipelineCodes,
+    });
+  } catch (e: any) {
+    errors.push(`fund_nav: ${String(e?.message ?? e)}`);
   }
   for (const [code, n] of Object.entries(summary.fund_adj)) {
     if (!n && (ETF_UNIVERSE as readonly string[]).includes(code)) errors.push(`fund_adj ${code}: 无数据或请求失败`);

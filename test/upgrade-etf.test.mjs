@@ -75,7 +75,7 @@ test('screen retains actual held instruments and reveals stale prices without mi
   try {
     const screen = screenEtfCandidates(db, { asOf, heldCodes: ['510777.SH'], limit: 1 });
     assert.deepEqual(screen.held, ['510777.SH']);
-    assert.equal(screen.universe_version, 'r2-etf-candidates-1.0.0', 'declared seed version remains compatible');
+    assert.equal(screen.universe_version, 'v3-etf-candidates-2.0.0', 'declared seed version remains compatible');
     assert.equal(screen.research_version, 'etf-research-20261021-v2');
     assert.equal(screen.universe_discovery.version, 'etf-discovery-20261021-v1');
     assert.ok(screen.universe_discovery.discovered_total > 0);

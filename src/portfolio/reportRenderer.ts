@@ -796,9 +796,13 @@ function renderSectionA(r: DailyReportResult, view: RenderView): string {
     ? '数据补齐前不给交易结论。'
     : r.actionable && r.first_section.count > 0
       ? `给出 ${r.first_section.count} 项下一交易日动作，须你确认后手动执行。`
-      : '本期没有足够证据支持新的交易，建议暂不操作。';
-  const unconfirmed = r.gate.unreported_trade_risk
-    || r.data_quality.tiers.account_trade_completeness.status !== 'CONFIRMED_THROUGH_TARGET_DATE';
+      : r.v3_cockpit
+        ? '本日未触发调仓阈值，维持现有持仓。'
+        : '本期没有足够证据支持新的交易，建议暂不操作。';
+  const unconfirmed = !r.gate.satisfied && (
+    r.gate.unreported_trade_risk
+    || r.data_quality.tiers.account_trade_completeness.status !== 'CONFIRMED_THROUGH_TARGET_DATE'
+  );
   const riskWithAmount = view.focus
     ? `最大风险是高集中下行：权益整体跌 10% 的压力情景约 ${yuan(Math.abs(view.holdStressCents ?? 0))} 元${unconfirmed ? '；成交核对未完成，暂不提供买卖数量' : ''}。`
     : `最大风险是市场继续下行${unconfirmed ? '；成交核对未完成，暂不提供买卖数量' : ''}。`;
@@ -821,21 +825,37 @@ function renderSectionA(r: DailyReportResult, view: RenderView): string {
 /** B. 下一交易日关注重点：0–3 项，区分可交易决策 / 待研究候选 / 待核事实。 */
 function renderSectionB(r: DailyReportResult): string {
   const items: string[] = [];
+  const c = r.v3_cockpit;
   if (r.status === 'DATA_INSUFFICIENT') {
     items.push('【需要核实的事实】当日市场数据未就绪；补齐收盘数据后重跑本期研究，期间不沿用旧数据下结论。');
   } else if (r.actionable && r.first_section.actions.length > 0) {
     for (const action of r.first_section.actions.slice(0, 2)) {
-      items.push(`【可考虑的交易决策】${zh(action.title)}：${action.reasons.slice(0, 2).map(zh).join('；')}。`);
+      const legText = action.legs
+        .filter(l => (l.quantity ?? 0) > 0)
+        .map(l => `${l.side === 'SELL' ? '卖出' : '买入'} ${l.ts_code} ${l.quantity} 份（参考价 ${((l.price_milli ?? 0) / 1000).toFixed(3)} 元，估算费用 ${((l.fees_cents ?? 0) / 100).toFixed(2)} 元）`)
+        .join('；');
+      items.push(`【可考虑的交易决策】${zh(action.title)}（${legText}）：${action.reasons.slice(0, 2).map(zh).join('；')}。`);
     }
+  } else if (c) {
+    const rebText = c.deconcentration.rebound_trigger_cny !== null ? `${c.deconcentration.rebound_trigger_cny.toFixed(3)} 元` : '—';
+    const monText = c.deconcentration.next_monthly_trigger_date ? ymd(c.deconcentration.next_monthly_trigger_date) : '下一月度首日';
+    items.push(
+      `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
+      + `159558.SZ 四批换马下次观察位为反弹 +8%（${rebText}）或月度窗口 ${monText}，动态高水位 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+    );
   } else {
     items.push('【可考虑的交易决策】本期没有足够证据支持新的交易，建议暂不操作。（没有经过检验的优势证据支持新的买卖）');
   }
-  const unreported = r.gate.unreported_trade_risk
-    || r.data_quality.tiers.account_trade_completeness.status !== 'CONFIRMED_THROUGH_TARGET_DATE';
+  const unreported = !r.gate.satisfied && (
+    r.gate.unreported_trade_risk
+    || r.data_quality.tiers.account_trade_completeness.status !== 'CONFIRMED_THROUGH_TARGET_DATE'
+  );
   if (unreported) {
     items.push('【需要核实的事实】账本事件只记录到 '
       + `${ymd(r.gate.reported_events_through)}，其后的券商成交尚未录入；`
       + '补齐并完成核对前，本报告不提供可直接使用的买卖数量。');
+  } else if (c?.reconciliation_reminder.needs_reminder && c.reconciliation_reminder.message_zh) {
+    items.push(`【需要核实的事实】${zh(c.reconciliation_reminder.message_zh)}`);
   }
   const watch = r.holdings
     .map(holding => ({ holding, condition: holding.research.conditions.find(cond => cond.stance === 'WATCH')?.when?.[0] }))
@@ -892,7 +912,15 @@ function renderSectionC(r: DailyReportResult, view: RenderView): string {
     && r.data_quality.tiers.account_trade_completeness.status === 'CONFIRMED_THROUGH_TARGET_DATE';
   lines.push(reconciled
     ? `- **账户核对**：已完成——完整性声明覆盖目标交易日（最后人工核对 ${isoDate(r.gate.last_user_reconciled_at)}）。`
-    : `- **账户核对**：未完成——账本事件记录至 ${ymd(r.gate.reported_events_through)}，最后人工核对 ${isoDate(r.gate.last_user_reconciled_at)}；存在未录入的成交风险，因此本期不提供可直接使用的买卖数量，上述金额是研究参考而非对账结果。`);
+    : r.gate.satisfied
+      ? `- **账户核对**：账本事件记录至 ${ymd(r.gate.reported_events_through)}（最后人工核对 ${isoDate(r.gate.last_user_reconciled_at)}）；若期间有手工成交请补录账本事件后再复核委托份数。`
+      : `- **账户核对**：未完成——账本事件记录至 ${ymd(r.gate.reported_events_through)}，最后人工核对 ${isoDate(r.gate.last_user_reconciled_at)}；存在未录入的成交风险，因此本期不提供可直接使用的买卖数量，上述金额是研究参考而非对账结果。`);
+  if (r.v3_cockpit) {
+    const c = r.v3_cockpit;
+    lines.push(
+      `- **本金回本与动态高水位防线**：初始投入本金 ${yuan(c.principal.initial_principal_cents)} 元，距回本还差 ${yuan(Math.abs(c.principal.to_principal_gap_cents))} 元（需涨 ${c.principal.to_principal_return_needed_pct.toFixed(2)}%）；动态高水位 ${yuan(c.router.hwm_nav_cents)} 元（${ymd(c.router.hwm_date)}），15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）。`,
+    );
+  }
   return lines.join('\n');
 }
 
@@ -903,6 +931,13 @@ function renderSectionD(r: DailyReportResult, view: RenderView): string {
     return '- 本期市场数据未就绪：不以任何旧日期数据替代当日行情，市场判断暂停一期。';
   }
   const lines: string[] = [];
+  if (r.v3_cockpit) {
+    const mr = r.v3_cockpit.market_regime;
+    lines.push(
+      `- **双锚攻防档位与风格信号**：${mr.regime_label_zh}（目标权益上限 ${mr.target_equity_pct.toFixed(0)}%、防御现金下限 ${mr.defensive_cash_pct.toFixed(0)}%），风格判断「${mr.style_label_zh}」`
+      + `${mr.style_spread_20d_pp !== null ? `（20 日大小盘剪刀差 ${mr.style_spread_20d_pp >= 0 ? '+' : ''}${mr.style_spread_20d_pp.toFixed(2)} 个百分点）` : ''}。`,
+    );
+  }
   lines.push(`- **整体状态**：${market.regime_label ?? '未分类'}（${market.tone === 'neutral' ? '情绪中性' : market.tone === 'bearish' ? '情绪偏弱' : market.tone === 'bullish' ? '情绪偏强' : '情绪未标注'}），行情日期 ${ymd(market.fact_meta.as_of)}。`);
   const metrics = market.judgement
     .map(line => zh(line))
@@ -1100,7 +1135,11 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
   } else {
     lines.push(`3. **换入其他 ETF**：本期没有通过完整筛选资格的 ETF 候选${observationClause ? `；本次展示的候选中有 ${observationClause}，均不参与资金比较` : ''}，也不构成换入依据。换入需要先卖出，构成两步决策，目前没有经过检验的优势证据支持换入。`);
   }
-  lines.push('4. **沪深主板个股**：本期候选池只覆盖 ETF，没有个股比较数据——这是覆盖缺口，不等于"没有更好的股票"。');
+  lines.push(
+    r.v3_cockpit
+      ? '4. **沪深主板个股**：仅放行强势股回踩 20 日均线买点（缩量条件较成交量 20 日均值萎缩、最多 2 只、单只上限 18%），平台突破买点已按实证负期望剔除。'
+      : '4. **沪深主板个股**：本期候选池只覆盖 ETF，没有个股比较数据——这是覆盖缺口，不等于"没有更好的股票"。',
+  );
   if (!eligibilityKnown) {
     lines.push(`5. **保留现金**：现金仅占 ${weightPct(view.cashRatio)}，一手门槛普遍高于现金；"多留现金"实际意味着卖出持仓，回到方案 2 的决策。`);
     lines.push(Number.isFinite(cheapest)
@@ -1116,6 +1155,37 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
   }
   lines.push('');
   lines.push('**结论**：没有可靠优势支持换仓或新增交易；唯一有数据支撑的比较是"集中度 vs 反弹参与度"，它属于风险管理决策，依据是你的风险政策，而不是新的行情信息。');
+  if (r.v3_cockpit) {
+    const c = r.v3_cockpit;
+    const execCnt = c.deconcentration.tranches.filter(t => t.status === 'EXECUTED').length;
+    const totalCnt = c.deconcentration.tranches.length || 4;
+    const batchDesc = c.deconcentration.tranches.map(t => `第${t.tranche_no}批 ${t.planned_shares} 份`).join('、');
+    lines.push('');
+    lines.push('**攻防引擎核心轨道进展**');
+    lines.push(
+      `- **四批换马状态机（159558.SZ）**：已执行 ${execCnt}/${totalCnt} 批（计划分解：${batchDesc || '未建计划'}，目标留存 ${c.deconcentration.target_keep_shares} 份）；${zh(c.deconcentration.status_summary_zh)}`
+      + `${c.deconcentration.rebound_trigger_cny !== null ? `；反弹 +8% 目标价 ${c.deconcentration.rebound_trigger_cny.toFixed(3)} 元` : ''}`
+      + `${c.deconcentration.ma60_protect_cny !== null ? `；60 日均线保护价 ${c.deconcentration.ma60_protect_cny.toFixed(3)} 元` : ''}`
+      + `${c.deconcentration.next_monthly_trigger_date ? `；下个保底月度窗口 ${ymd(c.deconcentration.next_monthly_trigger_date)}` : ''}。`,
+    );
+    const superList = c.super_etf_candidates.slice(0, 3);
+    if (superList.length > 0) {
+      lines.push(
+        `- **东财免五超级基金候选**：${superList.map(s => `${s.name}（${s.ts_code}，收盘 ${s.close_cny !== null ? `${s.close_cny.toFixed(3)} 元` : '—'}，${s.style_match_zh}）`).join('；')}（佣金万分之 0.5 且免 5 元低消）。`,
+      );
+    }
+    if (c.cross_border_monitor.length > 0) {
+      lines.push(
+        `- **跨境基金净值折溢价红线（>+2.5% 或滞后超3日禁买）**：${c.cross_border_monitor.slice(0, 5).map(m => `${m.name}（${m.ts_code}，净值 ${m.unit_nav !== null ? m.unit_nav.toFixed(3) : '—'}，折溢价 ${m.premium_pct !== null ? `${m.premium_pct >= 0 ? '+' : ''}${m.premium_pct.toFixed(2)}%` : '—'}，${m.status_zh}）`).join('；')}。`,
+      );
+    }
+    lines.push(`- **个股波段先锋子策略**：${c.router.sub_strategies_zh.stock_swing_label}（执行中严格遵守单笔 -8% 硬止损、+15% 保本上移及 20 日均线移动止盈）。`);
+    if (c.stock_swing_candidates && c.stock_swing_candidates.length > 0) {
+      lines.push(
+        `- **主板个股强势回踩候选（前 ${c.stock_swing_candidates.length} 名，单只上限 18% / 止损风险上限 1.3%）**：${c.stock_swing_candidates.slice(0, 2).map(cand => `${cand.name}（${cand.ts_code}，参考买价 ${cand.entry_ref_price_cny.toFixed(2)} 元，最高追价 ${cand.max_chase_price_cny.toFixed(2)} 元，硬止损 ${cand.hard_stop_price_cny.toFixed(2)} 元 / ${cand.stop_loss_pct.toFixed(2)}%，年化净资产收益率 ${cand.roe_annualized_pct.toFixed(1)}%）`).join('；')}。`,
+      );
+    }
+  }
   return lines.join('\n');
 }
 
@@ -1145,6 +1215,12 @@ function renderSectionG(r: DailyReportResult, view: RenderView): string {
   } else {
     lines.push('- **风险政策预警**：本期没有可展示的组合风险政策状态。');
   }
+  if (r.v3_cockpit) {
+    const c = r.v3_cockpit;
+    lines.push(
+      `- **动态高水位熔断防线**：动态高水位 ${yuan(c.router.hwm_nav_cents)} 元对应 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）；新建个股严格执行单笔 -8% 硬止损与 +15% 保本上移。`,
+    );
+  }
   lines.push('- **口径提醒**：以上压力数字是预设情景不是收益预测；账户全历史最大回撤数据不足，不以观察窗口回撤冒充。');
   return lines.join('\n');
 }
@@ -1165,7 +1241,11 @@ function renderSectionH(r: DailyReportResult): string {
     items.push(`下一交易日收盘后核对：${trigger}——若成立，重估持有依据。`);
   }
   if (r.gate.unreported_trade_risk) {
-    items.push(`补录 ${ymd(r.gate.reported_events_through)} 之后的券商成交并完成现金/持仓核对——在未录入成交风险解除前，不提供可直接使用的买卖数量。`);
+    if (r.gate.satisfied && r.gate.reported_events_through) {
+      items.push(`若 ${ymd(r.gate.reported_events_through)} 之后存在手工成交，请补录账本事件以保持现金与可用份额同步。`);
+    } else {
+      items.push(`补录 ${ymd(r.gate.reported_events_through)} 之后的券商成交并完成现金/持仓核对——在未录入成交风险解除前，不提供可直接使用的买卖数量。`);
+    }
   } else if (!r.plan_tracking.available) {
     items.push('历史预案跟踪数据补齐后，回看观察触发条件是否被触发（当前无法核对）。');
   }
@@ -1340,6 +1420,53 @@ function buildTechnicalSections(
     etf_quantity: r.holdings.map(holding => holding.quantity),
     etf_diluted_cost_per_share: r.holdings.map(holding => holding.diluted_cost_per_share),
     etf_diluted_total_cost_cents: r.holdings.map(holding => holding.diluted_total_cost_cents),
+    v3_cockpit_numbers: r.v3_cockpit ? {
+      initial_principal_cents: r.v3_cockpit.principal.initial_principal_cents,
+      to_principal_gap_cents: r.v3_cockpit.principal.to_principal_gap_cents,
+      to_principal_gap_abs_cents: Math.abs(r.v3_cockpit.principal.to_principal_gap_cents),
+      to_principal_return_needed_pct: r.v3_cockpit.principal.to_principal_return_needed_pct,
+      hwm_nav_cents: r.v3_cockpit.router.hwm_nav_cents,
+      lifeline_nav_cents: r.v3_cockpit.router.lifeline_nav_cents,
+      lifeline_buffer_pct: r.v3_cockpit.router.lifeline_buffer_pct,
+      hwm_drawdown_pct: r.v3_cockpit.router.hwm_drawdown_pct,
+      target_equity_pct: r.v3_cockpit.market_regime.target_equity_pct,
+      defensive_cash_pct: r.v3_cockpit.market_regime.defensive_cash_pct,
+      style_spread_20d_pp: r.v3_cockpit.market_regime.style_spread_20d_pp,
+      rebound_trigger_cny: r.v3_cockpit.deconcentration.rebound_trigger_cny,
+      ma60_protect_cny: r.v3_cockpit.deconcentration.ma60_protect_cny,
+      l2_trigger_drawdown_pct: r.v3_cockpit.router.l2_trigger_drawdown_bps / 100,
+      post_breaker_equity_pct: r.v3_cockpit.router.post_breaker_equity_bps / 100,
+      rule_constants_pct: [18, 1.3, 12, 10, 0, 15, 8, -8, 2.5, 2, 0.5, 3, 30],
+      rule_constants_cny: [8000, 1000, 90, 10, 5],
+      action_leg_prices_cny: r.first_section.actions.flatMap(a => a.legs.map(l => l.price_milli !== null ? l.price_milli / 1000 : null)),
+      action_leg_fees_cents: r.first_section.actions.flatMap(a => a.legs.map(l => l.fees_cents)),
+      stock_buy_leg_metrics: r.first_section.actions.flatMap(a => a.legs.flatMap(l => {
+        if (l.side !== 'BUY') return [];
+        const cand = r.v3_cockpit?.stock_swing_candidates?.find(c => c.ts_code === l.ts_code);
+        if (!cand) return [];
+        const nav = Math.max(1, r.v3_cockpit!.principal.current_nav_cents);
+        const weightPct = Math.round(((l.gross_cents ?? 0) / nav) * 1000) / 10;
+        const riskCents = Math.round((l.quantity ?? 0) * ((cand.entry_ref_price_milli - cand.hard_stop_price_milli) / 10));
+        const riskPct = Math.round((riskCents / nav) * 10000) / 100;
+        return [{ weight_pct: weightPct, risk_pct: riskPct }];
+      })),
+      cross_border_navs: r.v3_cockpit.cross_border_monitor.map(m => m.unit_nav),
+      cross_border_premium_pcts: r.v3_cockpit.cross_border_monitor.map(m => m.premium_pct),
+      super_etf_closes_cny: r.v3_cockpit.super_etf_candidates.map(s => s.close_cny),
+      stock_swing_candidates_numbers: (r.v3_cockpit.stock_swing_candidates ?? []).map(c => ({
+        close_cny: c.close_cny,
+        entry_ref_price_cny: c.entry_ref_price_cny,
+        max_chase_price_cny: c.max_chase_price_cny,
+        hard_stop_price_cny: c.hard_stop_price_cny,
+        stop_loss_pct: c.stop_loss_pct,
+        ma20_cny: c.ma20_cny,
+        low_5d_cny: c.low_5d_cny,
+        roe_annualized_pct: c.roe_annualized_pct,
+        ocf_to_profit_pct: c.ocf_to_profit_pct,
+        amount20_yi: c.amount20_yi,
+        circ_mv_yi: c.circ_mv_yi,
+      })),
+    } : null,
   };
   return {
     '0. 报告头': {

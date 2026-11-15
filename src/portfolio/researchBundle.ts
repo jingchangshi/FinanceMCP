@@ -1006,7 +1006,9 @@ export function buildHotspotState(input: {
   const byCode = new Map(universe.stocks.map(s => [s.ts_code, s]));
   const highlights = universe.daily_highlights
     .map(code => byCode.get(code))
-    .filter((s): s is ResearchStockView => !!s)
+    .filter((s): s is ResearchStockView =>
+      !!s && s.primary_family !== 'REVERSAL' && s.primary_family !== 'MEAN_REVERSION',
+    )
     .slice(0, HIGHLIGHT_LIMIT);
   const highlightSet = new Set(highlights.map(s => s.ts_code));
   const watch = universe.stocks

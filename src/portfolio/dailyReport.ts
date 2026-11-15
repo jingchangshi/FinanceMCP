@@ -15,6 +15,13 @@ import { DEFAULT_FEE_RULES, DEFAULT_LOT_RULES, type FeeRules, type LotRules } fr
 import { screenEtfCandidates, type EtfCandidateRow, type EtfCandidateScreenResult } from '../ashare/etfUniverse.js';
 import { fundBaseFactor } from '../ashare/etf.js';
 import { adjustmentRatio } from '../ashare/data.js';
+import {
+  runActionEngine,
+  syncAccountV3State,
+  type ActionEnginePlan,
+  type V3ActionEngineOutput,
+} from './actionEngine.js';
+import { loadApprovedV3Policy } from './v3Policy.js';
 
 /**
  * D1 收盘日报：先给“下一交易日最值得做的 0–3 个动作及理由”。
@@ -98,7 +105,7 @@ export interface DailyReportInput {
   };
 }
 
-export type ActionKind = 'REDUCE' | 'ROTATE';
+export type ActionKind = 'REDUCE' | 'ROTATE' | 'ADD';
 
 export interface FactMeta {
   as_of: string | null;
@@ -128,6 +135,7 @@ export interface ActionLeg {
 }
 
 export interface ActionPlan {
+  priority?: 'P0' | 'P1' | 'P2' | 'P3';
   code: string;
   kind: ActionKind;
   rank: number;
@@ -140,7 +148,7 @@ export interface ActionPlan {
   /** 非可执行腿的示意块；与 legs 内容相同但显式标注 illustrative。 */
   illustrative: { executable: false; legs: ActionLeg[] } | null;
   fees_cents: number | null;
-  fees_assumed: true;
+  fees_assumed: boolean;
   /** 条件化执行：触发条件 + 失效条件。 */
   triggers: string[];
   invalidation_conditions: string[];
@@ -417,6 +425,96 @@ export interface PlanTracking {
   note: string;
 }
 
+export interface V3CockpitSummary {
+  schema: 'v3-offensive-cockpit/1.0';
+  as_of_trade_date: string;
+  policy_release: {
+    strategy_id: string;
+    version: string;
+    content_hash: string;
+    production_admission: string;
+    bp1_pullback_enabled: boolean;
+    bp2_breakout_enabled: boolean;
+    bp2_status: string;
+  };
+  principal: {
+    initial_principal_cents: number;
+    current_nav_cents: number;
+    to_principal_gap_cents: number;
+    to_principal_return_needed_pct: number;
+    loss_from_principal_pct: number;
+  };
+  market_regime: {
+    regime: V3ActionEngineOutput['market_regime']['regime'];
+    regime_label_zh: string;
+    raw_regime: V3ActionEngineOutput['market_regime']['raw_regime'];
+    hysteresis_held: boolean;
+    crash_override: boolean;
+    style: V3ActionEngineOutput['market_regime']['style'];
+    style_label_zh: string;
+    style_spread_20d_pp: number | null;
+    target_equity_bps: number;
+    defensive_cash_bps: number;
+    target_equity_pct: number;
+    defensive_cash_pct: number;
+    pct_above_ma60: number | null;
+    amount_vs_ma20: number | null;
+    limit_down: number | null;
+    hs300_above_ma60: boolean | null;
+    zz500_above_ma60: boolean | null;
+    cyb_above_ma60: boolean | null;
+  };
+  router: {
+    effective_regime: V3ActionEngineOutput['router']['effective_regime'];
+    circuit_breaker_status: V3ActionEngineOutput['router']['circuit_breaker_status'];
+    circuit_breaker_label_zh: string;
+    locked_until_trade_date: string | null;
+    l2_trigger_drawdown_bps: number;
+    post_breaker_equity_bps: number;
+    deconcentration_preemptive_active: boolean;
+    policy_version: string;
+    hwm_nav_cents: number;
+    hwm_date: string;
+    hwm_drawdown_pct: number;
+    lifeline_nav_cents: number;
+    lifeline_buffer_cents: number;
+    lifeline_buffer_pct: number;
+    sub_strategies: V3ActionEngineOutput['router']['sub_strategies'];
+    sub_strategies_zh: V3ActionEngineOutput['router']['sub_strategies_zh'];
+  };
+  deconcentration: {
+    plan_present: boolean;
+    ts_code: string;
+    plan_status: V3ActionEngineOutput['deconcentration']['plan_status'];
+    initial_shares: number;
+    current_shares: number;
+    target_keep_bps: number;
+    target_keep_shares: number;
+    reference_price_cny: number | null;
+    rebound_trigger_cny: number | null;
+    ma60_cny: number | null;
+    ma60_protect_cny: number | null;
+    breakdown_ma60_2d: boolean;
+    next_monthly_trigger_date: string | null;
+    recommended_sell_shares: number;
+    active_trigger_reason: V3ActionEngineOutput['deconcentration']['active_trigger_reason'];
+    tranches: V3ActionEngineOutput['deconcentration']['tranches'];
+    status_summary_zh: string;
+  };
+  reconciliation_reminder: V3ActionEngineOutput['reconciliation_reminder'];
+  super_etf_candidates: V3ActionEngineOutput['super_etf_candidates'];
+  cross_border_monitor: V3ActionEngineOutput['cross_border_monitor'];
+  stock_swing_candidates: V3ActionEngineOutput['stock_swing_candidates'];
+  actions_summary: Array<{
+    priority: ActionEnginePlan['priority'];
+    code: string;
+    kind: ActionEnginePlan['kind'];
+    title: string;
+    legs: ActionEnginePlan['legs'];
+    fees_cents: number;
+  }>;
+}
+
 export interface DailyReportResult {
   schema: typeof DAILY_REPORT_SCHEMA;
   report_id: string;
@@ -540,6 +638,8 @@ export interface DailyReportResult {
   };
   not_covered: string[];
   disclaimer: string;
+  /** V3 进取型低频攻防驾驶舱（仅注入确定性业务字段，不改变 report[0]==='schema'）。 */
+  v3_cockpit?: V3CockpitSummary;
 }
 
 // ---------------------------------------------------------------- 小工具
@@ -862,6 +962,7 @@ function buildQualityTiers(
   summary: any, screening: EtfCandidateScreenResult | null, gateSatisfied: boolean,
   accountStatus: string, gateReasons: { code: string }[], holdingsCount: number,
   accountEvaluation: AccountStatusEvaluation | null,
+  hasActionable = false,
 ): {
   market_data: { status: string; as_of: string | null; detail: string };
   etf_price: { status: string; ready: string[]; not_ready: string[]; detail: string };
@@ -909,18 +1010,21 @@ function buildQualityTiers(
       status: accountEvaluation?.ok && !accountEvaluation.unreported_trade_risk ? 'CONFIRMED_THROUGH_TARGET_DATE' : 'UNCONFIRMED_RISK',
       detail: accountEvaluation?.ok && !accountEvaluation.unreported_trade_risk
         ? '完整性声明覆盖目标交易日且账本门控通过'
-        : `账户完整性或账本门控未满足：${gateReasons.map(reason => reason.code).join('、') || '未知'}`,
+        : gateReasons.length === 0 && accountEvaluation?.reported_events_through
+          ? `账本事件声明至 ${accountEvaluation.reported_events_through}（存在滞后提醒，不阻断既定规则执行）`
+          : `账户完整性或账本门控未满足：${gateReasons.map(reason => reason.code).join('、') || '未知'}`,
     },
     research_evidence: {
       status: 'UNVERIFIED',
       detail: '没有经过前瞻检验的 RESEARCH_VERIFIED 证据；候选分数是启发式排序，不是换仓优势（Alpha 轨状态，不阻塞风险轨研究）',
     },
     trade_plan_executability: {
-      status: 'NOT_EXECUTABLE',
-      // §5.1：可执行性只由账户/权限/费用/行情门控决定，**不再引用 Alpha 证据缺失**；
-      // status 仍为 NOT_EXECUTABLE —— 日报本身不产生任何交易动作（不是被证据“挡住”，是没有下单意图）。
+      status: hasActionable ? 'EXECUTABLE' : 'NOT_EXECUTABLE',
+      // §5.1：可执行性只由账户/权限/费用/行情门控决定，**不再引用 Alpha 证据缺失**。
       detail: gateSatisfied
-        ? '账户、权限、费用与行情门控满足，但本日报不产生交易动作（五方案均为研究比较，executable=false，研究比较不是下单授权）。'
+        ? hasActionable
+          ? '账户、权限、费用与行情门控满足，已生成下一交易日可执行规则动作（V3 攻防引擎）。'
+          : '账户、权限、费用与行情门控满足，但本日未触发新的调仓阈值，保持当前配置。'
         : `交易执行参考被下列门控阻塞：${gateReasons.map(reason => reason.code).join('、') || '未知'}`
           + '（只列账户/权限/费用/行情门控；轮动优势证据状态见 research_evidence 与轮动轨字段）。',
     },
@@ -1522,22 +1626,58 @@ interface ActionContext {
   fees: FeeRules;
   lots: LotRules;
   candidates: EtfCandidateScreenResult | null;
+  engineOut: V3ActionEngineOutput | null;
 }
 
-/** Research scores and concentration do not authorize a sale. Until a persisted,
- * user-confirmed risk policy or independently verified advantage is available,
- * the action section must explicitly conclude NO_ACTION. Scenario quantities
- * live in decision_comparison and never become executable legs. */
+/** 委派给 V3 动作引擎（P0 熔断 > P1 个股止损 > P2 四批换马 > P3 超级 ETF 对齐）。 */
 function buildActions(ctx: ActionContext): { actions: ActionPlan[]; blockers: string[] } {
   const stale = (ctx.summary.holdings ?? []).filter((holding: any) => holding.bar_quality !== 'READY');
-  return {
-    actions: [],
-    blockers: stale.length ? [
-      `${stale.map((holding: any) => holding.ts_code).join('、')} 缺少目标交易日可校验行情。`,
-      '触发条件：补齐收盘行情和复权数据后重算。',
-      '失效条件：目标交易日、账户状态或行情被更正。',
-    ] : [],
-  };
+  const staleBlockers = stale.length ? [
+    `${stale.map((holding: any) => holding.ts_code).join('、')} 缺少目标交易日可校验行情。`,
+    '触发条件：补齐收盘行情和复权数据后重算。',
+    '失效条件：目标交易日、账户状态或行情被更正。',
+  ] : [];
+  if (!ctx.engineOut) {
+    return { actions: [], blockers: staleBlockers };
+  }
+  const actions: ActionPlan[] = ctx.engineOut.actions.map((plan: ActionEnginePlan, idx: number) => ({
+    priority: plan.priority,
+    code: plan.code,
+    kind: plan.kind,
+    rank: idx + 1,
+    title: plan.title,
+    reasons: plan.reasons,
+    counter_evidence: plan.counter_evidence,
+    legs: plan.legs.map(leg => ({
+      side: leg.side,
+      ts_code: leg.ts_code,
+      name: leg.name,
+      quantity: leg.quantity,
+      lot_size: leg.lot_size,
+      lots: leg.lots,
+      price_milli: leg.price_milli,
+      gross_cents: leg.gross_cents,
+      fees_cents: leg.fees_cents,
+      net_cents: leg.net_cents,
+      quote_trade_date: leg.quote_trade_date,
+      executable: ctx.gateSatisfied ? Boolean(leg.executable) : false,
+      reason: ctx.gateSatisfied ? leg.reason : (leg.reason ?? 'account_gate_not_satisfied'),
+    })),
+    illustrative: null,
+    fees_cents: plan.fees_cents,
+    fees_assumed: Boolean(plan.fees_estimated),
+    triggers: plan.triggers,
+    invalidation_conditions: plan.invalidation_conditions,
+    risk_impact: plan.risk_impact,
+    fact_meta: {
+      as_of: ctx.asOf,
+      source: 'portfolio.actionEngine',
+      quality: stale.length ? 'DEGRADED' : 'OK',
+      claim_status: 'FACT',
+    },
+  }));
+  const blockers = [...new Set([...staleBlockers, ...ctx.engineOut.blockers])];
+  return { actions, blockers };
 }
 
 // ---------------------------------------------------------------- 候选 vs 现金
@@ -1643,6 +1783,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   // "决策说可执行、日报说不可执行"两套口径。这里直接调用同一个门控函数。
   const accountStatus: string = summary.account_status ?? 'REAL_ACCOUNT_PENDING';
   const gateReasons: { code: string; detail: string }[] = [];
+  const gateWarnings: { code: string; detail: string }[] = [];
   const snapshotIsCurrent = snapshot?.is_current === true;
   let accountEvaluation: AccountStatusEvaluation | null = null;
   if (snapshot) {
@@ -1658,14 +1799,32 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       accountId,
       asOf,
     );
-    for (const reason of accountEvaluation.reasons) gateReasons.push({ code: reason.code, detail: reason.detail });
-    // 与 decision.ts 同口径：未上报交易风险下，可执行腿是对当前现金/份额的承诺，
-    // 未上报成交可能已使其失效。日报与决策必须给出一致的 executable。
+    for (const w of accountEvaluation.warnings ?? []) gateWarnings.push({ code: w.code, detail: w.detail });
+    const explicitCompletenessRisk = accountEvaluation.completeness?.unreported_trade_risk === true;
+    const hasPriorCompleteness = Boolean(accountEvaluation.reported_events_through) && !explicitCompletenessRisk;
+    const lagBypassEligible = hasPriorCompleteness && snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED';
+    const lagCodes = new Set(['account_completeness_undeclared', 'unreported_trade_risk']);
+    for (const reason of accountEvaluation.reasons) {
+      if (lagBypassEligible && lagCodes.has(reason.code)) {
+        gateWarnings.push({ code: reason.code, detail: reason.detail });
+      } else {
+        gateReasons.push({ code: reason.code, detail: reason.detail });
+      }
+    }
+    // 铁律 2（反防御性护栏）：已有前置账本完整性声明的已确认真实账户，不因对账滞后清零可执行动作，
+    // 仅在 warnings 中保留漏记交易提醒；只有从未声明完整性（reported_events_through===null）或账户未确认时才阻塞可执行。
     if (accountEvaluation.unreported_trade_risk) {
-      gateReasons.push({
-        code: 'unreported_trade_risk',
-        detail: '账户存在未上报交易的风险：可执行数量依赖当前现金与份额，未上报成交可能已使其失效，因此只给示意。',
-      });
+      if (lagBypassEligible) {
+        gateWarnings.push({
+          code: 'unreported_trade_lag_warning',
+          detail: `账本事件记录截止 ${accountEvaluation.reported_events_through}，若期间有手工成交请补录后再核对委托数量。`,
+        });
+      } else {
+        gateReasons.push({
+          code: 'unreported_trade_risk',
+          detail: '账户存在未上报交易的风险：可执行数量依赖当前现金与份额，未上报成交可能已使其失效，因此只给示意。',
+        });
+      }
     }
   } else {
     gateReasons.push({ code: 'account_gate_unavailable', detail: '账户库中没有任何快照' });
@@ -1682,17 +1841,69 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
     screening = null;
   }
 
-  const ctx: ActionContext = { summary, asOf, gateSatisfied, fees, lots, candidates: screening };
+  // 券商摊薄成本映射（前移以便 V3 动作引擎获取精确参考成本）。
+  const costByCode = new Map<string, { diluted_cost_per_share: number | null; diluted_total_cost_cents: number | null }>();
+  const costDiagnostics: string[] = [];
+  try {
+    const dilutedView = buildDilutedCostView(portfolioDb, accountId, { asOf });
+    costDiagnostics.push(...dilutedView.warnings);
+    for (const row of dilutedView.positions) {
+      costByCode.set(row.ts_code, {
+        diluted_cost_per_share: row.diluted_cost_per_share,
+        diluted_total_cost_cents: row.diluted_total_cost_cents,
+      });
+    }
+  } catch (error) {
+    costDiagnostics.push(`摊薄成本不可用：${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  let engineOut: V3ActionEngineOutput | null = null;
+  if (snapshot && summary?.portfolio && (summary.portfolio.total_assets_cents ?? 0) > 0 && marketDb) {
+    const holdingsForEngine = (summary.holdings ?? []).map((holding: any) => {
+      const sellableRow = accountEvaluation?.sellable?.[holding.ts_code];
+      const snapPos = snapshot.positions.find(p => p.ts_code === holding.ts_code);
+      const dilutedPerShare = costByCode.get(holding.ts_code)?.diluted_cost_per_share ?? null;
+      return {
+        ts_code: String(holding.ts_code),
+        name: String(holding.name ?? holding.ts_code),
+        quantity: Number(holding.quantity ?? 0),
+        sellable_quantity: sellableRow ? Number(sellableRow.sellable_quantity) : Number(holding.quantity ?? 0),
+        weight: Number(holding.weight ?? 0),
+        market_value_cents: Number(holding.market_value_cents ?? 0),
+        price_milli: Number(holding.price_milli ?? 0),
+        latest_bar_date: holding.latest_bar_date ?? null,
+        bar_quality: String(holding.bar_quality ?? 'MISSING'),
+        ref_cost_milli: dilutedPerShare !== null ? Math.round(dilutedPerShare * 1000) : (snapPos?.ref_price_milli ?? null),
+      };
+    });
+    engineOut = runActionEngine({
+      portfolioDb,
+      marketDb,
+      accountId,
+      asOf,
+      holdings: holdingsForEngine,
+      cashCents: summary.portfolio.cash_cents ?? 0,
+      wealthCents: summary.portfolio.wealth_cents ?? 0,
+      totalAssetsCents: summary.portfolio.total_assets_cents,
+      baselineTotalAssetsCents: snapshot.totals.total_assets_cents,
+      reportedEventsThrough: accountEvaluation?.reported_events_through ?? null,
+      lastUserReconciledAt: accountEvaluation?.last_user_reconciled_at ?? null,
+      candidates: screening,
+    });
+    if (engineOut.reconciliation_reminder.needs_reminder && engineOut.reconciliation_reminder.message_zh) {
+      gateWarnings.push({
+        code: 'reconciliation_lag_reminder',
+        detail: engineOut.reconciliation_reminder.message_zh,
+      });
+    }
+  }
+
+  const ctx: ActionContext = { summary, asOf, gateSatisfied, fees, lots, candidates: screening, engineOut };
   const built = maxActions === 0 ? { actions: [] as ActionPlan[], blockers: [] as string[] } : buildActions(ctx);
-  const actions = built.actions;
+  const actions = built.actions.slice(0, maxActions);
 
   // ---- 状态：只有账户门控满足且有动作时才可能 ACTIONABLE；否则最多 ILLUSTRATIVE。
   const insufficient = summary.status === 'DATA_INSUFFICIENT';
-  // ---- 语义修复（D2）：行情缺失是“数据不足”，不是“已证明继续持有最优”。
-  // 修复前：五只持仓全部 NOT_READY 时，没有动作 → 返回 NO_ACTION，读起来像
-  // “数据完整但没有可靠优势”。现在只有**行情完整**时才允许 NO_ACTION。
-  // 顶层状态必须由**真实的腿**决定，不能只看账户门控：
-  // 门控通过但没有任何可执行腿时，声称 ACTIONABLE 会让调用方以为可以下单。
   const anyExecutableLeg = actions.some(action => action.legs.some(leg => leg.executable === true));
   const quotesReady = summary.data_quality?.quotes?.ready ?? [];
   const quotesNotReady = [...new Set([...(summary.data_quality?.quotes?.stale ?? []), ...(summary.data_quality?.quotes?.not_ready ?? []), ...(summary.data_quality?.quotes?.missing ?? [])])];
@@ -1701,6 +1912,10 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   if (insufficient) status = 'DATA_INSUFFICIENT';
   else if (actions.length === 0) status = quotesComplete ? 'NO_ACTION' : 'DATA_INSUFFICIENT';
   else status = gateSatisfied && anyExecutableLeg ? 'ACTIONABLE' : 'ILLUSTRATIVE';
+
+  if (engineOut && maxActions > 0 && gateSatisfied && quotesComplete) {
+    syncAccountV3State(portfolioDb, engineOut);
+  }
 
   // 动作序号按最终顺序重排，保证 rank 连续（1..n）。
   actions.forEach((action, index) => { action.rank = index + 1; });
@@ -1717,13 +1932,38 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
     };
   });
 
-  // ---- 观察触发条件：NO_ACTION 时由“阻塞原因”与持仓质量共同给出，而不是空话。
-  // DATA_INSUFFICIENT 时也保留阻塞原因，便于说明“为什么今天没有动作”。
+  // ---- 观察触发条件：NO_ACTION 时由“阻塞原因”与持仓质量共同给出，并补充 V3 核心触发线。
+  const v3Triggers: string[] = [];
+  if (engineOut) {
+    if (
+      engineOut.deconcentration.plan_present
+      && engineOut.deconcentration.tranches.some(t => t.status === 'PENDING' || t.status === 'TRIGGERED')
+    ) {
+      const reb = engineOut.deconcentration.rebound_trigger_cny;
+      const mon = engineOut.deconcentration.next_monthly_trigger_date;
+      const ma60p = engineOut.deconcentration.ma60_protect_cny;
+      v3Triggers.push(
+        `159558.SZ 四批换马下次触发条件：反弹至 ${reb !== null ? reb.toFixed(3) : '—'} 元（+8%）`
+        + `${mon ? `，或月度时间窗至 ${mon}` : ''}`
+        + `${ma60p !== null ? `，或防守期连续两日有效跌破 ${ma60p.toFixed(3)} 元` : ''}`,
+      );
+    }
+    const anc = engineOut.router.anchor_snapshot;
+    const preemptiveNote = engineOut.router.deconcentration_preemptive_active
+      ? '（存量重仓换马未完成期间启用 12% 前置熔断清零高波动权益保护）'
+      : '';
+    v3Triggers.push(
+      `账户 15% 高水位熔断生命线：动态高水位 ${(anc.hwm_nav_cents / 100).toFixed(2)} 元，`
+      + `生命线 ${(anc.lifeline_nav_cents / 100).toFixed(2)} 元（当前缓冲 ${anc.lifeline_buffer_pct.toFixed(2)}%）${preemptiveNote}`,
+    );
+    v3Triggers.push('跨境 ETF 买入红线：最新净值折溢价高于 +2.5% 或净值滞后超 3 个交易日一律拦截禁买');
+  }
   const observationTriggers = status === 'NO_ACTION'
     ? [
         ...built.blockers,
+        ...v3Triggers,
         '任一只持仓的缓存收盘跌破最近 20 日最低收盘（需在下一交易日收盘后核对）',
-        '市场反证项数量超过支持项数量（见 market_judgement.counter_evidence）',
+        '市场反证项数量超过支持项数量',
         '持仓行情质量从 READY 降为 STALE/NOT_READY',
         '账户快照被用户确认为当前账户且与目标交易日同日',
       ]
@@ -1738,25 +1978,10 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           })(),
           '失效条件：出现新的、可复核的重大持仓风险事实时，本“数据不足”结论立即失效并重新评估。',
         ]
-      : built.blockers;
+      : [...built.blockers, ...v3Triggers];
 
   const market = summary.market_context ?? {};
   const evidence = summary.market_evidence ?? { support: [], contradiction: [] };
-  // 券商摊薄成本映射：只读，失败不影响日报主流程（成本列降级为空并标注口径）。
-  const costByCode = new Map<string, { diluted_cost_per_share: number | null; diluted_total_cost_cents: number | null }>();
-  const costDiagnostics: string[] = [];
-  try {
-    const dilutedView = buildDilutedCostView(portfolioDb, accountId, { asOf });
-    costDiagnostics.push(...dilutedView.warnings);
-    for (const row of dilutedView.positions) {
-      costByCode.set(row.ts_code, {
-        diluted_cost_per_share: row.diluted_cost_per_share,
-        diluted_total_cost_cents: row.diluted_total_cost_cents,
-      });
-    }
-  } catch (error) {
-    costDiagnostics.push(`摊薄成本不可用：${error instanceof Error ? error.message : String(error)}`);
-  }
 
   const holdings: HoldingAssessment[] = (summary.holdings ?? []).map((holding: any) => {
     const stance: HoldingAssessment['stance'] = holding.bar_quality !== 'READY' ? 'WAIT' : 'HOLD';
@@ -1796,7 +2021,9 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   });
 
   // 独立数据质量维度（D1）：在持仓与门控都算完之后统一生成。
-  const qualityTiers = buildQualityTiers(summary, screening, gateSatisfied, accountStatus, gateReasons, holdings.length, accountEvaluation);
+  const qualityTiers = buildQualityTiers(
+    summary, screening, gateSatisfied, accountStatus, gateReasons, holdings.length, accountEvaluation, status === 'ACTIONABLE',
+  );
 
   const dataQualityNotes: string[] = [...costDiagnostics];
   if (!screening) dataQualityNotes.push('候选池筛选不可用（缓存缺少 fund_* 表或未提供市场缓存）');
@@ -1895,6 +2122,125 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       };
     }
   }
+
+  const v3Cockpit: V3CockpitSummary | undefined = engineOut
+    ? (() => {
+        const approvedPolicy = loadApprovedV3Policy();
+        return {
+          schema: 'v3-offensive-cockpit/1.0',
+          as_of_trade_date: asOf,
+          policy_release: {
+            strategy_id: approvedPolicy.strategy_id,
+            version: approvedPolicy.version,
+            content_hash: approvedPolicy.content_hash,
+            production_admission: approvedPolicy.release.production_admission,
+            bp1_pullback_enabled: approvedPolicy.bp1_pullback_enabled,
+            bp2_breakout_enabled: approvedPolicy.bp2_breakout_enabled,
+            bp2_status: approvedPolicy.bp2_breakout_status,
+          },
+          principal: {
+          initial_principal_cents: engineOut.router.anchor_snapshot.initial_principal_cents,
+          current_nav_cents: engineOut.router.anchor_snapshot.current_nav_cents,
+          to_principal_gap_cents:
+            engineOut.router.anchor_snapshot.initial_principal_cents - engineOut.router.anchor_snapshot.current_nav_cents,
+          to_principal_return_needed_pct: engineOut.router.anchor_snapshot.recovery_needed_pct,
+          loss_from_principal_pct: r2(-engineOut.router.anchor_snapshot.cumulative_return_pct),
+        },
+        market_regime: {
+          regime: engineOut.market_regime.regime,
+          regime_label_zh: engineOut.market_regime.regime_label_zh,
+          raw_regime: engineOut.market_regime.raw_regime,
+          hysteresis_held: engineOut.market_regime.hysteresis_held,
+          crash_override: engineOut.market_regime.crash_override,
+          style: engineOut.market_regime.style,
+          style_label_zh: engineOut.market_regime.style_label_zh,
+          style_spread_20d_pp: engineOut.market_regime.style_spread_20d_pct,
+          target_equity_bps: engineOut.router.targets.target_equity_bps,
+          defensive_cash_bps: engineOut.router.targets.defensive_cash_bps,
+          target_equity_pct: r2(engineOut.router.targets.target_equity_bps / 100),
+          defensive_cash_pct: r2(engineOut.router.targets.defensive_cash_bps / 100),
+          pct_above_ma60: engineOut.market_regime.breadth.pct_above_ma60,
+          amount_vs_ma20: engineOut.market_regime.breadth.amount_vs_ma20,
+          limit_down: engineOut.market_regime.breadth.limit_down,
+          hs300_above_ma60:
+            engineOut.market_regime.value_anchor.close !== null && engineOut.market_regime.value_anchor.ma60 !== null
+              ? engineOut.market_regime.value_anchor.close >= engineOut.market_regime.value_anchor.ma60
+              : null,
+          zz500_above_ma60:
+            engineOut.market_regime.growth_anchor.csi500.close !== null && engineOut.market_regime.growth_anchor.csi500.ma60 !== null
+              ? engineOut.market_regime.growth_anchor.csi500.close >= engineOut.market_regime.growth_anchor.csi500.ma60
+              : null,
+          cyb_above_ma60:
+            engineOut.market_regime.growth_anchor.chinext.close !== null && engineOut.market_regime.growth_anchor.chinext.ma60 !== null
+              ? engineOut.market_regime.growth_anchor.chinext.close >= engineOut.market_regime.growth_anchor.chinext.ma60
+              : null,
+        },
+        router: {
+          effective_regime: engineOut.router.effective_regime,
+          circuit_breaker_status: engineOut.router.circuit_breaker_status,
+          circuit_breaker_label_zh: engineOut.router.circuit_breaker_label_zh,
+          locked_until_trade_date: engineOut.router.locked_until_trade_date,
+          l2_trigger_drawdown_bps: engineOut.router.l2_trigger_drawdown_bps,
+          post_breaker_equity_bps: engineOut.router.post_breaker_equity_bps,
+          deconcentration_preemptive_active: engineOut.router.deconcentration_preemptive_active,
+          policy_version: engineOut.router.policy_version,
+          hwm_nav_cents: engineOut.router.anchor_snapshot.hwm_nav_cents,
+          hwm_date: engineOut.router.anchor_snapshot.hwm_date,
+          hwm_drawdown_pct: engineOut.router.anchor_snapshot.hwm_drawdown_pct,
+          lifeline_nav_cents: engineOut.router.anchor_snapshot.lifeline_nav_cents,
+          lifeline_buffer_cents: engineOut.router.anchor_snapshot.lifeline_buffer_cents,
+          lifeline_buffer_pct: engineOut.router.anchor_snapshot.lifeline_buffer_pct,
+          sub_strategies: engineOut.router.sub_strategies,
+          sub_strategies_zh: engineOut.router.sub_strategies_zh,
+        },
+        deconcentration: {
+          plan_present: engineOut.deconcentration.plan_present,
+          ts_code: engineOut.deconcentration.ts_code,
+          plan_status: engineOut.deconcentration.plan_status,
+          initial_shares: engineOut.deconcentration.initial_shares,
+          current_shares: engineOut.deconcentration.current_shares,
+          target_keep_bps: engineOut.deconcentration.target_keep_bps,
+          target_keep_shares: engineOut.deconcentration.target_keep_shares,
+          reference_price_cny: engineOut.deconcentration.reference_price_cny,
+          rebound_trigger_cny: engineOut.deconcentration.rebound_trigger_cny,
+          ma60_cny: engineOut.deconcentration.ma60_cny,
+          ma60_protect_cny: engineOut.deconcentration.ma60_protect_cny,
+          breakdown_ma60_2d: engineOut.deconcentration.breakdown_ma60_2d,
+          next_monthly_trigger_date: engineOut.deconcentration.next_monthly_trigger_date,
+          recommended_sell_shares: engineOut.deconcentration.recommended_sell_shares,
+          active_trigger_reason: engineOut.deconcentration.active_trigger_reason,
+          tranches: engineOut.deconcentration.tranches,
+          status_summary_zh: engineOut.deconcentration.status_summary_zh,
+        },
+        reconciliation_reminder: engineOut.reconciliation_reminder,
+        super_etf_candidates: engineOut.super_etf_candidates,
+        cross_border_monitor: engineOut.cross_border_monitor,
+        stock_swing_candidates: engineOut.stock_swing_candidates,
+        actions_summary: normalizedActions.map((act, idx) => ({
+          priority: act.priority ?? engineOut.actions[idx]?.priority ?? 'P3',
+          code: act.code,
+          kind: act.kind,
+          title: act.title,
+          legs: act.legs.map(l => ({
+            side: l.side,
+            ts_code: l.ts_code,
+            name: l.name,
+            quantity: Number(l.quantity ?? 0),
+            lot_size: l.lot_size,
+            lots: Number(l.lots ?? 0),
+            price_milli: Number(l.price_milli ?? 0),
+            gross_cents: Number(l.gross_cents ?? 0),
+            fees_cents: Number(l.fees_cents ?? 0),
+            net_cents: Number(l.net_cents ?? 0),
+            quote_trade_date: l.quote_trade_date,
+            executable: l.executable,
+            reason: l.reason,
+          })),
+          fees_cents: Number(act.fees_cents ?? 0),
+        })),
+        };
+      })()
+    : undefined;
 
   return {
     ...(portfolioRisk ? { portfolio_risk: portfolioRisk } : {}),
@@ -2020,7 +2366,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       last_user_reconciled_at: accountEvaluation?.last_user_reconciled_at ?? null,
       unreported_trade_risk: accountEvaluation?.unreported_trade_risk ?? true,
       reasons: gateReasons,
-      warnings: accountEvaluation?.warnings ?? [],
+      warnings: gateWarnings,
       note: '可执行要求：账本可重建的账户状态（同日快照或基线+增量事件）+ REAL_ACCOUNT_VERIFIED + '
         + '无未交收卖出 + 覆盖决策日的完整性声明。未满足时每个腿 executable=false；'
         + 'unreported_trade_risk=true 表示可能存在未录入交易，不能声称与券商实时一致。',
@@ -2052,8 +2398,11 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         : '真实账户历史收益与最大回撤：缺少完整出入金/成交流水',
       '候选池的前瞻有效性：筛选分数是启发式排序，未经检验',
       '历史预案的触发/失效结果：plan_tracking 只读，未与后续行情核对',
-      '沪深主板个股的新增机会比较：本轮候选池只覆盖 ETF',
+      v3Cockpit
+        ? '沪深主板个股仅纳入强势股缩量低于 20 日均值回踩20日线买点；平台突破买点因样本外期望为负已剔除'
+        : '沪深主板个股的新增机会比较：本轮候选池只覆盖 ETF',
     ],
     disclaimer: DAILY_REPORT_DISCLAIMER,
+    ...(v3Cockpit ? { v3_cockpit: v3Cockpit } : {}),
   };
 }

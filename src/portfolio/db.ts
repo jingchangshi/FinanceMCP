@@ -157,6 +157,62 @@ CREATE TABLE IF NOT EXISTS account_completeness (
 );
 `;
 
+export const PORTFOLIO_V3_SCHEMA = `
+CREATE TABLE IF NOT EXISTS account_risk_anchor (
+  account_id TEXT PRIMARY KEY,
+  initial_principal_cents INTEGER NOT NULL,
+  hwm_nav_cents INTEGER NOT NULL,
+  hwm_date TEXT NOT NULL,
+  circuit_breaker_status TEXT NOT NULL DEFAULT 'NORMAL',
+  locked_until_trade_date TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deconcentration_plan (
+  plan_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  ts_code TEXT NOT NULL,
+  initial_shares INTEGER NOT NULL,
+  target_keep_bps INTEGER NOT NULL,
+  anchor_price_milli INTEGER NOT NULL,
+  last_exec_price_milli INTEGER,
+  last_exec_date TEXT,
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deconcentration_tranche (
+  plan_id TEXT NOT NULL,
+  tranche_no INTEGER NOT NULL,
+  planned_shares INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  trigger_date TEXT,
+  trigger_reason TEXT,
+  executed_date TEXT,
+  executed_price_milli INTEGER,
+  PRIMARY KEY (plan_id, tranche_no)
+);
+
+CREATE TABLE IF NOT EXISTS position_stop_tracker (
+  account_id TEXT NOT NULL,
+  ts_code TEXT NOT NULL,
+  entry_date TEXT NOT NULL,
+  entry_price_milli INTEGER NOT NULL,
+  initial_stop_milli INTEGER NOT NULL,
+  current_stop_milli INTEGER NOT NULL,
+  trailing_ma20_armed INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, ts_code)
+);
+`;
+
+/** 只读探测指定表是否存在（避免在只读或未迁移的测试库上触发写操作）。 */
+export function portfolioTableExists(db: DatabaseSync | null | undefined, name: string): boolean {
+  if (!db) return false;
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+}
+
 /** 只读连接不会执行写 schema，因此读取前单独探测账本表是否存在。 */
 export function ledgerTablesPresent(db: DatabaseSync): boolean {
   const row = db.prepare(
@@ -172,6 +228,10 @@ export function ledgerTablesPresent(db: DatabaseSync): boolean {
 export function ensurePortfolioLedgerSchema(db: DatabaseSync): void {
   db.exec(PORTFOLIO_LEDGER_SCHEMA);
   db.exec(PORTFOLIO_COMPLETENESS_SCHEMA);
+}
+
+export function ensurePortfolioV3Schema(db: DatabaseSync): void {
+  db.exec(PORTFOLIO_V3_SCHEMA);
 }
 
 /**
@@ -234,6 +294,7 @@ export function openPortfolioDb(path = portfolioDbPath(), options: { writable?: 
     db.exec(PORTFOLIO_LEDGER_SCHEMA);
     db.exec(PORTFOLIO_COMPLETENESS_SCHEMA);
     db.exec(PORTFOLIO_RISK_POLICY_DDL);
+    db.exec(PORTFOLIO_V3_SCHEMA);
     return db;
   }
   const db = new DatabaseSync(resolved, { readOnly: true });

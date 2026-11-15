@@ -17,7 +17,10 @@ function timestamp(value: string): void {
 function releaseIdentity(value: unknown, scope: AdmissionScope): { release: StrategyRelease; hash: string } {
   const hash = validateStrategyRelease(value);
   const release = value as StrategyRelease;
-  if (!['FROZEN', 'PROSPECTIVE_SHADOW_ACTIVE'].includes(release.research_status)) throw new Error('release_not_eligible');
+  const researchEligible =
+    ['FROZEN', 'PROSPECTIVE_SHADOW_ACTIVE'].includes(release.research_status)
+    || (release.research_status === 'RESEARCH_PUBLISHED' && release.production_admission === 'APPROVED_FOR_ACCOUNT');
+  if (!researchEligible) throw new Error('release_not_eligible');
   const containsUnknown = (v: unknown): boolean => typeof v === 'string' ? v.trim().toUpperCase() === 'UNKNOWN' : Array.isArray(v) ? v.some(containsUnknown) : !!v && typeof v === 'object' && Object.values(v).some(containsUnknown);
   if (containsUnknown(release)) throw new Error('release_not_eligible');
   for (const v of [scope?.account, scope?.market, scope?.environment]) required(v);

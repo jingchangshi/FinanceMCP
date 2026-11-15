@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { ETF_UNIVERSE, fundBaseFactor } from './etf.js';
+import { CROSS_BORDER_MAX_PREMIUM_BPS, ETF_UNIVERSE, fundBaseFactor, resolveFundNavPremium } from './etf.js';
 import {
   ETF_CANDIDATE_CATEGORIES, ETF_CANDIDATE_CATEGORY_LABELS, ETF_CANDIDATE_DECLARATIONS,
   type EtfCandidateCategory, type EtfCandidateDeclaration,
@@ -8,7 +8,7 @@ import { adjustmentRatio } from './data.js';
 import { buildEtfOpportunity, discoverEtfUniverse, etfIdentity, listedAsOf, type EtfDiscovery } from './etfResearch.js';
 
 // 声明式候选池在 etfDeclarations.ts 中定义（无依赖），这里原样再导出，保持既有调用方不变。
-export const ETF_UNIVERSE_VERSION = 'r2-etf-candidates-1.0.0';
+export const ETF_UNIVERSE_VERSION = 'v3-etf-candidates-2.0.0';
 export const ETF_RESEARCH_VERSION = 'etf-research-20261021-v2';
 
 export {
@@ -59,7 +59,7 @@ export const ETF_SCREEN_MAX_TRACKING_ERROR_PCT = 8;
 /** 与基准指数的相关系数下限。 */
 export const ETF_SCREEN_MIN_CORRELATION = 0.8;
 /** 默认返回条数上限（五只持仓始终保留）。 */
-export const ETF_CANDIDATE_DEFAULT_LIMIT = 20;
+export const ETF_CANDIDATE_DEFAULT_LIMIT = 80;
 /** 年化交易日数（与项目其他模块一致的声明值）。 */
 export const ETF_SCREEN_TRADING_DAYS_PER_YEAR = 252;
 
@@ -107,11 +107,17 @@ export interface EtfCandidateData {
   share: { fd_share_wan: number | null; trade_date: string | null };
   /** 份额 × 最新收盘 = 万元；缺份额或收盘时为 null，不补 0。 */
   size_wan_cny: number | null;
+  unit_nav: number | null;
+  nav_date: string | null;
+  premium_bps: number | null;
+  nav_stale: boolean;
+  buy_blocked: boolean;
   coverage: {
     fund_basic: boolean;
     fund_daily: boolean;
     fund_adj: boolean;
     fund_share: boolean;
+    fund_nav: boolean;
     latest_trade_date: string | null;
   };
 }
@@ -131,8 +137,16 @@ export interface EtfCandidateFilters {
     size_wan_cny: number | null;
     threshold_wan_cny: number;
   };
-  /** 溢价折价：缓存没有净值/IOPV 字段时恒为 unavailable，绝不用估算值代替。 */
-  premium_discount: FilterOutcome & { value_pct: number | null };
+  /** 溢价折价：读取 fund_nav 与最新收盘计算；跨境 ETF 净值滞后 > 3 个交易日或溢价 > +2.5% (250bps) 禁买。 */
+  premium_discount: FilterOutcome & {
+    value_pct: number | null;
+    premium_bps: number | null;
+    unit_nav: number | null;
+    nav_date: string | null;
+    lag_trade_days: number | null;
+    nav_stale: boolean;
+    buy_blocked: boolean;
+  };
   tracking: FilterOutcome & {
     benchmark_index_code: string | null;
     tracking_error_pct: number | null;
@@ -157,11 +171,10 @@ export interface EtfCandidateRow {
   name: string | null;
   /** 名称来源：缓存事实 / 声明提示。绝不能把 hint 当成 fund_basic 的事实。 */
   name_source: 'fund_basic' | 'declared_hint' | 'unavailable';
-  /** true = 用户真实持仓；永远入选、永远不被流动性/规模过滤。 */
+  /** true = 用户真实持仓；与其它候选一并接受流动性、规模、风险与溢价门槛检查，不设豁免特权。 */
   held: boolean;
   /**
-   * 兼容标志：持仓或无排除原因即为 true，与旧版语义一致。
-   * 它不表示已通过身份/报价核验；是否可视为验证候选请看 eligibility。
+   * 仅当无任何排除原因（exclusions.length === 0）时为 true；持仓与非持仓采用统一准入门槛。
    */
   included: boolean;
   /** eligible = 身份、报价及筛选证据齐全；research_only = 仅研究与观察；excluded = 有排除原因。 */
@@ -189,7 +202,7 @@ export interface EtfCandidateScreenResult {
   categories_requested: EtfCandidateCategory[];
   limit: number;
   data_coverage: {
-    tables: { fund_basic: boolean; fund_daily: boolean; fund_adj: boolean; fund_share: boolean; index_daily: boolean; trade_cal: boolean };
+    tables: { fund_basic: boolean; fund_daily: boolean; fund_adj: boolean; fund_share: boolean; fund_nav: boolean; index_daily: boolean; trade_cal: boolean };
     missing_tables: string[];
     latest: { fund_daily: string | null; fund_adj: string | null; fund_share: string | null };
     expected_trade_date: string | null;
@@ -310,6 +323,7 @@ export function screenEtfCandidates(
     fund_daily: tableExists(db, 'fund_daily'),
     fund_adj: tableExists(db, 'fund_adj'),
     fund_share: tableExists(db, 'fund_share'),
+    fund_nav: tableExists(db, 'fund_nav'),
     index_daily: tableExists(db, 'index_daily'),
     trade_cal: tableExists(db, 'trade_cal'),
   };
@@ -381,6 +395,9 @@ export function screenEtfCandidates(
   // 被排除的行也保留在结果末尾（included:false + exclusions），便于复核“为什么没入选”，
   // 不因展示上限消失。
   const visible = capped.concat(excluded);
+  visible.forEach((row, index) => {
+    row.rank = index + 1;
+  });
 
   return {
     schema: 'ashare-etf-candidate-screen/1.0',
@@ -407,8 +424,8 @@ export function screenEtfCandidates(
       reasons: row.exclusions.map(item => `${item.filter}:${item.reason}`),
     })),
     degraded: allRows.filter(row => row.status !== 'OK').map(row => row.ts_code),
-    // held 报告的是“结果里实际出现的持仓”，与展示上限无关（持仓永远保留）。
-    held: includedRows.filter(row => row.held).map(row => row.ts_code),
+    // held 报告真实持仓代码列表；是否入选新开仓候选池仍以 exclusions.length === 0 为准（V3 禁止持仓豁免）。
+    held: allRows.filter(row => row.held).map(row => row.ts_code),
     candidates: visible,
     units: {
       amount_kcy: '千元（与 fund_daily.amount 原样一致）',
@@ -420,7 +437,7 @@ export function screenEtfCandidates(
       drawdown_pct: '百分数（%），负值表示回撤',
     },
     score_weights: ETF_SCREEN_SCORE_WEIGHTS,
-    held_policy: '五只真实持仓（' + ETF_UNIVERSE.join('、') + '）永远出现在结果里，永远不被流动性/规模/风险过滤排除；它们的失败项仍会写入 exclusions 以便复核。',
+    held_policy: '持仓（' + heldCodes.join('、') + '）与非持仓执行统一流动性、规模、风险与折溢价门槛，不设豁免特权；不合规持仓会落入 excluded（included=false）供复核。',
     disclaimer: ETF_UNIVERSE_DISCLAIMER,
   };
 }
@@ -431,7 +448,7 @@ function evaluateCandidate(
   db: DatabaseSync | null | undefined,
   declaration: EtfCandidateDeclaration,
   asOf: string,
-  tables: { fund_basic: boolean; fund_daily: boolean; fund_adj: boolean; fund_share: boolean; index_daily: boolean; trade_cal: boolean },
+  tables: { fund_basic: boolean; fund_daily: boolean; fund_adj: boolean; fund_share: boolean; fund_nav: boolean; index_daily: boolean; trade_cal: boolean },
   heldSet: ReadonlySet<string>,
   tradeDates: readonly string[],
 ): EtfCandidateRow {
@@ -593,11 +610,49 @@ function evaluateCandidate(
     threshold_wan_cny: ETF_SCREEN_MIN_SIZE_WAN_CNY,
   };
 
-  // ---- 溢价折价：缓存没有净值/IOPV 字段，恒为 unavailable，不臆造。
+  // ---- 溢价折价：结合 fund_nav 与最新收盘计算；跨境 ETF 滞后 > 3 交易日或溢价 > +2.5% (250bps) 禁买。
+  const latestCloseYuan = latestCloseMilli !== null ? latestCloseMilli / 1000 : null;
+  const navPremium = db && bars.length > 0
+    ? resolveFundNavPremium(db, code, latestCloseYuan, asOf, declaration.category)
+    : {
+      unit_nav: null,
+      nav_date: null,
+      lag_trade_days: null,
+      nav_stale: true,
+      premium_bps: null,
+      premium_pct: null,
+      buy_blocked: false,
+      block_reason: null,
+    };
   const premiumFilter: EtfCandidateFilters['premium_discount'] = {
-    ...unavailable('cache_lacks_nav_or_iopv',
-      'fund_basic 与 fund_daily 都没有净值（nav/iopv）字段，无法计算溢价折价；此处显式为 unavailable'),
-    value_pct: null,
+    ...((): FilterOutcome => {
+      if (!db || bars.length === 0) {
+        return unavailable('fund_daily_row_missing', '缺少目标日行情，暂无法计算净值折溢价');
+      }
+      if (declaration.category === 'cross_border') {
+        if (navPremium.block_reason === 'cross_border_nav_stale') {
+          return fail('cross_border_nav_stale', '跨境 ETF 单位净值缺失或滞后超过 3 个交易日，禁止买入');
+        }
+        if (navPremium.block_reason === 'cross_border_premium_above_250bps') {
+          return fail(
+            'cross_border_premium_above_250bps',
+            `跨境 ETF 溢价率 ${navPremium.premium_pct}% (${navPremium.premium_bps} bps) > +${CROSS_BORDER_MAX_PREMIUM_BPS} bps，禁止买入`,
+          );
+        }
+        return ok(`跨境 ETF 净值 ${navPremium.unit_nav}（${navPremium.nav_date}），折溢价 ${navPremium.premium_pct}% (${navPremium.premium_bps} bps)`);
+      }
+      if (navPremium.unit_nav === null || navPremium.premium_bps === null) {
+        return unavailable('fund_nav_missing', '缓存暂无该基金单位净值（fund_nav），折溢价标记为 unavailable');
+      }
+      return ok(`单位净值 ${navPremium.unit_nav}（${navPremium.nav_date}），折溢价 ${navPremium.premium_pct}% (${navPremium.premium_bps} bps)`);
+    })(),
+    value_pct: navPremium.premium_pct,
+    premium_bps: navPremium.premium_bps,
+    unit_nav: navPremium.unit_nav,
+    nav_date: navPremium.nav_date,
+    lag_trade_days: navPremium.lag_trade_days,
+    nav_stale: navPremium.nav_stale,
+    buy_blocked: navPremium.buy_blocked,
   };
 
   // 风险只用最近一段连续完整区间：最多 60 根，至少 21 根；不要求满 60 根。
@@ -671,19 +726,25 @@ function evaluateCandidate(
     adj_missing_bars: adjMissingBars,
     share: { fd_share_wan: fdShareWan, trade_date: shareRow?.trade_date ? String(shareRow.trade_date) : null },
     size_wan_cny: sizeWan,
+    unit_nav: navPremium.unit_nav,
+    nav_date: navPremium.nav_date,
+    premium_bps: navPremium.premium_bps,
+    nav_stale: navPremium.nav_stale,
+    buy_blocked: navPremium.buy_blocked,
     coverage: {
       fund_basic: !!(tables.fund_basic && basic),
       fund_daily: tables.fund_daily && bars.length > 0,
       fund_adj: !!(tables.fund_adj && adjBase),
       fund_share: !!(tables.fund_share && shareRow),
+      fund_nav: !!(tables.fund_nav && navPremium.unit_nav !== null),
       latest_trade_date: latestBar?.trade_date ?? null,
     },
   };
 
   const { score, components } = scoreCandidate(filters, data);
 
-  // 持仓永远入选；其余行只要有一个排除原因就不入选。
-  const included = held || exclusions.length === 0;
+  // V3 硬护栏 #4：持仓与非持仓统一执行过滤门槛，只要存在排除原因一律不纳入新开仓入选。
+  const included = exclusions.length === 0;
   // 缺表/缺行/缺因子/缺份额一律 DEGRADED，并保留 status_reasons；只有全部来源齐全才是 OK。
   const status: CandidateStatus = exclusions.length === 0 && statusReasons.length === 0 ? 'OK' : 'DEGRADED';
   const eligibility: EtfCandidateRow['eligibility'] = exclusions.length > 0 ? 'excluded'
@@ -706,7 +767,7 @@ function evaluateCandidate(
     filters,
     data,
     exclusions,
-    score,
+    score: exclusions.length === 0 ? score : null,
     score_components: components,
     source: 'server_cache',
     research: buildEtfOpportunity(db, code, asOf, [...heldSet]),
