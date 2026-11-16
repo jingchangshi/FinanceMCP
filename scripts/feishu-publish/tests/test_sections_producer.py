@@ -416,6 +416,9 @@ class TestV3CockpitSections(unittest.TestCase):
         cockpit = bundle["portfolio"]["v3_cockpit"]
         cockpit["router"]["deconcentration_preemptive_active"] = True
         cockpit["router"]["l2_trigger_drawdown_bps"] = 1200
+        cockpit["deconcentration"]["downside_protect_mode"] = "SUPPORT_FLOOR"
+        cockpit["deconcentration"]["support_floor_cny"] = 0.78
+        cockpit["deconcentration"]["downside_protect_cny"] = 0.78
         cockpit["router"]["sub_strategies"]["s_stock_swing"] = "ACTIVE"
         cockpit["router"]["sub_strategies_zh"]["stock_swing_label"] = "先锋主板强势股波段：强势股缩量回踩20日线买点已解锁运行"
         cockpit["stock_swing_candidates"] = [
@@ -440,3 +443,4 @@ class TestV3CockpitSections(unittest.TestCase):
         self.assertIn("优质主板回踩", vis)
         self.assertIn("601001.SH", vis)
         self.assertIn("12% 前置熔断清零高波动权益", vis)
+        self.assertIn("磨底箱体防守位 0.780 元", vis)

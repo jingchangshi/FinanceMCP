@@ -492,8 +492,11 @@ export interface V3CockpitSummary {
     target_keep_shares: number;
     reference_price_cny: number | null;
     rebound_trigger_cny: number | null;
+    support_floor_cny: number | null;
     ma60_cny: number | null;
     ma60_protect_cny: number | null;
+    downside_protect_cny: number | null;
+    downside_protect_mode: V3ActionEngineOutput['deconcentration']['downside_protect_mode'];
     breakdown_ma60_2d: boolean;
     next_monthly_trigger_date: string | null;
     recommended_sell_shares: number;
@@ -1942,10 +1945,16 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       const reb = engineOut.deconcentration.rebound_trigger_cny;
       const mon = engineOut.deconcentration.next_monthly_trigger_date;
       const ma60p = engineOut.deconcentration.ma60_protect_cny;
+      const downsideClause = engineOut.deconcentration.downside_protect_mode === 'SUPPORT_FLOOR'
+        && engineOut.deconcentration.downside_protect_cny !== null
+        ? `，或收盘跌破磨底箱体防守位 ${engineOut.deconcentration.downside_protect_cny.toFixed(3)} 元`
+        : ma60p !== null
+          ? `，或防守期连续两日有效跌破 ${ma60p.toFixed(3)} 元`
+          : '';
       v3Triggers.push(
         `159558.SZ 四批换马下次触发条件：反弹至 ${reb !== null ? reb.toFixed(3) : '—'} 元（+8%）`
         + `${mon ? `，或月度时间窗至 ${mon}` : ''}`
-        + `${ma60p !== null ? `，或防守期连续两日有效跌破 ${ma60p.toFixed(3)} 元` : ''}`,
+        + downsideClause,
       );
     }
     const anc = engineOut.router.anchor_snapshot;
@@ -2203,8 +2212,11 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           target_keep_shares: engineOut.deconcentration.target_keep_shares,
           reference_price_cny: engineOut.deconcentration.reference_price_cny,
           rebound_trigger_cny: engineOut.deconcentration.rebound_trigger_cny,
+          support_floor_cny: engineOut.deconcentration.support_floor_cny,
           ma60_cny: engineOut.deconcentration.ma60_cny,
           ma60_protect_cny: engineOut.deconcentration.ma60_protect_cny,
+          downside_protect_cny: engineOut.deconcentration.downside_protect_cny,
+          downside_protect_mode: engineOut.deconcentration.downside_protect_mode,
           breakdown_ma60_2d: engineOut.deconcentration.breakdown_ma60_2d,
           next_monthly_trigger_date: engineOut.deconcentration.next_monthly_trigger_date,
           recommended_sell_shares: engineOut.deconcentration.recommended_sell_shares,

@@ -28,6 +28,7 @@ import { buildBenchmarkComparison } from './benchmarks.js';
 import { runFeeCommand, FEE_USAGE } from './feeCli.js';
 import { runRiskPolicyCommand, RISK_POLICY_USAGE } from './riskPolicyCli.js';
 import { parseTradeCsv } from './tradeImport.js';
+import { calibrateDeconcentrationPlan } from './deconcentrationPlan.js';
 import { loadFeeContext } from './fees.js';
 import { trustedEvidencePolicy, verifyTrustedRotation } from './trustedEvidence.js';
 import {
@@ -111,6 +112,9 @@ ${RISK_POLICY_USAGE}
   portfolio-evidence-revoke --id ID --recorded-by WHO --confirm [--reason TEXT] [--db PATH]
                                                        受控撤回（VERIFIED→REVOKED，追加审计事件，不改写原记录）
   portfolio-evidence-history --id ID [--db PATH]       查看某条证据的状态变更历史
+  portfolio-deconcentration-calibrate --account ID [--ts-code CODE] --confirm [--db PATH]
+        [--support-floor-milli 厘] [--anchor-price-milli 厘] [--reset-triggered]
+                                                       校准减仓状态机箱体防守位并重置已触发批次
 
   收盘日报与研究候选（D1/C2/C6）：
   portfolio-daily-report --account ID [--date YYYYMMDD] [--snapshot ID] [--max-actions 0..3]
@@ -792,6 +796,30 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       const db = openPortfolioDb(h.arg('db'));
       try {
         h.print({ ...confirmRealAccount(db, accountId, { confirm: true, note: h.arg('note') ?? '' }), db: portfolioDbPath() });
+      } finally {
+        db.close();
+      }
+      return true;
+    }
+    case 'portfolio-deconcentration-calibrate': {
+      const accountId = requireArg(h, 'account');
+      if (!h.flag('confirm')) {
+        throw new Error('校准减仓状态机必须显式给出 --confirm');
+      }
+      const rawFloor = intArg(h.arg('support-floor-milli'), '--support-floor-milli');
+      const supportFloorMilli = rawFloor === undefined ? undefined : rawFloor === 0 ? null : rawFloor;
+      const anchorPriceMilli = intArg(h.arg('anchor-price-milli'), '--anchor-price-milli');
+      const db = openPortfolioDb(h.arg('db'));
+      try {
+        resolveAccountId(db, accountId);
+        const result = calibrateDeconcentrationPlan(db, {
+          account_id: accountId,
+          ts_code: h.arg('ts-code') ?? '159558.SZ',
+          support_floor_milli: supportFloorMilli,
+          anchor_price_milli: anchorPriceMilli,
+          reset_triggered: h.flag('reset-triggered'),
+        });
+        h.print({ ...result, db: portfolioDbPath() });
       } finally {
         db.close();
       }

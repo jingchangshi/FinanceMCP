@@ -15,12 +15,13 @@ const { resolveFundNavPremium } = await import('../build/ashare/etf.js');
 const { screenEtfCandidates } = await import('../build/ashare/etfUniverse.js');
 const { EASTMONEY_SUPER_ETF_CODES } = await import('../build/ashare/etfDeclarations.js');
 const { evaluateMarketRegime } = await import('../build/ashare/marketRegime.js');
-const { isEtfCode, initBaseline, confirmRealAccount, setAccountCompleteness } = await import('../build/portfolio/ledger.js');
+const { isEtfCode, initBaseline, confirmRealAccount, setAccountCompleteness, recordEvent } = await import('../build/portfolio/ledger.js');
 const { importSnapshot, markSnapshotCurrent } = await import('../build/portfolio/account.js');
 const { calculateFees, resolveFeeRules, saveFeeProfile } = await import('../build/portfolio/fees.js');
 const {
   splitSharesIntoTranches,
   ensureDeconcentrationPlan,
+  calibrateDeconcentrationPlan,
   evaluateDeconcentrationPlan,
   persistDeconcentrationUpdates,
 } = await import('../build/portfolio/deconcentrationPlan.js');
@@ -471,6 +472,170 @@ test('V3-4 159558.SZ 四批换马状态机：拆分、规则 A/B/C 与 EXECUTED 
     assert.equal(evA.tranches.find(t => t.tranche_no === 1)?.status, 'TRIGGERED');
     assert.equal(evA.recommended_sell_shares, 11000);
     assert.equal(evA.active_trigger_reason, 'MONTHLY_SCHEDULE');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('V3-4b 磨底箱体防守校准：MA60下建表不追认旧破位、校准重置、0.780防守触发及TRADE_SELL闭环', () => {
+  const days = weekdays('20260701', 90);
+  const createdDay = days[days.length - 5];
+  const dayBox = days[days.length - 4];
+  const dayRebound = days[days.length - 3];
+  const dayBreak = days[days.length - 2];
+  const dayAfterSell = days[days.length - 1];
+
+  // 前 70 天在 1.050，最后几天下移至 0.819 磨底（此时 MA60 仍在 ~0.99，MA60*0.985 远高于 0.819）
+  const { db: mDb } = setupMarketDb('dec-floor', days, {
+    '159558.SZ': (i) => {
+      if (i < days.length - 10) return 1.050;
+      if (i <= days.length - 5) return 0.819;
+      if (i === days.length - 4) return 0.825; // 箱体内震荡
+      if (i === days.length - 3) return 0.885; // 反弹 +8.06%
+      if (i === days.length - 2) return 0.775; // 跌破 0.780 箱体防守位
+      return 0.785;
+    },
+  });
+  const pDb = openPortfolioDb(join(dir, 'dec-floor-portfolio.sqlite'));
+  try {
+    const accId = 'acc-floor';
+    importSnapshot(pDb, {
+      snapshot_id: 'snap-floor',
+      as_of: days[0],
+      source: 'synthetic-test',
+      note: 'floor test',
+      warnings: [],
+      is_current: false,
+      positions: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 58900, ref_price_milli: 819, ref_cost_milli: 1000, market_value_cents: 4_823_910 },
+      ],
+      totals: { total_assets_cents: 5_000_000, securities_mv_cents: 4_823_910, cash_cents: 176_090, wealth_cents: 0, unrealized_pnl_cents: 0 },
+    });
+    initBaseline(pDb, accId, { asOf: days[0], snapshotId: 'snap-floor' });
+    markSnapshotCurrent(pDb, 'snap-floor', { confirmedBy: 'test' });
+
+    const created = ensureDeconcentrationPlan(pDb, {
+      account_id: accId,
+      ts_code: '159558.SZ',
+      initial_shares: 58900,
+      nav_cents: 6_860_690,
+      target_keep_bps: 1791,
+      anchor_price_milli: 819,
+      support_floor_milli: 780,
+      total_tranches: 4,
+      created_at: createdDay,
+    });
+    assert.equal(created.created, true);
+    assert.equal(created.plan.support_floor_milli, 780);
+
+    // a) 在 MA60*0.985 下方初始化与箱体内震荡时，DEFENSIVE 下也不得追认历史 BREAKDOWN_MA60
+    const evInit = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accId,
+      asOf: createdDay,
+      currentShares: 58900,
+      sellableShares: 58900,
+      currentCloseMilli: 819,
+      navCents: 6_860_690,
+      marketRegime: 'DEFENSIVE',
+    });
+    assert.equal(evInit.was_above_ma60_since_ref, false);
+    assert.equal(evInit.downside_protect_mode, 'SUPPORT_FLOOR');
+    assert.equal(evInit.downside_protect_cny, 0.78);
+    assert.equal(evInit.recommended_sell_shares, 0);
+    assert.equal(evInit.active_trigger_reason, null);
+    assert.match(evInit.status_summary_zh, /0\.780 元/);
+
+    // b) 模拟人工校准：先强行污染前2批为 TRIGGERED，再调用 calibrateDeconcentrationPlan 重置为 PENDING
+    pDb.prepare("UPDATE deconcentration_tranche SET status = 'TRIGGERED', trigger_date = ?, trigger_reason = 'BREAKDOWN_MA60' WHERE plan_id = ? AND tranche_no IN (1, 2)")
+      .run(createdDay, created.plan.plan_id);
+    const cal = calibrateDeconcentrationPlan(pDb, {
+      account_id: accId,
+      ts_code: '159558.SZ',
+      support_floor_milli: 780,
+      reset_triggered: true,
+    });
+    assert.deepEqual(cal.reset_tranche_nos, [1, 2]);
+    assert.ok(cal.tranches.every(t => t.status === 'PENDING'));
+
+    // 箱体中枢 dayBox (0.825) 不触发
+    const evBox = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accId,
+      asOf: dayBox,
+      currentShares: 58900,
+      sellableShares: 58900,
+      currentCloseMilli: 825,
+      navCents: 6_900_000,
+      marketRegime: 'DEFENSIVE',
+    });
+    assert.equal(evBox.recommended_sell_shares, 0);
+
+    // c) 反弹至 0.885 (+8%) 仅触发第 1 批 11,000 份 (REBOUND_8PCT)
+    const evRebound = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accId,
+      asOf: dayRebound,
+      currentShares: 58900,
+      sellableShares: 58900,
+      currentCloseMilli: 885,
+      navCents: 7_200_000,
+      marketRegime: 'STRUCTURAL',
+    });
+    assert.equal(evRebound.recommended_sell_shares, 11000);
+    assert.equal(evRebound.active_trigger_reason, 'REBOUND_8PCT');
+    persistDeconcentrationUpdates(pDb, evRebound);
+
+    // e) 记录 TRADE_SELL 成交流水并验证第 1 批闭环记录精确成交价 885 与日期
+    recordEvent(pDb, {
+      event_id: 'sell-159558-rebound-1',
+      account_id: accId,
+      event_type: 'TRADE_SELL',
+      occurred_on: dayRebound,
+      ts_code: '159558.SZ',
+      quantity: 11000,
+      price_milli: 885,
+      gross_cents: 973500,
+      fee_cents: 49,
+      tax_cents: 0,
+      source: 'broker_statement',
+    });
+    const evAfterSell = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accId,
+      asOf: dayAfterSell,
+      currentShares: 47900,
+      sellableShares: 47900,
+      currentCloseMilli: 825,
+      navCents: 7_200_000,
+      marketRegime: 'STRUCTURAL',
+    });
+    assert.equal(evAfterSell.tranches[0].status, 'EXECUTED');
+    assert.equal(evAfterSell.tranches[0].executed_price_milli, 885);
+    assert.equal(evAfterSell.tranches[0].executed_date, dayRebound);
+    persistDeconcentrationUpdates(pDb, evAfterSell);
+
+    // d) 后续收盘 0.775 跌破 0.780 箱体防守位 -> 在 DEFENSIVE/STRUCTURAL 下触发剩余 3 批的一半向上取整 = 2 批 (22,000 份)
+    const evFloorBreak = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accId,
+      asOf: dayBreak,
+      currentShares: 47900,
+      sellableShares: 47900,
+      currentCloseMilli: 775,
+      navCents: 6_800_000,
+      marketRegime: 'DEFENSIVE',
+    });
+    assert.equal(evFloorBreak.active_trigger_reason, 'BREAKDOWN_SUPPORT_FLOOR');
+    assert.equal(evFloorBreak.recommended_sell_shares, 22000);
+    assert.equal(evFloorBreak.tranches[1].status, 'TRIGGERED');
+    assert.equal(evFloorBreak.tranches[2].status, 'TRIGGERED');
   } finally {
     pDb.close();
     mDb.close();

@@ -378,7 +378,9 @@ def _build_v3_cockpit_sections(
         deconc_next.append(f"反弹 +8% 目标价 {_tick_price(deconc['rebound_trigger_cny'])} 元")
     if deconc.get("next_monthly_trigger_date"):
         deconc_next.append(f"下个保底月度窗口 {_ymd(deconc['next_monthly_trigger_date'])}")
-    if deconc.get("ma60_protect_cny") is not None:
+    if deconc.get("downside_protect_mode") == "SUPPORT_FLOOR" and deconc.get("downside_protect_cny") is not None:
+        deconc_next.append(f"磨底箱体防守位 {_tick_price(deconc['downside_protect_cny'])} 元")
+    elif deconc.get("ma60_protect_cny") is not None:
         deconc_next.append(f"60日均线防守位 {_tick_price(deconc['ma60_protect_cny'])} 元")
     deconc_line = str(deconc.get("status_summary_zh") or "集中度换马状态未初始化。")
 
@@ -478,7 +480,7 @@ def _build_v3_cockpit_sections(
                 f"当前执行进度 {exec_cnt}/{len(tranches) or 4} 批，目标留存 {deconc.get('target_keep_shares', 15000)} 份；"
                 f"拆分计划：{tranche_desc}。"
             ),
-            "why": "锁定既有份数拆分避免每日重复卖出；仅当月度保底窗口、反弹+8%加速或空头防守跌破60日线才触发单批委托。",
+            "why": "锁定既有份数拆分避免每日重复卖出；仅当反弹+8%加速兑现、跌破下方防守位（磨底箱体下沿或60日线）或月度保底窗口才触发减仓委托。",
             "missing": "触发条件明确： " + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
         },
         {
