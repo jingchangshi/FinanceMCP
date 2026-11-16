@@ -189,7 +189,9 @@ def build_notification_markdown(
             trig_bits.append(f"反弹触发 {_fmt_price(deconc['rebound_trigger_cny'])} 元")
         if deconc.get("next_monthly_trigger_date"):
             trig_bits.append(f"下月窗口 {_format_iso_date(str(deconc['next_monthly_trigger_date']))}")
-        if deconc.get("ma60_protect_cny") is not None:
+        if deconc.get("downside_protect_mode") == "SUPPORT_FLOOR" and deconc.get("downside_protect_cny") is not None:
+            trig_bits.append(f"箱体防守 {_fmt_price(deconc['downside_protect_cny'])} 元")
+        elif deconc.get("ma60_protect_cny") is not None:
             trig_bits.append(f"60日线防守 {_fmt_price(deconc['ma60_protect_cny'])} 元")
         trig_txt = f"（{'；'.join(trig_bits)}）" if trig_bits else ""
         lines.append(f"- **159558 换马进度**：{exec_cnt}/{len(tranches)} 批已执行{trig_txt}")

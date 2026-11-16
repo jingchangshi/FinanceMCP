@@ -109,6 +109,15 @@ class TestFeishuNotify(unittest.TestCase):
             else:
                 self.assertIn("明日无新增买卖指令", md)
 
+        bundle_floor = self._helper._v3_bundle(actionable=False)
+        deconc = bundle_floor["portfolio"]["v3_cockpit"]["deconcentration"]
+        deconc["downside_protect_mode"] = "SUPPORT_FLOOR"
+        deconc["support_floor_cny"] = 0.78
+        deconc["downside_protect_cny"] = 0.78
+        md_floor, _ = build_notification_markdown(bundle_floor, pub_entry, data_delayed=False)
+        self.assertIn("箱体防守 0.780 元", md_floor)
+        self.assertEqual(check_forbidden(_URL_RE.sub("", md_floor)), [])
+
     def test_idempotency_ledger_skips_same_day_duplicate_and_resends_on_change(self):
         cfg = _base_config()
         bundle = self._helper._v3_bundle(actionable=True)

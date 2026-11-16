@@ -1165,7 +1165,7 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
     lines.push(
       `- **四批换马状态机（159558.SZ）**：已执行 ${execCnt}/${totalCnt} 批（计划分解：${batchDesc || '未建计划'}，目标留存 ${c.deconcentration.target_keep_shares} 份）；${zh(c.deconcentration.status_summary_zh)}`
       + `${c.deconcentration.rebound_trigger_cny !== null ? `；反弹 +8% 目标价 ${c.deconcentration.rebound_trigger_cny.toFixed(3)} 元` : ''}`
-      + `${c.deconcentration.ma60_protect_cny !== null ? `；60 日均线保护价 ${c.deconcentration.ma60_protect_cny.toFixed(3)} 元` : ''}`
+      + `${c.deconcentration.downside_protect_mode === 'SUPPORT_FLOOR' && c.deconcentration.downside_protect_cny !== null ? `；磨底箱体防守价 ${c.deconcentration.downside_protect_cny.toFixed(3)} 元` : c.deconcentration.ma60_protect_cny !== null ? `；60 日均线保护价 ${c.deconcentration.ma60_protect_cny.toFixed(3)} 元` : ''}`
       + `${c.deconcentration.next_monthly_trigger_date ? `；下个保底月度窗口 ${ymd(c.deconcentration.next_monthly_trigger_date)}` : ''}。`,
     );
     const superList = c.super_etf_candidates.slice(0, 3);
@@ -1433,7 +1433,9 @@ function buildTechnicalSections(
       defensive_cash_pct: r.v3_cockpit.market_regime.defensive_cash_pct,
       style_spread_20d_pp: r.v3_cockpit.market_regime.style_spread_20d_pp,
       rebound_trigger_cny: r.v3_cockpit.deconcentration.rebound_trigger_cny,
+      support_floor_cny: r.v3_cockpit.deconcentration.support_floor_cny,
       ma60_protect_cny: r.v3_cockpit.deconcentration.ma60_protect_cny,
+      downside_protect_cny: r.v3_cockpit.deconcentration.downside_protect_cny,
       l2_trigger_drawdown_pct: r.v3_cockpit.router.l2_trigger_drawdown_bps / 100,
       post_breaker_equity_pct: r.v3_cockpit.router.post_breaker_equity_bps / 100,
       rule_constants_pct: [18, 1.3, 12, 10, 0, 15, 8, -8, 2.5, 2, 0.5, 3, 30],

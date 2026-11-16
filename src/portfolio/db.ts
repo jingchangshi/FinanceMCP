@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS deconcentration_plan (
   initial_shares INTEGER NOT NULL,
   target_keep_bps INTEGER NOT NULL,
   anchor_price_milli INTEGER NOT NULL,
+  support_floor_milli INTEGER,
   last_exec_price_milli INTEGER,
   last_exec_date TEXT,
   status TEXT NOT NULL DEFAULT 'ACTIVE',
@@ -232,6 +233,10 @@ export function ensurePortfolioLedgerSchema(db: DatabaseSync): void {
 
 export function ensurePortfolioV3Schema(db: DatabaseSync): void {
   db.exec(PORTFOLIO_V3_SCHEMA);
+  const cols = db.prepare('PRAGMA table_info(deconcentration_plan)').all() as Array<{ name?: string }>;
+  if (!cols.some(c => c.name === 'support_floor_milli')) {
+    db.exec('ALTER TABLE deconcentration_plan ADD COLUMN support_floor_milli INTEGER;');
+  }
 }
 
 /**

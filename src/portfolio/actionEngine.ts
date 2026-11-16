@@ -671,9 +671,11 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         .join('、') || '当前批次';
       const triggerDetail = deconcentration.active_trigger_reason === 'REBOUND_8PCT'
         ? `收盘 ${(h159558.price_milli / 1000).toFixed(3)} 元已达到自基准价反弹 +8% 目标（${(deconcentration.rebound_trigger_cny ?? 0).toFixed(3)} 元）`
-        : deconcentration.active_trigger_reason === 'BREAKDOWN_MA60'
-          ? `空头防守环境下连续两日有效跌破 60 日线（${(deconcentration.ma60_protect_cny ?? 0).toFixed(3)} 元），触发保护减仓`
-          : `已进入月度时间保底窗口且距前次间隔满 12 个交易日`;
+        : deconcentration.active_trigger_reason === 'BREAKDOWN_SUPPORT_FLOOR'
+          ? `收盘 ${(h159558.price_milli / 1000).toFixed(3)} 元跌破磨底箱体防守位（${(deconcentration.support_floor_cny ?? deconcentration.downside_protect_cny ?? 0).toFixed(3)} 元），触发保护减仓`
+          : deconcentration.active_trigger_reason === 'BREAKDOWN_MA60'
+            ? `空头防守环境下连续两日有效跌破 60 日线（${(deconcentration.ma60_protect_cny ?? 0).toFixed(3)} 元），触发保护减仓`
+            : `已进入月度时间保底窗口且距前次间隔满 12 个交易日`;
 
       actions.push({
         priority: 'P2',
