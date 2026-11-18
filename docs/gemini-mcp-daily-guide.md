@@ -1,6 +1,6 @@
 # Gemini 网页版自定义 MCP 应用接入与定时日报实施指南（V3）
 
-> **定位**：与本机 `17:20` 自动飞书日报管线并行的双轨外部研究接入方案；完全复用生产级 `/private/mcp` 私有账户端点与 OAuth 2.1 授权服务器，不新建平行服务，不暴露任何敏感明文凭证。
+> **定位**：与本机 `19:30` 自动飞书日报管线并行的双轨外部研究接入方案；完全复用生产级 `/private/mcp` 私有账户端点与 OAuth 2.1 授权服务器，不新建平行服务，不暴露任何敏感明文凭证。
 
 ---
 
@@ -9,9 +9,9 @@
 ```text
                        ┌─────────────────────────────────────────────────┐
                        │ 轨道 A（主生产·无人工·飞书直达）                │
-Tushare Pro ──► cron/systemd (17:20 CST)                                 │
+免费多源行情 (TDX/腾讯/东财) ──► systemd (19:30 CST)                     │
                        │  └─ run-daily-unified.sh                        │
-                       │      ├─ 日线/ETF/fund_nav 同步（异常隔离与延迟告警）│
+                       │      ├─ 日线/ETF/fund_nav 同步（主备降级与延迟告警）│
                        │      ├─ 热点快照 + 账户研究快照入库              │
                        │      └─ 飞书 Docx + IM 推送                      │
                        └─────────────────────────────────────────────────┘
@@ -19,7 +19,7 @@ Tushare Pro ──► cron/systemd (17:20 CST)                                 �
                                          ▼
   Gemini 网页版（gemini.google.com）
     ├─ Connected Apps / DevMode（Streamable HTTP + OAuth 2.1）
-    └─ Scheduled Actions（建议每个交易日 19:30 Asia/Shanghai）
+    └─ Scheduled Actions（建议每个交易日 20:00 Asia/Shanghai）
            │
            │ HTTPS + Bearer Access Token (portfolio:read research:append)
            ▼
@@ -88,7 +88,7 @@ docker exec finance-mcp-ashare node build/ashare/cli.js oauth-client-create \
 
 ## 四、Gemini Scheduled Actions（定时日报）提示词模板
 
-在 Gemini 网页版侧边栏 **Scheduled Actions** 新建每日排程（建议时间：**每个交易日 `19:30` Asia/Shanghai**；注意：Tushare 收盘日线通常在 `18:00–19:15` 入库完毕，19:30 可避开上游延迟窗口），粘贴以下提示词：
+在 Gemini 网页版侧边栏 **Scheduled Actions** 新建每日排程（建议时间：**每个交易日 `20:00` Asia/Shanghai**；说明：本机 `19:30` 自动流水线同步完当日多源收盘与场内基金净值后，20:00 触发 Gemini 可直接读取最新 `PERSISTED` 冻结快照），粘贴以下提示词：
 
 ```text
 请通过已连接的 FinanceMCP 私有 MCP 应用执行今日 A 股 V3 攻防账户盘后研究并输出中文日报：

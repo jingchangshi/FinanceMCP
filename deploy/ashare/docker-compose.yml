@@ -50,6 +50,8 @@ services:
       ASHARE_OAUTH_REQUIRE_WRITE_SCOPE: ${ASHARE_OAUTH_REQUIRE_WRITE_SCOPE:-0}
       # Expose only the five A-share tools to ChatGPT.
       FINANCE_TOOL_PROFILE: ashare_daily
+      # Default to free multi-source router (TDX TCP + Tencent + Eastmoney); override with 'tushare' if needed.
+      ASHARE_DATA_PROVIDER: ${ASHARE_DATA_PROVIDER:-free}
       # Never take data-source credentials from requests; Tushare comes from TUSHARE_TOKEN in .env.
       MCP_ACCEPT_REQUEST_CREDENTIALS: "0"
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-share.shijingchang.cn,localhost,127.0.0.1}

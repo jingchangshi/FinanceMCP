@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { fetchAll } from './fetch.js';
+import { fetchAll, withSyncDb } from './fetch.js';
 import { logSync, RefreshStatus, replaceDate, upsertRows } from './db.js';
 export type { RefreshStatus };
 
@@ -38,6 +38,7 @@ export function shanghaiToday(): string {
 // ---------------------------------------------------------------- calendar
 
 export async function syncTradeCal(db: DatabaseSync, start: string, end: string): Promise<number> {
+  return withSyncDb(db, async () => {
   try {
     const rows = await fetchAll('trade_cal', { exchange: 'SSE', start_date: start, end_date: end },
       'cal_date,is_open,pretrade_date');
@@ -58,6 +59,7 @@ export async function syncTradeCal(db: DatabaseSync, start: string, end: string)
     }
     throw error;
   }
+  });
 }
 
 export function isTradeDay(db: DatabaseSync, date: string): boolean | undefined {
@@ -89,6 +91,7 @@ export function recentTradeDays(db: DatabaseSync, end: string, count: number): s
 // ---------------------------------------------------------------- stock list
 
 export async function syncStockBasic(db: DatabaseSync): Promise<number> {
+  return withSyncDb(db, async () => {
   const fields = 'ts_code,symbol,name,area,industry,market,exchange,list_date,delist_date,list_status,is_hs';
   const rows: Record<string, any>[] = [];
   try {
@@ -112,6 +115,7 @@ export async function syncStockBasic(db: DatabaseSync): Promise<number> {
   const n = upsertRows(db, 'stock_basic', [...fields.split(','), 'updated_at'], rows);
   logSync(db, 'stock_basic', 'all', n, 'ok', '', { refresh_status: 'REFRESH_OK', write_mode: 'merged' });
   return n;
+  });
 }
 
 // ---------------------------------------------------------------- per trade date
@@ -175,6 +179,7 @@ export interface DatasetSync {
  * the run to some datasets, so repairing one does not rewrite the others.
  */
 export async function syncTradeDate(db: DatabaseSync, date: string, mode: SyncMode | boolean = 'skip_ok', only?: string[]): Promise<Record<string, DatasetSync>> {
+  return withSyncDb(db, async () => {
   const refresh = mode === true || mode === 'refresh';
   const result: Record<string, DatasetSync> = {};
   const prev = previousTradeDay(db, date);
@@ -214,6 +219,7 @@ export async function syncTradeDate(db: DatabaseSync, date: string, mode: SyncMo
     result[ds.table] = { rows: after, fetched: true, status, refresh_status: refreshStatus, fetched_rows: rows.length, before_rows: before, write };
   }
   return result;
+  });
 }
 
 /**
@@ -224,6 +230,7 @@ export async function syncTradeDate(db: DatabaseSync, date: string, mode: SyncMo
  * date; a failed one changes nothing and leaves the date to be fetched again.
  */
 export async function syncSuspend(db: DatabaseSync, date: string, refresh = false): Promise<DatasetSync> {
+  return withSyncDb(db, async () => {
   const before = countFor(db, 'suspend_d', date);
   const latest = db.prepare("SELECT status, refresh_status FROM sync_log WHERE dataset = 'suspend_d' AND key = ?").get(date) as any;
   if (!refresh && latest?.status === 'ok' && latest.refresh_status !== 'REFRESH_FAILED') return { rows: before, fetched: false };
@@ -241,10 +248,12 @@ export async function syncSuspend(db: DatabaseSync, date: string, refresh = fals
       { refresh_status: 'REFRESH_FAILED', before_rows: before, after_rows: before, write_mode: 'none' });
     return { rows: before, fetched: true, status, refresh_status: 'REFRESH_FAILED', fetched_rows: 0, before_rows: before, write: 'none', error: message.slice(0, 200) };
   }
+  });
 }
 
 /** Fetch one core index over [start, end] and merge it; used for regular sync and for filling holes. */
 export async function syncIndexRange(db: DatabaseSync, code: string, start: string, end: string, asOf = end): Promise<number> {
+  return withSyncDb(db, async () => {
   const fields = 'ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount';
   const key = `${code}:${start}-${end}`;
   try {
@@ -259,6 +268,7 @@ export async function syncIndexRange(db: DatabaseSync, code: string, start: stri
     logSync(db, 'index_daily', key, 0, 'failed', 'request failed: ' + String(error?.message ?? error), { refresh_status: 'REFRESH_FAILED', write_mode: 'none' });
     return 0;
   }
+  });
 }
 
 /**
@@ -267,6 +277,7 @@ export async function syncIndexRange(db: DatabaseSync, code: string, start: stri
  * as-of day's index close is re-checked like the stock data.
  */
 export async function syncIndexDaily(db: DatabaseSync, end: string, defaultStart: string, refreshFrom?: string): Promise<Record<string, number>> {
+  return withSyncDb(db, async () => {
   const result: Record<string, number> = {};
   for (const code of Object.keys(CORE_INDICES)) {
     const span = db.prepare('SELECT MIN(trade_date) first, MAX(trade_date) last FROM index_daily WHERE ts_code = ?').get(code) as any;
@@ -283,6 +294,7 @@ export async function syncIndexDaily(db: DatabaseSync, end: string, defaultStart
     result[code] = count;
   }
   return result;
+  });
 }
 
 // ---------------------------------------------------------------- financials
@@ -309,6 +321,7 @@ export function reportPeriods(end: string, count: number): string[] {
  * periods are fetched once.
  */
 export async function syncFinaIndicator(db: DatabaseSync, asOf: string, periods = 12, refreshRecent = 3): Promise<Record<string, number>> {
+  return withSyncDb(db, async () => {
   const result: Record<string, number> = {};
   const list = reportPeriods(asOf, periods);
   for (const [i, period] of list.entries()) {
@@ -331,6 +344,7 @@ export async function syncFinaIndicator(db: DatabaseSync, asOf: string, periods 
     }
   }
   return result;
+  });
 }
 
 // ---------------------------------------------------------------- quality

@@ -1,9 +1,9 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { callWithRetry, fetchAll } from './fetch.js';
+import { callWithRetry, fetchAll, withSyncDb } from './fetch.js';
 import { upsertRows } from './db.js';
 import { addDays, isTradeDay, latestTradeDay, previousTradeDay, shanghaiToday, syncTradeCal, tradeDaysBetween } from './ingest.js';
 import { adjustmentRatio, AdjustMode, DataQueryError, parseYmd } from './data.js';
-import { ETF_CANDIDATE_DECLARATIONS } from './etfDeclarations.js';
+import { ETF_CANDIDATE_DECLARATIONS, ETF_UNIVERSE } from './etfDeclarations.js';
 import { BASKET_CODES } from '../portfolio/benchmarkDefinitions.js';
 import { discoverEtfUniverse, ETF_DYNAMIC_SYNC_LIMIT } from './etfResearch.js';
 
@@ -17,8 +17,8 @@ import { discoverEtfUniverse, ETF_DYNAMIC_SYNC_LIMIT } from './etfResearch.js';
  * - fund_daily 支持按 trade_date 取全市场，因此按交易日同步，而不是逐代码同步。
  */
 
-/** R0 冻结的五只持仓 ETF。 */
-export const ETF_UNIVERSE = ['159241.SZ', '159278.SZ', '159558.SZ', '516080.SH', '560390.SH'] as const;
+/** R0 冻结的五只持仓 ETF（重导出自无依赖模块 etfDeclarations.ts）。 */
+export { ETF_UNIVERSE };
 
 /** ETF 交易单位：1 手 = 100 份（场内 ETF 的申报单位）。 */
 export const ETF_LOT_SIZE = 100;
@@ -169,6 +169,7 @@ export function fundBasicPermissionDenied(db: DatabaseSync): boolean {
  * —— 不做“一次调用就覆盖全市场”的假设。只写 fund_basic，不触碰 stock_basic。
  */
 export async function syncFundBasic(db: DatabaseSync): Promise<FundBasicSync> {
+  return withSyncDb(db, async () => {
   assertEtfSchema(db);
   const now = new Date().toISOString();
   let rows: Record<string, any>[] = [];
@@ -202,6 +203,7 @@ export async function syncFundBasic(db: DatabaseSync): Promise<FundBasicSync> {
     ...(missing.length ? { per_code_codes: missing } : {}),
     ...(permission ? { permission_denied: true } : {}),
   };
+  });
 }
 
 export interface FundDateSync {
@@ -219,6 +221,7 @@ export interface FundDateSync {
  * 已有的完整快照，而是合并或保留。
  */
 export async function syncFundDaily(db: DatabaseSync, start: string, end: string, opts: { refresh?: boolean } = {}): Promise<Record<string, FundDateSync>> {
+  return withSyncDb(db, async () => {
   assertEtfSchema(db);
   const days = tradeDaysBetween(db, start, end);
   if (!days.length) throw new DataQueryError(`交易日历在 ${start}-${end} 内为空，请先同步 trade_cal`);
@@ -282,6 +285,7 @@ export async function syncFundDaily(db: DatabaseSync, start: string, end: string
     out[date] = { rows: after, fetched: true, status, write, ...(why ? { error: why } : {}) };
   }
   return out;
+  });
 }
 
 /**
@@ -293,6 +297,7 @@ export async function syncFundDaily(db: DatabaseSync, start: string, end: string
 export async function syncFundAdj(
   db: DatabaseSync, start: string, end: string, opts: { codes?: readonly string[] } = {},
 ): Promise<Record<string, number>> {
+  return withSyncDb(db, async () => {
   assertEtfSchema(db);
   const out: Record<string, number> = {};
   for (const code of opts.codes ?? ETF_UNIVERSE) {
@@ -309,12 +314,14 @@ export async function syncFundAdj(
     }
   }
   return out;
+  });
 }
 
 /** 基金份额（时点存量，万份）。同样按代码区间合并写入。 */
 export async function syncFundShare(
   db: DatabaseSync, start: string, end: string, opts: { codes?: readonly string[] } = {},
 ): Promise<Record<string, number>> {
+  return withSyncDb(db, async () => {
   assertEtfSchema(db);
   const out: Record<string, number> = {};
   for (const code of opts.codes ?? ETF_UNIVERSE) {
@@ -331,6 +338,7 @@ export async function syncFundShare(
     }
   }
   return out;
+  });
 }
 
 const FUND_NAV_COLS = FUND_NAV_FIELDS.split(',');
@@ -390,6 +398,7 @@ export async function syncFundNav(
   db: DatabaseSync,
   opts: { end?: string; days?: number; fallbackCodes?: readonly string[] } = {},
 ): Promise<FundNavSync> {
+  return withSyncDb(db, async () => {
   assertEtfSchema(db);
   ensureFundNavTable(db);
   const end = opts.end ?? latestTradeDay(db, shanghaiToday()) ?? shanghaiToday();
@@ -451,6 +460,7 @@ export async function syncFundNav(
   }
 
   return { dates, rows, per_date, fallback_codes, errors };
+  });
 }
 
 /**
@@ -560,6 +570,7 @@ export interface EtfSyncSummary {
 
 /** 五只 ETF 的完整同步：基础信息 → 逐交易日全市场日线 → 逐代码复权/份额 → 单位净值。 */
 export async function syncEtf(db: DatabaseSync, start: string, end: string, opts: { refresh?: boolean } = {}): Promise<EtfSyncSummary> {
+  return withSyncDb(db, async () => {
   const t0 = Date.now();
   const errors: string[] = [];
   // 按交易日同步需要交易日历；缺失时先补该区间，不假设“工作日 = 交易日”。
@@ -593,6 +604,7 @@ export async function syncEtf(db: DatabaseSync, start: string, end: string, opts
     ...(fund_nav ? { fund_nav } : {}),
     errors, seconds: Math.round((Date.now() - t0) / 1000),
   };
+  });
 }
 
 // ---------------------------------------------------------------- daily pipeline integration
@@ -678,6 +690,7 @@ export interface FundHoldingFetch {
 export async function syncFundDailyCodes(
   db: DatabaseSync, date: string, codes: readonly string[] = ETF_UNIVERSE, opts: { refresh?: boolean } = {},
 ): Promise<FundHoldingFetch[]> {
+  return withSyncDb(db, async () => {
   assertEtfSchema(db);
   const out: FundHoldingFetch[] = [];
   for (const code of codes) {
@@ -709,6 +722,7 @@ export async function syncFundDailyCodes(
     }
   }
   return out;
+  });
 }
 
 /** 某交易日五只持仓的覆盖情况：哪些有合法 bar，哪些上游确认无行情（停牌）。 */
@@ -779,6 +793,7 @@ export interface EtfDailySyncSummary {
 export async function syncEtfForDaily(
   db: DatabaseSync, end: string, opts: { refreshFrom?: string; days?: number } = {},
 ): Promise<EtfDailySyncSummary> {
+  return withSyncDb(db, async () => {
   const t0 = Date.now();
   const errors: string[] = [];
   const days = opts.days ?? 5;
@@ -894,6 +909,7 @@ export async function syncEtfForDaily(
 
   summary.seconds = Math.round((Date.now() - t0) / 1000);
   return summary;
+  });
 }
 
 // ---------------------------------------------------------------- flow labelling

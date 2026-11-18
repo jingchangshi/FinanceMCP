@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { fetchStats } from './fetch.js';
+import { fetchStats, withSyncDb } from './fetch.js';
 import {
   addDays, DatasetSync, checkQuality, QualityReport, shanghaiToday, syncFinaIndicator, syncIndexDaily,
   syncStockBasic, syncSuspend, syncTradeCal, syncTradeDate, tradeDaysBetween,
@@ -29,6 +29,7 @@ export async function syncRange(
   end: string,
   opts: { force?: boolean; fina?: boolean; refreshFrom?: string; skipCalendar?: boolean } = {},
 ): Promise<SyncSummary> {
+  return withSyncDb(db, async () => {
   const t0 = Date.now();
   if (!opts.skipCalendar) {
     await syncTradeCal(db, addDays(start, -400), addDays(shanghaiToday(), 30));
@@ -64,4 +65,5 @@ export async function syncRange(
     fina = await syncFinaIndicator(db, end);
   }
   return { start, end, trade_days: days.length, refreshed, datasets, quality, fina, tushare: { ...fetchStats }, seconds: Math.round((Date.now() - t0) / 1000) };
+  });
 }
