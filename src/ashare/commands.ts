@@ -83,7 +83,7 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       // continuity of every later watchlist. Use `report` or `replay` (research database) instead.
       const last = lastLiveDate(db);
       if (last && last > date) throw new Error(`正式股票池已到 ${last}，daily 不能回写更早的 ${date}；历史日期请用 report --date ${date}（研究库）或 replay`);
-      await syncTradeCal(db, addDays(date, -30), addDays(date, 30));
+      await syncTradeCal(db, addDays(date, -420), addDays(date, 30));
       if (!isTradeDay(db, date)) {
         h.print({ trade_date: date, skipped: true, reason: '非交易日' });
         return true;
@@ -91,7 +91,7 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       // Fill in any of the last 5 trading days that are missing, and always re-query the
       // as-of day itself: the 21:10 run must re-check what the 18:40 run stored.
       const start = recentTradeDays(db, date, 5)[0];
-      const sync = await syncRange(db, start, date, { refreshFrom: date });
+      const sync = await syncRange(db, start, date, { refreshFrom: date, skipCalendar: true });
       // ETF（持仓 + 已声明候选池）与股票同步在同一入口内完成，保证 21:40 之前
       // ChatGPT 读到的是当日的 ETF 收盘行情。整个 ETF 段落被隔离：任何失败只写入
       // 返回值，不中断股票日报（任务书 B2.9）。

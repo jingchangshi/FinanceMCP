@@ -22,6 +22,16 @@ import { WRITE_SCOPE_TOOL_NAMES } from './ashare/definitions.js';
 
 export const PRIVATE_ENDPOINT_PATH = '/private/mcp';
 
+const SUPPORTED_MCP_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
+
+/** 协商 MCP 协议版本：请求未指定时保持 `'2024-11-05'` 默认值以兼容既有客户端。 */
+export function negotiateMcpProtocolVersion(requested: unknown): string {
+  if (typeof requested !== 'string' || !requested.trim()) return '2024-11-05';
+  const ver = requested.trim();
+  if ((SUPPORTED_MCP_PROTOCOL_VERSIONS as readonly string[]).includes(ver)) return ver;
+  return SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
+}
+
 const MAX_PRIVATE_SESSIONS = Number(process.env.ASHARE_PRIVATE_MAX_SESSIONS || 100);
 const DEFAULT_PRIVATE_RATE_LIMIT = 10;
 
@@ -161,8 +171,9 @@ async function handlePrivateRpc(req: Request, res: Response): Promise<void> {
     trimPrivateSessions();
     const newId = randomUUID();
     privateSessions.set(newId, { id: newId, createdAt: new Date(), lastActivity: new Date() });
+    const protocolVersion = negotiateMcpProtocolVersion(body?.params?.protocolVersion);
     res.setHeader('Mcp-Session-Id', newId);
-    res.json({ jsonrpc: '2.0', result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'FinanceMCP-Private', version: SERVER_VERSION } }, id: body.id });
+    res.json({ jsonrpc: '2.0', result: { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'FinanceMCP-Private', version: SERVER_VERSION } }, id: body.id });
     return;
   }
 

@@ -20,7 +20,32 @@ export interface StoredClient {
   grant_types: string[];
   response_types: string[];
   token_endpoint_auth_method: string;
+  client_secret_hash: string | null;
   created_at: number;
+}
+
+/**
+ * 校验授权请求的 `redirect_uri` 是否被客户端允许：
+ * - 支持精确字符串匹配；
+ * - 支持显式以 `/*` 结尾的 `https:` 路径前缀模式（如 Google Connected Apps 的
+ *   `https://oauth-redirect.googleusercontent.com/r/*`），强制同 origin 且无 fragment。
+ */
+export function isRedirectUriAllowed(registeredUris: string[], candidateUri: string): boolean {
+  if (registeredUris.includes(candidateUri)) return true;
+  let cand: URL;
+  try { cand = new URL(candidateUri); } catch { return false; }
+  if (cand.hash || cand.username || cand.password) return false;
+  for (const pattern of registeredUris) {
+    if (!pattern.endsWith('/*')) continue;
+    let pat: URL;
+    try { pat = new URL(pattern); } catch { continue; }
+    if (pat.protocol !== 'https:' || pat.search || pat.hash) continue;
+    const prefix = pat.pathname.slice(0, -1);
+    if (cand.protocol === 'https:' && cand.origin === pat.origin && cand.pathname.startsWith(prefix)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface StoredCode {
@@ -54,6 +79,7 @@ CREATE TABLE IF NOT EXISTS oauth_client (
   grant_types TEXT NOT NULL,
   response_types TEXT NOT NULL,
   token_endpoint_auth_method TEXT NOT NULL,
+  client_secret_hash TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS oauth_code (
@@ -112,36 +138,44 @@ export class OAuthStore {
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
     this.db.exec(SCHEMA);
+    const cols = this.db.prepare('PRAGMA table_info(oauth_client)').all() as Array<{ name: string }>;
+    if (!cols.some(c => c.name === 'client_secret_hash')) {
+      this.db.exec('ALTER TABLE oauth_client ADD COLUMN client_secret_hash TEXT');
+    }
   }
 
   close(): void {
     this.db.close();
   }
 
-  // ---------------------------------------------------------------- 客户端（DCR）
+  // ---------------------------------------------------------------- 客户端（DCR / 预置机密客户端）
 
   createClient(input: {
+    clientId?: string;
     clientName: string | null;
     redirectUris: string[];
     grantTypes: string[];
     responseTypes: string[];
     tokenEndpointAuthMethod: string;
+    clientSecret?: string | null;
   }): StoredClient {
+    const secretHash = input.clientSecret ? tokenHash(input.clientSecret) : null;
     const client: StoredClient = {
-      client_id: `fmc_${opaqueToken(18)}`,
+      client_id: input.clientId?.trim() || `fmc_${opaqueToken(18)}`,
       client_name: input.clientName,
       redirect_uris: input.redirectUris,
       grant_types: input.grantTypes,
       response_types: input.responseTypes,
       token_endpoint_auth_method: input.tokenEndpointAuthMethod,
+      client_secret_hash: secretHash,
       created_at: Date.now(),
     };
     this.db.prepare(`INSERT INTO oauth_client
-      (client_id, client_name, redirect_uris, grant_types, response_types, token_endpoint_auth_method, created_at)
-      VALUES (?,?,?,?,?,?,?)`).run(
+      (client_id, client_name, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_secret_hash, created_at)
+      VALUES (?,?,?,?,?,?,?,?)`).run(
       client.client_id, client.client_name, JSON.stringify(client.redirect_uris),
       JSON.stringify(client.grant_types), JSON.stringify(client.response_types),
-      client.token_endpoint_auth_method, client.created_at,
+      client.token_endpoint_auth_method, client.client_secret_hash, client.created_at,
     );
     return client;
   }
@@ -156,8 +190,35 @@ export class OAuthStore {
       grant_types: JSON.parse(row.grant_types),
       response_types: JSON.parse(row.response_types),
       token_endpoint_auth_method: row.token_endpoint_auth_method,
+      client_secret_hash: row.client_secret_hash ?? null,
       created_at: row.created_at,
     };
+  }
+
+  listClients(): Array<Omit<StoredClient, 'client_secret_hash'> & { confidential: boolean }> {
+    const rows = this.db.prepare('SELECT * FROM oauth_client ORDER BY created_at ASC').all() as any[];
+    return rows.map(row => ({
+      client_id: row.client_id,
+      client_name: row.client_name ?? null,
+      redirect_uris: JSON.parse(row.redirect_uris),
+      grant_types: JSON.parse(row.grant_types),
+      response_types: JSON.parse(row.response_types),
+      token_endpoint_auth_method: row.token_endpoint_auth_method,
+      confidential: !!row.client_secret_hash,
+      created_at: row.created_at,
+    }));
+  }
+
+  /** 将已通过前缀匹配验证的精确回调地址固化进客户端记录，保证后续 token 换取通过精确校验。 */
+  rememberRedirectUri(clientId: string, redirectUri: string): void {
+    const existing = this.getClient(clientId);
+    if (!existing || existing.redirect_uris.includes(redirectUri)) return;
+    if (!isRedirectUriAllowed(existing.redirect_uris, redirectUri)) return;
+    const wildcards = existing.redirect_uris.filter(u => u.endsWith('/*'));
+    const concretes = existing.redirect_uris.filter(u => !u.endsWith('/*'));
+    const maxConcrete = Math.max(1, 32 - wildcards.length);
+    const next = [...wildcards, ...[...concretes, redirectUri].slice(-maxConcrete)];
+    this.db.prepare('UPDATE oauth_client SET redirect_uris = ? WHERE client_id = ?').run(JSON.stringify(next), clientId);
   }
 
   // ---------------------------------------------------------------- 授权码

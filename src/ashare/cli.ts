@@ -46,7 +46,10 @@ const USAGE = `用法: finance-ashare <command> [options]
         [--buy CODE] [--market-db PATH]                          条件化配置比较（候选行情只来自服务端缓存）
   portfolio-strategy-admission <grant|pause|resume|revoke|status>  本地策略准入记录
   portfolio-strategy-feedback <import|list>                      本地策略反馈事件
-  portfolio-news-evidence <import|list>                          本地可核验消息/公告证据`;
+  portfolio-news-evidence <import|list>                          本地可核验消息/公告证据
+  oauth-client-create --name NAME --redirect-uri URI[,URI...] [--auth-method client_secret_post|client_secret_basic|none] [--db PATH]
+                                                                 创建 OAuth 2.1 客户端（供 Gemini/ChatGPT 自定义 MCP 连接）
+  oauth-client-list [--db PATH]                                  列出已注册的 OAuth 客户端`;
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -140,6 +143,15 @@ async function main() {
       : process.argv[3] === 'list' ? 'news-evidence-list' : null;
     if (!sub) throw new Error('usage: portfolio-news-evidence <import|list> ...');
     if (!runNewsEvidenceCommand(sub, { arg, flag, ymd, print })) process.exitCode = 2;
+    return;
+  }
+  // OAuth 客户端管理只读写 oauth.sqlite，不触碰市场缓存。
+  if (command === 'oauth-client-create' || command === 'oauth-client-list') {
+    const { runOAuthCliCommand } = await import('../oauth/cli.js');
+    if (!runOAuthCliCommand(command, { arg, flag, print })) {
+      process.stderr.write(USAGE + '\n');
+      process.exitCode = 2;
+    }
     return;
   }
   // Account commands only touch the separate portfolio database. They must not

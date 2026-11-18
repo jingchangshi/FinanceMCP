@@ -17,6 +17,7 @@ const { runCommand } = await import('../build/ashare/commands.js');
 const { appendChatgptResearchRecord, parseIntakeArgs } = await import('../build/portfolio/chatgptIntake.js');
 const { recordResearchJournal, readResearchJournal, JOURNAL_SOURCES } = await import('../build/portfolio/researchJournal.js');
 const { appendCombinedResearch } = await import('../build/portfolio/combinedResearch.js');
+const { buildResearchEval } = await import('../build/portfolio/researchEval.js');
 const { openPortfolioDb } = await import('../build/portfolio/db.js');
 const { openAshareDb } = await import('../build/ashare/db.js');
 const { initBaseline } = await import('../build/portfolio/ledger.js');
@@ -237,8 +238,8 @@ const body = (extra = {}) => ({
 });
 const NOW = at('20261022', '20:00');
 
-test('journal sources include hermes as a first-class source', () => {
-  assert.deepEqual([...JOURNAL_SOURCES], ['vps', 'chatgpt', 'hermes', 'combined']);
+test('journal sources include hermes and gemini as first-class sources', () => {
+  assert.deepEqual([...JOURNAL_SOURCES], ['vps', 'chatgpt', 'hermes', 'gemini', 'combined']);
 });
 
 test('hermes append records source=hermes and provenance.author=hermes', () => {
@@ -256,7 +257,7 @@ test('hermes append records source=hermes and provenance.author=hermes', () => {
     assert.equal(readResearchJournal(db, chatgpt.record_id).source, 'chatgpt');
     assert.equal(readResearchJournal(db, chatgpt.record_id).provenance.author, 'chatgpt');
     // Unknown sources are refused.
-    assert.throws(() => parseIntakeArgs(body({ source: 'claude' }), NOW), /source must be chatgpt or hermes/);
+    assert.throws(() => parseIntakeArgs(body({ source: 'claude' }), NOW), /source must be chatgpt, hermes or gemini/);
   } finally { db.close(); }
 });
 
@@ -270,7 +271,7 @@ test('corrections work across external sources; VPS records still cannot be corr
     assert.equal(readResearchJournal(db, fix.record_id).correction_of, chatgpt.record_id);
     // VPS records are not correctable targets.
     const vpsId = db.prepare("SELECT record_id FROM research_journal WHERE source='vps'").get().record_id;
-    assert.throws(() => appendChatgptResearchRecord(db, ACCOUNT, body({ source: 'hermes', idempotency_key: 'h2', corrects_record_id: vpsId }), NOW), /existing ChatGPT record/);
+    assert.throws(() => appendChatgptResearchRecord(db, ACCOUNT, body({ source: 'hermes', idempotency_key: 'h2', corrects_record_id: vpsId }), NOW), /existing ChatGPT\/Hermes\/Gemini record/);
   } finally { db.close(); }
 });
 
@@ -308,5 +309,31 @@ test('journal-level combined record accepts vps+hermes parents', () => {
     recordResearchJournal(db, rec('r1', 'vps'));
     recordResearchJournal(db, { ...rec('h1', 'hermes'), provenance });
     assert.equal(recordResearchJournal(db, { ...rec('c1', 'combined'), parent_record_ids: ['r1', 'h1'], provenance }).created, true);
+  } finally { db.close(); }
+});
+
+test('gemini append writes GEMINI-* journal, shares daily cap, feeds combined & researchEval layers.gemini', () => {
+  const db = vps(fresh(), '20261022', 'RPT-1');
+  try {
+    const g = appendChatgptResearchRecord(db, ACCOUNT, body({ source: 'gemini', idempotency_key: 'g1' }), NOW);
+    assert.equal(g.created, true);
+    assert.match(g.record_id, /^GEMINI-20261022-/);
+    const stored = readResearchJournal(db, g.record_id);
+    assert.equal(stored.source, 'gemini');
+    assert.equal(stored.provenance.author, 'gemini');
+
+    // 每日外部 LLM 写入配额在 chatgpt / hermes / gemini 之间共享
+    assert.throws(
+      () => appendChatgptResearchRecord(db, ACCOUNT, body({ source: 'chatgpt', idempotency_key: 'c-over' }), NOW, 1),
+      /rate_limited/,
+    );
+
+    const combined = appendCombinedResearch(db, { accountId: ACCOUNT, asOf: '20261022', nowMs: NOW });
+    assert.equal(combined.created, true);
+    assert.equal(combined.chatgpt_record_id, g.record_id);
+
+    const ev = buildResearchEval({ portfolioDb: db, marketDb: null, accountId: ACCOUNT, asOf: '20261022' });
+    assert.ok(ev.layers.gemini);
+    assert.equal(ev.records.by_source.gemini, 1);
   } finally { db.close(); }
 });

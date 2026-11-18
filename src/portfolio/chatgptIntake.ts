@@ -110,12 +110,11 @@ export function parseIntakeArgs(args: Record<string, unknown>, nowMs: number) {
     counter_evidence: evidenceList(input.counter_evidence, 'counter_evidence', INTAKE_LIMITS.counterItems, false, nowMs),
   };
   if (Buffer.byteLength(canonicalJson(content), 'utf8') > INTAKE_LIMITS.totalBytes) throw new Error(`research content exceeds ${INTAKE_LIMITS.totalBytes} bytes`);
-  // goal-1106: the intake tool serves two external-LLM sources. `source`
-  // defaults to 'chatgpt' (historical tool name); Hermes callers pass
-  // source='hermes'. It is part of the client-request whitelist — everything
-  // else about authorship stays server-derived.
+  // `source` 默认 `'chatgpt'`；Hermes / Gemini 调用方分别传 `'hermes'` / `'gemini'`。
   const source = input.source === undefined || input.source === null || input.source === '' ? 'chatgpt' : String(input.source);
-  if (source !== 'chatgpt' && source !== 'hermes') throw new Error('source must be chatgpt or hermes');
+  if (source !== 'chatgpt' && source !== 'hermes' && source !== 'gemini') {
+    throw new Error('source must be chatgpt, hermes or gemini');
+  }
   return {
     accountId: input.account_id === undefined ? undefined : String(input.account_id),
     reportId: str(input.report_id, 'report_id', 200)!, asOf, idempotencyKey,
@@ -150,7 +149,7 @@ function missingBundleReason(db: DatabaseSync, accountId: string, reportId: stri
  * `nowMs` is the server clock (injectable for tests only, never from the client).
  */
 export function appendChatgptResearchRecord(db: DatabaseSync, accountId: string, args: Record<string, unknown>, nowMs = Date.now(), dailyLimit: number = INTAKE_LIMITS.dailyRecords,
-  options: { market?: DatabaseSync | null; source?: 'chatgpt' | 'hermes' } = {}): ChatgptIntakeResult {
+  options: { market?: DatabaseSync | null; source?: 'chatgpt' | 'hermes' | 'gemini' } = {}): ChatgptIntakeResult {
   const parsed = parseIntakeArgs(args, nowMs);
   // options.source (internal callers) overrides the request's source field.
   const source = options.source ?? parsed.source;
@@ -168,26 +167,23 @@ function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnT
   if (!bundles.length) throw new Error(missingBundleReason(db, accountId, parsed.reportId, parsed.asOf));
   if (parsed.correctsRecordId) {
     const target = readResearchJournal(db, parsed.correctsRecordId);
-    // goal-1106: a correction may target either external source — correcting
-    // external-LLM research is the same operation regardless of which LLM
-    // wrote the original. (Message kept for compatibility.)
-    if (!target || target.account_id !== accountId || (target.source !== 'chatgpt' && target.source !== 'hermes')) throw new Error('corrects_record_id must be an existing ChatGPT record of this account');
+    // 支持更正同一账户下既有外部 LLM（chatgpt / hermes / gemini）研究记录。
+    if (!target || target.account_id !== accountId || (target.source !== 'chatgpt' && target.source !== 'hermes' && target.source !== 'gemini')) {
+      throw new Error('corrects_record_id must be an existing ChatGPT/Hermes/Gemini record of this account');
+    }
   }
   const clientHash = createHash('sha256').update(canonicalJson({ ...parsed.content, report_id: parsed.reportId, as_of: parsed.asOf, corrects: parsed.correctsRecordId ?? null })).digest('hex');
   const identity = createHash('sha256').update(canonicalJson({ account: accountId, as_of: parsed.asOf, report: parsed.reportId, key: parsed.idempotencyKey ?? clientHash })).digest('hex').slice(0, 20);
-  const recordId = `${source === 'hermes' ? 'HERMES' : 'CHATGPT'}-${parsed.asOf}-${identity}`;
+  const recordId = `${source.toUpperCase()}-${parsed.asOf}-${identity}`;
   const existing = readResearchJournal(db, recordId);
   if (existing) {
     if ((existing.payload as any)?.client_content_hash !== clientHash) throw new Error(`journal_id_conflict: ${recordId}; append a correction with a new idempotency_key`);
     return { created: false, record_id: recordId, content_hash: existing.content_hash, evidence_class: classifyRecord(existing) };
   }
-  // Daily intake cap counts only new rows, by server receipt time. Both
-  // external sources share ONE external-research cap of 20/day (goal-1106):
-  // the cap guards write amplification, and per-source sub-caps would only
-  // double the budget without changing what the cap protects.
+  // 每日写入上限由 chatgpt / hermes / gemini 三个外部研究源共同计数（默认 20 条/日）。
   const dayStart = new Date(Date.parse(`${shanghaiDate(nowMs).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')}T00:00:00+08:00`)).toISOString();
-  const today = (db.prepare("SELECT COUNT(*) n FROM research_journal WHERE source IN ('chatgpt','hermes') AND recorded_at>=?").get(dayStart) as any).n as number;
-  if (today >= dailyLimit) throw new Error(`rate_limited: at most ${dailyLimit} external (chatgpt/hermes) research records per day`);
+  const today = (db.prepare("SELECT COUNT(*) n FROM research_journal WHERE source IN ('chatgpt','hermes','gemini') AND recorded_at>=?").get(dayStart) as any).n as number;
+  if (today >= dailyLimit) throw new Error(`rate_limited: at most ${dailyLimit} external (chatgpt/hermes/gemini) research records per day`);
   const received = new Date(nowMs).toISOString();
   const { content } = parsed;
   // goal-1032 follow-up: the independent research record is bound to the same
@@ -195,7 +191,7 @@ function appendParsedRecord(db: DatabaseSync, accountId: string, parsed: ReturnT
   // Unbound when no snapshot exists — never guessed.
   const hotspot = resolveHotspotBinding(market, parsed.asOf);
   const result = recordResearchJournal(db, {
-    record_id: recordId, account_id: accountId, source: source as 'chatgpt' | 'hermes', as_of_trade_date: parsed.asOf,
+    record_id: recordId, account_id: accountId, source: source as 'chatgpt' | 'hermes' | 'gemini', as_of_trade_date: parsed.asOf,
     bundle_id: parsed.reportId, generated_at: received,
     versions: { journal: JOURNAL_VERSION, chatgpt_intake: CHATGPT_INTAKE_VERSION },
     judgement: { independent_judgement: content.independent_judgement, final_conclusion: content.final_conclusion },

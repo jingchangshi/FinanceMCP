@@ -83,6 +83,10 @@ case "$1" in
         echo '{"ok":true}'
         exit 0
         ;;
+      *"cli.js investment-research-bundle"*)
+        echo '{"as_of_trade_date":"${TRADE_DATE}"}'
+        exit 0
+        ;;
     esac
     ;;
 esac
@@ -122,6 +126,7 @@ exit 0
     });
 
   return {
+    dir,
     run,
     readDockerLog: () => (existsSync(dockerLog) ? readFileSync(dockerLog, 'utf8') : ''),
     readPythonLog: () => (existsSync(pythonLog) ? readFileSync(pythonLog, 'utf8') : ''),
@@ -204,4 +209,60 @@ test('U4 observe exit 79 does not block hotspot, account-daily or Feishu push wh
   assert.match(h.readDockerLog(), /hotspot-snapshot/);
   assert.match(h.readDockerLog(), /investment-research-record/);
   assert.match(h.readPythonLog(), /publish_and_notify\.py/);
+});
+
+test('U5 polling triggers one-shot delay alert at configured attempt then publishes without delay flag when READY', t => {
+  const h = setupHarness(t, {
+    dailyPayloads: [
+      { report: { trade_date: TRADE_DATE, status: 'NOT_READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
+      { report: { trade_date: TRADE_DATE, status: 'NOT_READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
+      { report: { trade_date: TRADE_DATE, status: 'NOT_READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
+      { report: { trade_date: TRADE_DATE, status: 'READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
+    ],
+  });
+  const delayScript = join(h.dir, 'mock-delay-alert.py');
+  writeFileSync(delayScript, '#!/usr/bin/env python3\n');
+  chmodSync(delayScript, 0o755);
+
+  const res = h.run({
+    ASHARE_DELAY_ALERT_ATTEMPT: '2',
+    ASHARE_DELAY_ALERT_SCRIPT: delayScript,
+    ASHARE_READINESS_POLL_SECONDS: '0',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(h.getDailyCalls(), 4);
+
+  const pyLines = h.readPythonLog().trim().split('\n').filter(Boolean);
+  const delayCalls = pyLines.filter(l => l.includes('mock-delay-alert.py'));
+  const publishCalls = pyLines.filter(l => l.includes('publish_and_notify.py'));
+  assert.equal(delayCalls.length, 1, h.readPythonLog());
+  assert.match(delayCalls[0], new RegExp(`--trade-date ${TRADE_DATE} --status NOT_READY --attempt 2`));
+  assert.equal(publishCalls.length, 1, h.readPythonLog());
+  assert.doesNotMatch(publishCalls[0], /--data-delayed/);
+  assert.equal(existsSync(join(h.dir, 'data', 'logs', `delay-alert-${TRADE_DATE}.sent`)), true);
+});
+
+test('U6 deadline reached without daily JSON logs warning and falls back to live bundle with --data-delayed', t => {
+  const h = setupHarness(t, {
+    dailyPayloads: [],
+  });
+  const crashDaily = join(h.dir, 'crash-daily.sh');
+  writeFileSync(crashDaily, '#!/bin/sh\necho "upstream timeout" >&2\nexit 1\n');
+  chmodSync(crashDaily, 0o755);
+
+  const noBundleAccount = join(h.dir, 'no-bundle-account.sh');
+  writeFileSync(noBundleAccount, '#!/bin/sh\necho "no account bundle written"\nexit 0\n');
+  chmodSync(noBundleAccount, 0o755);
+
+  const res = h.run({
+    ASHARE_DAILY_SCRIPT: crashDaily,
+    ASHARE_ACCOUNT_SCRIPT: noBundleAccount,
+    ASHARE_MAX_WAIT_ATTEMPTS: '1',
+    ASHARE_READINESS_POLL_SECONDS: '0',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stderr, /deadline reached without daily JSON/);
+  assert.match(h.readDockerLog(), /investment-research-bundle/);
+  const publishLine = h.readPythonLog().trim().split('\n').find(l => l.includes('publish_and_notify.py')) ?? '';
+  assert.match(publishLine, /--data-delayed/);
 });
