@@ -401,6 +401,12 @@ class TestV3CockpitSections(unittest.TestCase):
             self.assertEqual(check_markdown_leak(vis), [])
             self.assertIn("100,000.00 元", vis)
             self.assertIn("159558.SZ", vis)
+            self.assertIn("执行边界与触发条件：", vis)
+            self.assertIn("账户仓位水位与增量资金预算", vis)
+            self.assertNotIn("仍缺什么证据：", vis)
+            self.assertNotIn("跨境基金净值折溢价红线", vis)
+            self.assertNotIn("待减仓回款释放后按档位分配", vis)
+            self.assertNotIn("没有经复核的相对优势证据", vis)
             self.assertIn("纳指ETF", vis)
             self.assertIn("已拦截禁买", vis)
             if actionable:
@@ -408,6 +414,51 @@ class TestV3CockpitSections(unittest.TestCase):
                 self.assertIn("已按规则生成可执行份数", sections["sections"]["今日判断"]["execution_note"])
             else:
                 self.assertIn("已过 8 个交易日", sections["sections"]["账户与风险"]["narrative"])
+
+    def test_v3_cockpit_defensive_cash_and_stale_report_model_isolation(self):
+        from feishu_render import check_forbidden, check_internal_tokens, check_markdown_leak, render_xml, strip_tags
+
+        bundle = self._v3_bundle(actionable=False)
+        bundle["portfolio"]["gate"]["satisfied"] = True
+        bundle["portfolio"]["account_view"]["revalued_basis"] = {
+            "total_assets_cents": 6792503,
+            "cash_cents": 1780590,
+            "wealth_cents": 33,
+            "securities_mv_cents": 5011880,
+        }
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["market_regime"].update({
+            "regime": "DEFENSIVE",
+            "regime_label_zh": "空头防守档（目标总仓位 15%）",
+            "target_equity_bps": 1500,
+            "target_equity_pct": 15,
+            "defensive_cash_bps": 8500,
+            "defensive_cash_pct": 85,
+            "pct_above_ma60": 0.119,
+            "amount_vs_ma20": 0.821,
+        })
+        cockpit["router"]["effective_regime"] = "DEFENSIVE"
+        bundle["report_model"] = {
+            "conclusion": "本期研究首选：继续持有，不交易。没有经复核的相对优势证据，账户尚未完成券商对账。"
+        }
+
+        sections = build_sections(bundle, generated_at="21:30")
+        self.assertEqual(validate_sections(sections), [])
+        self.assertEqual(sections["account_status"], "账户数据：已按最新交易增量确认（可执行规则已启用）")
+        xml = render_xml(sections)
+        vis = strip_tags(xml)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertEqual(check_markdown_leak(vis), [])
+        self.assertNotIn("没有经复核的相对优势证据", vis)
+        self.assertNotIn("账户尚未完成券商对账", vis)
+        self.assertNotIn("仍缺什么证据", vis)
+        self.assertNotIn("跨境基金净值折溢价红线", vis)
+        self.assertNotIn("待减仓回款释放后按档位分配", vis)
+        self.assertIn("17,805.90 元", vis)
+        self.assertIn("执行边界与触发条件：", vis)
+        self.assertIn("账户仓位水位与增量资金预算", vis)
+        self.assertIn("当前处于空头防守档", vis)
 
     def test_v3_cockpit_phase3_stock_swing_and_preemptive_l2(self):
         from feishu_render import check_forbidden, check_internal_tokens, check_markdown_leak, render_xml, strip_tags

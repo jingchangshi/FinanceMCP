@@ -337,8 +337,6 @@ def _build_v3_cockpit_sections(
     first_section = portfolio.get("first_section") or {}
     actions = first_section.get("actions") or []
     is_actionable = bool(portfolio.get("actionable")) and bool(actions)
-    report_model = bundle.get("report_model") if isinstance(bundle.get("report_model"), dict) else {}
-    conclusion = str(report_model.get("conclusion") or "").strip()
 
     action_lines: List[str] = []
     if actions:
@@ -356,14 +354,13 @@ def _build_v3_cockpit_sections(
                 legs_txt.append(f"{side_zh} {leg.get('ts_code')} {qty} 份（参考收盘 {px:.3f} 元，估算费用 {fee}）")
             action_lines.append(f"{act.get('title', '交易指令')}：{'；'.join(legs_txt)}")
 
-    if not conclusion:
-        if is_actionable and action_lines:
-            conclusion = "本期可执行规则指令：" + "；".join(action_lines) + "。"
-        else:
-            conclusion = (
-                f"本期处于{mr.get('regime_label_zh', '结构震荡档')}（{mr.get('style_label_zh', '风格均衡')}），"
-                f"未触发新的规则调仓阈值；{deconc.get('status_summary_zh', '维持当前配置观察。')}"
-            )
+    if is_actionable and action_lines:
+        conclusion = "本期可执行规则指令：" + "；".join(action_lines) + "。"
+    else:
+        conclusion = (
+            f"本期处于{mr.get('regime_label_zh', '结构震荡档')}（{mr.get('style_label_zh', '风格均衡')}），"
+            f"未触发新的规则调仓阈值；{deconc.get('status_summary_zh', '维持当前配置观察。')}"
+        )
 
     regime_desc = (
         f"双锚攻防档位：{mr.get('regime_label_zh', '未知')}（目标权益上限 {_fmt_pct(mr.get('target_equity_pct'), 0)}，"
@@ -406,13 +403,13 @@ def _build_v3_cockpit_sections(
     if is_actionable and action_lines:
         execution_note = "已按规则生成可执行份数，请核对委托价格与券商端余额后手动下单。"
     elif gate_satisfied:
-        execution_note = "本日未触发买卖条件，继续按既定止损线与四批换马条件跟踪，不因对账间隔天数盲目清空策略输出。"
+        execution_note = "本日未触发新增买卖阈值，按既定价格触发线与风控护栏持续跟踪。"
     else:
         execution_note = "账户基础核验或快照未确认为当日有效状态，本报告仅作只读观察参考，不授权直接下单。"
 
     # 2. 账户与风险
     ref = "" if gate_satisfied else "（参考）"
-    account_status_note = "已完成基础确认（可执行规则已启用）" if gate_satisfied else "待确认（仅作研究参考）"
+    account_status_note = "已按最新交易增量确认（可执行规则已启用）" if gate_satisfied else "待确认（仅作研究参考）"
     metrics: List[List[str]] = [
         [f"总资产{ref}", _fmt_money(total_cents)],
         [f"现金{ref}", _fmt_money(cash_cents)],
@@ -448,46 +445,102 @@ def _build_v3_cockpit_sections(
     breadth = market.get("breadth") or {}
     up, down = breadth.get("up"), breadth.get("down")
     amt = breadth.get("amount_yi")
+    pct_ma60_raw = mr.get("pct_above_ma60")
+    pct_ma60_txt = f"{pct_ma60_raw * 100:.1f}%" if isinstance(pct_ma60_raw, (int, float)) else "—"
+    amt_ratio = mr.get("amount_vs_ma20")
+    amt_ratio_txt = f"{amt_ratio:.2f} 倍" if isinstance(amt_ratio, (int, float)) else "—"
+
     tranches = deconc.get("tranches") or []
     exec_cnt = sum(1 for t in tranches if isinstance(t, dict) and t.get("status") == "EXECUTED")
     tranche_desc = "、".join(
         f"第{t.get('tranche_no')}批{t.get('planned_shares')}份({ '已执行' if t.get('status')=='EXECUTED' else '已触发' if t.get('status')=='TRIGGERED' else '待触发' })"
         for t in tranches if isinstance(t, dict)
     ) or "暂无分批记录"
-    cb_rows = cockpit.get("cross_border_monitor") or []
-    cb_text = "；".join(
-        f"{c.get('name')}({c.get('ts_code')})：净值 {_tick_price(c.get('unit_nav')) if c.get('unit_nav') is not None else '缺失'}，"
-        f"折溢价 {c.get('premium_pct'):+.2f}%（{c.get('status_zh')}）"
-        if isinstance(c.get("premium_pct"), (int, float))
-        else f"{c.get('name')}({c.get('ts_code')})：{c.get('status_zh')}"
-        for c in cb_rows[:5] if isinstance(c, dict)
-    ) or "本期未检出待购跨境基金超溢价风险。"
+    cur_shares = deconc.get("current_shares")
+    cur_shares_txt = f"当前持仓 {cur_shares} 份，" if isinstance(cur_shares, (int, float)) else ""
+
+    eff_regime = str(router.get("effective_regime") or mr.get("regime") or "")
+    target_eq_pct = mr.get("target_equity_pct")
+    cur_eq_pct = (
+        (securities_cents / total_cents) * 100.0
+        if isinstance(securities_cents, (int, float)) and isinstance(total_cents, (int, float)) and total_cents > 0
+        else None
+    )
+    cash_pct = (
+        (cash_cents / total_cents) * 100.0
+        if isinstance(cash_cents, (int, float)) and isinstance(total_cents, (int, float)) and total_cents > 0
+        else None
+    )
+
+    if eff_regime == "DEFENSIVE":
+        regime_rule_note = (
+            "需双锚脱离同步空头且全市场站上60日线占比回升至 30% 以上并连续两日确认，方可升入震荡结构档（60%）；"
+            "全面进攻档（85%）需至少一锚多头、站上60日线达 45% 以上且量比达 0.85 倍。"
+        )
+        budget_rule_note = (
+            f"当前处于空头防守档（权益上限 15%），存量权益（{_fmt_pct(cur_eq_pct)}）仍高于档位上限，"
+            f"账上已释放的 {_fmt_money(cash_cents)} 现金留作防守安全垫（可参与盘后现金理财或国债逆回购），暂不新开权益仓位。"
+        )
+    elif eff_regime == "OFFENSIVE":
+        regime_rule_note = (
+            "全面进攻档需持续保持至少一锚多头、另一锚非空头且全市场站上60日线占比不低于 45%、量比不低于 0.85 倍；"
+            "若任一条件连续两日走弱则退回震荡结构档（60%）。"
+        )
+        if isinstance(cur_eq_pct, float) and isinstance(target_eq_pct, (int, float)) and cur_eq_pct >= target_eq_pct:
+            budget_rule_note = (
+                f"当前存量权益（{_fmt_pct(cur_eq_pct)}）已达或高于本档目标上限（{_fmt_pct(target_eq_pct, 0)}），"
+                f"账上 {_fmt_money(cash_cents)} 现金暂作安全缓冲；待市场升入更高档位或存量权益降至上限内后自动释放买入预算。"
+            )
+        else:
+            budget_rule_note = (
+                f"当前权益占比 {_fmt_pct(cur_eq_pct)} 低于本档上限 {_fmt_pct(target_eq_pct, 0)}，"
+                f"账上 {_fmt_money(cash_cents)} 现金可按超级基金（1,000 元起）或主板个股回踩（8,000 元起）阈值释放增量买入预算。"
+            )
+    else:
+        regime_rule_note = (
+            "当前处于震荡结构档（60%）：若双锚任一走强且全市场站上60日线达 45% 以上、量比达 0.85 倍并连续两日确认可升入进攻档（85%）；"
+            "若双锚转空或站上60日线跌破 30% 将退守防守档（15%）。"
+        )
+        if isinstance(cur_eq_pct, float) and isinstance(target_eq_pct, (int, float)) and cur_eq_pct >= target_eq_pct:
+            budget_rule_note = (
+                f"当前存量权益（{_fmt_pct(cur_eq_pct)}）已达或高于本档目标上限（{_fmt_pct(target_eq_pct, 0)}），"
+                f"账上 {_fmt_money(cash_cents)} 现金暂作安全缓冲；待市场升入更高档位或存量权益降至上限内后自动释放买入预算。"
+            )
+        else:
+            budget_rule_note = (
+                f"当前权益占比 {_fmt_pct(cur_eq_pct)} 低于本档上限 {_fmt_pct(target_eq_pct, 0)}，"
+                f"账上 {_fmt_money(cash_cents)} 现金可按超级基金（1,000 元起）或主板个股回踩（8,000 元起）阈值释放增量买入预算。"
+            )
 
     items = [
         {
             "label": "① 市场双锚档位与风格广度",
             "observation": (
                 f"{mr.get('regime_label_zh', '未知')}｜{mr.get('style_label_zh', '均衡')}；"
+                f"全市场站上60日线占比 {pct_ma60_txt}，成交量比 {amt_ratio_txt}；"
                 f"上涨 {up if up is not None else '—'} 家 / 下跌 {down if down is not None else '—'} 家，"
                 f"两市成交额 {f'{amt:.0f} 亿' if isinstance(amt, (int, float)) else '—'}。"
             ),
-            "why": "进攻85%/结构60%/防守15%仓位切换由双锚均线、60日站上占比与放量过滤（含连续两日确认与单日急跌熔断）共同决定。",
-            "missing": "已提供本地双锚指数与市场广度缓存。",
+            "why": "大盘价值锚（沪深300）与成长弹性锚（中证500、创业板指）叠加全市场站上60日线占比和量比，共同决定进攻85%、结构60%、防守15%三档总权益上限（含连续两日收盘防抖确认）。",
+            "rule_note": regime_rule_note,
         },
         {
             "label": "② 159558.SZ 四批换马状态机",
             "observation": (
-                f"当前执行进度 {exec_cnt}/{len(tranches) or 4} 批，目标留存 {deconc.get('target_keep_shares', 15000)} 份；"
+                f"{cur_shares_txt}已执行 {exec_cnt}/{len(tranches) or 4} 批，目标保留底仓 {deconc.get('target_keep_shares', 15000)} 份；"
                 f"拆分计划：{tranche_desc}。"
             ),
-            "why": "锁定既有份数拆分避免每日重复卖出；仅当反弹+8%加速兑现、跌破下方防守位（磨底箱体下沿或60日线）或月度保底窗口才触发减仓委托。",
-            "missing": "触发条件明确： " + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
+            "why": "持久化锁定分批份数避免每日无状态重复卖出，在保留核心半导体设备底仓弹性的同时有序降低单一标的集中暴露。",
+            "rule_note": "下一批触发条件：" + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
         },
         {
-            "label": "③ 跨境基金净值折溢价红线（> +2.5% 或滞后超 3 日禁买）",
-            "observation": cb_text,
-            "why": "直接读取基金单位净值核算溢价率，从源头拦截高溢价追高与净值滞后盲买。",
-            "missing": "若期间存在场外未录入手工成交，请结合券商 App 核对最新可用现金与份数。",
+            "label": "③ 账户仓位水位与增量资金预算",
+            "observation": (
+                f"当前证券市值 {_fmt_money(securities_cents)}（占总资产 {_fmt_pct(cur_eq_pct)}），"
+                f"可用现金 {_fmt_money(cash_cents)}（占 {_fmt_pct(cash_pct)}）；当前档位目标权益上限 {_fmt_pct(target_eq_pct, 0)}。"
+            ),
+            "why": "增量权益买入预算由「档位目标权益上限减去当前存量权益市值」与「可用现金减去防守现金底线」共同约束，防止在空头防守期或权益超配时继续叠加风险敞口。",
+            "rule_note": budget_rule_note,
         },
     ]
 
@@ -509,17 +562,36 @@ def _build_v3_cockpit_sections(
         holdings_rows.append({"symbol": f"{ts_code}（{name}）", "judgment": judgment, "basis": basis})
 
     # 5. 是否存在更好的选择
+    action_buy_codes = {
+        str(leg.get("ts_code") or "")
+        for act in actions if isinstance(act, dict)
+        for leg in (act.get("legs") or []) if isinstance(leg, dict) and leg.get("side") == "BUY"
+    }
     options: List[Dict[str, str]] = []
     super_cands = cockpit.get("super_etf_candidates") or []
     for cand in super_cands[:3]:
         if not isinstance(cand, dict):
             continue
         prem = f"折溢价 {cand['premium_pct']:+.2f}%" if isinstance(cand.get("premium_pct"), (int, float)) else "场内折溢价正常"
+        if is_actionable and cand.get("ts_code") in action_buy_codes:
+            super_gap = "本期已生成可执行买入指令。"
+        elif eff_regime == "DEFENSIVE":
+            super_gap = (
+                f"账户已有可用现金 {_fmt_money(cash_cents)}，但当前处于空头防守档"
+                f"（权益上限 15%，存量权益已占 {_fmt_pct(cur_eq_pct)}），防守期冻结权益新开仓，现金留作防守缓冲。"
+            )
+        elif isinstance(cur_eq_pct, float) and isinstance(target_eq_pct, (int, float)) and cur_eq_pct >= target_eq_pct:
+            super_gap = (
+                f"账户已有可用现金 {_fmt_money(cash_cents)}，但当前存量权益占比 {_fmt_pct(cur_eq_pct)} 高于本档上限 "
+                f"{_fmt_pct(target_eq_pct, 0)}，待升档或权益占比回落后按优先级配置。"
+            )
+        else:
+            super_gap = "作为当前占优风格备选标的跟踪，达到调仓阈值时按优先级配置。"
         options.append({
             "name": f"东财免五超级基金｜{cand.get('name')}（{cand.get('ts_code')}）",
             "upside": f"收盘 {_tick_price(cand.get('close_cny'))} 元，{cand.get('style_match_zh', '匹配当前风格')}。",
             "cost": f"{cand.get('fee_label_zh', '万分之0.5佣金免5元')}，{prem}。",
-            "gap": "当前无可用增量买入预算时先进入备选池，待减仓回款释放后按档位分配。" if not is_actionable else "资金已按规则优先级路由评估。",
+            "gap": super_gap,
         })
     stock_cands = cockpit.get("stock_swing_candidates") or []
     s_stock_status = (router.get("sub_strategies") or {}).get("s_stock_swing")
@@ -559,6 +631,14 @@ def _build_v3_cockpit_sections(
         "本报告由 V3 进取型低频攻防引擎与固定账户账本状态机生成，行情来自本地只读收盘缓存。",
         f"账本最近事件记录截止 {_ymd(gate.get('reported_events_through'))}；{rem.get('message_zh') or '保持定期同步券商交割流水。'}",
     ]
+    cb_rows = cockpit.get("cross_border_monitor") or []
+    blocked_cb = [c for c in cb_rows if isinstance(c, dict) and c.get("buy_blocked")]
+    if blocked_cb:
+        cb_summary = "、".join(
+            f"{c.get('name')}({c.get('ts_code')}，{c.get('status_zh')})"
+            for c in blocked_cb[:3]
+        ) + (" 等。" if len(blocked_cb) > 3 else "。")
+        notes.append("后台折溢价风控备案（仅作禁买拦截，非重点关注方向）：当日触发超 +2.5% 溢价或净值滞后禁买的跨境品种含 " + cb_summary)
     notes.extend(str(trigger) for trigger in (first_section.get("observation_triggers") or [])[:2] if trigger)
 
     result = {

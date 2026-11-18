@@ -451,12 +451,13 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       if (!h.flag('confirm')) throw new Error('声明账本完整性需要显式 --confirm（该动作只能由用户本人执行）');
       const db = openPortfolioDb(h.arg('db'));
       try {
+        const unreportedRisk = (h.arg('unreported-risk') ?? 'yes').toLowerCase() !== 'no';
         const result = setAccountCompleteness(db, accountId, {
           as_of: h.ymd(requireArg(h, 'as-of'), '--as-of'),
-          last_user_reconciled_at: h.arg('last-reconciled-at') ?? null,
+          last_user_reconciled_at: h.arg('last-reconciled-at') ?? (unreportedRisk ? null : new Date().toISOString()),
           reported_events_through: h.arg('events-through') ? h.ymd(h.arg('events-through')!, '--events-through') : null,
           // --unreported-risk yes|no：缺省保守为「存在未上报交易风险」。
-          unreported_trade_risk: (h.arg('unreported-risk') ?? 'yes').toLowerCase() !== 'no',
+          unreported_trade_risk: unreportedRisk,
           note: h.arg('note') ?? '',
         }, { confirm: true, recordedBy: requireArg(h, 'recorded-by') });
         h.print({ ...result, db: portfolioDbPath(), note: '完整性声明只描述"用户已核对到哪个时点"，不代表券商实时余额。' });

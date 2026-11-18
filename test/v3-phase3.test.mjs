@@ -26,7 +26,8 @@ const {
 } = await import('../build/portfolio/actionEngine.js');
 const { ensureDeconcentrationPlan } = await import('../build/portfolio/deconcentrationPlan.js');
 const { persistRiskAnchor, evaluateStrategyRouter } = await import('../build/portfolio/strategyRouter.js');
-const { initBaseline, confirmRealAccount, setAccountCompleteness } = await import('../build/portfolio/ledger.js');
+const { initBaseline, confirmRealAccount, setAccountCompleteness, recordEvent } = await import('../build/portfolio/ledger.js');
+const { buildInvestorReportModel } = await import('../build/portfolio/reportModel.js');
 const { importSnapshot, markSnapshotCurrent } = await import('../build/portfolio/account.js');
 const { buildDailyReport } = await import('../build/portfolio/dailyReport.js');
 const { renderDailyReport, forbiddenHits } = await import('../build/portfolio/reportRenderer.js');
@@ -472,6 +473,93 @@ test('T4: L2 熔断前置（重仓换马 -12%->0%，分散后 -15%->15%）与国
     assert.ok(sell159);
     assert.ok(sell159.legs[0].quantity < 50000, '分散态 15% 熔断可保留 15% 权益底仓');
     assert.equal(outC.actions.some(a => a.legs.some(l => l.ts_code === '511010.SH' && l.side === 'SELL')), false);
+  } finally {
+    mDb.close();
+    pDb.close();
+  }
+});
+
+test('T5: 当日卖出 T+1 待交收在增量确认真实账户下不阻断 gate.satisfied，且 V3 结论无旧版防御话术', () => {
+  const { db: mDb, days, asOf } = seedPhase3StockMarket('t5settle');
+  const pDb = openPortfolioDb(join(dir, 't5-portfolio.sqlite'), { marketPath: join(dir, 't5settle-market.sqlite') });
+  try {
+    const accId = 'real-main';
+    const baseDay = days.at(-5);
+    importSnapshot(pDb, {
+      snapshot_id: 'snap-t5-base',
+      as_of: baseDay,
+      source: 'test',
+      note: 'phase3-t5',
+      warnings: [],
+      is_current: false,
+      positions: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 20000, ref_price_milli: 800, ref_cost_milli: 800, market_value_cents: 1_600_000 },
+      ],
+      totals: { total_assets_cents: 10_000_000, securities_mv_cents: 1_600_000, cash_cents: 8_400_000, wealth_cents: 0, unrealized_pnl_cents: 0 },
+    });
+    initBaseline(pDb, accId, { asOf: baseDay, snapshotId: 'snap-t5-base' });
+    markSnapshotCurrent(pDb, 'snap-t5-base', { confirmedBy: 'user' });
+    confirmRealAccount(pDb, accId, { confirm: true, note: 'user' });
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${accId}`, '10000000');
+
+    const sellRes = recordEvent(pDb, {
+      event_id: 't5-sell-159558',
+      account_id: accId,
+      event_type: 'TRADE_SELL',
+      occurred_on: asOf,
+      ts_code: '159558.SZ',
+      quantity: 10000,
+      price_milli: 820,
+      fee_cents: 41,
+      tax_cents: 0,
+      source: 'broker_statement',
+    });
+    assert.equal(sellRes.status, 'RECORDED');
+    assert.ok(sellRes.settled_on && sellRes.settled_on > asOf, '卖出应生成下一交易日待交收日');
+
+    setAccountCompleteness(pDb, accId, {
+      as_of: asOf,
+      reported_events_through: asOf,
+      last_user_reconciled_at: '2026-11-18T14:00:00Z',
+      unreported_trade_risk: false,
+      note: '增量申报已确认',
+    }, { confirm: true, recordedBy: 'user' });
+
+    const report = buildDailyReport({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accId,
+      snapshotId: 'snap-t5-base',
+      asOfTradeDate: asOf,
+    });
+    assert.equal(report.gate.satisfied, true, `T+1 待交收不应阻断已增量确认账户的 gate.satisfied: ${JSON.stringify(report.gate)}`);
+    assert.ok(report.gate.warnings.some(w => w.code === 'account_settlement_pending'));
+
+    const model = buildInvestorReportModel({
+      asOf,
+      generatedAt: '2026-11-18T21:00:00+08:00',
+      verification: {
+        account_id: accId,
+        snapshot_id: 'snap-t5-base',
+        summary_status: 'DEGRADED',
+        reported_events_through: asOf,
+        last_user_reconciled_at: '2026-11-18T14:00:00Z',
+      },
+      portfolio: {
+        ...report,
+        decision_comparison: {
+          decision_plans: [
+            { role: 'PREFERRED', action: 'HOLD', label: '继续持有', research_lean: '没有经复核的相对优势证据。', strongest_counter: '集中度偏高。' },
+          ],
+        },
+      },
+      benchmarks: null,
+      researchCases: [],
+      gaps: [],
+      marketAsOf: asOf,
+    });
+    assert.doesNotMatch(model.conclusion, /没有经复核的相对优势证据|账户尚未完成券商对账/);
+    assert.match(model.conclusion, /15% 高水位熔断生命线/);
   } finally {
     mDb.close();
     pDb.close();

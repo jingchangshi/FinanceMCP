@@ -1806,7 +1806,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
     const explicitCompletenessRisk = accountEvaluation.completeness?.unreported_trade_risk === true;
     const hasPriorCompleteness = Boolean(accountEvaluation.reported_events_through) && !explicitCompletenessRisk;
     const lagBypassEligible = hasPriorCompleteness && snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED';
-    const lagCodes = new Set(['account_completeness_undeclared', 'unreported_trade_risk']);
+    const lagCodes = new Set(['account_completeness_undeclared', 'unreported_trade_risk', 'account_settlement_pending']);
     for (const reason of accountEvaluation.reasons) {
       if (lagBypassEligible && lagCodes.has(reason.code)) {
         gateWarnings.push({ code: reason.code, detail: reason.detail });
