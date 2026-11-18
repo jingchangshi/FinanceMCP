@@ -16,6 +16,7 @@ import {
   evaluateDeconcentrationPlan,
   persistDeconcentrationUpdates,
   type DeconcentrationEvaluation,
+  type DeconcentrationPlanMode,
 } from './deconcentrationPlan.js';
 import { calculateFees, resolveFeeRules } from './fees.js';
 import { isEtfCode } from './ledger.js';
@@ -380,37 +381,49 @@ export interface RunActionEngineInput {
   stockSwingScreen?: StockSwingScreenResult | null;
 }
 
-function detectActiveDeconcentrationPlan(
+function resolveDeconcentrationControl(
   portfolioDb: DatabaseSync | null | undefined,
   accountId: string,
   holdings: RunActionEngineInput['holdings'],
-): boolean {
-  if (!portfolioDb || !portfolioTableExists(portfolioDb, 'deconcentration_plan')) return false;
+): { active: boolean; mode: DeconcentrationPlanMode } {
+  if (!portfolioDb || !portfolioTableExists(portfolioDb, 'deconcentration_plan')) {
+    return { active: false, mode: 'STANDARD' };
+  }
   try {
+    const cols = portfolioDb.prepare('PRAGMA table_info(deconcentration_plan)').all() as Array<{ name?: string }>;
+    const hasPlanMode = cols.some(c => c.name === 'plan_mode');
     const plans = portfolioDb.prepare(`
-      SELECT plan_id, ts_code FROM deconcentration_plan
+      SELECT plan_id, ts_code${hasPlanMode ? ', plan_mode' : ''} FROM deconcentration_plan
       WHERE account_id = ? AND status = 'ACTIVE'
-    `).all(accountId) as Array<{ plan_id: string; ts_code: string }>;
+      ORDER BY created_at DESC
+    `).all(accountId) as Array<{ plan_id: string; ts_code: string; plan_mode?: string }>;
+    let detectedMode: DeconcentrationPlanMode = 'STANDARD';
     for (const p of plans) {
+      if (p.plan_mode === 'BOTTOM_GRIND_25') detectedMode = 'BOTTOM_GRIND_25';
       const h = holdings.find(row => row.ts_code === p.ts_code);
       if (!h || h.quantity < 100) continue;
-      if (!portfolioTableExists(portfolioDb, 'deconcentration_tranche')) return true;
+      if (!portfolioTableExists(portfolioDb, 'deconcentration_tranche')) {
+        if (h.weight > 0.30 || detectedMode === 'STANDARD') return { active: true, mode: detectedMode };
+        continue;
+      }
       const pending = portfolioDb.prepare(`
         SELECT COUNT(*) AS cnt FROM deconcentration_tranche
         WHERE plan_id = ? AND status IN ('PENDING', 'TRIGGERED')
       `).get(p.plan_id) as { cnt: number };
-      if (Number(pending?.cnt ?? 0) > 0) return true;
+      if (Number(pending?.cnt ?? 0) > 0 || h.weight > 0.30) {
+        return { active: true, mode: detectedMode };
+      }
     }
-    return false;
+    return { active: false, mode: detectedMode };
   } catch {
-    return false;
+    return { active: false, mode: 'STANDARD' };
   }
 }
 
 export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutput {
   const regime = input.marketRegime ?? evaluateMarketRegime(input.marketDb, input.asOf);
-  const deconcentrationActive = input.deconcentrationActive
-    ?? detectActiveDeconcentrationPlan(input.portfolioDb, input.accountId, input.holdings);
+  const deconcControl = resolveDeconcentrationControl(input.portfolioDb, input.accountId, input.holdings);
+  const deconcentrationActive = input.deconcentrationActive ?? deconcControl.active;
   const router = evaluateStrategyRouter({
     portfolioDb: input.portfolioDb,
     marketDb: input.marketDb,
@@ -421,6 +434,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     marketRegime: regime,
     phase1LockStockSwing: input.phase1LockStockSwing,
     deconcentrationActive,
+    deconcentrationMode: deconcControl.mode,
   });
 
   const holding159558 = input.holdings.find(h => h.ts_code === '159558.SZ');
@@ -434,6 +448,8 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     sellableShares: holding159558?.sellable_quantity ?? holding159558?.quantity ?? 0,
     currentCloseMilli: holding159558?.price_milli ?? null,
     navCents: input.totalAssetsCents,
+    availableCashCents: input.cashCents,
+    circuitBreakerStatus: router.circuit_breaker_status,
     marketRegime: router.effective_regime,
   });
 
@@ -650,7 +666,8 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     }
   }
 
-  // -------------------------------- P2: 159558.SZ 四批状态机触发减仓与顺势换马
+  // -------------------------------- P2: 159558.SZ 状态机减仓 / 磨底降本高抛低吸
+  const keepPctLabel = (deconcentration.target_keep_bps / 100).toFixed(0);
   if (deconcentration.plan_present && deconcentration.recommended_sell_shares >= 100) {
     const h159558 = holding159558;
     const remSellable = Math.floor((workingSellable.get('159558.SZ') ?? 0) / 100) * 100;
@@ -665,29 +682,61 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       workingSellable.set('159558.SZ', Math.max(0, remSellable - sellShares));
       workingCashCents += netCents;
 
+      const reason = deconcentration.active_trigger_reason;
       const trigBatches = deconcentration.tranches
         .filter(t => t.status === 'TRIGGERED')
         .map(t => `第${t.tranche_no}批`)
         .join('、') || '当前批次';
-      const triggerDetail = deconcentration.active_trigger_reason === 'REBOUND_8PCT'
-        ? `收盘 ${(h159558.price_milli / 1000).toFixed(3)} 元已达到自基准价反弹 +8% 目标（${(deconcentration.rebound_trigger_cny ?? 0).toFixed(3)} 元）`
-        : deconcentration.active_trigger_reason === 'BREAKDOWN_SUPPORT_FLOOR'
-          ? `收盘 ${(h159558.price_milli / 1000).toFixed(3)} 元跌破磨底箱体防守位（${(deconcentration.support_floor_cny ?? deconcentration.downside_protect_cny ?? 0).toFixed(3)} 元），触发保护减仓`
-          : deconcentration.active_trigger_reason === 'BREAKDOWN_MA60'
-            ? `空头防守环境下连续两日有效跌破 60 日线（${(deconcentration.ma60_protect_cny ?? 0).toFixed(3)} 元），触发保护减仓`
-            : `已进入月度时间保底窗口且距前次间隔满 12 个交易日`;
+      const isTacticalTp = reason === 'GRIND_TACTICAL_TAKE_PROFIT';
+      const isDriftHarvest = reason === 'GRIND_OVERWEIGHT_DRIFT_HARVEST';
+
+      let actionCode = 'P2-DECONCENTRATE-159558';
+      let actionTitle = `执行 159558.SZ 四批换马（${trigBatches}）：卖出 ${sellShares} 份`;
+      let triggerDetail = '已进入月度时间保底窗口且距前次间隔满 12 个交易日';
+      let actionReasons = [
+        `${triggerDetail}，按计划减持 ${sellShares} 份以降低单一半导体 ETF 超额集中度（当前占比 ${(h159558.weight * 100).toFixed(2)}% -> 目标留存 ${keepPctLabel}%）。`,
+        '卖出回款将按当前市场档位转入东财超级 ETF（万0.5免五）或留作现金防线。',
+      ];
+      if (isTacticalTp) {
+        actionCode = 'P2-GRIND-TAKE-PROFIT-159558';
+        actionTitle = `执行 159558.SZ 磨底降本止盈：卖出 ${sellShares} 份`;
+        const tpDesc = deconcentration.grind_guards?.in_bull_trend
+          ? '60日均线上方多头趋势跟踪触发右侧止盈回落条件'
+          : `已达到战术回补入场价 ${(deconcentration.tactical_entry_price_cny ?? 0).toFixed(3)} 元之上 +7.5% 止盈位（${(deconcentration.tactical_take_profit_cny ?? 0).toFixed(3)} 元）`;
+        actionReasons = [
+          `159558.SZ 磨底机动降本仓位 ${sellShares} 份${tpDesc}，执行高抛锁盈并保留 ${keepPctLabel}%（约 ${deconcentration.target_keep_shares} 份）战略底仓。`,
+          '卖出回款重新记作降本锚定价并留作下一次深折价止稳回补弹药。',
+        ];
+      } else if (isDriftHarvest) {
+        actionCode = 'P2-GRIND-DRIFT-HARVEST-159558';
+        actionTitle = `执行 159558.SZ 超配漂移获利了结：卖出 ${sellShares} 份`;
+        actionReasons = [
+          `159558.SZ 随板块反弹被动漂移至总资产 ${(h159558.weight * 100).toFixed(2)}%（已达 34% 以上）且出现短线超买/滞涨信号，高抛超出 ${keepPctLabel}% 底仓的 ${sellShares} 份兑现浮盈。`,
+          '兑现后持仓比例回到约 25% 战略底仓，释放资金恢复防御与机动能力。',
+        ];
+      } else {
+        if (reason === 'REBOUND_8PCT') {
+          triggerDetail = `收盘 ${(h159558.price_milli / 1000).toFixed(3)} 元已达到自基准价反弹 +8% 目标（${(deconcentration.rebound_trigger_cny ?? 0).toFixed(3)} 元）`;
+        } else if (reason === 'BREAKDOWN_SUPPORT_FLOOR') {
+          const confirmPrefix = deconcentration.plan_mode === 'BOTTOM_GRIND_25' ? '连续两日收盘或深幅跌破' : '收盘跌破';
+          triggerDetail = `${confirmPrefix}磨底箱体防守位（${(deconcentration.support_floor_cny ?? deconcentration.downside_protect_cny ?? 0).toFixed(3)} 元），触发保护减仓`;
+        } else if (reason === 'BREAKDOWN_MA60') {
+          triggerDetail = `空头防守环境下连续两日有效跌破 60 日线（${(deconcentration.ma60_protect_cny ?? 0).toFixed(3)} 元），触发保护减仓`;
+        }
+        actionReasons = [
+          `${triggerDetail}，按计划减持 ${sellShares} 份以降低单一半导体 ETF 超额集中度（当前占比 ${(h159558.weight * 100).toFixed(2)}% -> 目标留存 ${keepPctLabel}%）。`,
+          '卖出回款将按当前市场档位转入东财超级 ETF（万0.5免五）或留作现金防线。',
+        ];
+      }
 
       actions.push({
         priority: 'P2',
-        code: 'P2-DECONCENTRATE-159558',
+        code: actionCode,
         kind: 'REDUCE',
         rank: actions.length + 1,
-        title: `执行 159558.SZ 四批换马（${trigBatches}）：卖出 ${sellShares} 份`,
-        reasons: [
-          `${triggerDetail}，按计划减持 ${sellShares} 份以降低单一半导体 ETF 超额集中度（当前占比 ${(h159558.weight * 100).toFixed(2)}% -> 目标留存 18%）。`,
-          '卖出回款将按当前市场档位转入东财超级 ETF（万0.5免五）或留作现金防线。',
-        ],
-        counter_evidence: ['若半导体板块次日继续脉冲拉升，已减仓部分不再享受后续涨幅。'],
+        title: actionTitle,
+        reasons: actionReasons,
+        counter_evidence: ['若半导体板块次日继续脉冲拉升，已减仓部分不再享受后续涨幅，但核心战略底仓仍保留全部后续弹性。'],
         legs: [{
           side: 'SELL',
           ts_code: '159558.SZ',
@@ -701,14 +750,72 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           net_cents: netCents,
           quote_trade_date: h159558.latest_bar_date,
           executable: true,
-          reason: `P2_${deconcentration.active_trigger_reason ?? 'TRANCHE_TRIGGERED'}`,
+          reason: `P2_${reason ?? 'TRANCHE_TRIGGERED'}`,
         }],
         fees_cents: fees.total_cents,
         fees_estimated: Boolean(rules.fee_model?.estimated),
         triggers: [`次日开盘或盘中分笔限价卖出 ${sellShares} 份 159558.SZ（计划内固定整手份额）`],
-        invalidation_conditions: ['成交并在账本录入卖出事件后本批状态自动切换为已执行'],
-        risk_impact: ['有序压降 159558.SZ 集中风险，不触发无状态连续重复卖出'],
+        invalidation_conditions: ['成交并在账本录入卖出事件后状态机自动更新已执行批次与基准价'],
+        risk_impact: [`有序维持 159558.SZ 约 ${keepPctLabel}% 核心底仓并锁盈降本`],
       });
+    }
+  } else if (
+    deconcentration.plan_present
+    && deconcentration.plan_mode === 'BOTTOM_GRIND_25'
+    && deconcentration.recommended_buy_shares >= 100
+    && router.circuit_breaker_status === 'NORMAL'
+  ) {
+    const h159558 = holding159558;
+    const buyPriceMilli = h159558?.price_milli ?? deconcentration.current_close_milli ?? 0;
+    if (buyPriceMilli > 0) {
+      const rules = feeFor('159558.SZ', 'ETF');
+      const priceCents = buyPriceMilli / 10;
+      let buyShares = deconcentration.recommended_buy_shares;
+      while (buyShares >= 100) {
+        const grossCents = roundCent(buyShares * priceCents);
+        const fees = calculateFees(grossCents, 'buy', rules);
+        if (grossCents + fees.total_cents <= workingCashCents - 10_000) {
+          if (grossCents >= 100_000) {
+            workingCashCents -= grossCents + fees.total_cents;
+            workingQty.set('159558.SZ', (workingQty.get('159558.SZ') ?? 0) + buyShares);
+            const guards = deconcentration.grind_guards;
+            actions.push({
+              priority: 'P2',
+              code: 'P2-GRIND-RELOAD-159558',
+              kind: 'ADD',
+              rank: actions.length + 1,
+              title: `执行 159558.SZ 震荡磨底战术回补：买入 ${buyShares} 份`,
+              reasons: [
+                `25%底仓降本四门槛全部满足：60日均线10日斜率 ${guards?.ma60_slope10_pct?.toFixed(2) ?? '0.00'}%（未下行）、折价目标 ${(guards?.reload_target_cny ?? 0).toFixed(3)} 元达成、近3日出现极值超卖且当日右侧阳线站稳5日线。`,
+                `按单个 +${(deconcentration.tactical_slot_bps / 100).toFixed(0)}% 战术降本槽买入 ${buyShares} 份（买后封顶总仓位约 ${deconcentration.max_grind_weight_pct.toFixed(0)}%），不设窄幅噪点止损，统一由账户级熔断线兜底并在反弹 +7.5% 或牛市均线破位兑现降本。`,
+              ],
+              counter_evidence: ['若次日行业突发黑天鹅大幅低开，短期账面波动可能放大，但仓位已严控在单槽上限内并受账户高水位熔断保护。'],
+              legs: [{
+                side: 'BUY',
+                ts_code: '159558.SZ',
+                name: h159558?.name ?? '半导体设备ETF',
+                quantity: buyShares,
+                lot_size: 100,
+                lots: buyShares / 100,
+                price_milli: buyPriceMilli,
+                gross_cents: grossCents,
+                fees_cents: fees.total_cents,
+                net_cents: grossCents + fees.total_cents,
+                quote_trade_date: h159558?.latest_bar_date ?? input.asOf,
+                executable: true,
+                reason: 'P2_GRIND_OVERSOLD_RELOAD',
+              }],
+              fees_cents: fees.total_cents,
+              fees_estimated: Boolean(rules.fee_model?.estimated),
+              triggers: [`次日限价买入 ${buyShares} 份 159558.SZ（参考价 ${(buyPriceMilli / 1000).toFixed(3)} 元，不追高）`],
+              invalidation_conditions: ['次日跳空高开超过 +2% 失去折价空间，或账户触及高水位回撤警戒线'],
+              risk_impact: [`以单槽 +${(deconcentration.tactical_slot_bps / 100).toFixed(0)}% 上限拉低 159558.SZ 综合持仓成本，严格禁止连续加仓或网格补仓`],
+            });
+          }
+          break;
+        }
+        buyShares -= 100;
+      }
     }
   }
 

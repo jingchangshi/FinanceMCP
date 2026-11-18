@@ -837,12 +837,20 @@ function renderSectionB(r: DailyReportResult): string {
       items.push(`【可考虑的交易决策】${zh(action.title)}（${legText}）：${action.reasons.slice(0, 2).map(zh).join('；')}。`);
     }
   } else if (c) {
-    const rebText = c.deconcentration.rebound_trigger_cny !== null ? `${c.deconcentration.rebound_trigger_cny.toFixed(3)} 元` : '—';
-    const monText = c.deconcentration.next_monthly_trigger_date ? ymd(c.deconcentration.next_monthly_trigger_date) : '下一月度首日';
-    items.push(
-      `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
-      + `159558.SZ 四批换马下次观察位为反弹 +8%（${rebText}）或月度窗口 ${monText}，动态高水位 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
-    );
+    const dec = c.deconcentration;
+    if (dec.plan_mode === 'BOTTOM_GRIND_25') {
+      items.push(
+        `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
+        + `${zh(dec.status_summary_zh)}，动态高水位 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+      );
+    } else {
+      const rebText = dec.rebound_trigger_cny !== null ? `${dec.rebound_trigger_cny.toFixed(3)} 元` : '—';
+      const monText = dec.next_monthly_trigger_date ? ymd(dec.next_monthly_trigger_date) : '下一月度首日';
+      items.push(
+        `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
+        + `159558.SZ 四批换马下次观察位为反弹 +8%（${rebText}）或月度窗口 ${monText}，动态高水位 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+      );
+    }
   } else {
     items.push('【可考虑的交易决策】本期没有足够证据支持新的交易，建议暂不操作。（没有经过检验的优势证据支持新的买卖）');
   }
@@ -1162,12 +1170,30 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
     const batchDesc = c.deconcentration.tranches.map(t => `第${t.tranche_no}批 ${t.planned_shares} 份`).join('、');
     lines.push('');
     lines.push('**攻防引擎核心轨道进展**');
-    lines.push(
-      `- **四批换马状态机（159558.SZ）**：已执行 ${execCnt}/${totalCnt} 批（计划分解：${batchDesc || '未建计划'}，目标留存 ${c.deconcentration.target_keep_shares} 份）；${zh(c.deconcentration.status_summary_zh)}`
-      + `${c.deconcentration.rebound_trigger_cny !== null ? `；反弹 +8% 目标价 ${c.deconcentration.rebound_trigger_cny.toFixed(3)} 元` : ''}`
-      + `${c.deconcentration.downside_protect_mode === 'SUPPORT_FLOOR' && c.deconcentration.downside_protect_cny !== null ? `；磨底箱体防守价 ${c.deconcentration.downside_protect_cny.toFixed(3)} 元` : c.deconcentration.ma60_protect_cny !== null ? `；60 日均线保护价 ${c.deconcentration.ma60_protect_cny.toFixed(3)} 元` : ''}`
-      + `${c.deconcentration.next_monthly_trigger_date ? `；下个保底月度窗口 ${ymd(c.deconcentration.next_monthly_trigger_date)}` : ''}。`,
-    );
+    if (c.deconcentration.plan_mode === 'BOTTOM_GRIND_25') {
+      const gg = c.deconcentration.grind_guards;
+      const reloadPriceTxt = gg?.reload_target_cny !== null && gg?.reload_target_cny !== undefined
+        ? `；7% 折价回补目标价 ${gg.reload_target_cny.toFixed(3)} 元（60日均线斜率 ${gg.ma60_slope10_pct !== null ? `${gg.ma60_slope10_pct.toFixed(2)}%` : '—'}）`
+        : '';
+      const tpTxt = c.deconcentration.tactical_shares >= 100 && c.deconcentration.tactical_take_profit_cny !== null
+        ? `；机动槽 +7.5% 止盈价 ${c.deconcentration.tactical_take_profit_cny.toFixed(3)} 元`
+        : '';
+      lines.push(
+        `- **25%底仓与震荡磨底降本状态机（159558.SZ）**：已执行 ${execCnt}/${totalCnt} 批（计划分解：${batchDesc || '未建计划'}，目标保留 25% 底仓 ${c.deconcentration.target_keep_shares} 份，已完成磨底波段 ${c.deconcentration.completed_swing_count} 次）；${zh(c.deconcentration.status_summary_zh)}`
+        + `${c.deconcentration.rebound_trigger_cny !== null ? `；反弹 +8% 目标价 ${c.deconcentration.rebound_trigger_cny.toFixed(3)} 元` : ''}`
+        + `${c.deconcentration.downside_protect_mode === 'SUPPORT_FLOOR' && c.deconcentration.downside_protect_cny !== null ? `；连续两日箱体防守位 ${c.deconcentration.downside_protect_cny.toFixed(3)} 元` : c.deconcentration.ma60_protect_cny !== null ? `；60 日均线保护价 ${c.deconcentration.ma60_protect_cny.toFixed(3)} 元` : ''}`
+        + reloadPriceTxt
+        + tpTxt
+        + '（已取消低位月度强卖，且持仓降至 30% 及以下且超额清零后切回 15% 正常熔断线）。',
+      );
+    } else {
+      lines.push(
+        `- **四批换马状态机（159558.SZ）**：已执行 ${execCnt}/${totalCnt} 批（计划分解：${batchDesc || '未建计划'}，目标留存 ${c.deconcentration.target_keep_shares} 份）；${zh(c.deconcentration.status_summary_zh)}`
+        + `${c.deconcentration.rebound_trigger_cny !== null ? `；反弹 +8% 目标价 ${c.deconcentration.rebound_trigger_cny.toFixed(3)} 元` : ''}`
+        + `${c.deconcentration.downside_protect_mode === 'SUPPORT_FLOOR' && c.deconcentration.downside_protect_cny !== null ? `；磨底箱体防守价 ${c.deconcentration.downside_protect_cny.toFixed(3)} 元` : c.deconcentration.ma60_protect_cny !== null ? `；60 日均线保护价 ${c.deconcentration.ma60_protect_cny.toFixed(3)} 元` : ''}`
+        + `${c.deconcentration.next_monthly_trigger_date ? `；下个保底月度窗口 ${ymd(c.deconcentration.next_monthly_trigger_date)}` : ''}。`,
+      );
+    }
     const superList = c.super_etf_candidates.slice(0, 3);
     if (superList.length > 0) {
       lines.push(

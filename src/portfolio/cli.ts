@@ -113,8 +113,10 @@ ${RISK_POLICY_USAGE}
                                                        受控撤回（VERIFIED→REVOKED，追加审计事件，不改写原记录）
   portfolio-evidence-history --id ID [--db PATH]       查看某条证据的状态变更历史
   portfolio-deconcentration-calibrate --account ID [--ts-code CODE] --confirm [--db PATH]
-        [--support-floor-milli 厘] [--anchor-price-milli 厘] [--reset-triggered]
-                                                       校准减仓状态机箱体防守位并重置已触发批次
+        [--mode STANDARD|BOTTOM_GRIND_25] [--target-keep-bps 2500] [--tactical-slot-bps 1000]
+        [--support-floor-milli 厘] [--anchor-price-milli 厘] [--trade-date YYYYMMDD] [--market-db PATH]
+        [--reset-triggered]
+                                                       校准减仓/磨底降本状态机模式、目标底仓比例、防守位与剩余拆分份数
 
   收盘日报与研究候选（D1/C2/C6）：
   portfolio-daily-report --account ID [--date YYYYMMDD] [--snapshot ID] [--max-actions 0..3]
@@ -807,20 +809,78 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       if (!h.flag('confirm')) {
         throw new Error('校准减仓状态机必须显式给出 --confirm');
       }
+      const modeArgRaw = h.arg('mode')?.trim().toUpperCase();
+      if (modeArgRaw !== undefined && modeArgRaw !== 'STANDARD' && modeArgRaw !== 'BOTTOM_GRIND_25') {
+        throw new Error(`--mode 仅支持 STANDARD 或 BOTTOM_GRIND_25（收到 ${modeArgRaw}）`);
+      }
+      const planMode = modeArgRaw as ('STANDARD' | 'BOTTOM_GRIND_25' | undefined);
+      const targetKeepBps = intArg(h.arg('target-keep-bps'), '--target-keep-bps');
+      const tacticalSlotBps = intArg(h.arg('tactical-slot-bps'), '--tactical-slot-bps');
       const rawFloor = intArg(h.arg('support-floor-milli'), '--support-floor-milli');
       const supportFloorMilli = rawFloor === undefined ? undefined : rawFloor === 0 ? null : rawFloor;
       const anchorPriceMilli = intArg(h.arg('anchor-price-milli'), '--anchor-price-milli');
+      const tsCode = h.arg('ts-code') ?? '159558.SZ';
       const db = openPortfolioDb(h.arg('db'));
       try {
-        resolveAccountId(db, accountId);
+        const resolvedAcc = resolveAccountId(db, accountId).account_id;
+        let currentShares: number | undefined;
+        let currentPriceMilli: number | undefined;
+        let navCents: number | undefined;
+        if (planMode !== undefined || targetKeepBps !== undefined || tacticalSlotBps !== undefined) {
+          const original = resolveAccountSnapshot(db, resolvedAcc).snapshot;
+          const market = openMarketCache(h.arg('market-db') ?? ashareDbPath());
+          try {
+            let latestMarketDate: string | undefined;
+            if (market) {
+              const row = market.prepare('SELECT MAX(trade_date) AS d FROM fund_daily').get() as { d?: string } | undefined;
+              if (row?.d) latestMarketDate = String(row.d);
+            }
+            const tradeDate = h.arg('trade-date') ?? latestMarketDate ?? original.as_of.replace(/-/g, '');
+            const calendar = market ? settlementCalendarFromDb(market) : undefined;
+            const state = resolveAccountState(db, resolvedAcc, tradeDate, undefined, { calendar }).snapshot;
+            let securitiesMvCents = 0;
+            for (const pos of state.positions) {
+              if (!(pos.quantity > 0)) continue;
+              let pxMilli = pos.ref_price_milli ?? 0;
+              if (market) {
+                const fundBar = market.prepare(
+                  'SELECT close FROM fund_daily WHERE ts_code = ? AND trade_date <= ? AND close > 0 ORDER BY trade_date DESC LIMIT 1',
+                ).get(pos.ts_code, tradeDate) as { close?: number } | undefined;
+                if (fundBar?.close) {
+                  pxMilli = Math.round(Number(fundBar.close) * 1000);
+                } else {
+                  const stockBar = market.prepare(
+                    'SELECT close FROM daily WHERE ts_code = ? AND trade_date <= ? AND close > 0 ORDER BY trade_date DESC LIMIT 1',
+                  ).get(pos.ts_code, tradeDate) as { close?: number } | undefined;
+                  if (stockBar?.close) pxMilli = Math.round(Number(stockBar.close) * 1000);
+                }
+              }
+              if (pos.ts_code === tsCode) {
+                currentShares = pos.quantity;
+                if (pxMilli > 0) currentPriceMilli = pxMilli;
+              }
+              securitiesMvCents += pxMilli > 0 ? Math.round(pos.quantity * (pxMilli / 10)) : (pos.market_value_cents ?? 0);
+            }
+            if (currentShares === undefined) currentShares = 0;
+            navCents = (state.totals.cash_cents ?? 0) + (state.totals.wealth_cents ?? 0) + securitiesMvCents;
+          } finally {
+            market?.close();
+          }
+        }
         const result = calibrateDeconcentrationPlan(db, {
-          account_id: accountId,
-          ts_code: h.arg('ts-code') ?? '159558.SZ',
+          account_id: resolvedAcc,
+          ts_code: tsCode,
+          plan_mode: planMode,
+          target_keep_bps: targetKeepBps,
+          tactical_slot_bps: tacticalSlotBps,
+          current_shares: currentShares,
+          current_price_milli: currentPriceMilli,
+          nav_cents: navCents,
           support_floor_milli: supportFloorMilli,
           anchor_price_milli: anchorPriceMilli,
           reset_triggered: h.flag('reset-triggered'),
         });
-        h.print({ ...result, db: portfolioDbPath() });
+        h.print({ ...result, nav_cents: navCents, current_shares: currentShares, current_price_milli: currentPriceMilli, db: portfolioDbPath() });
       } finally {
         db.close();
       }

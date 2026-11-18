@@ -486,10 +486,27 @@ export interface V3CockpitSummary {
     plan_present: boolean;
     ts_code: string;
     plan_status: V3ActionEngineOutput['deconcentration']['plan_status'];
+    plan_mode: V3ActionEngineOutput['deconcentration']['plan_mode'];
     initial_shares: number;
     current_shares: number;
     target_keep_bps: number;
+    target_keep_pct: number;
     target_keep_shares: number;
+    tactical_slot_bps: number;
+    tactical_slot_pct: number;
+    max_grind_weight_pct: number;
+    drift_harvest_trigger_pct: number;
+    preemptive_weight_threshold_pct: number;
+    normal_lifeline_pct: number;
+    reload_discount_pct: number;
+    take_profit_pct: number;
+    rebound_pct: number;
+    tactical_shares: number;
+    tactical_entry_price_cny: number | null;
+    tactical_entry_date: string | null;
+    tactical_take_profit_cny: number | null;
+    completed_swing_count: number;
+    live_weight_pct: number | null;
     reference_price_cny: number | null;
     rebound_trigger_cny: number | null;
     support_floor_cny: number | null;
@@ -500,8 +517,10 @@ export interface V3CockpitSummary {
     breakdown_ma60_2d: boolean;
     next_monthly_trigger_date: string | null;
     recommended_sell_shares: number;
+    recommended_buy_shares: number;
     active_trigger_reason: V3ActionEngineOutput['deconcentration']['active_trigger_reason'];
     tranches: V3ActionEngineOutput['deconcentration']['tranches'];
+    grind_guards: V3ActionEngineOutput['deconcentration']['grind_guards'];
     status_summary_zh: string;
   };
   reconciliation_reminder: V3ActionEngineOutput['reconciliation_reminder'];
@@ -1938,24 +1957,48 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   // ---- 观察触发条件：NO_ACTION 时由“阻塞原因”与持仓质量共同给出，并补充 V3 核心触发线。
   const v3Triggers: string[] = [];
   if (engineOut) {
-    if (
-      engineOut.deconcentration.plan_present
-      && engineOut.deconcentration.tranches.some(t => t.status === 'PENDING' || t.status === 'TRIGGERED')
-    ) {
-      const reb = engineOut.deconcentration.rebound_trigger_cny;
-      const mon = engineOut.deconcentration.next_monthly_trigger_date;
-      const ma60p = engineOut.deconcentration.ma60_protect_cny;
-      const downsideClause = engineOut.deconcentration.downside_protect_mode === 'SUPPORT_FLOOR'
-        && engineOut.deconcentration.downside_protect_cny !== null
-        ? `，或收盘跌破磨底箱体防守位 ${engineOut.deconcentration.downside_protect_cny.toFixed(3)} 元`
-        : ma60p !== null
-          ? `，或防守期连续两日有效跌破 ${ma60p.toFixed(3)} 元`
-          : '';
-      v3Triggers.push(
-        `159558.SZ 四批换马下次触发条件：反弹至 ${reb !== null ? reb.toFixed(3) : '—'} 元（+8%）`
-        + `${mon ? `，或月度时间窗至 ${mon}` : ''}`
-        + downsideClause,
-      );
+    if (engineOut.deconcentration.plan_present) {
+      const dec = engineOut.deconcentration;
+      const hasOpenExcess = dec.tranches.some(t => t.status === 'PENDING' || t.status === 'TRIGGERED');
+      if (dec.plan_mode === 'BOTTOM_GRIND_25') {
+        if (hasOpenExcess) {
+          const reb = dec.rebound_trigger_cny;
+          const downsideClause = dec.downside_protect_mode === 'SUPPORT_FLOOR' && dec.downside_protect_cny !== null
+            ? `，或连续两日收盘跌破磨底箱体防守位 ${dec.downside_protect_cny.toFixed(3)} 元`
+            : dec.ma60_protect_cny !== null
+              ? `，或防守期连续两日有效跌破 ${dec.ma60_protect_cny.toFixed(3)} 元`
+              : '';
+          v3Triggers.push(
+            `159558.SZ 25%底仓超额减仓下次触发条件：反弹至 ${reb !== null ? reb.toFixed(3) : '—'} 元（+8%）`
+            + `${downsideClause}（已取消低位月度强卖）`,
+          );
+        } else if (dec.tactical_shares >= 100 && dec.tactical_take_profit_cny !== null) {
+          v3Triggers.push(
+            `159558.SZ 磨底降本机动槽（${dec.tactical_shares} 份）止盈线：+7.5% 目标价 ${dec.tactical_take_profit_cny.toFixed(3)} 元（不设窄止损，由账户熔断兜底）`,
+          );
+        } else {
+          const rPrice = dec.grind_guards?.reload_target_cny;
+          v3Triggers.push(
+            `159558.SZ 25%战略底仓震荡磨底回补四门槛：60日均线10日斜率走平（当前 ${dec.grind_guards?.ma60_slope10_pct?.toFixed(2) ?? '—'}%）`
+            + `、较前次卖出折价7%（${rPrice !== null && rPrice !== undefined ? rPrice.toFixed(3) : '—'} 元）、近3日超卖极值及右侧收阳站稳5日线`,
+          );
+        }
+      } else if (hasOpenExcess) {
+        const reb = dec.rebound_trigger_cny;
+        const mon = dec.next_monthly_trigger_date;
+        const ma60p = dec.ma60_protect_cny;
+        const downsideClause = dec.downside_protect_mode === 'SUPPORT_FLOOR'
+          && dec.downside_protect_cny !== null
+          ? `，或收盘跌破磨底箱体防守位 ${dec.downside_protect_cny.toFixed(3)} 元`
+          : ma60p !== null
+            ? `，或防守期连续两日有效跌破 ${ma60p.toFixed(3)} 元`
+            : '';
+        v3Triggers.push(
+          `159558.SZ 四批换马下次触发条件：反弹至 ${reb !== null ? reb.toFixed(3) : '—'} 元（+8%）`
+          + `${mon ? `，或月度时间窗至 ${mon}` : ''}`
+          + downsideClause,
+        );
+      }
     }
     const anc = engineOut.router.anchor_snapshot;
     const preemptiveNote = engineOut.router.deconcentration_preemptive_active
@@ -2206,10 +2249,27 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           plan_present: engineOut.deconcentration.plan_present,
           ts_code: engineOut.deconcentration.ts_code,
           plan_status: engineOut.deconcentration.plan_status,
+          plan_mode: engineOut.deconcentration.plan_mode,
           initial_shares: engineOut.deconcentration.initial_shares,
           current_shares: engineOut.deconcentration.current_shares,
           target_keep_bps: engineOut.deconcentration.target_keep_bps,
+          target_keep_pct: engineOut.deconcentration.target_keep_pct,
           target_keep_shares: engineOut.deconcentration.target_keep_shares,
+          tactical_slot_bps: engineOut.deconcentration.tactical_slot_bps,
+          tactical_slot_pct: engineOut.deconcentration.tactical_slot_pct,
+          max_grind_weight_pct: engineOut.deconcentration.max_grind_weight_pct,
+          drift_harvest_trigger_pct: engineOut.deconcentration.drift_harvest_trigger_pct,
+          preemptive_weight_threshold_pct: engineOut.deconcentration.preemptive_weight_threshold_pct,
+          normal_lifeline_pct: engineOut.deconcentration.normal_lifeline_pct,
+          reload_discount_pct: engineOut.deconcentration.reload_discount_pct,
+          take_profit_pct: engineOut.deconcentration.take_profit_pct,
+          rebound_pct: engineOut.deconcentration.rebound_pct,
+          tactical_shares: engineOut.deconcentration.tactical_shares,
+          tactical_entry_price_cny: engineOut.deconcentration.tactical_entry_price_cny,
+          tactical_entry_date: engineOut.deconcentration.tactical_entry_date,
+          tactical_take_profit_cny: engineOut.deconcentration.tactical_take_profit_cny,
+          completed_swing_count: engineOut.deconcentration.completed_swing_count,
+          live_weight_pct: engineOut.deconcentration.live_weight_pct,
           reference_price_cny: engineOut.deconcentration.reference_price_cny,
           rebound_trigger_cny: engineOut.deconcentration.rebound_trigger_cny,
           support_floor_cny: engineOut.deconcentration.support_floor_cny,
@@ -2220,8 +2280,10 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           breakdown_ma60_2d: engineOut.deconcentration.breakdown_ma60_2d,
           next_monthly_trigger_date: engineOut.deconcentration.next_monthly_trigger_date,
           recommended_sell_shares: engineOut.deconcentration.recommended_sell_shares,
+          recommended_buy_shares: engineOut.deconcentration.recommended_buy_shares,
           active_trigger_reason: engineOut.deconcentration.active_trigger_reason,
           tranches: engineOut.deconcentration.tranches,
+          grind_guards: engineOut.deconcentration.grind_guards,
           status_summary_zh: engineOut.deconcentration.status_summary_zh,
         },
         reconciliation_reminder: engineOut.reconciliation_reminder,

@@ -178,6 +178,12 @@ CREATE TABLE IF NOT EXISTS deconcentration_plan (
   support_floor_milli INTEGER,
   last_exec_price_milli INTEGER,
   last_exec_date TEXT,
+  plan_mode TEXT NOT NULL DEFAULT 'STANDARD',
+  tactical_slot_bps INTEGER NOT NULL DEFAULT 1000,
+  tactical_shares INTEGER NOT NULL DEFAULT 0,
+  tactical_entry_price_milli INTEGER,
+  tactical_entry_date TEXT,
+  completed_swing_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'ACTIVE',
   created_at TEXT NOT NULL
 );
@@ -233,9 +239,22 @@ export function ensurePortfolioLedgerSchema(db: DatabaseSync): void {
 
 export function ensurePortfolioV3Schema(db: DatabaseSync): void {
   db.exec(PORTFOLIO_V3_SCHEMA);
-  const cols = db.prepare('PRAGMA table_info(deconcentration_plan)').all() as Array<{ name?: string }>;
-  if (!cols.some(c => c.name === 'support_floor_milli')) {
-    db.exec('ALTER TABLE deconcentration_plan ADD COLUMN support_floor_milli INTEGER;');
+  const cols = new Set(
+    (db.prepare('PRAGMA table_info(deconcentration_plan)').all() as Array<{ name?: string }>)
+      .map(c => c.name)
+      .filter((n): n is string => Boolean(n)),
+  );
+  const migrations: Array<[string, string]> = [
+    ['support_floor_milli', 'ALTER TABLE deconcentration_plan ADD COLUMN support_floor_milli INTEGER;'],
+    ['plan_mode', "ALTER TABLE deconcentration_plan ADD COLUMN plan_mode TEXT NOT NULL DEFAULT 'STANDARD';"],
+    ['tactical_slot_bps', 'ALTER TABLE deconcentration_plan ADD COLUMN tactical_slot_bps INTEGER NOT NULL DEFAULT 1000;'],
+    ['tactical_shares', 'ALTER TABLE deconcentration_plan ADD COLUMN tactical_shares INTEGER NOT NULL DEFAULT 0;'],
+    ['tactical_entry_price_milli', 'ALTER TABLE deconcentration_plan ADD COLUMN tactical_entry_price_milli INTEGER;'],
+    ['tactical_entry_date', 'ALTER TABLE deconcentration_plan ADD COLUMN tactical_entry_date TEXT;'],
+    ['completed_swing_count', 'ALTER TABLE deconcentration_plan ADD COLUMN completed_swing_count INTEGER NOT NULL DEFAULT 0;'],
+  ];
+  for (const [col, ddl] of migrations) {
+    if (!cols.has(col)) db.exec(ddl);
   }
 }
 
