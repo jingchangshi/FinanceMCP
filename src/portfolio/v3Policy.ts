@@ -1,11 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { validateStrategyRelease, type StrategyRelease } from '../ashare/strategyRelease.js';
 
-export const V3_POLICY_EXPECTED_HASH = 'eeacd72de68d463a045a1be1159bede7b3dbae13da92f9b05e68983995e4e008';
+export const V3_POLICY_V3_1_0_HASH = 'eeacd72de68d463a045a1be1159bede7b3dbae13da92f9b05e68983995e4e008';
+export const V3_POLICY_EXPECTED_HASH = '05346a961e01f746055143e0bb5790caa9d6460aa579bb26c085cca20d77b55f';
 
 /**
- * Signed V3 Offensive Policy Release v3.1.0 (Phase 2 TactiCore validated & approved for account).
- * Byte-identical contract to AShareInvestor/docs/v3-offensive-system/fee-profiles/v3_offensive_policy_release_v3.1.0.json.
+ * Signed V3 Offensive Policy Release v3.1.0 (archived baseline contract, retained for audit compatibility).
  */
 export const V3_OFFENSIVE_POLICY_RELEASE_V3_1_0: StrategyRelease = {
   schema_version: 'strategy-release-1',
@@ -142,6 +142,95 @@ export const V3_OFFENSIVE_POLICY_RELEASE_V3_1_0: StrategyRelease = {
       sha256: '53c274a2c6bef219ad44b67de758f41d2b3a04962622129bfaba7c532ad3138b',
     },
   ],
+  content_hash: V3_POLICY_V3_1_0_HASH,
+};
+
+/**
+ * Signed V3 Offensive Policy Release v3.2.0 (Phase 2 EXP-V3-01..04 validated & approved for account).
+ * Byte-identical contract to AShareInvestor/docs/v3-offensive-system/fee-profiles/v3_offensive_policy_release_v3.2.0.json.
+ */
+export const V3_OFFENSIVE_POLICY_RELEASE_V3_2_0: StrategyRelease = {
+  schema_version: 'strategy-release-1',
+  research_status: 'RESEARCH_PUBLISHED',
+  production_admission: 'APPROVED_FOR_ACCOUNT',
+  strategy: {
+    id: 'V3_OFFENSIVE_LOW_FREQ_SYSTEM',
+    version: '3.2.0',
+    implementation_sha256: '4ceab1b42815c7863d1f7cdbfa3948b95d61ad772a7ab90da5fc51060db79629',
+  },
+  applicability: {
+    market: 'CN_ASHARE_MAINBOARD_AND_EXCHANGE_ETF',
+    environment: 'EASTMONEY_100K_LOW_FREQ_ACCOUNT',
+  },
+  execution_assumptions: {
+    signal_timing: 'End-of-day PIT close indicators after market close (T)',
+    earliest_execution: 'Next trading session T+1 (open_auction for stocks; T+1 ETF rebalance)',
+    exit: 'Dual-anchor regime shift, stock -8% hard stop / +15% breakeven / MA20 trailing, and 25% core bottom-grind mode (+10% guarded tactical slot, 2d floor confirm, >=34% drift harvest, preemptive -12%->0% L2 above 30% weight)',
+    fees: 'Super ETF 0.5bp commission (min 0 CNY); normal ETF 2.5bp (min 5 CNY); stocks 2.5bp (min 5 CNY) + 5bp sell stamp tax + 0.1bp transfer; 5bp slip',
+    lot_size: '100 shares integer board lots; minimum >=8,000 CNY per stock pioneer trade',
+  },
+  inputs: {
+    ...V3_OFFENSIVE_POLICY_RELEASE_V3_1_0.inputs,
+    assets: [...V3_OFFENSIVE_POLICY_RELEASE_V3_1_0.inputs.assets],
+  },
+  rules: [
+    'Dual-anchor market regime (CSI300 + CSI500/ChiNext + breadth >=45% + vol >=0.85x) routes OFFENSIVE 85% / STRUCTURAL 60% / DEFENSIVE 15%.',
+    'Idle defensive weight deploys into 511010.SH treasury bond ETF reservoir rather than 0% cash (EXP-V3-01 Full MaxDD -13.79% vs -17.32% cash-only).',
+    'Super ETF universe uses Eastmoney 33-ETF 0.5bp no-min-5 whitelist and blocks cross-border ETFs above +2.5% IOPV premium or >3-day stale NAV.',
+    'Mainboard quality momentum swing enables BP1_PULLBACK ONLY (+2.329% OOS 100k / +0.592% OOS 70k) and DROPS BP2_BREAKOUT (-0.187% OOS 100k / -0.001% OOS 70k).',
+    'Every stock pioneer trade requires QualityCore (ROE>5%, EPS>0, OCF/Profit>50% with PIT ann_date<=T), -8% hard stop, +15% breakeven arming, and MA20 trailing exit.',
+    'Concentrated sector ETF uses BOTTOM_GRIND_25 (keep 25% strategic core, drop low-level monthly forced selling, 2-day support floor breakdown confirm, plus +10% guarded reload only when MA60_slope10>=0, >=7% discount, oversold washout, and right-side close>MA5; >=34% drift stall harvest; EXP-V3-04 15/0 RT win rate).',
+  ],
+  parameters: {
+    offensive_equity_bps: '8500',
+    structural_equity_bps: '6000',
+    defensive_equity_bps: '1500',
+    defensive_bond_reservoir_etf: '511010.SH',
+    super_etf_commission_rate: '0.00005',
+    super_etf_min_commission_cents: '0',
+    cross_border_max_premium_bps: '250',
+    bp1_pullback_status: 'ENABLED',
+    bp1_oos_100k_net_expectancy_pct: '+2.329',
+    bp1_oos_70k_net_expectancy_pct: '+0.592',
+    bp2_breakout_status: 'DROPPED_NEGATIVE_OOS',
+    bp2_oos_100k_net_expectancy_pct: '-0.187',
+    bp2_oos_70k_net_expectancy_pct: '-0.001',
+    stock_hard_stop_max_loss_bps: '800',
+    stock_breakeven_arm_gain_bps: '1500',
+    stock_max_positions: '2',
+    stock_max_single_weight_bps: '1800',
+    stock_risk_budget_per_trade_bps: '130',
+    deconcentration_mode: 'BOTTOM_GRIND_25',
+    deconcentration_tranches: '4',
+    deconcentration_keep_weight_bps: '2500',
+    deconcentration_rebound_trigger_bps: '800',
+    deconcentration_monthly_min_gap_days: '12',
+    deconcentration_monthly_rule_enabled: 'false',
+    deconcentration_support_breakdown_confirm_days: '2',
+    grind_tactical_slot_bps: '1000',
+    grind_reload_min_discount_bps: '700',
+    grind_reload_ma60_slope10_min_bps: '0',
+    grind_reload_rsi14_max: '36',
+    grind_reload_bias20_max_bps: '-650',
+    grind_take_profit_bps: '750',
+    grind_drift_harvest_trigger_bps: '3400',
+    l1_warn_drawdown_bps: '1000',
+    l2_hard_lifeline_drawdown_bps: '1500',
+    l2_preemptive_trigger_drawdown_bps: '1200',
+    l2_deconcentration_post_breaker_equity_bps: '0',
+    l2_lock_trade_days: '15',
+  },
+  evidence: [
+    ...V3_OFFENSIVE_POLICY_RELEASE_V3_1_0.evidence,
+    {
+      reference: 'research/results/EXP_V3_04_BOTTOM_GRIND_COST_REDUCTION.json',
+      sha256: 'd8551f1321b4f8c21a624714a00539a7810ccaef9f694053b0e740e2926a0234',
+    },
+    {
+      reference: 'research/results/EXP_V3_04_BOTTOM_GRIND_COST_REDUCTION.md',
+      sha256: '673a7f3cd31c51fbd638b1df2b97533b2ec500ee8f59e121ebb6ae42ffa617ee',
+    },
+  ],
   content_hash: V3_POLICY_EXPECTED_HASH,
 };
 
@@ -166,6 +255,15 @@ export interface ApprovedV3Policy {
   l2_deconcentration_post_breaker_equity_bps: number;
   l2_lock_trade_days: number;
   defensive_bond_reservoir_etf: string;
+  deconcentration_mode: 'STANDARD' | 'BOTTOM_GRIND_25';
+  deconcentration_keep_weight_bps: number;
+  deconcentration_support_breakdown_confirm_days: number;
+  grind_tactical_slot_bps: number;
+  grind_reload_min_discount_bps: number;
+  grind_reload_rsi14_max: number;
+  grind_reload_bias20_max_bps: number;
+  grind_take_profit_bps: number;
+  grind_drift_harvest_trigger_bps: number;
 }
 
 function intParam(params: Record<string, string>, key: string, fallback: number): number {
@@ -174,11 +272,11 @@ function intParam(params: Record<string, string>, key: string, fallback: number)
 }
 
 /**
- * Load and verify the approved V3 offensive policy release (v3.1.0).
+ * Load and verify the approved V3 offensive policy release (v3.2.0).
  * Supports optional ASHARE_V3_POLICY_RELEASE_PATH runtime override while verifying canonical StrategyRelease hash.
  */
 export function loadApprovedV3Policy(): ApprovedV3Policy {
-  let release: StrategyRelease = V3_OFFENSIVE_POLICY_RELEASE_V3_1_0;
+  let release: StrategyRelease = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0;
   const overridePath = process.env.ASHARE_V3_POLICY_RELEASE_PATH?.trim();
   const isCustomOverride = Boolean(overridePath && existsSync(overridePath));
   if (isCustomOverride && overridePath) {
@@ -192,6 +290,7 @@ export function loadApprovedV3Policy(): ApprovedV3Policy {
 
   const p = release.parameters;
   const approved = release.production_admission === 'APPROVED_FOR_ACCOUNT';
+  const deconcMode = p.deconcentration_mode === 'BOTTOM_GRIND_25' ? 'BOTTOM_GRIND_25' : 'STANDARD';
   return {
     release,
     approved,
@@ -213,5 +312,14 @@ export function loadApprovedV3Policy(): ApprovedV3Policy {
     l2_deconcentration_post_breaker_equity_bps: intParam(p, 'l2_deconcentration_post_breaker_equity_bps', 0),
     l2_lock_trade_days: intParam(p, 'l2_lock_trade_days', 15),
     defensive_bond_reservoir_etf: p.defensive_bond_reservoir_etf || '511010.SH',
+    deconcentration_mode: deconcMode,
+    deconcentration_keep_weight_bps: intParam(p, 'deconcentration_keep_weight_bps', 2500),
+    deconcentration_support_breakdown_confirm_days: intParam(p, 'deconcentration_support_breakdown_confirm_days', 2),
+    grind_tactical_slot_bps: intParam(p, 'grind_tactical_slot_bps', 1000),
+    grind_reload_min_discount_bps: intParam(p, 'grind_reload_min_discount_bps', 700),
+    grind_reload_rsi14_max: intParam(p, 'grind_reload_rsi14_max', 36),
+    grind_reload_bias20_max_bps: intParam(p, 'grind_reload_bias20_max_bps', -650),
+    grind_take_profit_bps: intParam(p, 'grind_take_profit_bps', 750),
+    grind_drift_harvest_trigger_bps: intParam(p, 'grind_drift_harvest_trigger_bps', 3400),
   };
 }

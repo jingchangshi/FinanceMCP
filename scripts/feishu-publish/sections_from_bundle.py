@@ -370,15 +370,44 @@ def _build_v3_cockpit_sections(
     if isinstance(spread, (int, float)):
         regime_desc += f"近20日大小盘相对收益差 {spread:+.2f} 个百分点。"
 
+    deconc_mode = str(deconc.get("plan_mode") or "STANDARD")
+    is_grind25 = (deconc_mode == "BOTTOM_GRIND_25")
+    tranches = deconc.get("tranches") or []
+    open_excess = [t for t in tranches if isinstance(t, dict) and t.get("status") in ("PENDING", "TRIGGERED")]
+    gg = deconc.get("grind_guards") or {}
+    slope_val = gg.get("ma60_slope10_pct")
+    slope_txt = f"{slope_val:+.2f}%" if isinstance(slope_val, (int, float)) else "测算中"
+    reload_target_val = gg.get("reload_target_cny")
+    reload_txt = f"{_tick_price(reload_target_val)} 元" if isinstance(reload_target_val, (int, float)) else "待确认"
+
     deconc_next = []
-    if deconc.get("rebound_trigger_cny") is not None:
-        deconc_next.append(f"反弹 +8% 目标价 {_tick_price(deconc['rebound_trigger_cny'])} 元")
-    if deconc.get("next_monthly_trigger_date"):
-        deconc_next.append(f"下个保底月度窗口 {_ymd(deconc['next_monthly_trigger_date'])}")
-    if deconc.get("downside_protect_mode") == "SUPPORT_FLOOR" and deconc.get("downside_protect_cny") is not None:
-        deconc_next.append(f"磨底箱体防守位 {_tick_price(deconc['downside_protect_cny'])} 元")
-    elif deconc.get("ma60_protect_cny") is not None:
-        deconc_next.append(f"60日均线防守位 {_tick_price(deconc['ma60_protect_cny'])} 元")
+    if is_grind25:
+        if open_excess:
+            if deconc.get("rebound_trigger_cny") is not None:
+                deconc_next.append(f"超额份额反弹 +8% 减仓价 {_tick_price(deconc['rebound_trigger_cny'])} 元")
+            if deconc.get("downside_protect_mode") == "SUPPORT_FLOOR" and deconc.get("downside_protect_cny") is not None:
+                deconc_next.append(f"连续2日跌破箱体防守位 {_tick_price(deconc['downside_protect_cny'])} 元（已取消低位月度强卖）")
+            elif deconc.get("ma60_protect_cny") is not None:
+                deconc_next.append(f"防守期连续2日跌破60日线保护位 {_tick_price(deconc['ma60_protect_cny'])} 元")
+            deconc_next.append(f"四门槛回补参考：60日均线斜率 {slope_txt}（需非负）且折价7%位 {reload_txt}")
+        else:
+            tac_shares_cur = int(deconc.get("tactical_shares") or 0)
+            if tac_shares_cur >= 100 and deconc.get("tactical_take_profit_cny") is not None:
+                deconc_next.append(f"机动降本仓位止盈 +7.5% 目标价 {_tick_price(deconc['tactical_take_profit_cny'])} 元（上破60日线则按均线追踪止盈）")
+            else:
+                deconc_next.append(
+                    f"四门槛回补条件：60日均线10日斜率 {slope_txt}（需走平非负）、折价7%目标位 {reload_txt}、近3日超卖极值及右侧阳线站稳5日线"
+                )
+            deconc_next.append("超配被动漂移达34%且出现滞涨信号时高抛回落至25%底仓")
+    else:
+        if deconc.get("rebound_trigger_cny") is not None:
+            deconc_next.append(f"反弹 +8% 目标价 {_tick_price(deconc['rebound_trigger_cny'])} 元")
+        if deconc.get("next_monthly_trigger_date"):
+            deconc_next.append(f"下个保底月度窗口 {_ymd(deconc['next_monthly_trigger_date'])}")
+        if deconc.get("downside_protect_mode") == "SUPPORT_FLOOR" and deconc.get("downside_protect_cny") is not None:
+            deconc_next.append(f"磨底箱体防守位 {_tick_price(deconc['downside_protect_cny'])} 元")
+        elif deconc.get("ma60_protect_cny") is not None:
+            deconc_next.append(f"60日均线防守位 {_tick_price(deconc['ma60_protect_cny'])} 元")
     deconc_line = str(deconc.get("status_summary_zh") or "集中度换马状态未初始化。")
 
     reasons: List[str] = [regime_desc]
@@ -450,10 +479,9 @@ def _build_v3_cockpit_sections(
     amt_ratio = mr.get("amount_vs_ma20")
     amt_ratio_txt = f"{amt_ratio:.2f} 倍" if isinstance(amt_ratio, (int, float)) else "—"
 
-    tranches = deconc.get("tranches") or []
     exec_cnt = sum(1 for t in tranches if isinstance(t, dict) and t.get("status") == "EXECUTED")
     tranche_desc = "、".join(
-        f"第{t.get('tranche_no')}批{t.get('planned_shares')}份({ '已执行' if t.get('status')=='EXECUTED' else '已触发' if t.get('status')=='TRIGGERED' else '待触发' })"
+        f"第{t.get('tranche_no')}批{t.get('planned_shares')}份({ '已执行' if t.get('status')=='EXECUTED' else '已触发' if t.get('status')=='TRIGGERED' else '跳过' if t.get('status')=='SKIPPED' else '待触发' })"
         for t in tranches if isinstance(t, dict)
     ) or "暂无分批记录"
     cur_shares = deconc.get("current_shares")
@@ -524,15 +552,37 @@ def _build_v3_cockpit_sections(
             "why": "大盘价值锚（沪深300）与成长弹性锚（中证500、创业板指）叠加全市场站上60日线占比和量比，共同决定进攻85%、结构60%、防守15%三档总权益上限（含连续两日收盘防抖确认）。",
             "rule_note": regime_rule_note,
         },
-        {
-            "label": "② 159558.SZ 四批换马状态机",
-            "observation": (
-                f"{cur_shares_txt}已执行 {exec_cnt}/{len(tranches) or 4} 批，目标保留底仓 {deconc.get('target_keep_shares', 15000)} 份；"
-                f"拆分计划：{tranche_desc}。"
-            ),
-            "why": "持久化锁定分批份数避免每日无状态重复卖出，在保留核心半导体设备底仓弹性的同时有序降低单一标的集中暴露。",
-            "rule_note": "下一批触发条件：" + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
-        },
+        (
+            {
+                "label": "② 159558.SZ 25%底仓与震荡磨底降本状态机",
+                "observation": (
+                    (
+                        f"{cur_shares_txt}目标保留 25% 核心底仓 {deconc.get('target_keep_shares', 20600)} 份，"
+                        f"已执行 {exec_cnt}/{len(tranches) or 4} 批超额减仓（余量拆分：{tranche_desc}）；"
+                        f"60日均线10日斜率 {slope_txt}（{'走平允许观察' if gg.get('ma60_flat_ready') else '下行期禁止左侧接飞刀'}），"
+                        f"折价7%参考位 {reload_txt}。"
+                    )
+                    if open_excess
+                    else (
+                        f"{cur_shares_txt}目标 25% 核心底仓 {deconc.get('target_keep_shares', 20600)} 份，"
+                        f"当前机动降本持仓 {int(deconc.get('tactical_shares') or 0)} 份（已闭环降本波段 {int(deconc.get('completed_swing_count') or 0)} 轮）；"
+                        f"60日均线10日斜率 {slope_txt}，折价7%回补目标位 {reload_txt}。"
+                    )
+                ),
+                "why": "取消低位月度强卖，长期留存25%核心半导体设备底仓弹性；仅在60日均线走平+深折价超卖+右侧企稳四门槛齐备时启用单槽+10%战术回补（不设窄幅噪点止损），规避越做越亏风险。",
+                "rule_note": ("；".join(deconc_next) if deconc_next else "按四门槛持续观察") + "（持仓占比降至30%及以下且超额归零后恢复15%标准熔断线）。",
+            }
+            if is_grind25
+            else {
+                "label": "② 159558.SZ 四批换马状态机",
+                "observation": (
+                    f"{cur_shares_txt}已执行 {exec_cnt}/{len(tranches) or 4} 批，目标保留底仓 {deconc.get('target_keep_shares', 15000)} 份；"
+                    f"拆分计划：{tranche_desc}。"
+                ),
+                "why": "持久化锁定分批份数避免每日无状态重复卖出，在保留核心半导体设备底仓弹性的同时有序降低单一标的集中暴露。",
+                "rule_note": "下一批触发条件：" + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
+            }
+        ),
         {
             "label": "③ 账户仓位水位与增量资金预算",
             "observation": (
@@ -554,7 +604,16 @@ def _build_v3_cockpit_sections(
         chg = quote.get("pct_chg")
         chg_txt = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "—"
         if ts_code == "159558.SZ":
-            judgment = "执行减仓" if is_actionable and any("159558.SZ" in l for l in action_lines) else "按四批换马持有观察"
+            has_159558_act = is_actionable and any("159558.SZ" in l for l in action_lines)
+            if is_grind25:
+                if has_159558_act and any("159558.SZ" in l and ("买入" in l or "回补" in l) for l in action_lines):
+                    judgment = "执行磨底回补"
+                elif has_159558_act:
+                    judgment = "执行减仓降本"
+                else:
+                    judgment = "保留25%底仓并按磨底规则观察"
+            else:
+                judgment = "执行减仓" if has_159558_act else "按四批换马持有观察"
             basis = f"收盘 {close_px} 元（{chg_txt}），权重 {_fmt_pct((h.get('weight') or 0) * 100)}；{deconc_line}"
         else:
             judgment = "继续持有并随组合跟踪"
@@ -621,8 +680,9 @@ def _build_v3_cockpit_sections(
         if preemptive_active
         else f"{_ymd(next_date)}：盯防动态高水位 15% 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}，破线无条件压仓至 15% 以下。"
     )
+    deconc_cond_prefix = "159558.SZ 25%底仓与磨底降本观察位——" if is_grind25 else "159558.SZ 四批换马触发位——"
     conditions: List[str] = [
-        f"{_ymd(next_date)}：159558.SZ 四批换马触发位——" + ("；".join(deconc_next) if deconc_next else "待触发") + "。",
+        f"{_ymd(next_date)}：{deconc_cond_prefix}" + ("；".join(deconc_next) if deconc_next else "待触发") + "。",
         lifeline_text,
         f"{_ymd(next_date)}：新建个股统一遵循单笔 -8% 硬止损、+15% 提至保本及 20 日均线移动止盈，跨境买入严禁超过 +2.5% 溢价。",
     ]

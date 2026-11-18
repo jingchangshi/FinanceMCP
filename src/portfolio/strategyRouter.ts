@@ -78,6 +78,7 @@ export interface EvaluateStrategyRouterInput {
   phase1LockStockSwing?: boolean;
   /** True when a concentrated sector ETF deconcentration plan is active (triggers preemptive -12%->0% L2). */
   deconcentrationActive?: boolean;
+  deconcentrationMode?: 'STANDARD' | 'BOTTOM_GRIND_25';
 }
 
 const r2 = (v: number): number => Math.round(v * 100) / 100;
@@ -287,7 +288,9 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
       s_stock_swing: sStockSwing,
     },
     sub_strategies_zh: {
-      deconcentrate_label: '存量重仓四批换马状态机：运行中',
+      deconcentrate_label: input.deconcentrationMode === 'BOTTOM_GRIND_25'
+        ? '存量重仓 25%底仓与震荡磨底降本状态机：运行中'
+        : '存量重仓四批换马状态机：运行中',
       base_etf_label: sBaseSuperEtf === 'REDUCE_ONLY'
         ? '底盘超级 ETF 桶：熔断期间只降不加'
         : '底盘超级 ETF 桶：正常运行',

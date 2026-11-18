@@ -495,3 +495,55 @@ class TestV3CockpitSections(unittest.TestCase):
         self.assertIn("601001.SH", vis)
         self.assertIn("12% 前置熔断清零高波动权益", vis)
         self.assertIn("磨底箱体防守位 0.780 元", vis)
+
+    def test_v3_bottom_grind_25_sections_and_hygiene(self):
+        from feishu_render import check_forbidden, check_internal_tokens, check_markdown_leak, render_xml, strip_tags
+
+        bundle = self._v3_bundle(actionable=False)
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["router"]["deconcentration_preemptive_active"] = True
+        cockpit["router"]["sub_strategies_zh"]["deconcentrate_label"] = "存量重仓 25%底仓与震荡磨底降本状态机：运行中"
+        cockpit["deconcentration"].update({
+            "plan_mode": "BOTTOM_GRIND_25",
+            "initial_shares": 58900,
+            "current_shares": 36900,
+            "target_keep_bps": 2500,
+            "target_keep_shares": 20600,
+            "tactical_slot_bps": 1000,
+            "tactical_shares": 0,
+            "completed_swing_count": 0,
+            "rebound_trigger_cny": 0.894,
+            "support_floor_cny": 0.78,
+            "downside_protect_cny": 0.78,
+            "downside_protect_mode": "SUPPORT_FLOOR",
+            "next_monthly_trigger_date": None,
+            "tranches": [
+                {"tranche_no": 1, "planned_shares": 11000, "status": "EXECUTED"},
+                {"tranche_no": 2, "planned_shares": 11000, "status": "EXECUTED"},
+                {"tranche_no": 3, "planned_shares": 8200, "status": "PENDING"},
+                {"tranche_no": 4, "planned_shares": 8100, "status": "PENDING"},
+            ],
+            "grind_guards": {
+                "ma60_slope10_pct": -4.25,
+                "ma60_flat_ready": False,
+                "reload_target_cny": 0.770,
+                "discount_ready": False,
+                "oversold_3d_ready": False,
+                "right_side_turn_ready": False,
+                "all_reload_guards_ready": False,
+            },
+            "status_summary_zh": "159558.SZ 已切换25%底仓磨底降本模式：目标保留 20600 份，已执行 2/4 批超额减仓；下一高抛条件为反弹 +8% 至 0.894 元，或连续2日跌破磨底防守位 0.780 元（已取消低位月度强卖）。",
+        })
+        sections = build_sections(bundle, generated_at="2026-11-18 20:00")
+        self.assertEqual(validate_sections(sections), [])
+        xml = render_xml(sections)
+        vis = strip_tags(xml)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertEqual(check_markdown_leak(vis), [])
+        self.assertIn("25%底仓与震荡磨底降本状态机", vis)
+        self.assertIn("20600 份", vis)
+        self.assertIn("8200份", vis)
+        self.assertIn("已取消低位月度强卖", vis)
+        self.assertIn("禁止左侧接飞刀", vis)
+        self.assertIn("0.770 元", vis)

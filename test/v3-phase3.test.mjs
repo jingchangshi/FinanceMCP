@@ -17,6 +17,8 @@ const { screenStockSwingCandidates } = await import('../build/ashare/stockSwingS
 const { StrategyAdmissionStore } = await import('../build/ashare/strategyAdmission.js');
 const {
   V3_OFFENSIVE_POLICY_RELEASE_V3_1_0,
+  V3_OFFENSIVE_POLICY_RELEASE_V3_2_0,
+  V3_POLICY_V3_1_0_HASH,
   V3_POLICY_EXPECTED_HASH,
   loadApprovedV3Policy,
 } = await import('../build/portfolio/v3Policy.js');
@@ -24,7 +26,12 @@ const {
   runActionEngine,
   isRiskEquityHolding,
 } = await import('../build/portfolio/actionEngine.js');
-const { ensureDeconcentrationPlan } = await import('../build/portfolio/deconcentrationPlan.js');
+const {
+  ensureDeconcentrationPlan,
+  calibrateDeconcentrationPlan,
+  evaluateDeconcentrationPlan,
+  persistDeconcentrationUpdates,
+} = await import('../build/portfolio/deconcentrationPlan.js');
 const { persistRiskAnchor, evaluateStrategyRouter } = await import('../build/portfolio/strategyRouter.js');
 const { initBaseline, confirmRealAccount, setAccountCompleteness, recordEvent } = await import('../build/portfolio/ledger.js');
 const { buildInvestorReportModel } = await import('../build/portfolio/reportModel.js');
@@ -239,14 +246,20 @@ function seedPhase3StockMarket(name, asOfOpt) {
   return { db, days, asOf };
 }
 
-test('T1: 签名策略版本 v3.1.0 哈希校验与准入账本放行', () => {
+test('T1: 签名策略版本 v3.2.0 哈希校验与准入账本放行（含 v3.1.0 向后兼容）', () => {
   const policy = loadApprovedV3Policy();
   assert.equal(policy.approved, true);
-  assert.equal(policy.version, 'v3.1.0');
+  assert.equal(policy.version, 'v3.2.0');
   assert.equal(policy.content_hash, V3_POLICY_EXPECTED_HASH);
   assert.equal(policy.bp1_pullback_enabled, true);
   assert.equal(policy.bp2_breakout_enabled, false);
   assert.equal(policy.bp2_breakout_status, 'DROPPED_NEGATIVE_OOS');
+  assert.equal(policy.deconcentration_mode, 'BOTTOM_GRIND_25');
+  assert.equal(policy.deconcentration_keep_weight_bps, 2500);
+  assert.equal(policy.grind_tactical_slot_bps, 1000);
+  assert.equal(policy.grind_take_profit_bps, 750);
+  assert.equal(policy.grind_drift_harvest_trigger_bps, 3400);
+  assert.equal(V3_OFFENSIVE_POLICY_RELEASE_V3_1_0.content_hash, V3_POLICY_V3_1_0_HASH);
 
   const admDir = join(dir, 'adm-private');
   mkdirSync(admDir, { recursive: true });
@@ -255,13 +268,22 @@ test('T1: 签名策略版本 v3.1.0 哈希校验与准入账本放行', () => {
   try {
     const scope = {
       account: 'real',
-      market: V3_OFFENSIVE_POLICY_RELEASE_V3_1_0.applicability.market,
-      environment: V3_OFFENSIVE_POLICY_RELEASE_V3_1_0.applicability.environment,
+      market: V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.applicability.market,
+      environment: V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.applicability.environment,
     };
     const validFrom = '2026-11-15T00:00:00.000Z';
     const validUntil = '2099-12-31T00:00:00.000Z';
+    store.record('GRANT', V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, scope, {
+      reason: 'Phase 2 EXP-V3-01..04 validated',
+      validFrom,
+      validUntil,
+    });
+    assert.equal(
+      store.check(V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, scope, V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.strategy.implementation_sha256),
+      true,
+    );
     store.record('GRANT', V3_OFFENSIVE_POLICY_RELEASE_V3_1_0, scope, {
-      reason: 'Phase 2 EXP-V3-01/02/03 validated',
+      reason: 'Legacy baseline compatibility',
       validFrom,
       validUntil,
     });
@@ -270,7 +292,7 @@ test('T1: 签名策略版本 v3.1.0 哈希校验与准入账本放行', () => {
       true,
     );
 
-    const unapproved = { ...V3_OFFENSIVE_POLICY_RELEASE_V3_1_0, production_admission: 'NOT_APPROVED' };
+    const unapproved = { ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, production_admission: 'NOT_APPROVED' };
     assert.throws(
       () => store.record('GRANT', unapproved, scope, { reason: 'should fail', validFrom, validUntil }),
       /invalid_strategy_release|release_not_eligible/,
@@ -335,7 +357,7 @@ test('T3: P3 个股波段先锋真实买入定仓 + 日报禁词/数字追溯 + 
     });
     assert.equal(report.status, 'ACTIONABLE');
     assert.ok(report.v3_cockpit, '应挂载 v3_cockpit');
-    assert.equal(report.v3_cockpit.policy_release.version, 'v3.1.0');
+    assert.equal(report.v3_cockpit.policy_release.version, 'v3.2.0');
     assert.equal(report.v3_cockpit.policy_release.bp1_pullback_enabled, true);
     assert.equal(report.v3_cockpit.policy_release.bp2_breakout_enabled, false);
     assert.equal(report.v3_cockpit.router.sub_strategies.s_stock_swing, 'ACTIVE');
@@ -560,6 +582,422 @@ test('T5: 当日卖出 T+1 待交收在增量确认真实账户下不阻断 gate
     });
     assert.doesNotMatch(model.conclusion, /没有经复核的相对优势证据|账户尚未完成券商对账/);
     assert.match(model.conclusion, /15% 高水位熔断生命线/);
+  } finally {
+    mDb.close();
+    pDb.close();
+  }
+});
+
+test('T6: 159558 BOTTOM_GRIND_25 校准拆分、2日防守确认、四门槛磨底回补/+7.5%止盈/超配34%兑现及日报自洽', () => {
+  const days = weekdays('20260401', 170);
+  const novFirstIdx = days.findIndex(d => d.startsWith('202611'));
+  const calAsOf = days.at(-1);
+  const mDb = openAshareDb(join(dir, 't6-market.sqlite'));
+  const pDb = openPortfolioDb(join(dir, 't6-portfolio.sqlite'), { marketPath: join(dir, 't6-market.sqlite') });
+
+  try {
+    upsertRows(mDb, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [
+      ...days.map((cal_date, i) => ({ cal_date, is_open: 1, pretrade_date: days[i - 1] ?? null })),
+      { cal_date: weekdays(calAsOf, 2)[1], is_open: 1, pretrade_date: calAsOf },
+    ]);
+
+    const bgStocks = [
+      ...Array.from({ length: 20 }, (_, i) => ({
+        ts_code: `${602100 + i}.SH`, symbol: String(602100 + i), name: `磨底背景${i}`, industry: '背景', drift: 0.001,
+      })),
+    ];
+    upsertRows(mDb, 'stock_basic', ['ts_code', 'symbol', 'name', 'industry', 'list_date', 'list_status'],
+      bgStocks.map(s => ({ ts_code: s.ts_code, symbol: s.symbol, name: s.name, industry: s.industry, list_date: '20180101', list_status: 'L' })));
+    const stDaily = [];
+    for (const s of bgStocks) {
+      for (let i = 0; i < days.length; i += 1) {
+        const close = 10 + i * 0.02;
+        stDaily.push({ ts_code: s.ts_code, trade_date: days[i], open: close, high: close * 1.01, low: close * 0.99, close, pre_close: close, pct_chg: 0.2, vol: 1e5, amount: 1e5 });
+      }
+    }
+    upsertRows(mDb, 'daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'], stDaily);
+
+    const idxRows = [];
+    for (const code of Object.keys(CORE_INDICES)) {
+      for (let i = 0; i < days.length; i += 1) {
+        const close = 3600 + i * 2;
+        idxRows.push({ ts_code: code, trade_date: days[i], open: close, high: close * 1.005, low: close * 0.995, close, pre_close: close, pct_chg: 0.2, vol: 1e8, amount: 1e8 });
+      }
+    }
+    upsertRows(mDb, 'index_daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'], idxRows);
+
+    // 构造 159558.SZ 先平稳磨底 (0.90 -> 0.85)，最后阶段允许控制不同情境
+    const setEtfSeries = (fnClose) => {
+      mDb.prepare("DELETE FROM fund_daily WHERE ts_code = '159558.SZ'").run();
+      upsertRows(mDb, 'fund_daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
+        days.map((trade_date, i) => {
+          const close = fnClose(i);
+          const prev = i > 0 ? fnClose(i - 1) : close;
+          return { ts_code: '159558.SZ', trade_date, open: close, high: close * 1.01, low: close * 0.99, close, pre_close: prev, pct_chg: ((close / prev) - 1) * 100, vol: 1e6, amount: 1e6 };
+        }));
+    };
+
+    upsertRows(mDb, 'fund_basic', ['ts_code', 'name', 'fund_type', 'invest_type', 'benchmark', 'status', 'market'],
+      [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', fund_type: '股票型', invest_type: '被动指数型', benchmark: '半导体设备', status: 'L', market: 'E' },
+        { ts_code: '511010.SH', name: '国债ETF', fund_type: '债券型', invest_type: '被动指数型', benchmark: '国债', status: 'L', market: 'E' },
+      ]);
+    upsertRows(mDb, 'fund_adj', ['ts_code', 'trade_date', 'adj_factor'],
+      days.flatMap(trade_date => [
+        { ts_code: '159558.SZ', trade_date, adj_factor: 1 },
+        { ts_code: '511010.SH', trade_date, adj_factor: 1 },
+      ]));
+    upsertRows(mDb, 'fund_daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
+      days.map(trade_date => ({ ts_code: '511010.SH', trade_date, open: 100, high: 100.1, low: 99.9, close: 100, pre_close: 100, pct_chg: 0, vol: 1e6, amount: 1e6 })));
+    upsertRows(mDb, 'fund_share', ['ts_code', 'trade_date', 'fd_share', 'fund_type', 'market'],
+      days.flatMap(trade_date => [
+        { ts_code: '159558.SZ', trade_date, fd_share: 1e8, fund_type: '股票型', market: 'E' },
+        { ts_code: '511010.SH', trade_date, fd_share: 1e8, fund_type: '债券型', market: 'E' },
+      ]));
+    upsertRows(mDb, 'fund_nav', ['ts_code', 'ann_date', 'nav_date', 'unit_nav', 'accum_nav', 'adj_nav'],
+      [
+        { ts_code: '159558.SZ', ann_date: calAsOf, nav_date: calAsOf, unit_nav: 0.823, accum_nav: 0.823, adj_nav: 0.823 },
+        { ts_code: '511010.SH', ann_date: calAsOf, nav_date: calAsOf, unit_nav: 100, accum_nav: 100, adj_nav: 100 },
+      ]);
+
+    // Case 1: 模拟 real-main 从 18% 升级校准至 BOTTOM_GRIND_25 (36,900 份 -> 保留 20,600 份，余 8,200 + 8,100)
+    const accCal = 'real-cal';
+    const createdDay = days[novFirstIdx - 18];
+    const setBaseFloorCurve = (overrideTailFn) => setEtfSeries((i) => {
+      if (i < novFirstIdx - 10) return 1.05;
+      return overrideTailFn ? overrideTailFn(i) : 0.823;
+    });
+    setBaseFloorCurve();
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${accCal}`, '10000000');
+    ensureDeconcentrationPlan(pDb, {
+      account_id: accCal,
+      ts_code: '159558.SZ',
+      initial_shares: 58900,
+      nav_cents: 6_860_690,
+      target_keep_bps: 1800,
+      anchor_price_milli: 819,
+      support_floor_milli: 780,
+      total_tranches: 4,
+      created_at: createdDay,
+    });
+    // 执行前两批（58900 -> 47900 -> 36900）
+    const evExec12 = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accCal,
+      asOf: days[novFirstIdx - 5],
+      currentShares: 36900,
+      sellableShares: 36900,
+      currentCloseMilli: 828,
+      navCents: 6_792_503,
+      marketRegime: 'STRUCTURAL',
+    });
+    persistDeconcentrationUpdates(pDb, evExec12);
+    const calRes = calibrateDeconcentrationPlan(pDb, {
+      account_id: accCal,
+      ts_code: '159558.SZ',
+      plan_mode: 'BOTTOM_GRIND_25',
+      target_keep_bps: 2500,
+      tactical_slot_bps: 1000,
+      current_shares: 36900,
+      current_price_milli: 823,
+      nav_cents: 6_792_503,
+      support_floor_milli: 780,
+      reset_triggered: true,
+    });
+    assert.equal(calRes.plan_mode, 'BOTTOM_GRIND_25');
+    assert.equal(calRes.target_keep_shares, 20600);
+    assert.equal(calRes.remaining_excess_shares, 16300);
+    assert.deepEqual(calRes.tranches.map(t => [t.planned_shares, t.status]), [
+      [11000, 'EXECUTED'],
+      [11000, 'EXECUTED'],
+      [8200, 'PENDING'],
+      [8100, 'PENDING'],
+    ]);
+
+    // 取消低位 MONTHLY_SCHEDULE：即便来到月初且间隔 >=12 交易日，不触发强卖
+    const evMonthlyBlocked = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accCal,
+      asOf: days[novFirstIdx],
+      currentShares: 36900,
+      sellableShares: 36900,
+      currentCloseMilli: 823,
+      navCents: 6_792_503,
+      marketRegime: 'STRUCTURAL',
+    });
+    assert.equal(evMonthlyBlocked.recommended_sell_shares, 0);
+    assert.equal(evMonthlyBlocked.next_monthly_trigger_date, null);
+
+    // 2日箱体防守位确认：仅1日收盘 0.770 (<0.780) 不触发；连续两日 0.770 触发
+    setBaseFloorCurve(i => (i === novFirstIdx + 2 ? 0.770 : 0.823));
+    const ev1dFloor = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accCal,
+      asOf: days[novFirstIdx + 2],
+      currentShares: 36900,
+      sellableShares: 36900,
+      currentCloseMilli: 770,
+      navCents: 6_600_000,
+      marketRegime: 'STRUCTURAL',
+    });
+    assert.equal(ev1dFloor.recommended_sell_shares, 0, '单日跌破 0.780 不得立即触发保护割肉');
+
+    setBaseFloorCurve(i => (i === novFirstIdx + 1 || i === novFirstIdx + 2 ? 0.770 : 0.823));
+    const ev2dFloor = evaluateDeconcentrationPlan({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accCal,
+      asOf: days[novFirstIdx + 2],
+      currentShares: 36900,
+      sellableShares: 36900,
+      currentCloseMilli: 770,
+      navCents: 6_600_000,
+      marketRegime: 'STRUCTURAL',
+    });
+    assert.equal(ev2dFloor.active_trigger_reason, 'BREAKDOWN_SUPPORT_FLOOR');
+    assert.equal(ev2dFloor.recommended_sell_shares, 8200);
+
+    // Case 2: 独立账户已完成超额减仓至 25% 底仓（20,600 份，25% 占比）：验证四门槛磨底回补、MA60斜率拦截、+7.5%止盈、>=34%漂移获利、L2 回切 -15%
+    const accGrind = 'real-grind';
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${accGrind}`, '10000000');
+    const anchorDay = days[days.length - 12];
+    const anchorRouter = evaluateStrategyRouter({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accGrind,
+      asOf: anchorDay,
+      currentNavCents: 10_000_000,
+      marketRegime: evaluateMarketRegime(mDb, anchorDay, { pctAboveMa60ByDate: { [anchorDay]: 0.55 } }),
+    });
+    persistRiskAnchor(pDb, { ...anchorRouter, should_persist_anchor: true });
+    ensureDeconcentrationPlan(pDb, {
+      account_id: accGrind,
+      ts_code: '159558.SZ',
+      initial_shares: 30000,
+      nav_cents: 10_000_000,
+      target_keep_bps: 2500,
+      plan_mode: 'BOTTOM_GRIND_25',
+      tactical_slot_bps: 1000,
+      anchor_price_milli: 833,
+      support_floor_milli: 780,
+      total_tranches: 4,
+      created_at: anchorDay,
+    });
+    // 验证超额清零且当前持仓 25% <= 30% 时，前置 -12% 关闭，回切至 -15%->15% 正常生命线
+    const regimePos = evaluateMarketRegime(mDb, calAsOf, { pctAboveMa60ByDate: { [calAsOf]: 0.55 } });
+    // 先把初始持仓压成已完成超额（25000 股 -> targetKeep=30000, so remainingExcess=0 already）
+    // Re-create clean zero-excess plan at 25,000 shares @ 1.000 CNY = 25% weight
+    const accGrindZero = 'real-grind-zero';
+    importSnapshot(pDb, {
+      snapshot_id: 'snap-t6-zero',
+      as_of: anchorDay,
+      source: 'test',
+      note: 't6-zero',
+      warnings: [],
+      is_current: false,
+      positions: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 25000, ref_price_milli: 1000, ref_cost_milli: 1000, market_value_cents: 2_500_000 },
+      ],
+      totals: { total_assets_cents: 10_000_000, securities_mv_cents: 2_500_000, cash_cents: 7_500_000, wealth_cents: 0, unrealized_pnl_cents: 0 },
+    });
+    initBaseline(pDb, accGrindZero, { asOf: anchorDay, snapshotId: 'snap-t6-zero' });
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${accGrindZero}`, '10000000');
+    persistRiskAnchor(pDb, { ...evaluateStrategyRouter({
+      portfolioDb: pDb, marketDb: mDb, accountId: accGrindZero, asOf: anchorDay, currentNavCents: 10_000_000,
+      marketRegime: evaluateMarketRegime(mDb, anchorDay, { pctAboveMa60ByDate: { [anchorDay]: 0.55 } }),
+    }), should_persist_anchor: true });
+    ensureDeconcentrationPlan(pDb, {
+      account_id: accGrindZero,
+      ts_code: '159558.SZ',
+      initial_shares: 25000,
+      nav_cents: 10_000_000,
+      target_keep_bps: 2500,
+      plan_mode: 'BOTTOM_GRIND_25',
+      tactical_slot_bps: 1000,
+      anchor_price_milli: 1000,
+      support_floor_milli: 780,
+      total_tranches: 4,
+      created_at: anchorDay,
+    });
+
+    // 构造前期高位 1.15 后深跌反弹：如果前段在下跌中（MA60斜率<0），即使大折价+超卖+阳线也不得接飞刀
+    setEtfSeries(i => {
+      if (i < days.length - 40) return 1.15;
+      if (i < days.length - 3) return 1.15 - (i - (days.length - 40)) * 0.01; // 急跌拉低 MA60 斜率
+      if (i === days.length - 3) return 0.720;
+      if (i === days.length - 2) return 0.700;
+      return 0.735;
+    });
+    const outNegSlope = runActionEngine({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accGrindZero,
+      asOf: calAsOf,
+      holdings: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 25000, sellable_quantity: 25000, weight: 0.21, market_value_cents: 1_837_500, price_milli: 735, latest_bar_date: calAsOf, bar_quality: 'READY', ref_cost_milli: 1000 },
+      ],
+      cashCents: 6_912_500,
+      totalAssetsCents: 8_750_000, // -12.5% 回撤
+      marketRegime: regimePos,
+    });
+    assert.equal(outNegSlope.router.deconcentration_preemptive_active, false, '25%底仓且无剩余超额批次时不得再启用前置12%清零');
+    assert.equal(outNegSlope.router.l2_trigger_drawdown_bps, 1500);
+    assert.equal(outNegSlope.router.circuit_breaker_status, 'L1_WARN');
+    assert.equal(outNegSlope.deconcentration.grind_guards?.ma60_flat_ready, false);
+    assert.equal(outNegSlope.deconcentration.recommended_buy_shares, 0, 'MA60 10日斜率为负时严禁左侧接飞刀');
+
+    // 现在构造满足全部四门槛的行情：前段稳步走平/抬升令 MA60_slope10 >= 0，近20日内有阶段高点 >= 0.90（折价>=15%），近3日急洗超卖并今日收阳站稳 MA5
+    const endIdx = days.length - 1;
+    setEtfSeries(i => {
+      if (i < endIdx - 50) return 0.65;
+      if (i < endIdx - 12) return 0.92; // 推高 MA60（流出段为0.65，故斜率>0）且形成 High60 = 0.92 (85% = 0.782)
+      if (i < endIdx - 3) return 0.80;
+      if (i === endIdx - 3) return 0.740;
+      if (i === endIdx - 2) return 0.710;
+      if (i === endIdx - 1) return 0.705;
+      return 0.745; // 当日收阳 >0.705, >= MA5, <= 0.782, MA60 10日斜率 > 0, RSI14/Bias20 极值超卖
+    });
+    const navReload = 9_600_000;
+    const outReload = runActionEngine({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accGrindZero,
+      asOf: calAsOf,
+      holdings: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 30000, sellable_quantity: 30000, weight: 0.2328, market_value_cents: 2_235_000, price_milli: 745, latest_bar_date: calAsOf, bar_quality: 'READY', ref_cost_milli: 900 },
+      ],
+      cashCents: 7_365_000,
+      totalAssetsCents: navReload,
+      marketRegime: regimePos,
+    });
+    assert.equal(outReload.deconcentration.grind_guards?.ma60_flat_ready, true);
+    assert.equal(outReload.deconcentration.grind_guards?.discount_ready, true);
+    assert.equal(outReload.deconcentration.grind_guards?.oversold_3d_ready, true);
+    assert.equal(outReload.deconcentration.grind_guards?.right_side_turn_ready, true);
+    assert.equal(outReload.deconcentration.active_trigger_reason, 'GRIND_OVERSOLD_RELOAD');
+    assert.ok(outReload.deconcentration.recommended_buy_shares >= 10000);
+    const reloadAct = outReload.actions.find(a => a.code === 'P2-GRIND-RELOAD-159558');
+    assert.ok(reloadAct, '四门槛齐备时应生成 P2-GRIND-RELOAD-159558 买单');
+    assert.equal(reloadAct.legs[0].side, 'BUY');
+
+    // 验证全链日报构建与渲染（含禁词 & 数字回溯断言）
+    const accRep = 'real-report-grind';
+    importSnapshot(pDb, {
+      snapshot_id: 'snap-t6-rep',
+      as_of: days[endIdx - 5],
+      source: 'test',
+      note: 't6',
+      warnings: [],
+      is_current: false,
+      positions: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 30000, ref_price_milli: 800, ref_cost_milli: 850, market_value_cents: 2_400_000 },
+      ],
+      totals: { total_assets_cents: 9_600_000, securities_mv_cents: 2_400_000, cash_cents: 7_200_000, wealth_cents: 0, unrealized_pnl_cents: 0 },
+    });
+    initBaseline(pDb, accRep, { asOf: days[endIdx - 5], snapshotId: 'snap-t6-rep' });
+    markSnapshotCurrent(pDb, 'snap-t6-rep', { confirmedBy: 'user' });
+    confirmRealAccount(pDb, accRep, { confirm: true, note: 'user' });
+    setAccountCompleteness(pDb, accRep, {
+      as_of: calAsOf, reported_events_through: calAsOf, last_user_reconciled_at: '2026-11-18T14:00:00Z', unreported_trade_risk: false,
+    }, { confirm: true, recordedBy: 'user' });
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${accRep}`, '10000000');
+    ensureDeconcentrationPlan(pDb, {
+      account_id: accRep,
+      ts_code: '159558.SZ',
+      initial_shares: 30000,
+      nav_cents: 9_600_000,
+      target_keep_bps: 2500,
+      plan_mode: 'BOTTOM_GRIND_25',
+      tactical_slot_bps: 1000,
+      anchor_price_milli: 900,
+      support_floor_milli: 780,
+      total_tranches: 4,
+      created_at: days[endIdx - 10],
+    });
+    const repReport = buildDailyReport({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accRep,
+      snapshotId: 'snap-t6-rep',
+      asOfTradeDate: calAsOf,
+    });
+    assert.equal(repReport.v3_cockpit.deconcentration.plan_mode, 'BOTTOM_GRIND_25');
+    const repRendered = renderDailyReport(repReport);
+    assert.deepEqual(forbiddenHits(repRendered.user), []);
+    const repAttNums = attachmentNumbers(repRendered.attachment);
+    const repUntrace = importantNumbers(repRendered.user).filter(n => !repAttNums.some(a => numberMatches(n.value, a)));
+    assert.deepEqual(repUntrace.map(u => u.raw), []);
+
+    // 验证战术买入记录后 +7.5% 止盈，以及无战术仓但被动超配 >=34% 且滞涨时获利了结
+    recordEvent(pDb, {
+      event_id: 't6-tac-buy',
+      account_id: accGrindZero,
+      event_type: 'TRADE_BUY',
+      occurred_on: days[endIdx - 2],
+      ts_code: '159558.SZ',
+      quantity: 12000,
+      price_milli: 745,
+      fee_cents: 45,
+      tax_cents: 0,
+      source: 'broker_statement',
+    });
+    // 下跌到 MA60 (约 0.85) 以下，价格 0.805 (+8.05% >= +7.5%)
+    const outTp = runActionEngine({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accGrindZero,
+      asOf: calAsOf,
+      holdings: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 37000, sellable_quantity: 37000, weight: 0.305, market_value_cents: 2_978_500, price_milli: 805, latest_bar_date: calAsOf, bar_quality: 'READY', ref_cost_milli: 850 },
+      ],
+      cashCents: 6_780_000,
+      totalAssetsCents: 9_758_500,
+      marketRegime: regimePos,
+    });
+    assert.equal(outTp.deconcentration.tactical_shares, 12000);
+    assert.equal(outTp.deconcentration.active_trigger_reason, 'GRIND_TACTICAL_TAKE_PROFIT');
+    assert.equal(outTp.deconcentration.recommended_sell_shares, 12000);
+    assert.ok(outTp.actions.some(a => a.code === 'P2-GRIND-TAKE-PROFIT-159558' && a.legs[0].quantity === 12000));
+
+    // 超配被动漂移 >=34% 且滞涨兑现（无战术仓位，权重 35% 且较 MA20 偏离 >= +10% 收阴）
+    const accDrift = 'real-drift';
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${accDrift}`, '10000000');
+    ensureDeconcentrationPlan(pDb, {
+      account_id: accDrift,
+      ts_code: '159558.SZ',
+      initial_shares: 25000,
+      nav_cents: 10_000_000,
+      target_keep_bps: 2500,
+      plan_mode: 'BOTTOM_GRIND_25',
+      tactical_slot_bps: 1000,
+      anchor_price_milli: 1000,
+      support_floor_milli: 780,
+      total_tranches: 4,
+      created_at: anchorDay,
+    });
+    setEtfSeries(i => {
+      if (i < endIdx - 2) return 0.90;
+      if (i === endIdx - 1) return 1.05;
+      return 1.03; // >= MA20 * 1.10 (0.908*1.10 = 0.9988) and < prevClose (1.05) -> stall!
+    });
+    const outDrift = runActionEngine({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: accDrift,
+      asOf: calAsOf,
+      holdings: [
+        { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 35000, sellable_quantity: 35000, weight: 0.35, market_value_cents: 3_605_000, price_milli: 1030, latest_bar_date: calAsOf, bar_quality: 'READY', ref_cost_milli: 850 },
+      ],
+      cashCents: 6_695_000,
+      totalAssetsCents: 10_300_000,
+      marketRegime: regimePos,
+    });
+    assert.equal(outDrift.deconcentration.active_trigger_reason, 'GRIND_OVERWEIGHT_DRIFT_HARVEST');
+    assert.equal(outDrift.deconcentration.recommended_sell_shares, 10000, '权重35%超配滞涨应减回25%(25000份)');
+    assert.ok(outDrift.actions.some(a => a.code === 'P2-GRIND-DRIFT-HARVEST-159558' && a.legs[0].quantity === 10000));
   } finally {
     mDb.close();
     pDb.close();
