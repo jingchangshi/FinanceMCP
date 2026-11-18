@@ -74,7 +74,7 @@ export function isResearchEvalReadError(error: unknown): error is ResearchEvalRe
 
 // goal-1106: hermes is a first-class evidence layer next to chatgpt (external
 // LLM, own layer); combined keeps measuring the merged judgement.
-export const EVAL_LAYERS = ['vps', 'chatgpt', 'hermes', 'combined'] as const;
+export const EVAL_LAYERS = ['vps', 'chatgpt', 'hermes', 'gemini', 'combined'] as const;
 export type EvalLayer = typeof EVAL_LAYERS[number];
 export const THESIS_DIRECTIONS = ['bullish', 'bearish', 'neutral', 'conditional', 'evidence_insufficient'] as const;
 export type ThesisDirection = typeof THESIS_DIRECTIONS[number];
@@ -763,7 +763,7 @@ function assembleEval(input: {
   const bySource: Record<string, number> = {};
   for (const { record, cls } of input.recordStats) { byClass[cls]++; bySource[record.source] = (bySource[record.source] ?? 0) + 1; }
   const thesisByClass = classCountInit();
-  const thesisByLayer: Record<EvalLayer, number> = { vps: 0, chatgpt: 0, hermes: 0, combined: 0 };
+  const thesisByLayer: Record<EvalLayer, number> = { vps: 0, chatgpt: 0, hermes: 0, gemini: 0, combined: 0 };
   const thesisPendingReasons: Record<string, number> = {};
   let thesisWithWindow = 0;
   for (const view of input.unitViews) {

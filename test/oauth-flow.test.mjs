@@ -199,7 +199,7 @@ test('O1 未认证请求被拒绝，并给出 RFC 9728 发现信息', async () =
     assert.equal(as.body.issuer, server.issuer);
     assert.deepEqual(as.body.code_challenge_methods_supported, ['S256']);
     assert.deepEqual(as.body.grant_types_supported, ['authorization_code', 'refresh_token']);
-    assert.deepEqual(as.body.token_endpoint_auth_methods_supported, ['none']);
+    assert.deepEqual(as.body.token_endpoint_auth_methods_supported, ['none', 'client_secret_post', 'client_secret_basic']);
     assert.ok(as.body.registration_endpoint, '必须公布 DCR registration_endpoint');
     assert.equal(as.body.authorization_response_iss_parameter_supported, true);
 
@@ -552,5 +552,290 @@ test('O8 授权页不得设置 form-action（否则浏览器会拦截授权后�
     const redirect = await obtainCode(server, { clientId: client.client_id, redirectUri, challenge, resource });
     assert.equal(redirect.status, 302);
     assert.ok(redirect.headers.get('location')?.startsWith(redirectUri));
+  } finally { await server.stop(); }
+});
+
+test('O9 Confidential client (client_secret_post & client_secret_basic) 与可选 PKCE 校验', async () => {
+  const server = await startServer();
+  const redirectUri = 'https://gemini.google.com/callback';
+  const resource = `${server.issuer}${RESOURCE_PATH}`;
+  try {
+    // 1. client_secret_post 客户端（支持省略 PKCE，也支持携带 PKCE）
+    const regPost = await server.json('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Gemini Post',
+        redirect_uris: [redirectUri],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_post',
+      }),
+    });
+    assert.equal(regPost.status, 201, regPost.text);
+    const postClient = regPost.body;
+    assert.equal(postClient.token_endpoint_auth_method, 'client_secret_post');
+    assert.ok(typeof postClient.client_secret === 'string' && postClient.client_secret.length >= 24);
+
+    // Confidential 客户端允许不带 code_challenge 授权，也必须在 /oauth/token 验证 client_secret
+    const authNoPkce = new URLSearchParams({
+      response_type: 'code',
+      client_id: postClient.client_id,
+      redirect_uri: redirectUri,
+      state: 'st-no-pkce',
+      scope: 'portfolio:read',
+      resource,
+    });
+    const codeRes = await fetch(`${server.issuer}/oauth/authorize?${authNoPkce}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ...Object.fromEntries(authNoPkce), password: PASSWORD }).toString(),
+      redirect: 'manual',
+    });
+    assert.equal(codeRes.status, 302);
+    const code1 = new URL(codeRes.headers.get('location')).searchParams.get('code');
+    assert.ok(code1);
+
+    // 缺少或错误 client_secret 必须被拒绝
+    const missingSecret = await server.form('/oauth/token', {
+      grant_type: 'authorization_code',
+      code: code1,
+      redirect_uri: redirectUri,
+      client_id: postClient.client_id,
+      resource,
+    });
+    assert.ok(missingSecret.status >= 400 && missingSecret.status < 500, missingSecret.text);
+
+    // 授权码已在失败尝试或未消费时需重新发码以测试错误 secret
+    const codeRes2 = await fetch(`${server.issuer}/oauth/authorize?${authNoPkce}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ...Object.fromEntries(authNoPkce), password: PASSWORD }).toString(),
+      redirect: 'manual',
+    });
+    const code2 = new URL(codeRes2.headers.get('location')).searchParams.get('code');
+    const wrongSecret = await server.form('/oauth/token', {
+      grant_type: 'authorization_code',
+      code: code2,
+      redirect_uri: redirectUri,
+      client_id: postClient.client_id,
+      client_secret: 'wrong-secret',
+      resource,
+    });
+    assert.ok(wrongSecret.status >= 400 && wrongSecret.status < 500, wrongSecret.text);
+
+    // 携带正确 client_secret（form body）成功换取 token 并可 refresh
+    const codeRes3 = await fetch(`${server.issuer}/oauth/authorize?${authNoPkce}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ...Object.fromEntries(authNoPkce), password: PASSWORD }).toString(),
+      redirect: 'manual',
+    });
+    const code3 = new URL(codeRes3.headers.get('location')).searchParams.get('code');
+    const okPost = await server.form('/oauth/token', {
+      grant_type: 'authorization_code',
+      code: code3,
+      redirect_uri: redirectUri,
+      client_id: postClient.client_id,
+      client_secret: postClient.client_secret,
+      resource,
+    });
+    assert.equal(okPost.status, 200, okPost.text);
+    assert.ok(okPost.body.access_token);
+    assert.ok(okPost.body.refresh_token);
+
+    const refreshOk = await server.form('/oauth/token', {
+      grant_type: 'refresh_token',
+      refresh_token: okPost.body.refresh_token,
+      client_id: postClient.client_id,
+      client_secret: postClient.client_secret,
+      resource,
+    });
+    assert.equal(refreshOk.status, 200, refreshOk.text);
+    assert.ok(refreshOk.body.access_token);
+
+    // 2. client_secret_basic 客户端（使用 HTTP Basic Auth + PKCE S256）
+    const regBasic = await server.json('/oauth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Gemini Basic',
+        redirect_uris: [redirectUri],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_basic',
+      }),
+    });
+    assert.equal(regBasic.status, 201, regBasic.text);
+    const basicClient = regBasic.body;
+    assert.equal(basicClient.token_endpoint_auth_method, 'client_secret_basic');
+    assert.ok(basicClient.client_secret);
+
+    const { verifier, challenge } = pkce();
+    const redirBasic = await obtainCode(server, {
+      clientId: basicClient.client_id,
+      redirectUri,
+      challenge,
+      resource,
+    });
+    assert.equal(redirBasic.status, 302);
+    const basicCode = new URL(redirBasic.headers.get('location')).searchParams.get('code');
+    const basicAuth = Buffer.from(`${basicClient.client_id}:${basicClient.client_secret}`).toString('base64');
+    const okBasic = await server.form('/oauth/token', {
+      grant_type: 'authorization_code',
+      code: basicCode,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+      resource,
+    }, { Authorization: `Basic ${basicAuth}` });
+    assert.equal(okBasic.status, 200, okBasic.text);
+    assert.ok(okBasic.body.access_token);
+  } finally { await server.stop(); }
+});
+
+test('O10 Google 通配 redirect_uri 前缀匹配与非法回调拦截', async () => {
+  const server = await startServer();
+  const wildcard = 'https://oauth-redirect.googleusercontent.com/r/*';
+  const validCallback = 'https://oauth-redirect.googleusercontent.com/r/proj-123';
+  const resource = `${server.issuer}${RESOURCE_PATH}`;
+  try {
+    const client = await registerClient(server, wildcard);
+    const { verifier, challenge } = pkce();
+    const redir = await obtainCode(server, {
+      clientId: client.client_id,
+      redirectUri: validCallback,
+      challenge,
+      resource,
+    });
+    assert.equal(redir.status, 302);
+    const location = redir.headers.get('location') ?? '';
+    assert.ok(location.startsWith(`${validCallback}?`), location);
+    const code = new URL(location).searchParams.get('code');
+
+    const tok = await server.form('/oauth/token', {
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: validCallback,
+      client_id: client.client_id,
+      code_verifier: verifier,
+      resource,
+    });
+    assert.equal(tok.status, 200, tok.text);
+
+    // 路径越出前缀或不同域名都必须拒绝
+    for (const badUri of [
+      'https://oauth-redirect.googleusercontent.com/other/proj-123',
+      'https://evil.example/r/proj-123',
+    ]) {
+      const badQuery = authorizeQuery({
+        clientId: client.client_id,
+        redirectUri: badUri,
+        challenge: pkce().challenge,
+        resource,
+      });
+      const badRes = await fetch(`${server.issuer}/oauth/authorize?${badQuery}`);
+      assert.ok(badRes.status >= 400 && badRes.status < 500, `unexpected allow for ${badUri}: ${badRes.status}`);
+    }
+  } finally { await server.stop(); }
+});
+
+test('O11 元数据路径、CORS Mcp-Protocol-Version、协议版本协商与 OAuth CLI', async () => {
+  const server = await startServer();
+  const resource = `${server.issuer}${RESOURCE_PATH}`;
+  try {
+    for (const path of [
+      '/.well-known/oauth-authorization-server/private/mcp',
+      '/.well-known/openid-configuration',
+    ]) {
+      const res = await server.json(path);
+      assert.equal(res.status, 200, `${path} status=${res.status}`);
+      assert.equal(res.body.issuer, server.issuer);
+      assert.deepEqual(
+        res.body.token_endpoint_auth_methods_supported,
+        ['none', 'client_secret_post', 'client_secret_basic'],
+      );
+    }
+
+    const preflight = await fetch(`${server.issuer}${RESOURCE_PATH}`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://gemini.google.com',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'Authorization, Content-Type, Mcp-Protocol-Version',
+      },
+    });
+    const allowHeaders = (preflight.headers.get('access-control-allow-headers') ?? '').toLowerCase();
+    assert.ok(allowHeaders.includes('mcp-protocol-version'), allowHeaders);
+
+    // 注册 + 获取 access_token，验证 initialize 版本协商与响应 expose headers
+    const redirectUri = 'https://gemini.google.com/callback';
+    const client = await registerClient(server, redirectUri);
+    const { verifier, challenge } = pkce();
+    const redir = await obtainCode(server, { clientId: client.client_id, redirectUri, challenge, resource });
+    const code = new URL(redir.headers.get('location')).searchParams.get('code');
+    const tok = await server.form('/oauth/token', {
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: verifier,
+      resource,
+    });
+    const access = tok.body.access_token;
+
+    const initModern = await fetch(`${server.issuer}${RESOURCE_PATH}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        Origin: 'https://gemini.google.com',
+        Authorization: `Bearer ${access}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2025-11-25' },
+      }),
+    });
+    assert.equal(initModern.status, 200);
+    const exposeHeaders = (initModern.headers.get('access-control-expose-headers') ?? '').toLowerCase();
+    assert.ok(exposeHeaders.includes('mcp-protocol-version'), exposeHeaders);
+    const initModernBody = await initModern.json();
+    assert.equal(initModernBody.result.protocolVersion, '2025-11-25');
+
+    const initDefault = await server.rpc(RESOURCE_PATH, 'initialize', {}, access);
+    assert.equal(initDefault.status, 200);
+    assert.equal(initDefault.body.result.protocolVersion, '2024-11-05');
+
+    // 验证 CLI 子命令 oauth-client-create 与 oauth-client-list
+    const cliDb = join(dir, 'cli-oauth.sqlite');
+    const created = spawnSync(
+      process.execPath,
+      [
+        join(ROOT, 'build', 'ashare', 'cli.js'),
+        'oauth-client-create',
+        '--name', 'Gemini CLI Test',
+        '--redirect-uri', 'https://oauth-redirect.googleusercontent.com/r/*',
+        '--db', cliDb,
+      ],
+      { cwd: ROOT, encoding: 'utf8' },
+    );
+    assert.equal(created.status, 0, created.stderr);
+    const createdJson = JSON.parse(created.stdout);
+    assert.ok(createdJson.client_id);
+    assert.ok(createdJson.client_secret);
+    assert.equal(createdJson.token_endpoint_auth_method, 'client_secret_post');
+
+    const listed = spawnSync(
+      process.execPath,
+      [join(ROOT, 'build', 'ashare', 'cli.js'), 'oauth-client-list', '--db', cliDb],
+      { cwd: ROOT, encoding: 'utf8' },
+    );
+    assert.equal(listed.status, 0, listed.stderr);
+    const listedJson = JSON.parse(listed.stdout);
+    assert.equal(listedJson.clients.length, 1);
+    assert.equal(listedJson.clients[0].client_id, createdJson.client_id);
+    assert.equal(listedJson.clients[0].client_secret, undefined);
   } finally { await server.stop(); }
 });

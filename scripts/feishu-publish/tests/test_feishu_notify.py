@@ -18,6 +18,7 @@ from feishu_notify import (  # noqa: E402
     build_notification_markdown,
     notify,
 )
+from send_delay_alert import build_delay_alert_markdown, send_delay_alert  # noqa: E402
 from feishu_render import check_forbidden, check_internal_tokens, render_xml  # noqa: E402
 from publish_and_notify import run_publish_and_notify  # noqa: E402
 from test_sections_producer import TestV3CockpitSections  # noqa: E402
@@ -204,6 +205,42 @@ class TestFeishuNotify(unittest.TestCase):
             [(c[1], c[2]) for c in runner.calls[3:]],
             [("docs", "+update"), ("docs", "+fetch")],
         )
+
+    def test_delay_alert_markdown_is_clean_chinese_and_sends_with_idempotency_key(self):
+        md = build_delay_alert_markdown("20261118", status="exit_1", attempt=3, deadline_hm="2115")
+        self.assertEqual(check_forbidden(md), [])
+        self.assertEqual(check_internal_tokens(md), [])
+        self.assertIn("2026-11-18", md)
+        self.assertIn("21:15", md)
+
+        cfg = _base_config()
+        runner = _FakeLarkRunner()
+        res = send_delay_alert(
+            self.root,
+            cfg,
+            trade_date="20261118",
+            status="exit_1",
+            attempt=3,
+            deadline_hm="2115",
+            runner=runner,
+        )
+        self.assertEqual(res["status"], "sent")
+        self.assertEqual(res["recipient_flag"], "--user-id")
+        self.assertEqual(len(runner.calls), 1)
+        call = runner.calls[0]
+        self.assertEqual(call[call.index("--idempotency-key") + 1], "ashare-delay-alert-20261118")
+
+        disabled = send_delay_alert(
+            self.root,
+            _base_config(notify_enabled=False),
+            trade_date="20261118",
+            status="NOT_READY",
+            attempt=3,
+            deadline_hm="2115",
+            runner=runner,
+        )
+        self.assertEqual(disabled["status"], "disabled")
+        self.assertEqual(len(runner.calls), 1)
 
 
 if __name__ == "__main__":

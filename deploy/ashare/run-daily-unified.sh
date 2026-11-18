@@ -31,6 +31,7 @@ POLL_SECONDS="${ASHARE_READINESS_POLL_SECONDS:-600}"
 POLL_WINDOW_START_HM="${ASHARE_POLL_WINDOW_START_HM:-1500}"
 DEADLINE_HM="${ASHARE_READINESS_DEADLINE_HM:-2115}"
 MAX_WAIT_ATTEMPTS="${ASHARE_MAX_WAIT_ATTEMPTS:-30}"
+DELAY_ALERT_ATTEMPT="${ASHARE_DELAY_ALERT_ATTEMPT:-3}"
 FEISHU_CONFIG="${ASHARE_FEISHU_CONFIG:-$REPO_ROOT/scripts/feishu-publish/config.json}"
 PYTHON_BIN="${ASHARE_PYTHON_BIN:-python3}"
 
@@ -38,6 +39,7 @@ DAILY_SCRIPT="${ASHARE_DAILY_SCRIPT:-$HERE/run-daily.sh}"
 HOTSPOT_SCRIPT="${ASHARE_HOTSPOT_SCRIPT:-$HERE/run-hotspot-daily.sh}"
 ACCOUNT_SCRIPT="${ASHARE_ACCOUNT_SCRIPT:-$HERE/run-account-daily.sh}"
 PUBLISH_SCRIPT="${ASHARE_PUBLISH_SCRIPT:-$REPO_ROOT/scripts/feishu-publish/publish_and_notify.py}"
+DELAY_ALERT_SCRIPT="${ASHARE_DELAY_ALERT_SCRIPT:-$REPO_ROOT/scripts/feishu-publish/send_delay_alert.py}"
 
 STAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
 TMP_DIR="$(mktemp -d)"
@@ -109,18 +111,37 @@ while :; do
 
   if [ "$attempt" -lt "$MAX_WAIT_ATTEMPTS" ] && within_poll_window; then
     now_hm="${ASHARE_NOW_HM_OVERRIDE:-$(TZ=Asia/Shanghai date +%H%M)}"
+    delay_flag="$LOG_DIR/delay-alert-$EXPECTED_DATE.sent"
+    if [ "$attempt" -eq "$DELAY_ALERT_ATTEMPT" ] && [ ! -f "$delay_flag" ] && [ -f "$FEISHU_CONFIG" ] && [ -f "$DELAY_ALERT_SCRIPT" ]; then
+      set +e
+      "$PYTHON_BIN" "$DELAY_ALERT_SCRIPT" \
+        --root "$REPO_ROOT" \
+        --config "$FEISHU_CONFIG" \
+        --trade-date "$EXPECTED_DATE" \
+        --status "${REPORT_STATUS:-unknown}" \
+        --attempt "$attempt" \
+        --deadline-hm "$DEADLINE_HM" \
+        >"$LOG_DIR/delay-alert-$STAMP.json" 2>"$LOG_DIR/delay-alert-$STAMP.log"
+      delay_rc=$?
+      set -e
+      if [ "$delay_rc" -eq 0 ]; then
+        : > "$delay_flag"
+      else
+        echo "finance-ashare unified delay alert failed (exit $delay_rc); continuing poll" >&2
+      fi
+    fi
     echo "finance-ashare unified waiting for readiness (attempt=$attempt expected=$EXPECTED_DATE report_date=${REPORT_DATE:-none} status=${REPORT_STATUS:-unknown} etf_missing=${ETF_MISSING:-?} now=$now_hm < $DEADLINE_HM); sleeping ${POLL_SECONDS}s..." >&2
     sleep "$POLL_SECONDS"
     attempt=$((attempt + 1))
     continue
   fi
 
-  if [ -z "$DAILY_JSON" ] || [ ! -f "$DAILY_JSON" ]; then
-    echo "finance-ashare unified FAILED: daily sync did not produce a report by deadline (exit=$daily_exit)" >&2
-    exit "${daily_exit:-1}"
-  fi
   DATA_DELAYED=1
-  echo "finance-ashare unified WARNING: deadline reached with partial readiness (report_date=${REPORT_DATE:-none} status=${REPORT_STATUS:-unknown} etf_missing=${ETF_MISSING:-?}); continuing with delay alert" >&2
+  if [ -z "$DAILY_JSON" ] || [ ! -f "$DAILY_JSON" ]; then
+    echo "finance-ashare unified WARNING: deadline reached without daily JSON (exit=$daily_exit); continuing with fallback account bundle and Feishu delay report" >&2
+  else
+    echo "finance-ashare unified WARNING: deadline reached with partial readiness (report_date=${REPORT_DATE:-none} status=${REPORT_STATUS:-unknown} etf_missing=${ETF_MISSING:-?}); continuing with delay alert" >&2
+  fi
   break
 done
 

@@ -367,13 +367,13 @@ export const portfolioToolDefinitions: { name: string; description: string; inpu
   },
   {
     name: 'ashare_chatgpt_research_record_append',
-    description: '只追加：把外部 LLM 日报任务**已经产出**的独立研究判断写入不可变研究日志（source 默认 chatgpt；Hermes 调用方请传 source=\'hermes\'；时间戳、record_id、哈希由服务器生成，调用方无法设置；工具名含 chatgpt 为历史命名，内部已同时服务 chatgpt 与 hermes 两源）。必须在日报写完之后调用，且只提交实际产出的内容，不得补写。必须关联已存在的 VPS 研究快照（report_id 与 as_of_trade_date 须与之一致，否则拒绝）。不接受也不会写入任何账本事件、持仓、账户完整性、订单、风险政策或费用。同键同内容幂等；同键不同内容拒绝；更正请用新的 idempotency_key 并填 corrects_record_id。每日有条数上限（chatgpt 与 hermes 共用同一外部研究上限）。仅返回 record_id、content_hash 与证据分类（TRUE_FORWARD 仅当交易日>=20261022 且当天上海时间内写入，否则 RETROSPECTIVE_RECORD）。只在受认证的 /private/mcp 提供。',
+    description: '只追加：把外部 LLM 日报任务**已经产出**的独立研究判断写入不可变研究日志（source 默认 chatgpt；Hermes 调用方传 source=\'hermes\'，Gemini 调用方传 source=\'gemini\'；时间戳、record_id、哈希由服务器生成，调用方无法设置；工具名含 chatgpt 为历史命名，内部已同时服务 chatgpt、hermes 与 gemini 三源）。必须在日报写完之后调用，且只提交实际产出的内容，不得补写。必须关联已存在的 VPS 研究快照（report_id 与 as_of_trade_date 须与之一致，否则拒绝）。不接受也不会写入任何账本事件、持仓、账户完整性、订单、风险政策或费用。同键同内容幂等；同键不同内容拒绝；更正请用新的 idempotency_key 并填 corrects_record_id。每日有条数上限（chatgpt、hermes 与 gemini 共用同一外部研究上限）。仅返回 record_id、content_hash 与证据分类（TRUE_FORWARD 仅当交易日>=20261022 且当天上海时间内写入，否则 RETROSPECTIVE_RECORD）。只在受认证的 /private/mcp 提供。',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
         account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
-        source: { type: 'string', enum: ['chatgpt', 'hermes'], description: '研究记录来源；默认 chatgpt。Hermes 写入必须传 hermes（记录 source 与 provenance.author 均为 hermes）' },
+        source: { type: 'string', enum: ['chatgpt', 'hermes', 'gemini'], description: '研究记录来源；默认 chatgpt。Hermes 传 hermes，Gemini 传 gemini（记录 source 与 provenance.author）' },
         report_id: { type: 'string', maxLength: 200, description: '所关联的 VPS 研究快照 bundle 的 report_id（来自 ashare_investment_research_bundle）' },
         as_of_trade_date: { type: 'string', description: 'YYYYMMDD，须与该 report_id 的交易日一致，不得晚于今天' },
         idempotency_key: { type: 'string', maxLength: 64, description: '可选；字母数字及 . _ : -。省略则按内容哈希幂等' },

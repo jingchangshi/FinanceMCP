@@ -5,7 +5,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import { parseSourcePriority, runWithRequestContext } from "./config.js";
 import { getAvailableToolList, dispatchTool } from "./dispatch.js";
-import { mountPrivateEndpoint, PRIVATE_ENDPOINT_PATH, configurePrivateOAuth } from "./privateServer.js";
+import { mountPrivateEndpoint, PRIVATE_ENDPOINT_PATH, configurePrivateOAuth, negotiateMcpProtocolVersion } from "./privateServer.js";
 import { oauthConfig } from "./oauth/config.js";
 import { createOAuthRuntime } from "./oauth/router.js";
 import { SERVER_VERSION } from "./version.js";
@@ -222,11 +222,11 @@ app.use(cors({
   origin: '*',
   methods: ['GET','POST','DELETE','OPTIONS'],
   allowedHeaders: [
-    'Content-Type','Accept','Authorization','Mcp-Session-Id','Last-Event-ID',
+    'Content-Type','Accept','Authorization','Mcp-Session-Id','Mcp-Protocol-Version','Last-Event-ID',
     'X-Tenant-Id','X-Api-Key','X-Tushare-Token','X-Qveris-Api-Key','X-Twingly-Api-Key','X-Finance-Source-Priority',
     'X-Smithery-Config','X-Config','X-Session-Config'  // Smithery 可能的配置头
   ],
-  exposedHeaders: ['Content-Type','Mcp-Session-Id']
+  exposedHeaders: ['Content-Type','Mcp-Session-Id','Mcp-Protocol-Version']
 }));
 // Tool calls are small JSON-RPC messages; deployments can lower the cap (e.g. MCP_BODY_LIMIT=64kb).
 app.use(express.json({ limit: process.env.MCP_BODY_LIMIT?.trim() || '10mb' }));
@@ -328,9 +328,10 @@ app.post('/mcp', async (req: Request, res: Response) => {
     }
     const newId = randomUUID();
     sessions.set(newId, { id: newId, createdAt: new Date(), lastActivity: new Date() });
+    const protocolVersion = negotiateMcpProtocolVersion(body?.params?.protocolVersion);
     res.setHeader('Mcp-Session-Id', newId);
     console.log(`✅ [MCP-initialize] New session created: ${newId}`);
-    return res.json({ jsonrpc: '2.0', result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'FinanceMCP', version: SERVER_VERSION } }, id: body.id });
+    return res.json({ jsonrpc: '2.0', result: { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'FinanceMCP', version: SERVER_VERSION } }, id: body.id });
   }
 
   if (method === 'tools/list') {

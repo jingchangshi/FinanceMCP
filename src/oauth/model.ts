@@ -1,4 +1,5 @@
-import { OAuthStore, opaqueToken, type StoredClient, type StoredToken } from './store.js';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { OAuthStore, isRedirectUriAllowed, opaqueToken, type StoredClient, type StoredToken } from './store.js';
 import type { OAuthConfig } from './config.js';
 
 /**
@@ -30,13 +31,33 @@ function toUser(subject: string, resource: string): User {
   return { id: subject, resource };
 }
 
+function secretMatches(expectedHashHex: string, presentedSecret: string): boolean {
+  const actualHashHex = createHash('sha256').update(presentedSecret, 'utf8').digest('hex');
+  const a = Buffer.from(expectedHashHex, 'hex');
+  const b = Buffer.from(actualHashHex, 'hex');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function createModel(store: OAuthStore, config: OAuthConfig): any {
   const model = {
     // ---------------------------------------------------------------- 客户端
 
-    async getClient(clientId: string): Promise<Client | false> {
+    async getClient(clientId: string, clientSecret?: string | null): Promise<Client | false> {
       const stored = store.getClient(clientId);
-      return stored ? toClient(stored) : false;
+      if (!stored) return false;
+      // AuthorizeHandler 传入 clientSecret=null；TokenHandler 传入 string 或 undefined。
+      if (clientSecret === null) return toClient(stored);
+      if (stored.client_secret_hash) {
+        if (typeof clientSecret !== 'string' || !clientSecret.length) return false;
+        if (!secretMatches(stored.client_secret_hash, clientSecret)) return false;
+      } else if (clientSecret !== undefined) {
+        return false;
+      }
+      return toClient(stored);
+    },
+
+    async validateRedirectUri(redirectUri: string, client: Client): Promise<boolean> {
+      return isRedirectUriAllowed(client.redirectUris ?? [], redirectUri);
     },
 
     // ---------------------------------------------------------------- 授权码

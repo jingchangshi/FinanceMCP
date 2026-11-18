@@ -23,9 +23,16 @@ export interface SyncSummary {
  * as whole-market batches, the core indices and the financial indicators.
  * Days on or after `refreshFrom` are re-queried even when already complete.
  */
-export async function syncRange(db: DatabaseSync, start: string, end: string, opts: { force?: boolean; fina?: boolean; refreshFrom?: string } = {}): Promise<SyncSummary> {
+export async function syncRange(
+  db: DatabaseSync,
+  start: string,
+  end: string,
+  opts: { force?: boolean; fina?: boolean; refreshFrom?: string; skipCalendar?: boolean } = {},
+): Promise<SyncSummary> {
   const t0 = Date.now();
-  await syncTradeCal(db, addDays(start, -400), addDays(shanghaiToday(), 30));
+  if (!opts.skipCalendar) {
+    await syncTradeCal(db, addDays(start, -400), addDays(shanghaiToday(), 30));
+  }
   await syncStockBasic(db);
   const days = tradeDaysBetween(db, start, end);
   const quality: SyncSummary['quality'] = [];
@@ -43,6 +50,18 @@ export async function syncRange(db: DatabaseSync, start: string, end: string, op
     const q = checkQuality(db, day);
     quality.push({ trade_date: q.trade_date, status: q.status, reasons: q.reasons });
   }
-  const fina = opts.fina === false ? undefined : await syncFinaIndicator(db, end);
+  let fina: Record<string, number> | undefined;
+  if (opts.fina === false) {
+    fina = undefined;
+  } else if (
+    opts.refreshFrom === end
+    && (datasets[end]?.daily?.rows ?? 0) === 0
+    && db.prepare('SELECT 1 FROM fina_indicator LIMIT 1').get()
+  ) {
+    console.warn(`[ashare] ${end} 日线尚未入库且已有存量财务缓存，本轮跳过 fina_indicator_vip 刷新`);
+    fina = {};
+  } else {
+    fina = await syncFinaIndicator(db, end);
+  }
   return { start, end, trade_days: days.length, refreshed, datasets, quality, fina, tushare: { ...fetchStats }, seconds: Math.round((Date.now() - t0) / 1000) };
 }

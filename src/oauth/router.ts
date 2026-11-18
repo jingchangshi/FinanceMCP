@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import OAuth2Server from '@node-oauth/oauth2-server';
 import { OAUTH_SUBJECT, type OAuthConfig } from './config.js';
-import { OAuthStore } from './store.js';
+import { OAuthStore, isRedirectUriAllowed, opaqueToken } from './store.js';
 import { createModel } from './model.js';
 
 /**
@@ -103,7 +103,8 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
   const model = createModel(store, config);
   const server = new OAuth2Server({
     model,
-    requirePKCE: true,
+    // 公开客户端在 readAuthorizeParams 中强制要求 PKCE S256；机密客户端（持有 client_secret）允许按需省略 PKCE。
+    requirePKCE: false,
     alwaysIssueNewRefreshToken: true,
     authorizationCodeLifetime: 300,
     accessTokenLifetime: config.accessTokenLifetime,
@@ -134,29 +135,48 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
     res.set('Cache-Control', 'public, max-age=300').json(protectedResourceMetadata());
   });
 
+  const authServerMetadata = () => ({
+    issuer: config.issuer,
+    authorization_endpoint: `${config.issuer}/oauth/authorize`,
+    token_endpoint: `${config.issuer}/oauth/token`,
+    registration_endpoint: `${config.issuer}/oauth/register`,
+    revocation_endpoint: `${config.issuer}/oauth/revoke`,
+    scopes_supported: [config.scope, config.writeScope],
+    response_types_supported: ['code'],
+    response_modes_supported: ['query'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+    // 我们在每个授权响应里都追加 `iss`，因此可以如实声明。
+    authorization_response_iss_parameter_supported: true,
+    service_documentation: `${config.issuer}/docs/v1/V1_CHATGPT_ACCEPTANCE_CHECKLIST.md`,
+  });
+
   router.get('/.well-known/oauth-authorization-server', (_req, res) => {
-    res.set('Cache-Control', 'public, max-age=300').json({
-      issuer: config.issuer,
-      authorization_endpoint: `${config.issuer}/oauth/authorize`,
-      token_endpoint: `${config.issuer}/oauth/token`,
-      registration_endpoint: `${config.issuer}/oauth/register`,
-      revocation_endpoint: `${config.issuer}/oauth/revoke`,
-      scopes_supported: [config.scope, config.writeScope],
-      response_types_supported: ['code'],
-      response_modes_supported: ['query'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
-      code_challenge_methods_supported: ['S256'],
-      token_endpoint_auth_methods_supported: ['none'],
-      // 我们在每个授权响应里都追加 `iss`，因此可以如实声明。
-      authorization_response_iss_parameter_supported: true,
-      service_documentation: `${config.issuer}/docs/v1/V1_CHATGPT_ACCEPTANCE_CHECKLIST.md`,
-    });
+    res.set('Cache-Control', 'public, max-age=300').json(authServerMetadata());
+  });
+  router.get('/.well-known/oauth-authorization-server/private/mcp', (_req, res) => {
+    res.set('Cache-Control', 'public, max-age=300').json(authServerMetadata());
+  });
+  router.get('/.well-known/openid-configuration', (_req, res) => {
+    res.set('Cache-Control', 'public, max-age=300').json(authServerMetadata());
   });
 
   // ---------------------------------------------------------------- DCR
 
   router.post('/oauth/register', limitRegister, (req, res) => {
     const body = req.body ?? {};
+    const authMethodRaw = body.token_endpoint_auth_method === undefined ? 'none' : body.token_endpoint_auth_method;
+    const allowedMethods = ['none', 'client_secret_post', 'client_secret_basic'] as const;
+    if (typeof authMethodRaw !== 'string' || !(allowedMethods as readonly string[]).includes(authMethodRaw)) {
+      res.status(400).json({
+        error: 'invalid_client_metadata',
+        error_description: 'token_endpoint_auth_method 仅支持 none、client_secret_post 或 client_secret_basic',
+      });
+      return;
+    }
+    const authMethod = authMethodRaw as typeof allowedMethods[number];
+
     const redirectUris = Array.isArray(body.redirect_uris)
       ? body.redirect_uris.filter((u: unknown): u is string => typeof u === 'string')
       : [];
@@ -170,6 +190,13 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
         res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uri 不是合法 URL' });
         return;
       }
+      if (uri.endsWith('/*')) {
+        if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
+          res.status(400).json({ error: 'invalid_redirect_uri', error_description: '通配 redirect_uri 必须是无查询无 fragment 的 https URL' });
+          return;
+        }
+        continue;
+      }
       const local = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
       if (parsed.protocol !== 'https:' && !local) {
         res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uri 必须是 https' });
@@ -181,21 +208,24 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
       }
     }
 
+    const clientSecret = authMethod === 'none' ? null : opaqueToken(32);
     const client = store.createClient({
       clientName: typeof body.client_name === 'string' ? body.client_name.slice(0, 200) : null,
       redirectUris,
       grantTypes: ['authorization_code', 'refresh_token'],
       responseTypes: ['code'],
-      tokenEndpointAuthMethod: 'none',
+      tokenEndpointAuthMethod: authMethod,
+      clientSecret,
     });
     res.status(201).json({
       client_id: client.client_id,
+      ...(clientSecret ? { client_secret: clientSecret, client_secret_expires_at: 0 } : {}),
       client_id_issued_at: Math.floor(client.created_at / 1000),
       client_name: client.client_name ?? undefined,
       redirect_uris: client.redirect_uris,
       grant_types: client.grant_types,
       response_types: client.response_types,
-      token_endpoint_auth_method: 'none',
+      token_endpoint_auth_method: authMethod,
       scope: config.scope,
     });
   });
@@ -218,7 +248,8 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
     const redirectUri = firstStr(req.query.redirect_uri, req.body?.redirect_uri);
     const responseType = firstStr(req.query.response_type, req.body?.response_type);
     const codeChallenge = firstStr(req.query.code_challenge, req.body?.code_challenge);
-    const method = firstStr(req.query.code_challenge_method, req.body?.code_challenge_method) ?? 'S256';
+    const explicitMethod = firstStr(req.query.code_challenge_method, req.body?.code_challenge_method);
+    const method = explicitMethod ?? 'S256';
     const resource = firstStr(req.query.resource, req.body?.resource) ?? config.resource;
     const scope = firstStr(req.query.scope, req.body?.scope) ?? config.scope;
     const state = firstStr(req.query.state, req.body?.state);
@@ -226,7 +257,6 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
     if (!clientId) return { error: 'client_id 缺失' };
     if (!redirectUri) return { error: 'redirect_uri 缺失' };
     if (responseType !== 'code') return { error: 'response_type 必须是 code' };
-    if (!codeChallenge) return { error: 'code_challenge 缺失（必须使用 PKCE S256）' };
     if (method !== 'S256') return { error: 'code_challenge_method 必须是 S256' };
     if (resource !== config.resource) return { error: 'resource 与受保护资源不匹配' };
     // `portfolio:admin` 不是可申请的 scope：同意页只展示读/追加两项，若允许申请它，
@@ -243,12 +273,17 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
 
     const client = store.getClient(clientId);
     if (!client) return { error: '未知的 client_id（请先注册）' };
-    if (!client.redirect_uris.includes(redirectUri)) return { error: 'redirect_uri 未在客户端注册' };
+    if (!client.client_secret_hash && !codeChallenge) {
+      return { error: 'code_challenge 缺失（必须使用 PKCE S256）' };
+    }
+    if (!isRedirectUriAllowed(client.redirect_uris, redirectUri)) {
+      return { error: 'redirect_uri 未在客户端注册' };
+    }
 
     return {
       params: {
         client_id: clientId, redirect_uri: redirectUri, response_type: responseType,
-        state, code_challenge: codeChallenge, code_challenge_method: method, scope, resource,
+        state, code_challenge: codeChallenge ?? '', code_challenge_method: codeChallenge ? method : '', scope, resource,
       },
     };
   }
@@ -322,6 +357,7 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
       renderLogin(res, params, 401, '密码不正确');
       return;
     }
+    store.rememberRedirectUri(params.client_id, params.redirect_uri);
 
     const oauthRequest = new OAuth2Server.Request({
       headers: req.headers,

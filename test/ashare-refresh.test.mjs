@@ -12,7 +12,8 @@ process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
 process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
 
 const { openAshareDb, upsertRows, closeAshareDb } = await import('../build/ashare/db.js');
-const { syncTradeDate, checkQuality } = await import('../build/ashare/ingest.js');
+const { syncTradeDate, checkQuality, syncTradeCal, syncStockBasic, syncFinaIndicator } = await import('../build/ashare/ingest.js');
+const { syncRange } = await import('../build/ashare/sync.js');
 const { generateReport, latestReportMeta } = await import('../build/ashare/report.js');
 const { runAshareTool } = await import('../build/ashare/tools.js');
 const { seedMarket, weekdays } = await import('./ashare-fixture.mjs');
@@ -27,7 +28,7 @@ const originalFetch = globalThis.fetch;
 function mockTushare(answer) {
   globalThis.fetch = async (_url, init) => {
     const { api_name: api, params, fields } = JSON.parse(init.body);
-    const rows = answer(api, params.trade_date);
+    const rows = answer(api, params.trade_date, params);
     if (rows === 'error') return { ok: true, json: async () => ({ code: 40001, msg: '参数异常：上游服务暂不可用' }) };
     const cols = fields.split(',');
     const page = rows.slice(params.offset ?? 0, (params.offset ?? 0) + (params.limit ?? rows.length));
@@ -217,6 +218,54 @@ test('B (report level): an incomplete first run is NOT_READY, the completed seco
     mockTushare((api, d) => (d === day ? good[api] : []));
     await syncTradeDate(db, day, 'refresh');
     assert.equal(checkQuality(db, day, false).status, 'READY');
+  } finally {
+    globalThis.fetch = originalFetch;
+    db.close();
+  }
+});
+
+test('fault tolerance: trade_cal / stock_basic reuse cache on upstream error and throw when empty', async () => {
+  const empty = openAshareDb(':memory:');
+  const seeded = freshSyncDb();
+  upsertRows(seeded, 'stock_basic', ['ts_code', 'name'], [{ ts_code: '000001.SZ', name: '平安银行' }]);
+  try {
+    mockTushare(() => 'error');
+    await assert.rejects(() => syncTradeCal(empty, P, D), /参数异常/);
+    await assert.rejects(() => syncStockBasic(empty), /参数异常/);
+
+    assert.equal(await syncTradeCal(seeded, P, D), 0);
+    assert.equal(await syncStockBasic(seeded), 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    empty.close();
+    seeded.close();
+  }
+});
+
+test('fault tolerance: syncFinaIndicator isolates per-period failures and syncRange skips fina_indicator_vip when daily has 0 rows', async () => {
+  const db = freshSyncDb();
+  upsertRows(db, 'stock_basic', ['ts_code', 'name'], [{ ts_code: '000001.SZ', name: '平安银行' }]);
+  try {
+    mockTushare((api, _d, params) => {
+      if (api === 'fina_indicator_vip' && params.period === '20260630') return 'error';
+      if (api === 'fina_indicator_vip' && params.period === '20260930') {
+        return [{ ts_code: '000001.SZ', ann_date: '20261015', end_date: '20260930', roe: 12.3, update_flag: '0' }];
+      }
+      return [];
+    });
+    const finaRes = await syncFinaIndicator(db, D, 2, 2);
+    assert.equal(finaRes['20260930'], 1);
+    assert.equal(finaRes['20260630'], 0);
+
+    const apisCalled = [];
+    mockTushare(api => {
+      apisCalled.push(api);
+      return [];
+    });
+    const summary = await syncRange(db, D, D, { refreshFrom: D, skipCalendar: true });
+    assert.equal(apisCalled.includes('trade_cal'), false);
+    assert.equal(apisCalled.includes('fina_indicator_vip'), false);
+    assert.deepEqual(summary.fina, {});
   } finally {
     globalThis.fetch = originalFetch;
     db.close();

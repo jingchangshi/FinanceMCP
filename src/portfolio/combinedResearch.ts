@@ -135,13 +135,12 @@ function appendCombinedParsed(db: DatabaseSync, input: CombinedAppendInput, nowM
   const dayRecords = listResearchJournal(db, { accountId: input.accountId, asOf: input.asOf, limit: 1000 })
     .filter(r => r.as_of_trade_date === input.asOf);
   const vpsCandidates = dayRecords.filter(r => r.source === 'vps');
-  // goal-1106: the external parent is either chatgpt or hermes — one external
-  // parent is required, its source labels which LLM wrote it.
-  const externalCandidates = dayRecords.filter(r => r.source === 'chatgpt' || r.source === 'hermes');
+  // 外部父记录可来自 chatgpt、hermes 或 gemini。
+  const externalCandidates = dayRecords.filter(r => r.source === 'chatgpt' || r.source === 'hermes' || r.source === 'gemini');
   const pick = (rows: JournalRecord[], explicitId: string | undefined, label: string) => {
     if (explicitId) {
       const found = rows.find(r => r.record_id === explicitId);
-      if (!found) throw new Error(`${label}_record_not_found: ${explicitId} is not a ${label === 'vps' ? 'VPS' : 'external (ChatGPT/Hermes)'} record of account ${input.accountId} on ${input.asOf}`);
+      if (!found) throw new Error(`${label}_record_not_found: ${explicitId} is not a ${label === 'vps' ? 'VPS' : 'external (ChatGPT/Hermes/Gemini)'} record of account ${input.accountId} on ${input.asOf}`);
       return found;
     }
     if (!rows.length) return null;

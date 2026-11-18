@@ -38,11 +38,26 @@ export function shanghaiToday(): string {
 // ---------------------------------------------------------------- calendar
 
 export async function syncTradeCal(db: DatabaseSync, start: string, end: string): Promise<number> {
-  const rows = await fetchAll('trade_cal', { exchange: 'SSE', start_date: start, end_date: end },
-    'cal_date,is_open,pretrade_date');
-  const n = upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], rows);
-  logSync(db, 'trade_cal', `${start}-${end}`, n, 'ok');
-  return n;
+  try {
+    const rows = await fetchAll('trade_cal', { exchange: 'SSE', start_date: start, end_date: end },
+      'cal_date,is_open,pretrade_date');
+    const n = upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], rows);
+    logSync(db, 'trade_cal', `${start}-${end}`, n, 'ok', '', { refresh_status: 'REFRESH_OK', write_mode: 'merged' });
+    return n;
+  } catch (error: any) {
+    const message = String(error?.message ?? error);
+    const today = shanghaiToday();
+    const targetDate = end <= today ? end : (start <= today ? today : end);
+    const cachedCount = Number((db.prepare('SELECT COUNT(*) n FROM trade_cal WHERE cal_date BETWEEN ? AND ?').get(start, end) as any)?.n ?? 0);
+    const hasTarget = !!db.prepare('SELECT 1 FROM trade_cal WHERE cal_date = ?').get(targetDate);
+    if (cachedCount > 0 && hasTarget) {
+      logSync(db, 'trade_cal', `${start}-${end}`, 0, 'failed', 'request failed: ' + message,
+        { refresh_status: 'REFRESH_FAILED', write_mode: 'none' });
+      console.warn(`[ashare] trade_cal 刷新失败，沿用本地缓存日历 (${targetDate}): ${message.slice(0, 120)}`);
+      return 0;
+    }
+    throw error;
+  }
 }
 
 export function isTradeDay(db: DatabaseSync, date: string): boolean | undefined {
@@ -76,14 +91,26 @@ export function recentTradeDays(db: DatabaseSync, end: string, count: number): s
 export async function syncStockBasic(db: DatabaseSync): Promise<number> {
   const fields = 'ts_code,symbol,name,area,industry,market,exchange,list_date,delist_date,list_status,is_hs';
   const rows: Record<string, any>[] = [];
-  // Include delisted and paused names so historical replays are not survivor-only.
-  for (const status of ['L', 'D', 'P']) {
-    rows.push(...await fetchAll('stock_basic', { list_status: status }, fields));
+  try {
+    // Include delisted and paused names so historical replays are not survivor-only.
+    for (const status of ['L', 'D', 'P']) {
+      rows.push(...await fetchAll('stock_basic', { list_status: status }, fields));
+    }
+  } catch (error: any) {
+    const message = String(error?.message ?? error);
+    const cachedCount = Number((db.prepare('SELECT COUNT(*) n FROM stock_basic').get() as any)?.n ?? 0);
+    if (cachedCount > 0) {
+      logSync(db, 'stock_basic', 'all', 0, 'failed', 'request failed: ' + message,
+        { refresh_status: 'REFRESH_FAILED', before_rows: cachedCount, after_rows: cachedCount, write_mode: 'none' });
+      console.warn(`[ashare] stock_basic 刷新失败，沿用本地缓存 (${cachedCount} 条): ${message.slice(0, 120)}`);
+      return 0;
+    }
+    throw error;
   }
   const now = new Date().toISOString();
   rows.forEach(r => { r.updated_at = now; });
   const n = upsertRows(db, 'stock_basic', [...fields.split(','), 'updated_at'], rows);
-  logSync(db, 'stock_basic', 'all', n, 'ok');
+  logSync(db, 'stock_basic', 'all', n, 'ok', '', { refresh_status: 'REFRESH_OK', write_mode: 'merged' });
   return n;
 }
 
@@ -286,13 +313,22 @@ export async function syncFinaIndicator(db: DatabaseSync, asOf: string, periods 
   const list = reportPeriods(asOf, periods);
   for (const [i, period] of list.entries()) {
     if (i >= refreshRecent && syncedOk(db, 'fina_indicator', period)) continue;
-    const rows = await fetchAll('fina_indicator_vip', { period }, FINA_FIELDS, 5000);
-    // Restated rows (update_flag=1) are written last so they win on the same announcement date.
-    rows.sort((a, b) => String(a.update_flag ?? '').localeCompare(String(b.update_flag ?? '')));
-    const valid = rows.filter(r => r.ann_date && r.end_date);
-    upsertRows(db, 'fina_indicator', FINA_FIELDS.split(',').filter(f => f !== 'update_flag'), valid);
-    logSync(db, 'fina_indicator', period, valid.length, 'ok');
-    result[period] = valid.length;
+    const hadOk = syncedOk(db, 'fina_indicator', period);
+    try {
+      const rows = await fetchAll('fina_indicator_vip', { period }, FINA_FIELDS, 5000);
+      // Restated rows (update_flag=1) are written last so they win on the same announcement date.
+      rows.sort((a, b) => String(a.update_flag ?? '').localeCompare(String(b.update_flag ?? '')));
+      const valid = rows.filter(r => r.ann_date && r.end_date);
+      upsertRows(db, 'fina_indicator', FINA_FIELDS.split(',').filter(f => f !== 'update_flag'), valid);
+      logSync(db, 'fina_indicator', period, valid.length, 'ok', '', { refresh_status: 'REFRESH_OK', write_mode: 'merged' });
+      result[period] = valid.length;
+    } catch (error: any) {
+      const message = String(error?.message ?? error);
+      logSync(db, 'fina_indicator', period, 0, hadOk ? 'ok' : 'failed', 'request failed: ' + message,
+        { refresh_status: 'REFRESH_FAILED', write_mode: 'none' });
+      console.warn(`[ashare] fina_indicator_vip ${period} 刷新失败（已隔离继续）: ${message.slice(0, 120)}`);
+      result[period] = 0;
+    }
   }
   return result;
 }

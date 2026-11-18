@@ -101,8 +101,8 @@ test('forged source, timestamps, ids, hashes and forbidden account fields are re
       'events', 'ledger_events', 'account_completeness', 'orders', 'risk_policy', 'fees', 'payload', 'parent_record_ids', 'correction_of']) {
       assert.throws(() => appendAt(db, ACCOUNT, body({ [field]: [] }), NOW), /not accepted/, field);
     }
-    // goal-1106: `source` IS whitelisted now — but only chatgpt/hermes values.
-    assert.throws(() => appendAt(db, ACCOUNT, body({ source: 'vps' }), NOW), /source must be chatgpt or hermes/);
+    // goal-1106/Gemini: `source` IS whitelisted — chatgpt/hermes/gemini values only.
+    assert.throws(() => appendAt(db, ACCOUNT, body({ source: 'vps' }), NOW), /source must be chatgpt, hermes or gemini/);
     assert.throws(() => appendAt(db, ACCOUNT, body({ additional_evidence: [{ claim: 'x', source_url: 'https://e.com', published_at: '2026-10-22', quantity: 100 }] }), NOW), /not accepted/);
     assert.equal(db.prepare("SELECT COUNT(*) n FROM research_journal WHERE source='chatgpt'").get().n, 0);
     assert.deepEqual(counts(db), before);
@@ -151,9 +151,9 @@ test('same key + same content is idempotent, same key + different content confli
     assert.equal(appendAt(db, ACCOUNT, body({ idempotency_key: 'k1' }), NOW + 1000).created, false);
     assert.throws(() => appendAt(db, ACCOUNT, body({ idempotency_key: 'k1', final_conclusion: '改口' }), NOW), /journal_id_conflict/);
     assert.equal(readResearchJournal(db, a.record_id).judgement.final_conclusion, '维持观察，不构成交易建议。', 'the original is never rewritten');
-    assert.throws(() => appendAt(db, ACCOUNT, body({ idempotency_key: 'k2', corrects_record_id: 'VPS-missing' }), NOW), /existing ChatGPT record/);
+    assert.throws(() => appendAt(db, ACCOUNT, body({ idempotency_key: 'k2', corrects_record_id: 'VPS-missing' }), NOW), /existing ChatGPT\/Hermes\/Gemini record/);
     const vpsId = readResearchJournal(db, a.record_id).parent_record_ids[0];
-    assert.throws(() => appendAt(db, ACCOUNT, body({ idempotency_key: 'k2', corrects_record_id: vpsId }), NOW), /existing ChatGPT record/, 'VPS records cannot be "corrected" by ChatGPT');
+    assert.throws(() => appendAt(db, ACCOUNT, body({ idempotency_key: 'k2', corrects_record_id: vpsId }), NOW), /existing ChatGPT\/Hermes\/Gemini record/, 'VPS records cannot be "corrected" by ChatGPT');
     const fix = appendAt(db, ACCOUNT, body({ idempotency_key: 'k2', final_conclusion: '更正后的结论', corrects_record_id: a.record_id }), NOW + 5000);
     assert.equal(fix.created, true);
     assert.notEqual(fix.record_id, a.record_id);
