@@ -177,9 +177,14 @@ def validate_sections(sections: Dict[str, Any]) -> List[str]:
         problems.append("三项主要证据.items must be a non-empty list")
     else:
         for item in items:
-            for key in ("label", "observation", "why", "missing"):
+            for key in ("label", "observation", "why"):
                 if not str((item or {}).get(key) or "").strip():
                     problems.append(f"三项主要证据.items.{key} is empty")
+            if not (
+                str((item or {}).get("rule_note") or "").strip()
+                or str((item or {}).get("missing") or "").strip()
+            ):
+                problems.append("三项主要证据.items.missing is empty")
 
     holdings = _section_of(sections, "持仓判断").get("holdings")
     if not isinstance(holdings, list) or not holdings:
@@ -315,7 +320,11 @@ def render_xml(sections: Dict[str, Any]) -> str:
         blocks.append(f"<h2>{_esc(item['label'])}</h2>")
         blocks.append(f"<p><b>观察：</b>{_esc(item['observation'])}</p>")
         blocks.append(f"<p><b>为什么重要：</b>{_esc(item['why'])}</p>")
-        blocks.append(f"<p><b>仍缺什么证据：</b>{_esc(item['missing'])}</p>")
+        rule_note = str(item.get("rule_note") or "").strip()
+        if rule_note:
+            blocks.append(f"<p><b>执行边界与触发条件：</b>{_esc(rule_note)}</p>")
+        else:
+            blocks.append(f"<p><b>仍缺什么证据：</b>{_esc(item['missing'])}</p>")
 
     holdings = _section_of(sections, "持仓判断")["holdings"]
     blocks.append(_heading(4, "持仓判断"))

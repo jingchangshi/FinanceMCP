@@ -87,13 +87,10 @@ export function buildInvestorReportModel(input: {
     conclusion = `本期可执行指令：${v3Action.title}（${legDesc}）。`
       + `当前处于${cockpit.market_regime.regime_label_zh}、${cockpit.market_regime.style_label_zh}，`
       + `15% 高水位熔断生命线 ${(cockpit.router.lifeline_nav_cents / 100).toFixed(2)} 元（安全缓冲 ${cockpit.router.lifeline_buffer_pct.toFixed(2)}%）。`;
-  } else if (cockpit && gatePassed) {
-    const baseText = preferred
-      ? `本期研究首选：${preferred.label}。${preferred.research_lean}最强反证：${preferred.strongest_counter}`
-      : '本期维持现有仓位观察，暂未触发新的调仓条件。';
-    conclusion = `${baseText}当前处于${cockpit.market_regime.regime_label_zh}、${cockpit.market_regime.style_label_zh}，`
-      + `${cockpit.deconcentration.status_summary_zh}`
-      + `15% 高水位熔断生命线 ${(cockpit.router.lifeline_nav_cents / 100).toFixed(2)} 元（缓冲 ${cockpit.router.lifeline_buffer_pct.toFixed(2)}%）。`;
+  } else if (cockpit) {
+    conclusion = `本期处于${cockpit.market_regime.regime_label_zh}（${cockpit.market_regime.style_label_zh}），`
+      + `未触发新的规则调仓阈值；${cockpit.deconcentration.status_summary_zh}`
+      + `15% 高水位熔断生命线 ${(cockpit.router.lifeline_nav_cents / 100).toFixed(2)} 元（安全缓冲 ${cockpit.router.lifeline_buffer_pct.toFixed(2)}%）。`;
   } else {
     conclusion = preferred
       ? `本期研究首选：${preferred.label}。${preferred.research_lean}最强反证：${preferred.strongest_counter}`
