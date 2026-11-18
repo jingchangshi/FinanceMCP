@@ -37,8 +37,8 @@ def _format_hm(hm: str) -> str:
 def _humanize_status(raw_status: str) -> str:
     text = str(raw_status or "").strip().lower()
     if text.startswith("exit_") or "err" in text or "fail" in text:
-        return "Tushare 上游接口暂未返回完整收盘数据，后台正每 10 分钟自动重试"
-    return "Tushare 收盘日线/指数数据尚未发布就绪，后台每 10 分钟自动轮询"
+        return "上游行情接口暂未返回完整收盘数据，后台正每 10 分钟自动重试"
+    return "上游收盘日线/指数/净值数据尚未发布就绪，后台每 10 分钟自动轮询"
 
 
 def build_delay_alert_markdown(
@@ -55,7 +55,7 @@ def build_delay_alert_markdown(
     return "\n".join(
         [
             f"⏳ **A股 V3 日报等待上游行情通知（{iso_date}）**",
-            f"- 17:20 盘后同步任务已正常启动（当前第 {attempt} 次检查）",
+            f"- 19:30 盘后同步任务已正常启动（当前第 {attempt} 次检查）",
             f"- 当前状态：{status_txt}",
             f"- 数据就绪后将立即生成并推送完整 V3 日报；若至 {deadline_txt} 仍未就绪将发送兜底持仓报告。",
         ]

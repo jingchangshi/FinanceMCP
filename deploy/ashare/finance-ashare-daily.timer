@@ -2,10 +2,10 @@
 Description=Run the FinanceMCP unified A-share V3 daily pipeline after close (Asia/Shanghai)
 
 [Timer]
-# Start early once Tushare begins publishing daily/ETF/NAV; run-daily-unified.sh
-# polls every 10 minutes up to 21:15 CST only when data is not yet READY, then
-# runs hotspot snapshot, account research bundle, Feishu Docx publish, and IM notify.
-OnCalendar=Mon..Fri *-*-* 17:20:00 Asia/Shanghai
+# Trigger at 19:30 Asia/Shanghai after same-day ETF unit NAV updates converge,
+# using the free multi-source router (TDX TCP + Tencent + Eastmoney) with
+# bounded retries up to 21:15 CST if an upstream dataset is still pending.
+OnCalendar=Mon..Fri *-*-* 19:30:00 Asia/Shanghai
 Persistent=true
 RandomizedDelaySec=60
 

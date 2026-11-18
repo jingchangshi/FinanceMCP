@@ -8,6 +8,9 @@
  * 这里的内容仍然是**声明**，不是上游事实：真实名称只取 `fund_basic.name`。
  */
 
+/** R0 冻结的五只持仓 ETF（零依赖常量，避免循环导入）。 */
+export const ETF_UNIVERSE = ['159241.SZ', '159278.SZ', '159558.SZ', '516080.SH', '560390.SH'] as const;
+
 export type EtfCandidateCategory = 'broad_based' | 'industry_theme' | 'bond' | 'gold' | 'cross_border';
 
 export const ETF_CANDIDATE_CATEGORIES: readonly EtfCandidateCategory[] = [

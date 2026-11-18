@@ -6,6 +6,7 @@ import { resetWatchlistFrom } from './watchlist.js';
 import { computeEvidence, evaluateWatchlist, loadVerdicts } from './evidence.js';
 import { runAshareTool } from './tools.js';
 import { ashareResearchDbPath, openResearchDb } from './db.js';
+import { withSyncDb } from './fetch.js';
 import { acceptance } from './acceptance.js';
 import { syncEtfForDaily, type EtfDailySyncSummary } from './etf.js';
 import { auditCache, fillGaps, saveAudit } from './audit.js';
@@ -76,7 +77,8 @@ async function syncEtfForDailySafe(db: DatabaseSync, start: string, end: string)
 }
 
 export async function runCommand(db: DatabaseSync, command: string, h: CliHelpers): Promise<boolean> {
-  switch (command) {
+  return withSyncDb(db, async () => {
+    switch (command) {
     case 'daily': {
       const date = h.arg('date') ? h.ymd(h.arg('date'), '--date') : shanghaiToday();
       // The live pipeline only moves forward: rebuilding an older day would break the
@@ -307,5 +309,6 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
     }
     default:
       return false;
-  }
+    }
+  });
 }

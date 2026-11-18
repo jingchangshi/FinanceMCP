@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ashareDataDir, logSync, upsertRows } from './db.js';
-import { fetchAll } from './fetch.js';
+import { fetchAll, withSyncDb } from './fetch.js';
 import {
   checkQuality, CORE_INDICES, DATED_DATASETS, GAP_CHECK_MAX_AGE_DAYS, gapCheckFresh, INVALID_BAR_KINDS, INVALID_BAR_SQL, REQUIRED_INDICES,
   syncIndexRange, syncSuspend, syncTradeDate, tradeDaysBetween, type InvalidBarKind, type InvalidBarKinds,
@@ -320,6 +320,7 @@ export function saveAudit(db: DatabaseSync, audit: AuditResult, extra: Record<st
  * are recomputed for touched dates. Watchlists and reports are never written here.
  */
 export async function fillGaps(db: DatabaseSync, audit: AuditResult) {
+  return withSyncDb(db, async () => {
   const actions: { trade_date: string; action: string; result: unknown }[] = [];
   // Per-stock repairs are logged under their own dataset name so the date-level sync_log rows keep their meaning.
   const repairLog = (table: string, code: string, day: string, rows: number) =>
@@ -402,4 +403,5 @@ export async function fillGaps(db: DatabaseSync, audit: AuditResult) {
     if (touched) checkQuality(db, d.trade_date);
   }
   return actions;
+  });
 }

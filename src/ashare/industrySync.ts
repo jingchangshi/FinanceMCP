@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { fetchAll } from './fetch.js';
+import { fetchAll, withSyncDb } from './fetch.js';
 import { logSync, upsertRows } from './db.js';
 import { ensureHotspotSchema } from './hotspotTables.js';
 
@@ -45,6 +45,7 @@ export async function syncSwClassify(
   db: DatabaseSync,
   opts: { src?: string } = {},
 ): Promise<HotspotSyncResult> {
+  return withSyncDb(db, async () => {
   const { src = 'SW2021' } = opts;
   ensureHotspotSchema(db);
   const collectedAt = new Date().toISOString();
@@ -63,6 +64,7 @@ export async function syncSwClassify(
   logSync(db, 'sw_classify', src, n, cacheStatus(n), `levels L1-L3 ${collectedAt}`,
     { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
   return ok('sw_classify', n);
+  });
 }
 
 const SW_MEMBER_FIELDS = 'l1_code,l1_name,l2_code,l2_name,l3_code,l3_name,ts_code,name,in_date,out_date,is_new';
@@ -80,6 +82,7 @@ const SW_MEMBER_COLUMNS = ['ts_code', 'l1_code', 'l2_code', 'l3_code', 'l1_name'
  * ignores limit/offset (a short first page stops fetchAll immediately).
  */
 export async function syncSwMembers(db: DatabaseSync): Promise<HotspotSyncResult> {
+  return withSyncDb(db, async () => {
   ensureHotspotSchema(db);
   const collectedAt = new Date().toISOString();
   const fetched = await fetchAll(
@@ -98,6 +101,7 @@ export async function syncSwMembers(db: DatabaseSync): Promise<HotspotSyncResult
   logSync(db, 'sw_member', 'all', n, cacheStatus(n), `index_member_all ${collectedAt}`,
     { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
   return ok('sw_member', n);
+  });
 }
 
 const SW_DAILY_FIELDS = 'ts_code,trade_date,open,low,high,close,change,pct_change,vol,amount,pe,pb,float_mv,total_mv';
@@ -118,6 +122,7 @@ export async function syncSwIndexDaily(
   db: DatabaseSync,
   opts: { start: string; end: string; codes?: string[] },
 ): Promise<HotspotSyncResult> {
+  return withSyncDb(db, async () => {
   const { start, end, codes } = opts;
   ensureHotspotSchema(db);
   const resolved = codes ?? defaultSwCodes(db);
@@ -135,6 +140,7 @@ export async function syncSwIndexDaily(
     `${resolved.length} indices ${start}-${end}`,
     { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
   return ok('sw_index_daily', n);
+  });
 }
 
 // ---------------------------------------------------------------- Tonghuashun
@@ -147,6 +153,7 @@ export async function syncThsIndex(
   db: DatabaseSync,
   types: string[] = ['N', 'I', 'S', 'ST'],
 ): Promise<HotspotSyncResult> {
+  return withSyncDb(db, async () => {
   ensureHotspotSchema(db);
   const collectedAt = new Date().toISOString();
   const rows: Record<string, any>[] = [];
@@ -163,6 +170,7 @@ export async function syncThsIndex(
   logSync(db, 'ths_index', types.join(','), n, cacheStatus(n), `types ${types.join(',')} ${collectedAt}`,
     { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
   return ok('ths_index', n);
+  });
 }
 
 /**
@@ -192,6 +200,7 @@ export async function syncThsMembers(
   db: DatabaseSync,
   opts: { codes: string[] },
 ): Promise<HotspotSyncResult> {
+  return withSyncDb(db, async () => {
   const { codes } = opts;
   ensureHotspotSchema(db);
   if (codes.length === 0) throw new Error('ths_member: codes must not be empty');
@@ -211,6 +220,7 @@ export async function syncThsMembers(
     `${codes.length} indices ${collectedAt}`,
     { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
   return ok('ths_member', n);
+  });
 }
 
 const THS_DAILY_FIELDS = 'ts_code,trade_date,open,high,low,close,pre_close,avg_price,change,pct_change,vol,turnover_rate';
@@ -221,6 +231,7 @@ export async function syncThsIndexDaily(
   db: DatabaseSync,
   opts: { start: string; end: string; codes: string[] },
 ): Promise<HotspotSyncResult> {
+  return withSyncDb(db, async () => {
   const { start, end, codes } = opts;
   ensureHotspotSchema(db);
   if (codes.length === 0) throw new Error('ths_index_daily: codes must not be empty');
@@ -235,4 +246,5 @@ export async function syncThsIndexDaily(
     `${codes.length} indices ${start}-${end}`,
     { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
   return ok('ths_index_daily', n);
+  });
 }
