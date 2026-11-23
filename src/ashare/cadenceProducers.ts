@@ -197,10 +197,7 @@ function lastTradingDayOfMonth(
     // day is the evidence that "no later open day" really means month end.
     const covered = db.prepare('SELECT MAX(cal_date) AS d FROM trade_cal WHERE cal_date <= ?')
       .get(monthEnd) as { d: string | null } | undefined;
-    if (covered?.d === monthEnd) return { last: true };
-    // The calendar stops before month end. That is conclusive only when asOf is
-    // the month's last calendar day and its row was open (checked above).
-    return Number(asOf.slice(6, 8)) === lastCalendarDay ? { last: true } : null;
+    return covered?.d === monthEnd ? { last: true } : null;
   } catch {
     return null;
   }

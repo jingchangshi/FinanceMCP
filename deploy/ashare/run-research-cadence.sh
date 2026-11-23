@@ -17,7 +17,7 @@ umask 077
 CADENCE="${1:?usage: run-research-cadence.sh weekly|monthly [--force]}"
 case "$CADENCE" in weekly|monthly) ;; *) echo "unknown cadence: $CADENCE" >&2; exit 2 ;; esac
 FORCE="${ASHARE_CADENCE_FORCE:-0}"
-case "$FORCE" in 1|true|yes) FORCE=1 ;; *) FORCE=0 ;; esac
+[ "$FORCE" = 1 ] || FORCE=0
 FORCE_ARG=""
 [ "$FORCE" -eq 1 ] && FORCE_ARG=" --force"
 case "${2:-}" in
@@ -44,7 +44,7 @@ code=0
 # already-quoted word is the kind of quoting that silently produces one argument.
 set -- "$CADENCE" --as-of latest --account-id "$ACCOUNT"
 [ "$FORCE" -eq 1 ] && set -- "$@" --force
-docker exec -e RESEARCH_CADENCE_ENABLED=1 -e ASHARE_CADENCE_FORCE="$FORCE" -e NODE_OPTIONS="--max-old-space-size=$HEAP_MB" "$CONTAINER" \
+docker exec -e RESEARCH_CADENCE_ENABLED=1 -e NODE_OPTIONS="--max-old-space-size=$HEAP_MB" "$CONTAINER" \
   timeout -s KILL "$BUDGET_SECONDS" node build/ashare/cli.js research-cadence "$@" >"$OUT" 2>"$ERR" || code=$?
 if [ "$code" -ne 0 ]; then
   [ "$code" -eq 137 ] && echo "finance-ashare cadence $CADENCE KILLED after ${BUDGET_SECONDS}s budget; see $ERR" >&2
