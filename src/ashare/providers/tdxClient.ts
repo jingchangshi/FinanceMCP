@@ -397,7 +397,12 @@ export class TdxSession {
       const timer = setTimeout(() => {
         const idx = this.waiters.findIndex(w => w.reject === rej);
         if (idx >= 0) this.waiters.splice(idx, 1);
-        reject(new Error(`TDX read timeout (${this.target.host}:${this.target.port})`));
+        const err = new Error(`TDX read timeout (${this.target.host}:${this.target.port})`);
+        // 超时后 recvBuf 里可能残留半个响应，继续复用会话会把旧字节当成下一次响应。
+        // 直接作废整个会话：所有等待者失败，后续请求快速失败，由上层换主站/降级。
+        this.failWaiters(err);
+        this.close();
+        reject(err);
       }, this.timeoutMs);
       const res = (buf: Buffer) => { clearTimeout(timer); resolve(buf); };
       const rej = (err: Error) => { clearTimeout(timer); reject(err); };
@@ -416,6 +421,11 @@ export class TdxSession {
       const unzipsize = hdr.readUInt16LE(14);
       const body = await this.readExact(zipsize);
       return zipsize === unzipsize ? body : inflateSync(body);
+    }).catch((err: Error) => {
+      // 解析/写入/读取任一环节失败都视为流已不可信（响应边界无法再对齐），关闭会话。
+      this.failWaiters(err instanceof Error ? err : new Error(String(err)));
+      this.close();
+      throw err;
     });
     this.lock = run.catch(() => undefined);
     return run;

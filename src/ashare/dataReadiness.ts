@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { checkQuality, previousTradeDay, type QualityStatus } from './ingest.js';
+import { resolveDataProviderMode } from './providers/types.js';
 
 /**
  * Data readiness and the data fingerprint that goes INTO the snapshot hash
@@ -84,6 +85,30 @@ function countOn(db: DatabaseSync, table: string, date: string): number {
   if (!tableExists(db, table)) return 0;
   try {
     return Number((db.prepare(`SELECT COUNT(*) c FROM ${table} WHERE trade_date = ?`).get(date) as { c: number }).c);
+  } catch { return 0; }
+}
+
+/** Floor for a same-day page relative to the previous trading day / the daily universe. */
+const COVERAGE_FLOOR = 0.97;
+
+/**
+ * Rows of `dataset` on `date` that actually carry a usable value for the daily bars that exist
+ * that day. Free mode backfills `daily_basic`/`adj_factor` one row per stock with NULL values,
+ * so the row count alone is always "complete" while the ranking inputs are empty. A row with
+ * NULL pe/pb/circ_mv, or a non-positive factor, is a row that cannot be used.
+ */
+function usableCoverageOn(db: DatabaseSync, dataset: 'daily_basic' | 'adj_factor', date: string): number {
+  if (!tableExists(db, 'daily') || !tableExists(db, dataset)) return 0;
+  const alias = dataset === 'daily_basic' ? 'b' : 'a';
+  const usable = dataset === 'daily_basic'
+    ? `(${alias}.pe_ttm IS NOT NULL OR ${alias}.pb IS NOT NULL OR ${alias}.circ_mv IS NOT NULL)`
+    : `(${alias}.adj_factor IS NOT NULL AND ${alias}.adj_factor > 0)`;
+  try {
+    return Number((db.prepare(`
+      SELECT COUNT(*) c
+      FROM daily d
+      JOIN ${dataset} ${alias} ON ${alias}.trade_date = d.trade_date AND ${alias}.ts_code = d.ts_code
+      WHERE d.trade_date = ? AND ${usable}`).get(date) as { c: number }).c);
   } catch { return 0; }
 }
 
@@ -209,6 +234,43 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
       status: 'NOT_READY',
       checks: { bars_present, quality_ready, financials_synced_today },
       reason: `bar datasets incomplete for ${asOf} (daily=${daily}): ${short.join(', ')}`,
+    };
+  }
+
+  // Free mode writes daily_basic/adj_factor rows 1:1 with daily — the historical backfill path
+  // writes every valuation field as NULL — so a row-count check passes on an empty sheet.
+  // Measure usable values against the daily universe instead.
+  if (resolveDataProviderMode() === 'free') {
+    const floor = Math.ceil(daily * COVERAGE_FLOOR);
+    const usableBasic = usableCoverageOn(db, 'daily_basic', asOf);
+    const usableAdj = usableCoverageOn(db, 'adj_factor', asOf);
+    const unusable: string[] = [];
+    if (usableBasic < floor) unusable.push(`daily_basic 有效值=${usableBasic}`);
+    if (usableAdj < floor) unusable.push(`adj_factor 正值=${usableAdj}`);
+    if (unusable.length) {
+      return {
+        status: 'NOT_READY',
+        checks: { bars_present, quality_ready, financials_synced_today },
+        reason: `free 模式估值/复权有效覆盖不足 for ${asOf} (daily=${daily}, 需≥${floor}): ${unusable.join(', ')}`,
+      };
+    }
+  }
+
+  // Missing bar evidence is not a degradation to disclose: a short page, an invalid close or a
+  // NULL OHLC means the day's prices cannot be trusted. `checkQuality` already calls these
+  // NOT_READY in its own cache status; readiness must not downgrade that to DEGRADED.
+  const hardDefects: string[] = [];
+  const prevDaily = Number(quality.counts.prev_daily ?? 0);
+  if (prevDaily > 0 && daily < prevDaily * COVERAGE_FLOOR) {
+    hardDefects.push(`daily=${daily} 低于前一交易日 ${prevDaily} 的 97%`);
+  }
+  if ((quality.anomalies.bad_close ?? 0) > 0) hardDefects.push(`bad_close=${quality.anomalies.bad_close}`);
+  if ((quality.anomalies.null_ohlc ?? 0) > 0) hardDefects.push(`null_ohlc=${quality.anomalies.null_ohlc}`);
+  if (hardDefects.length) {
+    return {
+      status: 'NOT_READY',
+      checks: { bars_present, quality_ready, financials_synced_today },
+      reason: `行情数据硬缺陷 for ${asOf}: ${hardDefects.join(', ')}`,
     };
   }
 

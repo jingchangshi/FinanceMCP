@@ -375,9 +375,14 @@ export interface FinancialRecord {
  * announced before their period even ends are upstream errors and never used.
  */
 export function financialsAsOf(db: DatabaseSync, asOf: string): Map<string, FinancialRecord> {
+  // PIT selection: the record the market actually knew on `asOf` is the one with the latest
+  // announcement on or before `asOf`, regardless of which period it covers (a later
+  // re-announcement of an older period supersedes an earlier announcement of a newer one).
+  // TactiCore's selection (`exp_v3_02_stock_swing_rqalpha._lookup_quality_core`, ascending
+  // ann_date/end_date + searchsorted) is `ann_date DESC, end_date DESC`; this SQL must match it.
   const rows = db.prepare(`
     SELECT * FROM (
-      SELECT f.*, ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY end_date DESC, ann_date DESC) rn
+      SELECT f.*, ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY ann_date DESC, end_date DESC) rn
       FROM fina_indicator f
       WHERE ann_date <= ? AND end_date >= ? AND ann_date >= end_date
     ) WHERE rn = 1`).all(asOf, addDays(asOf, -550)) as any[];

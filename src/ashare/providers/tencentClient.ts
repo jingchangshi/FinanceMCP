@@ -17,8 +17,8 @@ export interface TencentQuoteRow {
   pct_chg: number | null;
   /** 手 */
   vol: number;
-  /** 千元 */
-  amount: number;
+  /** 千元；null = 上游未返回成交额（未知，不是 0，不能当作停牌或零成交证据） */
+  amount: number | null;
   turnover_rate: number | null;
   pe_ttm: number | null;
   pb: number | null;
@@ -65,13 +65,13 @@ export function parseTencentQuoteLine(line: string): TencentQuoteRow | null {
   const pctChg = finiteOrNull(p[32]);
   const vol = finiteOrNull(p[6]) ?? 0;
 
-  let amountQian = 0;
+  let amountQian: number | null = null;
   const amtTuple = (p[35] ?? '').split('/');
   if (amtTuple.length >= 3 && finiteOrNull(amtTuple[2]) !== null) {
     amountQian = Number(amtTuple[2]) / 1000;
   } else {
     const amtWan = finiteOrNull(p[37]);
-    amountQian = amtWan !== null ? amtWan * 10 : 0;
+    if (amtWan !== null) amountQian = amtWan * 10;
   }
 
   const turnoverRate = finiteOrNull(p[38]);
@@ -101,7 +101,7 @@ export function parseTencentQuoteLine(line: string): TencentQuoteRow | null {
     change,
     pct_chg: pctChg,
     vol,
-    amount: Math.round(amountQian * 10000) / 10000,
+    amount: amountQian !== null ? Math.round(amountQian * 10000) / 10000 : null,
     turnover_rate: turnoverRate,
     pe_ttm: peTtm,
     pb,
@@ -170,8 +170,8 @@ export interface TencentDailyBar {
   pct_chg: number | null;
   /** 手 */
   vol: number;
-  /** 千元（腾讯日K不返回精确成交额，返回0或估算，优先用TDX/东财） */
-  amount: number;
+  /** 千元；腾讯日K不返回精确成交额，恒为 null（未知），优先用 TDX/东财补齐 */
+  amount: number | null;
 }
 
 export async function fetchTencentDailyBars(
@@ -190,7 +190,9 @@ export async function fetchTencentDailyBars(
   });
   if (!res.ok) throw new Error(`Tencent daily HTTP ${res.status}`);
   const payload = await res.json() as any;
-  const items = payload?.data?.[tencentSymbol]?.day ?? payload?.data?.[tencentSymbol]?.qfqday;
+  // 只接受不复权（bfq）日线。qfqday 是前复权价，若拿来当原始价会把复权跳空
+  // 混进 raw 价格序列，PRE_CLOSE 与 adj_factor 随之全部错误。
+  const items = payload?.data?.[tencentSymbol]?.day;
   if (!Array.isArray(items)) return [];
 
   const bars: TencentDailyBar[] = [];
@@ -215,7 +217,7 @@ export async function fetchTencentDailyBars(
       pre_close: prevClose,
       pct_chg: pctChg,
       vol: Number.isFinite(vol) ? vol : 0,
-      amount: 0,
+      amount: null,
     });
     prevClose = Number.isFinite(close) && close > 0 ? close : prevClose;
   }
