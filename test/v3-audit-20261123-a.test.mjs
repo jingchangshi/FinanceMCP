@@ -195,6 +195,99 @@ test('P0-1 an ordinary open position still exits on the MA20 trail', () => {
   }
 });
 
+// ---------------------------------------------------------------- P0-2 个股 MA20 无条件离场
+
+test('P0-2 stock exits below MA20 without +15% arming (EXP-V3-02 parity)', () => {
+  const { mDb, pDb } = openDbPair('ma20-stock');
+  try {
+    const days = weekdays('20260901', 25);
+    const asOf = days.at(-1);
+    const closes = days.map((_, i) => (i === days.length - 1 ? 9.9 : 10.0));
+    seedDaily(mDb, '600036.SH', days, closes);
+    setTracker(pDb, {
+      ts_code: '600036.SH', entry_price_milli: 10000, initial_stop_milli: 9200,
+      current_stop_milli: 9200, trailing_ma20_armed: 0, entry_adj_factor: 1,
+      status: 'OPEN', entry_date: days[0],
+    });
+
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 9900, 10000)] });
+    const sells = sellsFor(out, '600036.SH');
+    assert.equal(sells.length, 1, '未武装的个股收盘跌破 MA20 也必须离场');
+    assert.equal(sells[0].legs[0].reason, 'P1_MA20_EXIT');
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.status, 'CLOSED');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-2 stock above MA20 holds without arming', () => {
+  const { mDb, pDb } = openDbPair('ma20-hold');
+  try {
+    const days = weekdays('20260901', 25);
+    const asOf = days.at(-1);
+    const closes = days.map((_, i) => (i === days.length - 1 ? 10.3 : 10.0));
+    seedDaily(mDb, '600036.SH', days, closes);
+    setTracker(pDb, {
+      ts_code: '600036.SH', entry_price_milli: 10000, initial_stop_milli: 9200,
+      current_stop_milli: 9200, trailing_ma20_armed: 0, entry_adj_factor: 1,
+      status: 'OPEN', entry_date: days[0],
+    });
+
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 10300, 10000)] });
+    assert.deepEqual(sellsFor(out, '600036.SH'), [], 'MA20 上方持仓不得离场');
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.status, 'OPEN');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-2 ETF tracker rows keep the armed-only MA20 semantics', () => {
+  const { mDb, pDb } = openDbPair('ma20-etf');
+  try {
+    const days = weekdays('20260901', 25);
+    const asOf = days.at(-1);
+    seedDaily(mDb, '159558.SZ', days, days.map(() => 0.85));
+    setTracker(pDb, {
+      ts_code: '159558.SZ', entry_price_milli: 850, initial_stop_milli: 782,
+      current_stop_milli: 782, trailing_ma20_armed: 0, entry_adj_factor: 1,
+      status: 'OPEN', entry_date: days[0],
+    });
+
+    const unarmed = runEngine({ pDb, mDb, asOf, holdings: [holding('159558.SZ', 800, 850, '半导体设备ETF')] });
+    assert.deepEqual(sellsFor(unarmed, '159558.SZ'), [], '未武装的 ETF 跌破 MA20 不得离场');
+
+    pDb.prepare('UPDATE position_stop_tracker SET trailing_ma20_armed = 1 WHERE account_id = ? AND ts_code = ?').run(ACC, '159558.SZ');
+    const armed = runEngine({ pDb, mDb, asOf, holdings: [holding('159558.SZ', 800, 850, '半导体设备ETF')] });
+    const sells = sellsFor(armed, '159558.SZ');
+    assert.equal(sells.length, 1, '武装后的 ETF 跌破 MA20 仍应移动止盈');
+    assert.equal(sells[0].legs[0].reason, 'P1_TRAILING_MA20_STOP');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-2 requireIndustryTop30 defaults to false (EXP-V3-02) and stays explicitly opt-in', () => {
+  const { db: mDb, asOf } = seedDepthMarket('ind30');
+  try {
+    const dflt = screenStockSwingCandidates(mDb, asOf, { maxCandidates: 10 });
+    assert.equal(dflt.qualified_count, 10, '默认不得按行业前 30% 过滤');
+    assert.equal(dflt.candidates.length, 10);
+    assert.ok(dflt.candidates.some(c => c.industry === '弱行业'), '行业排名靠后的合格回踩股默认应入围');
+
+    const gated = screenStockSwingCandidates(mDb, asOf, { maxCandidates: 10, requireIndustryTop30: true });
+    assert.ok(gated.qualified_count > 0);
+    assert.ok(gated.candidates.every(c => c.industry === '强行业'), '显式开启行业过滤后仅前 30% 行业入围');
+    assert.ok(!gated.candidates.some(c => c.industry === '弱行业'));
+  } finally {
+    mDb.close();
+  }
+});
+
 // ---------------------------------------------------------------- P1-1 920 北交所板块
 
 test('P1-1 920xxx.BJ is a restricted board, never executable', () => {
@@ -240,13 +333,27 @@ function seedDepthMarket(name) {
   upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'],
     days.map((cal_date, i) => ({ cal_date, is_open: 1, pretrade_date: days[i - 1] ?? null })));
 
+  // 两个行业各 25 只（≥5 才有行业排名）：强行业缓慢上行、弱行业阴跌，
+  // 让弱行业的 5 只 BP1 回踩股成为“行业排名不在前 30%”的对照组。
   const stocks = [
-    ...Array.from({ length: 40 }, (_, i) => ({ code: `603${String(i).padStart(3, '0')}.SH`, name: `背景${i}`, probe: null })),
-    ...Array.from({ length: 10 }, (_, k) => ({ code: `605${String(k).padStart(3, '0')}.SH`, name: `回踩${k}`, probe: k })),
+    ...Array.from({ length: 40 }, (_, i) => ({
+      code: `603${String(i).padStart(3, '0')}.SH`,
+      name: `背景${i}`,
+      industry: i < 20 ? '强行业' : '弱行业',
+      drift: i < 20 ? 0.0025 : -0.002,
+      probe: null,
+    })),
+    ...Array.from({ length: 10 }, (_, k) => ({
+      code: `605${String(k).padStart(3, '0')}.SH`,
+      name: `回踩${k}`,
+      industry: k < 5 ? '强行业' : '弱行业',
+      drift: 0,
+      probe: k,
+    })),
   ];
   upsertRows(db, 'stock_basic', ['ts_code', 'symbol', 'name', 'industry', 'market', 'exchange', 'list_date', 'list_status'],
     stocks.map(s => ({
-      ts_code: s.code, symbol: s.code.slice(0, 6), name: s.name, industry: '制造业',
+      ts_code: s.code, symbol: s.code.slice(0, 6), name: s.name, industry: s.industry,
       market: '主板', exchange: 'SSE', list_date: '20180101', list_status: 'L',
     })));
 
@@ -277,7 +384,7 @@ function seedDepthMarket(name) {
       let vol;
       let amount;
       if (s.probe === null) {
-        close = Math.round(10 * Math.pow(1.002, i) * 100) / 100;
+        close = Math.round(10 * Math.pow(1 + s.drift, i) * 100) / 100;
         open = Math.round(close * 0.998 * 100) / 100;
         high = Math.round(close * 1.01 * 100) / 100;
         low = Math.round(open * 0.99 * 100) / 100;

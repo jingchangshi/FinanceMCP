@@ -604,7 +604,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     }
   }
 
-  // -------------------------------- P1: 个股 -8% 硬止损 / +15% 保本 / 跌破 MA20 移动止盈
+  // -------------------------------- P1: 个股 -8% 硬止损 / +15% 保本 / 收盘跌破 MA20 无条件离场（ETF 仍为武装后移动止盈）
   const trackerByCode = new Map<string, StopTrackerRow>();
   if (portfolioTableExists(input.portfolioDb, 'position_stop_tracker') && input.portfolioDb) {
     const rows = input.portfolioDb.prepare(
@@ -644,7 +644,10 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
 
     const ma20Milli = stockMa20Milli(input.marketDb, h.ts_code, input.asOf);
     const hardStopHit = h.price_milli <= scaledCurrentStopMilli;
-    const trailingExitHit = ma20Armed === 1 && ma20Milli !== null && h.price_milli < ma20Milli;
+    // EXP-V3-02（research/ashare/experiments/exp_v3_02_stock_swing_rqalpha.py）：
+    // 个股在硬止损之后，收盘价 < MA20 即无条件离场，不依赖 +15% 武装；ETF tracker
+    // 行保持既有“浮盈 +15% 后才启用 MA20 移动止盈”的语义。
+    const trailingExitHit = ma20Milli !== null && h.price_milli < ma20Milli && (isStock || ma20Armed === 1);
 
     stopTrackerUpdates.push({
       account_id: input.accountId,
@@ -669,15 +672,18 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       workingQty.set(h.ts_code, Math.max(0, (workingQty.get(h.ts_code) ?? 0) - remSellable));
       workingSellable.set(h.ts_code, 0);
       workingCashCents += netCents;
+      const stockMa20Exit = isStock && trailingExitHit && ma20Armed !== 1;
       const reasonText = hardStopHit
         ? `收盘价 ${(h.price_milli / 1000).toFixed(2)} 元跌破止损线 ${(scaledCurrentStopMilli / 1000).toFixed(2)} 元，无条件执行止损。`
-        : `浮盈曾达 15% 后收盘跌破 20 日均线（${((ma20Milli ?? 0) / 1000).toFixed(2)} 元），执行移动止盈离场。`;
+        : stockMa20Exit
+          ? `收盘价 ${(h.price_milli / 1000).toFixed(2)} 元跌破 20 日均线（${((ma20Milli ?? 0) / 1000).toFixed(2)} 元），个股波段规则无条件离场（EXP-V3-02 口径）。`
+          : `浮盈曾达 15% 后收盘跌破 20 日均线（${((ma20Milli ?? 0) / 1000).toFixed(2)} 元），执行移动止盈离场。`;
       actions.push({
         priority: 'P1',
         code: `P1-STOP-SELL-${h.ts_code}`,
         kind: 'REDUCE',
         rank: actions.length + 1,
-        title: `${hardStopHit ? '触发硬止损清仓' : '触发移动止盈离场'}：卖出 ${h.name}（${h.ts_code}）`,
+        title: `${hardStopHit ? '触发硬止损清仓' : stockMa20Exit ? '个股跌破 20 日均线离场' : '触发移动止盈离场'}：卖出 ${h.name}（${h.ts_code}）`,
         reasons: [reasonText],
         counter_evidence: ['短期洗盘可能次日反包，但单笔严守止损是 10 万本金回本纪律核心。'],
         legs: [{
@@ -693,7 +699,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           net_cents: netCents,
           quote_trade_date: h.latest_bar_date,
           executable: true,
-          reason: hardStopHit ? 'P1_HARD_STOP_8PCT' : 'P1_TRAILING_MA20_STOP',
+          reason: hardStopHit ? 'P1_HARD_STOP_8PCT' : stockMa20Exit ? 'P1_MA20_EXIT' : 'P1_TRAILING_MA20_STOP',
         }],
         fees_cents: fees.total_cents,
         fees_estimated: Boolean(rules.fee_model?.estimated),
