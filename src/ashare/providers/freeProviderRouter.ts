@@ -80,6 +80,7 @@ const cachedStockDay = new Map<string, { at: number; data: DayStockSnapshot }>()
 const cachedFundDay = new Map<string, { at: number; data: DayFundSnapshot }>();
 const cachedFinaPeriod = new Map<string, { at: number; rows: Record<string, any>[] }>();
 let cachedNavByCode: { at: number; map: Map<string, EastmoneyFundNavRow[]> } | null = null;
+let xdxrUnavailableWarned = false;
 
 export function clearFreeProviderCache(): void {
   cachedTdxSecurities = null;
@@ -173,7 +174,11 @@ async function fetchBarsSingle(
           try {
             events = await s.getXdxrInfo(parsed.tdxMarket!, parsed.code);
           } catch {
-            // 除权信息失败不编造参考价：仍返回原始 K 线，昨收退回前一根原始收盘。
+            // 除权信息失败不编造参考价：保留原始前收（旧因子），并记录一次明确的数据质量警告。
+            if (!xdxrUnavailableWarned) {
+              xdxrUnavailableWarned = true;
+              console.warn('[ashare] TDX 除权除息信息不可用：除权日复权因子按原始前收保留旧值，不编造因子');
+            }
             events = [];
           }
         }

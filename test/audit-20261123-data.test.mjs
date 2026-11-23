@@ -477,28 +477,31 @@ test('P2-4: short page, bad close and NULL OHLC are NOT_READY, not just DEGRADED
   });
 });
 
-test('P2-4: free mode measures usable daily_basic/adj_factor values instead of 1:1 NULL rows', async () => {
+test('P2-4: free mode discloses unusable daily_basic/adj_factor instead of trusting 1:1 NULL rows', async () => {
   await withEnv({ ASHARE_DATA_PROVIDER: 'free' }, async () => {
     const db = openAshareDb(':memory:');
     try {
       upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: '20261118', is_open: 1, pretrade_date: null }]);
       seedReadinessDay(db, '20261118', codesOf(10));
       // Historical backfill shape: a daily_basic row per stock, every valuation field NULL.
+      // Anti-over-defense: a missing valuation column is a disclosed data-quality warning
+      // (DEGRADED still publishes), not a whole-day NOT_READY block.
       db.exec("UPDATE daily_basic SET pe_ttm = NULL, pb = NULL, circ_mv = NULL WHERE trade_date = '20261118'");
       const nullBasic = checkDataReadiness(db, '20261118');
-      assert.equal(nullBasic.status, 'NOT_READY');
-      assert.match(nullBasic.reason, /daily_basic 有效值=0/);
+      assert.equal(nullBasic.status, 'DEGRADED', 'publishes with a warning instead of blocking the report');
+      assert.match(nullBasic.reason, /free 模式 daily_basic 有效值 0/);
+      assert.match(nullBasic.reason, /不阻断日报/);
 
-      // Usable values pass the free-mode coverage gate (other quality disclosures may still degrade).
+      // Usable values clear the warning.
       db.exec("UPDATE daily_basic SET pb = 1.5 WHERE trade_date = '20261118'");
       const covered = checkDataReadiness(db, '20261118');
       assert.ok(!String(covered.reason).includes('daily_basic 有效值'), `unexpected free-mode reason: ${covered.reason}`);
 
-      // Non-positive factors are not coverage either.
+      // Non-positive factors are disclosed the same way.
       db.exec("UPDATE adj_factor SET adj_factor = 0 WHERE trade_date = '20261118'");
       const badAdj = checkDataReadiness(db, '20261118');
-      assert.equal(badAdj.status, 'NOT_READY');
-      assert.match(badAdj.reason, /adj_factor 正值=0/);
+      assert.equal(badAdj.status, 'DEGRADED');
+      assert.match(badAdj.reason, /free 模式 adj_factor 正值 0/);
     } finally {
       db.close();
     }
