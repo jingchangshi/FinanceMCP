@@ -1,0 +1,140 @@
+// Eastmoney-shaped broker CSV import and the v1 -> v2 event_id compatibility
+// path. The ledger facts are broker data, never estimates: fee columns are
+// preserved exactly, and re-importing the same statement with/without --broker
+// must not duplicate rows.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { parseTradeCsv } from '../build/portfolio/tradeImport.js';
+import { PORTFOLIO_LEDGER_SCHEMA, PORTFOLIO_COMPLETENESS_SCHEMA } from '../build/portfolio/db.js';
+import { importEvents, initBaseline, recordEvent } from '../build/portfolio/ledger.js';
+
+const EASTMONEY_HEADER = '成交日期,业务名称,证券代码,成交数量,成交价格,成交金额,发生金额,佣金,规费,印花税,过户费,成交编号';
+const EASTMONEY_BUY = '2026-10-19,证券买入,159999,100,1.250,125.00,-125.06,0.01,0.02,0,0.03,fill-1';
+const EASTMONEY_SELL = '2026-10-20,证券卖出,159999,100,1.350,135.00,134.93,0.02,0.02,0.03,0,fill-2';
+
+function fixture() {
+  const db = new DatabaseSync(':memory:');
+  db.exec(PORTFOLIO_LEDGER_SCHEMA);
+  db.exec(PORTFOLIO_COMPLETENESS_SCHEMA);
+  db.exec(`CREATE TABLE account_snapshot(snapshot_id TEXT PRIMARY KEY, as_of TEXT,source TEXT,note TEXT,warnings TEXT,is_current INTEGER,total_assets_cents INTEGER,securities_mv_cents INTEGER,cash_cents INTEGER,wealth_cents INTEGER,unrealized_pnl_cents INTEGER,created_at TEXT);
+    CREATE TABLE position(snapshot_id TEXT,ts_code TEXT,name TEXT,quantity INTEGER,ref_price_milli INTEGER,ref_cost_milli INTEGER,market_value_cents INTEGER);`);
+  db.prepare('INSERT INTO account_snapshot VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('baseline', '2026-10-16', 'synthetic', '', '[]', 0, 100000, 0, 100000, 0, 0, '2026-10-16');
+  initBaseline(db, 'synthetic', { asOf: '20261016', snapshotId: 'baseline' });
+  return db;
+}
+
+test('E1 Eastmoney columns with both 成交金额 and 发生金额 parse without ambiguity', () => {
+  const { events } = parseTradeCsv(`${EASTMONEY_HEADER}\n${EASTMONEY_BUY}\n${EASTMONEY_SELL}\n`, {
+    accountId: 'synthetic', brokerId: 'eastmoney',
+  });
+  const [buy, sell] = events;
+  assert.equal(buy.gross_cents, 12500, 'gross comes from 成交金额');
+  assert.equal(buy.cash_delta_cents, -12506, '发生金额 is the cash delta');
+  assert.equal(buy.fee_cents, 6, 'commission + 规费 + 过户费 are preserved exactly');
+  assert.equal(buy.tax_cents, 0);
+  assert.match(buy.event_id, /^broker:v2:synthetic:eastmoney:20261019:TRADE_BUY:fill-1$/);
+  const note = JSON.parse(buy.note);
+  assert.equal(note.format, 'broker_csv/2');
+  assert.equal(note.other_fee_cents, 2);
+  assert.equal(sell.gross_cents, 13500);
+  assert.equal(sell.cash_delta_cents, 13493);
+  assert.equal(sell.fee_cents, 4);
+  assert.equal(sell.tax_cents, 3);
+});
+
+test('E2 English column shape keeps working and the v2 id carries date and type', () => {
+  const csv = 'event_id,occurred_on,event_type,ts_code,quantity,price,gross,fee,tax,cash_delta\n' +
+    'x1,20261019,TRADE_BUY,159999.SZ,100,1.250,125.00,0.01,0,-125.01\n';
+  const { events } = parseTradeCsv(csv, { accountId: 'synthetic' });
+  assert.equal(events[0].event_id, 'broker:v2:synthetic:unspecified:20261019:TRADE_BUY:x1');
+  assert.equal(events[0].fee_cents, 1);
+});
+
+test('E3 re-import with and without --broker does not duplicate rows', () => {
+  const db = fixture();
+  try {
+    const csv = `${EASTMONEY_HEADER}\n${EASTMONEY_BUY}\n${EASTMONEY_SELL}\n`;
+    const first = parseTradeCsv(csv, { accountId: 'synthetic', brokerId: 'eastmoney' }).events;
+    assert.equal(importEvents(db, 'synthetic', first, { dedupeByContent: true }).counts.recorded, 2);
+
+    // Same statement imported again without --broker: different event_id scheme
+    // input, same broker facts -> DUPLICATE, no new rows.
+    const second = parseTradeCsv(csv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', second, { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 0);
+    assert.equal(result.counts.duplicate, 2);
+    assert.equal(result.counts.conflict, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event').get().n, 2);
+
+    // And with the broker again: the original v2 ids match by id.
+    const third = parseTradeCsv(csv, { accountId: 'synthetic', brokerId: 'eastmoney' }).events;
+    const again = importEvents(db, 'synthetic', third, { dedupeByContent: true });
+    assert.equal(again.counts.duplicate, 2);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event').get().n, 2);
+  } finally { db.close(); }
+});
+
+test('E4 a row imported under the v1 id scheme is recognised by the v2 compatibility path', () => {
+  const db = fixture();
+  try {
+    // Simulate a row written before this change: v1 id, same facts/fee columns.
+    recordEvent(db, {
+      event_id: 'broker:synthetic:unspecified:legacy-1',
+      account_id: 'synthetic', event_type: 'TRADE_BUY', occurred_on: '20261019',
+      ts_code: '159999.SZ', quantity: 100, price_milli: 1250,
+      fee_cents: 6, tax_cents: 0, cash_delta_cents: -12506,
+      source: 'broker_statement',
+      note: JSON.stringify({ format: 'broker_csv/1', broker: null, source_id: 'legacy-1' }),
+    });
+    const csv = `${EASTMONEY_HEADER}\n2026-10-19,证券买入,159999,100,1.250,125.00,-125.06,0.01,0.02,0,0.03,legacy-1\n`;
+    const events = parseTradeCsv(csv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 0);
+    assert.equal(result.counts.duplicate, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event').get().n, 1);
+    assert.equal(db.prepare('SELECT event_id FROM account_event').get().event_id, 'broker:synthetic:unspecified:legacy-1');
+  } finally { db.close(); }
+});
+
+test('E5 two genuinely distinct fills with identical fields are not collapsed', () => {
+  const db = fixture();
+  try {
+    const header = '流水号,成交日期,业务名称,证券代码,成交数量,成交价格,成交金额,佣金,印花税,资金发生额';
+    const csv = `${header}\n` +
+      'f1,2026-10-19,买入,159999,100,1.250,125.00,0.01,0,-125.01\n' +
+      'f2,2026-10-19,买入,159999,100,1.250,125.00,0.01,0,-125.01\n';
+    const events = parseTradeCsv(csv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 2, 'distinct broker source ids are distinct fills');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event').get().n, 2);
+  } finally { db.close(); }
+});
+
+test('E6 a v2-id original can be reversed by a statement that names the raw broker id', () => {
+  const db = fixture();
+  try {
+    const buy = parseTradeCsv(`${EASTMONEY_HEADER}\n${EASTMONEY_BUY}\n`, { accountId: 'synthetic' }).events;
+    assert.equal(importEvents(db, 'synthetic', buy, { dedupeByContent: true }).counts.recorded, 1);
+    const original = db.prepare('SELECT event_id FROM account_event').get().event_id;
+    assert.match(original, /^broker:v2:/);
+
+    const reverseCsv = '流水号,成交日期,业务名称,撤销流水号\nrev-1,2026-10-20,撤销,fill-1\n';
+    const reverse = parseTradeCsv(reverseCsv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', reverse, { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 1, JSON.stringify(result));
+    const reversed = db.prepare('SELECT reversed_by FROM account_event WHERE event_id = ?').get(original);
+    assert.ok(reversed.reversed_by, 'original row must be marked reversed');
+
+    // Re-importing the same reversal must be a DUPLICATE, not an
+    // already_reversed CONFLICT that aborts the batch.
+    const again = importEvents(
+      db, 'synthetic', parseTradeCsv(reverseCsv, { accountId: 'synthetic' }).events,
+      { dedupeByContent: true },
+    );
+    assert.equal(again.counts.duplicate, 1, JSON.stringify(again));
+    assert.equal(again.counts.conflict, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event').get().n, 2);
+  } finally { db.close(); }
+});

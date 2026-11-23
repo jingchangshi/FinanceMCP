@@ -19,6 +19,7 @@ from feishu_notify import (  # noqa: E402
     notify,
 )
 from send_delay_alert import build_delay_alert_markdown, send_delay_alert  # noqa: E402
+from feishu_publish import LarkError  # noqa: E402
 from feishu_render import check_forbidden, check_internal_tokens, render_xml  # noqa: E402
 from publish_and_notify import run_publish_and_notify  # noqa: E402
 from test_sections_producer import TestV3CockpitSections  # noqa: E402
@@ -241,6 +242,97 @@ class TestFeishuNotify(unittest.TestCase):
         )
         self.assertEqual(disabled["status"], "disabled")
         self.assertEqual(len(runner.calls), 1)
+
+
+    def test_delayed_banner_renders_the_configured_deadline(self):
+        pub_entry = {
+            "trade_date": "20261113",
+            "document_id": "doc-1",
+            "document_url": "https://my.feishu.cn/docx/doc-1",
+        }
+        bundle = self._helper._v3_bundle(actionable=False)
+        md, _ = build_notification_markdown(bundle, pub_entry, data_delayed=True, deadline_hm="2230")
+        self.assertIn("截至 22:30", md)
+        self.assertNotIn("21:15", md)
+        md_default, _ = build_notification_markdown(bundle, pub_entry, data_delayed=True)
+        self.assertIn("截至 21:15", md_default)
+
+    def test_orchestrator_passes_the_deadline_to_the_im_banner(self):
+        bundle_path = self.root / "VPS-BUNDLE-20261113-deadline.json"
+        bundle_path.write_text(
+            json.dumps(
+                {"record_id": "VPS-BUNDLE-20261113-deadline", "payload": self._helper._v3_bundle(actionable=False)},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        runner = _FakeLarkRunner()
+        receipt = run_publish_and_notify(
+            root=self.root,
+            bundle_path=bundle_path,
+            config=_base_config(),
+            generated_at="17:25",
+            data_delayed=True,
+            deadline_hm="2230",
+            runner=runner,
+        )
+        self.assertEqual(receipt["status"], "ok")
+        marks = [argv[argv.index("--markdown") + 1] for argv in runner.calls if "--markdown" in argv]
+        self.assertTrue(marks)
+        self.assertIn("截至 22:30", marks[0])
+
+    def test_private_message_timeout_does_not_fall_back_to_group(self):
+        """A timeout may mean the user already got the message; a group copy would duplicate it."""
+        cfg = _base_config()
+        bundle = self._helper._v3_bundle(actionable=True)
+        pub_entry = {
+            "trade_date": "20261113",
+            "document_id": "doc-1",
+            "document_url": "https://my.feishu.cn/docx/doc-1",
+        }
+
+        class TimeoutRunner:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, argv, cwd):
+                self.calls.append(list(argv))
+                raise LarkError("Lark publish failed: request timed out", retryable=True)
+
+        runner = TimeoutRunner()
+        with self.assertRaises(RuntimeError):
+            notify(self.root, bundle, pub_entry, cfg, runner=runner)
+        self.assertEqual(len(runner.calls), 1, "must not send the group fallback after a timeout")
+        self.assertIn("--user-id", runner.calls[0])
+        incidents = (
+            self.root / "data/feishu/account_publish_incidents.jsonl"
+        ).read_text(encoding="utf-8")
+        self.assertIn("notify_failed", incidents)
+
+    def test_explicit_4xx_permission_rejection_still_falls_back_to_group(self):
+        cfg = _base_config()
+        bundle = self._helper._v3_bundle(actionable=True)
+        pub_entry = {
+            "trade_date": "20261113",
+            "document_id": "doc-1",
+            "document_url": "https://my.feishu.cn/docx/doc-1",
+        }
+
+        class PermissionThenGroup:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, argv, cwd):
+                self.calls.append(list(argv))
+                if "--user-id" in argv:
+                    raise LarkError("Lark publish failed: permission forbidden", retryable=False, status=403)
+                return {"ok": True, "data": {"message_id": "om_group_ok"}}
+
+        runner = PermissionThenGroup()
+        res = notify(self.root, bundle, pub_entry, cfg, runner=runner)
+        self.assertEqual(res["status"], "sent")
+        self.assertEqual(res["recipient_flag"], "--chat-id")
+        self.assertEqual(len(runner.calls), 2)
 
 
 if __name__ == "__main__":

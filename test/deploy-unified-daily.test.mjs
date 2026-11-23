@@ -7,8 +7,28 @@ import test from 'node:test';
 
 const SCRIPT = join(process.cwd(), 'deploy/ashare/run-daily-unified.sh');
 const TRADE_DATE = '20261113';
+// Mirrors ETF_UNIVERSE from src/ashare/etfDeclarations.ts. The daily JSON carries
+// its own `expected` set; these tests feed the same shape the pipeline emits.
+const ETF_CODES = ['159241.SZ', '159278.SZ', '159558.SZ', '516080.SH', '560390.SH'];
 
-function setupHarness(t, { dailyPayloads, observeExit = 0, validationExists = true }) {
+function readyEtf(date = TRADE_DATE) {
+  return {
+    etf: {
+      coverage: {
+        [date]: {
+          date, expected: [...ETF_CODES], ready: [...ETF_CODES],
+          no_upstream_bar: [], missing: [], errors: [],
+        },
+      },
+      fund_nav: {
+        dates: [date], rows: 120, per_date: { [date]: 120 }, fallback_codes: [], errors: [],
+      },
+      errors: [],
+    },
+  };
+}
+
+function setupHarness(t, { dailyPayloads, observeExit = 0, validationExists = true, recordExit = 0, recordAsOf = TRADE_DATE }) {
   const dir = mkdtempSync(join(tmpdir(), 'unified-daily-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -32,7 +52,11 @@ function setupHarness(t, { dailyPayloads, observeExit = 0, validationExists = tr
   const pythonLog = join(dir, 'python.log');
 
   for (let i = 0; i < dailyPayloads.length; i += 1) {
-    writeFileSync(join(dir, `daily-${i + 1}.json`), JSON.stringify(dailyPayloads[i], null, 2));
+    const payload = dailyPayloads[i];
+    writeFileSync(
+      join(dir, `daily-${i + 1}.json`),
+      typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2),
+    );
   }
   writeFileSync(
     join(dir, 'observe.json'),
@@ -76,8 +100,8 @@ case "$1" in
         exit 0
         ;;
       *"cli.js investment-research-record"*)
-        echo '{"status":"READY","recorded":true,"as_of_trade_date":"${TRADE_DATE}","private_output":"/private/research-bundles/VPS-BUNDLE-${TRADE_DATE}-mock.json"}'
-        exit 0
+        echo '{"status":"READY","recorded":true,"as_of_trade_date":"${recordAsOf}","private_output":"/private/research-bundles/VPS-BUNDLE-${TRADE_DATE}-mock.json"}'
+        exit ${recordExit}
         ;;
       *"cli.js portfolio-journal-review"*)
         echo '{"ok":true}'
@@ -106,8 +130,8 @@ exit 0
   );
   chmodSync(mockPython, 0o755);
 
-  const run = (extraEnv = {}) =>
-    spawnSync('sh', [SCRIPT, '--date', TRADE_DATE], {
+  const runScript = (args = ['--date', TRADE_DATE], extraEnv = {}) =>
+    spawnSync('sh', [SCRIPT, ...args], {
       encoding: 'utf8',
       env: {
         ...process.env,
@@ -124,10 +148,14 @@ exit 0
         ...extraEnv,
       },
     });
+  const run = (extraEnv = {}) => runScript(['--date', TRADE_DATE], extraEnv);
 
   return {
     dir,
+    binDir,
+    dataDir,
     run,
+    runScript,
     readDockerLog: () => (existsSync(dockerLog) ? readFileSync(dockerLog, 'utf8') : ''),
     readPythonLog: () => (existsSync(pythonLog) ? readFileSync(pythonLog, 'utf8') : ''),
     getDailyCalls: () => Number(readFileSync(counterFile, 'utf8')),
@@ -148,10 +176,7 @@ test('U1 non-trading day exits 0 immediately without hotspot, account or Feishu'
 test('U2 READY on first pass runs all stages sequentially without sleeping or delay flag', t => {
   const h = setupHarness(t, {
     dailyPayloads: [
-      {
-        report: { trade_date: TRADE_DATE, status: 'READY' },
-        etf: { coverage: { [TRADE_DATE]: { missing: [] } } },
-      },
+      { report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() },
     ],
   });
   const res = h.run();
@@ -179,10 +204,7 @@ test('U3 NOT_READY retries within poll window and proceeds once READY', t => {
         report: { trade_date: TRADE_DATE, status: 'NOT_READY' },
         etf: { coverage: { [TRADE_DATE]: { missing: ['510300.SH'] } } },
       },
-      {
-        report: { trade_date: TRADE_DATE, status: 'READY' },
-        etf: { coverage: { [TRADE_DATE]: { missing: [] } } },
-      },
+      { report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() },
     ],
   });
   const res = h.run({ ASHARE_NOW_HM_OVERRIDE: '1800' });
@@ -196,10 +218,7 @@ test('U3 NOT_READY retries within poll window and proceeds once READY', t => {
 test('U4 observe exit 79 does not block hotspot, account-daily or Feishu push when market is READY', t => {
   const h = setupHarness(t, {
     dailyPayloads: [
-      {
-        report: { trade_date: TRADE_DATE, status: 'READY' },
-        etf: { coverage: { [TRADE_DATE]: { missing: [] } } },
-      },
+      { report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() },
     ],
     observeExit: 79,
   });
@@ -217,7 +236,7 @@ test('U5 polling triggers one-shot delay alert at configured attempt then publis
       { report: { trade_date: TRADE_DATE, status: 'NOT_READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
       { report: { trade_date: TRADE_DATE, status: 'NOT_READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
       { report: { trade_date: TRADE_DATE, status: 'NOT_READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
-      { report: { trade_date: TRADE_DATE, status: 'READY' }, etf: { coverage: { [TRADE_DATE]: { missing: [] } } } },
+      { report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() },
     ],
   });
   const delayScript = join(h.dir, 'mock-delay-alert.py');
@@ -265,4 +284,135 @@ test('U6 deadline reached without daily JSON logs warning and falls back to live
   assert.match(h.readDockerLog(), /investment-research-bundle/);
   const publishLine = h.readPythonLog().trim().split('\n').find(l => l.includes('publish_and_notify.py')) ?? '';
   assert.match(publishLine, /--data-delayed/);
+});
+
+function notReadyRun(t, payload, extraEnv = {}) {
+  const h = setupHarness(t, { dailyPayloads: [payload] });
+  const res = h.run({ ASHARE_MAX_WAIT_ATTEMPTS: '1', ...extraEnv });
+  assert.equal(res.status, 0, res.stderr);
+  const publishLine = h.readPythonLog().trim().split('\n').find(l => l.includes('publish_and_notify.py')) ?? '';
+  assert.match(publishLine, /--data-delayed/, `expected a delayed banner: ${res.stderr}`);
+  return { h, res, publishLine };
+}
+
+test('U7 missing ETF coverage entry is not READY (empty/missing must never pass)', t => {
+  const { res } = notReadyRun(t, {
+    report: { trade_date: TRADE_DATE, status: 'READY' },
+    etf: { coverage: {}, errors: [] },
+  });
+  assert.match(res.stderr, /etf_state=coverage_entry_missing/);
+});
+
+test('U8 no_upstream_bar/ready-set incompleteness are not READY', t => {
+  const suspended = {
+    report: { trade_date: TRADE_DATE, status: 'READY' },
+    etf: {
+      coverage: {
+        [TRADE_DATE]: {
+          date: TRADE_DATE, expected: [...ETF_CODES], ready: [...ETF_CODES],
+          no_upstream_bar: ['159278.SZ'], missing: [], errors: [],
+        },
+      },
+      fund_nav: { dates: [TRADE_DATE], rows: 1, per_date: { [TRADE_DATE]: 1 }, fallback_codes: [], errors: [] },
+      errors: [],
+    },
+  };
+  const { res } = notReadyRun(t, suspended);
+  assert.match(res.stderr, /etf_state=no_upstream_bar/);
+
+  const h2 = setupHarness(t, {
+    dailyPayloads: [{
+      report: { trade_date: TRADE_DATE, status: 'READY' },
+      ...readyEtf(),
+    }],
+  });
+  const incomplete = {
+    report: { trade_date: TRADE_DATE, status: 'READY' },
+    etf: {
+      coverage: {
+        [TRADE_DATE]: {
+          date: TRADE_DATE, expected: [...ETF_CODES],
+          ready: ETF_CODES.slice(0, 4), no_upstream_bar: [], missing: [], errors: [],
+        },
+      },
+      fund_nav: { dates: [TRADE_DATE], rows: 1, per_date: { [TRADE_DATE]: 1 }, fallback_codes: [], errors: [] },
+      errors: [],
+    },
+  };
+  writeFileSync(join(h2.dir, 'daily-1.json'), JSON.stringify(incomplete));
+  const res2 = h2.run({ ASHARE_MAX_WAIT_ATTEMPTS: '1' });
+  assert.equal(res2.status, 0, res2.stderr);
+  assert.match(res2.stderr, /etf_state=ready_set_incomplete/);
+  assert.match(h2.readPythonLog(), /--data-delayed/);
+});
+
+test('U9 ETF sync errors/fatal and fund_nav failures force the delayed banner', t => {
+  const withErrors = {
+    report: { trade_date: TRADE_DATE, status: 'READY' },
+    ...readyEtf(),
+  };
+  withErrors.etf.errors = ['fund_adj 159241.SZ: 无数据或请求失败'];
+  const { res } = notReadyRun(t, withErrors);
+  assert.match(res.stderr, /etf_state=etf_errors/);
+
+  const crashed = {
+    report: { trade_date: TRADE_DATE, status: 'READY' },
+    etf: { coverage: {}, errors: ['ETF 同步失败（已隔离）: exploded'], fatal: 'exploded' },
+  };
+  const h2 = setupHarness(t, { dailyPayloads: [crashed] });
+  const res2 = h2.run({ ASHARE_MAX_WAIT_ATTEMPTS: '1' });
+  assert.equal(res2.status, 0, res2.stderr);
+  assert.match(res2.stderr, /etf_state=(coverage_entry_missing|etf_fatal)/);
+  assert.match(h2.readPythonLog(), /--data-delayed/);
+});
+
+test('U10 malformed daily JSON is never accepted as READY', t => {
+  const { res } = notReadyRun(t, '{ this is not json');
+  assert.match(res.stderr, /etf_state=(jq_failed|daily_json_missing)/);
+});
+
+test('U11 account-daily failure is not published as a normal report', t => {
+  const h = setupHarness(t, {
+    dailyPayloads: [{ report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() }],
+    recordExit: 1,
+  });
+  const res = h.run();
+  // The unit stays visibly failed (account stage exit), but the user still gets
+  // the fallback report with an explicit delay banner - never a "normal" one.
+  assert.equal(res.status, 1, res.stderr);
+  assert.match(res.stderr, /account-daily exited 1 \(RC=1\); forcing the delayed-data banner/);
+  assert.match(h.readDockerLog(), /investment-research-bundle/);
+  const publishLine = h.readPythonLog().trim().split('\n').find(l => l.includes('publish_and_notify.py')) ?? '';
+  assert.match(publishLine, /--data-delayed/);
+});
+
+test('U12 account bundle for a different trade date is not used; fallback bundle is delayed', t => {
+  const h = setupHarness(t, {
+    dailyPayloads: [{ report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() }],
+    recordAsOf: '20261112',
+  });
+  const res = h.run();
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stderr, /account bundle is not for 20261113/);
+  assert.match(h.readDockerLog(), /investment-research-bundle/);
+  const publishLine = h.readPythonLog().trim().split('\n').find(l => l.includes('publish_and_notify.py')) ?? '';
+  assert.match(publishLine, /--data-delayed/);
+});
+
+test('U13 without --date the most recent closed trading day from trade_cal is used and passed to daily', t => {
+  const h = setupHarness(t, {
+    dailyPayloads: [{ report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() }],
+  });
+  writeFileSync(join(h.dataDir, 'ashare.sqlite'), '');
+  writeFileSync(join(h.binDir, 'sqlite3'), '#!/bin/sh\nprintf "20261113\\n"\nexit 0\n');
+  chmodSync(join(h.binDir, 'sqlite3'), 0o755);
+  const res = h.runScript([], {
+    ASHARE_TODAY_OVERRIDE: '20261114',
+    ASHARE_NOW_HM_OVERRIDE: '1725',
+  });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /expected date: 20261113/);
+  assert.match(h.readDockerLog(), /cli\.js daily --date 20261113/);
+  assert.match(res.stdout, /Stage 1 READY on attempt 1/);
+  assert.doesNotMatch(h.readPythonLog(), /--data-delayed/);
 });

@@ -45,9 +45,15 @@ services:
       ASHARE_OAUTH_LOGIN_PASSWORD: ${ASHARE_OAUTH_LOGIN_PASSWORD:-}
       ASHARE_OAUTH_DB_PATH: /private/oauth.sqlite
       ASHARE_PRIVATE_ALLOW_STATIC_TOKEN: ${ASHARE_PRIVATE_ALLOW_STATIC_TOKEN:-0}
-      # Append tool requires research:append (and portfolio:read) on the token. Off by default:
-      # enable only after ChatGPT has re-authorized with the dual scope.
-      ASHARE_OAUTH_REQUIRE_WRITE_SCOPE: ${ASHARE_OAUTH_REQUIRE_WRITE_SCOPE:-0}
+      # Append tool requires research:append (and portfolio:read) on the token.
+      # Default 1 (fail closed); set 0 only as a temporary compatibility switch
+      # for a connector that has not re-authorized with the dual scope yet.
+      ASHARE_OAUTH_REQUIRE_WRITE_SCOPE: ${ASHARE_OAUTH_REQUIRE_WRITE_SCOPE:-1}
+      # DCR redirect-host allowlist (comma separated, *.example.com supported).
+      # Defaults cover localhost and the known ChatGPT/Gemini callback hosts.
+      ASHARE_OAUTH_DCR_REDIRECT_HOSTS: ${ASHARE_OAUTH_DCR_REDIRECT_HOSTS:-localhost,127.0.0.1,chatgpt.com,chat.openai.com,gemini.google.com,oauth-redirect.googleusercontent.com}
+      ASHARE_OAUTH_MAX_CLIENTS: ${ASHARE_OAUTH_MAX_CLIENTS:-50}
+      ASHARE_OAUTH_MAX_LOGIN_FAILURES: ${ASHARE_OAUTH_MAX_LOGIN_FAILURES:-10}
       # Expose only the five A-share tools to ChatGPT.
       FINANCE_TOOL_PROFILE: ashare_daily
       # Default to free multi-source router (TDX TCP + Tencent + Eastmoney); override with 'tushare' if needed.
