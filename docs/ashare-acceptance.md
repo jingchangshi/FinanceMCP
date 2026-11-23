@@ -153,9 +153,9 @@ systemctl --user start finance-ashare-daily.service（20261017 周六）→ {"tr
 
 **两类证据分开核验**：`acceptance` 只证明*流水线执行*（数据库里的 live 报告与有效 Tushare 请求），不能证明这些运行由 systemd timer 触发
 （手动 `systemctl start` 或 `docker exec … daily` 也会留下同样的记录）。*调度证据*由 `deploy/ashare/check-schedule.sh <YYYYMMDD>` 从
-systemd 用户 journal 读取：分别报告北京时间 18:40:00–18:45:59 与 21:10:00–21:15:59 内是否观察到 `Starting`，并按日志顺序将结束记录关联到启动。`outcome` 为 `success`、`failed`、`unknown` 或 `ambiguous`；窗口无启动、日志不完整或结束记录无法关联时不能声称成功。窗口外运行的结束记录不计入窗口内运行。`run=no` 只表示查询结果中未观察到启动，不能证明日志完整。journal 查询失败时各状态为 `unknown`。
+systemd 用户 journal 读取：报告工作日北京时间 19:30:00–19:35:59 内是否观察到 `finance-ashare-daily.service`（统一入口）的 `Starting`，以及 22:15:00–22:20:59 内是否观察到 `finance-ashare-research-monthly.service` 的 `Starting`，并按日志顺序将结束记录关联到启动。`deadline_2115` 说明统一入口的结束时间在 21:15 数据就绪截止之前还是之后（`met` / `exceeded`；无结束记录时 `unknown`）。`outcome` 为 `success`、`failed`、`unknown` 或 `ambiguous`；窗口无启动、日志不完整或结束记录无法关联时不能声称成功。窗口外运行的结束记录不计入窗口内运行。`run=no` 只表示查询结果中未观察到启动，不能证明日志完整。journal 查询失败时各状态为 `unknown`。
 
-窗口内手动启动与 timer 启动在这些服务日志中无法区分；timer 的 `LastTriggerUSec` 也不能证明某次服务启动的来源。脚本因此始终输出 `trigger_source=unknown schedule=UNKNOWN` 并以 1 退出，不会声称调度通过；timer 状态查询失败另标为 `timer_status=unavailable`。即使两个窗口均观察到成功，也仍需独立的、能关联具体调用和 timer 的证据才能判定自动调度通过。流水线和调度证据均满足要求，当日才算 PASS；整体 `passed` 要求最近 N 个交易日全部 PASS（或允许时 PASS_DEGRADED）。
+窗口内手动启动与 timer 启动在这些服务日志中无法区分；timer 的 `LastTriggerUSec` 也不能证明某次服务启动的来源。脚本因此始终输出 `trigger_source=unknown schedule=UNKNOWN` 并以 1 退出，不会声称调度通过；timer 状态查询失败另标为 `timer_status=unavailable`。即使各窗口均观察到成功，也仍需独立的、能关联具体调用和 timer 的证据才能判定自动调度通过。流水线和调度证据均满足要求，当日才算 PASS；整体 `passed` 要求最近 N 个交易日全部 PASS（或允许时 PASS_DEGRADED）。
 
 2026-10-17 的历史查询曾观察到窗口外 00:35 和 07:45 的启动；旧脚本输出的 `schedule=FAIL` 不应被视为当前脚本的结论。
 修复前的版本把 DEGRADED 计为通过、只要求一份非 NOT_READY 报告，且无法证明第二次运行重新拉取了数据。

@@ -1,10 +1,10 @@
 # Strategy production admission
 
-本地准入存储提供由本机用户显式操作的授权记录，但尚未接入生产执行入口。`StrategyRelease` 是离线研究交换契约，其内容哈希只能验证内容一致性，不证明发布者或批准人身份。`candidateRegistry` 的 `VERIFIED` 表示建议人工审批，不是生产批准；账户研究证据和现有风险政策也没有提供绑定 release 哈希的可信生产授权。研究展示和执行授权必须分离。
+本地准入存储提供由本机用户显式操作的授权记录，但尚未接入生产执行入口。`StrategyRelease` 是离线研究交换契约，其内容哈希只能验证内容一致性，不证明发布者或批准人身份；`production_admission: APPROVED_FOR_ACCOUNT` 是发布方（账户所有者）对该 release 用于本机账户的声明，不是审计记录，也不等于本机准入库中的 `GRANT`。`candidateRegistry` 的 `VERIFIED` 表示建议人工审批，不是生产批准；账户研究证据和现有风险政策也没有提供绑定 release 哈希的可信生产授权。研究展示和执行授权必须分离。
 
-未来接入前，需要由账户所有者明确本地授权来源、可信批准人及其权限、授权记录的作用范围和生效期，并确定实际执行调用方。不能把 release 或请求中自报的批准人、`approved` 字段、哈希或自签材料直接当作可信批准。当前没有创建任何真实生产批准。
+未来接入前，需要由账户所有者明确本地授权来源、可信批准人及其权限、授权记录的作用范围和生效期，并确定实际执行调用方。不能把 release 或请求中自报的批准人、`approved` 字段、哈希或自签材料直接当作可信批准。本地准入库当前没有任何真实 `GRANT` 记录。
 
-生产执行入口应在每次执行前验证完整 release 与实际运行版本，并检查可信授权记录是否精确绑定 `strategy_id`、`version` 和 release `content_hash`，以及账户、市场、环境等具体作用范围和有效期。缺失、无效、未生效、过期、暂停、撤销、身份不可信或 release 无法验证时一律拒绝。`DRAFT`、`RESEARCH_PUBLISHED`、`REJECTED` 和含 `UNKNOWN` 条件的 release 不得获得执行准入；冻结或前瞻影子状态也不能自行构成批准。
+生产执行入口应在每次执行前验证完整 release 与实际运行版本，并检查可信授权记录是否精确绑定 `strategy_id`、`version` 和 release `content_hash`，以及账户、市场、环境等具体作用范围和有效期。缺失、无效、未生效、过期、暂停、撤销、身份不可信或 release 无法验证时一律拒绝。`DRAFT`、`REJECTED` 和含 `UNKNOWN` 条件的 release 不得获得执行准入；`RESEARCH_PUBLISHED` 仅当 release 显式声明 `production_admission: APPROVED_FOR_ACCOUNT` 时才进入准入校验（`src/ashare/strategyAdmission.ts`），`FROZEN` 或 `PROSPECTIVE_SHADOW_ACTIVE` 也仍需本机准入库的 `GRANT` 记录。研究状态本身不构成批准，冻结或前瞻影子状态不能自行构成批准。
 
 ## 本地命令
 

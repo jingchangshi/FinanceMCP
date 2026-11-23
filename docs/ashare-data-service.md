@@ -82,7 +82,7 @@
 
 ## 5. 更新、补齐与质量语义
 
-**日常更新**（`daily`，18:40 / 21:10）：最近 5 个交易日补缺，as-of 日每次都重新请求 `daily/daily_basic/adj_factor/stk_limit/suspend_d`
+**日常更新**（统一入口 `run-daily-unified.sh`，工作日 19:30 CST 启动，数据就绪轮询截止 21:15）：最近 5 个交易日补缺，as-of 日每次都重新请求 `daily/daily_basic/adj_factor/stk_limit/suspend_d`
 与核心指数。完整返回（≥ 前一交易日与已存条数的 97%）时整日原子替换；短返回时，若已有完整缓存则保留原快照（`kept`），
 否则合并有效行（`merged`）；请求报错不改动数据（`none`）。`suspend_d` 无法用条数判断完整性，请求成功即替换当日。
 

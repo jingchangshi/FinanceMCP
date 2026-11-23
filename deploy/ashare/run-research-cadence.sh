@@ -1,17 +1,31 @@
 #!/bin/sh
 # Weekly / monthly research cadence report, run inside the EXISTING production container.
-#   usage: run-research-cadence.sh weekly|monthly
+#   usage: run-research-cadence.sh weekly|monthly [--force]
 #
 # The activation switch is set HERE (docker exec -e), not in the container's environment, so
 # "is this cadence live" is answered by whether a reviewed unit file calls this script.
 # Bounds (weekly diagnosis measured 555s on the production cache on 2026-10-23, so 1500s leaves ~2.7x headroom): `timeout -s KILL` caps wall-clock and --max-old-space-size caps the Node heap, which
 # is the resource bound the in-process modules do not have.
-# A skip (disabled / not_enough_history / no_candidates / ...) is a legitimate outcome and exits 0,
-# but it is printed as SKIPPED(<reason>) so it cannot be mistaken for a produced report.
+# A skip (disabled / not_month_end / not_enough_history / no_candidates / ...) is a legitimate
+# outcome and exits 0, but it is printed as SKIPPED(<reason>) so it cannot be mistaken for a
+# produced report.
+#
+# The monthly unit fires daily; the CLI skips unless the as-of date is the month's last
+# trading day. --force (or ASHARE_CADENCE_FORCE=1) overrides that for a deliberate manual run.
 set -eu
 umask 077
-CADENCE="${1:?usage: run-research-cadence.sh weekly|monthly}"
+CADENCE="${1:?usage: run-research-cadence.sh weekly|monthly [--force]}"
 case "$CADENCE" in weekly|monthly) ;; *) echo "unknown cadence: $CADENCE" >&2; exit 2 ;; esac
+FORCE="${ASHARE_CADENCE_FORCE:-0}"
+case "$FORCE" in 1|true|yes) FORCE=1 ;; *) FORCE=0 ;; esac
+FORCE_ARG=""
+[ "$FORCE" -eq 1 ] && FORCE_ARG=" --force"
+case "${2:-}" in
+  '') ;;
+  --force) FORCE=1; FORCE_ARG=" --force" ;;
+  *) echo "unknown argument: $2 (only --force is accepted)" >&2; exit 2 ;;
+esac
+[ "$#" -le 2 ] || { echo "too many arguments; usage: run-research-cadence.sh weekly|monthly [--force]" >&2; exit 2; }
 CONTAINER="${ASHARE_CONTAINER:-finance-mcp-ashare}"
 ACCOUNT="${ASHARE_CADENCE_ACCOUNT:-real-main}"
 BUDGET_SECONDS="${ASHARE_CADENCE_TIMEOUT:-1500}"
@@ -23,11 +37,15 @@ STAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
 OUT="$LOG_DIR/cadence-$CADENCE-$STAMP.json"
 ERR="$LOG_DIR/cadence-$CADENCE-$STAMP.log"
 if ! docker info >/dev/null 2>&1 && [ -z "${ASHARE_SG_REEXEC:-}" ] && getent group docker | cut -d: -f4 | tr ',' '\n' | grep -qx "$(id -un)"; then
-  ASHARE_SG_REEXEC=1 exec sg docker -c "ASHARE_SG_REEXEC=1 $0 $CADENCE"
+  ASHARE_SG_REEXEC=1 exec sg docker -c "ASHARE_SG_REEXEC=1 $0 $CADENCE$FORCE_ARG"
 fi
 code=0
-docker exec -e RESEARCH_CADENCE_ENABLED=1 -e NODE_OPTIONS="--max-old-space-size=$HEAP_MB" "$CONTAINER" \
-  timeout -s KILL "$BUDGET_SECONDS" node build/ashare/cli.js research-cadence "$CADENCE" --as-of latest --account-id "$ACCOUNT" >"$OUT" 2>"$ERR" || code=$?
+# Build the argv explicitly: appending an optional flag by concatenating an
+# already-quoted word is the kind of quoting that silently produces one argument.
+set -- "$CADENCE" --as-of latest --account-id "$ACCOUNT"
+[ "$FORCE" -eq 1 ] && set -- "$@" --force
+docker exec -e RESEARCH_CADENCE_ENABLED=1 -e ASHARE_CADENCE_FORCE="$FORCE" -e NODE_OPTIONS="--max-old-space-size=$HEAP_MB" "$CONTAINER" \
+  timeout -s KILL "$BUDGET_SECONDS" node build/ashare/cli.js research-cadence "$@" >"$OUT" 2>"$ERR" || code=$?
 if [ "$code" -ne 0 ]; then
   [ "$code" -eq 137 ] && echo "finance-ashare cadence $CADENCE KILLED after ${BUDGET_SECONDS}s budget; see $ERR" >&2
   echo "finance-ashare cadence $CADENCE FAILED (exit $code); see private log $ERR" >&2
