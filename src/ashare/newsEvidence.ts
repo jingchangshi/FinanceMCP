@@ -62,7 +62,10 @@ export function openNewsEvidenceDb(path = newsEvidencePath()): DatabaseSync {
   try { chmodSync(path, 0o600); } finally { closeSync(fd); }
   const db = new DatabaseSync(path);
   try {
-    db.exec(`CREATE TABLE IF NOT EXISTS news_evidence (
+    // WAL keeps readers from blocking the append-only importer; busy_timeout waits for a
+    // concurrent importer instead of failing immediately with SQLITE_BUSY.
+    db.exec(`PRAGMA busy_timeout=15000; PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS news_evidence (
       id TEXT PRIMARY KEY, source_url TEXT NOT NULL, publisher TEXT NOT NULL, published_at TEXT NOT NULL,
       fetched_at TEXT NOT NULL, entity_codes TEXT NOT NULL, kind TEXT NOT NULL, stance TEXT NOT NULL,
       title TEXT, claim TEXT, content_hash TEXT NOT NULL UNIQUE

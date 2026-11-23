@@ -12,6 +12,7 @@
  *   - 期初：total_cost = 基线数量 × 基线成本价
  *   - TRADE_BUY ：total_cost += gross + fee + tax；qty += quantity
  *   - TRADE_SELL：total_cost -= (gross − fee − tax)；qty -= quantity
+ *   - DIVIDEND  ：total_cost -= cash_delta（东方财富摊薄口径：现金分红冲减成本；qty 不变）
  *   - SPLIT     ：qty 按比例调整；非零持仓时 total_cost 不变
  *   - 持仓数量归零时 total_cost 清零，下一次买入从新一轮成本开始
  *   - 摊薄成本均价 = total_cost / qty（qty > 0 时）
@@ -79,11 +80,13 @@ interface AccState {
 }
 
 const METHOD_NOTE =
-  '成本口径说明：本表为摊薄成本估算，按持仓周期计算，买入计入成本、卖出扣除净所得，份额归零时成本清零；'
+  '成本口径说明：本表为摊薄成本估算，按持仓周期计算，买入计入成本、卖出扣除净所得、现金分红冲减成本，份额归零时成本清零；'
   + '具体请以券商口径核对。账本另用平均成本法，卖出时按份额比例扣减成本。';
 
+/** 分与厘的换算必须对称舍入：Math.round(-1.5) = -1 会让负成本的整数分偏 1 分。 */
 function milliToCents(milli: number): number {
-  return Math.round(milli / 10);
+  const cents = milli / 10;
+  return cents >= 0 ? Math.round(cents) : -Math.round(-cents);
 }
 
 function round6(value: number): number {
@@ -191,6 +194,13 @@ export function buildDilutedCostView(
         }
         break;
       }
+      case 'DIVIDEND': {
+        // 东方财富摊薄口径：现金分红冲减总成本，份额不变；撤销时按同额回退。
+        const cash = Number(event.cash_delta_cents ?? 0);
+        delta = -cash * 10; // 分 → 厘
+        acc.total_cost_milli += delta;
+        break;
+      }
       case 'FEE': {
         // 独立费用是现金支出，账本不将它计入证券成本。
         break;
@@ -277,6 +287,7 @@ export function buildDilutedCostView(
     assumptions: [
       '摊薄口径：TRADE_SELL 把卖出净所得（成交额 − 费用 − 税）整体从总成本扣减，而非按份额比例扣减，因此卖出会改变剩余成本均价。',
       '买入成本包含佣金与税费；卖出净所得已扣除费用与税。',
+      'DIVIDEND 按东方财富摊薄口径以现金分红金额冲减总成本，份额不变；撤销分红时同额回退。',
       'SPLIT 按账本规则调整份额并向下取整；非零持仓时不改变总成本，撤销时按当时份额倒比例调整。',
       '持仓数量归零时摊薄总成本清零；后续买入开启新周期，撤销事件按其实际成本变化回退。',
       '这是本表采用的计算约定，不保证与所有券商展示口径一致。',

@@ -1979,8 +1979,9 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         } else {
           const rPrice = dec.grind_guards?.reload_target_cny;
           v3Triggers.push(
-            `159558.SZ 25%战略底仓震荡磨底回补四门槛：60日均线10日斜率走平（当前 ${dec.grind_guards?.ma60_slope10_pct?.toFixed(2) ?? '—'}%）`
-            + `、较前次卖出折价7%（${rPrice !== null && rPrice !== undefined ? rPrice.toFixed(3) : '—'} 元）、近3日超卖极值及右侧收阳站稳5日线`,
+            `159558.SZ 25%战略底仓震荡磨底回补护栏：60日均线10日斜率走平（当前 ${dec.grind_guards?.ma60_slope10_pct?.toFixed(2) ?? '—'}%）`
+            + `、较前次卖出折价7%（${rPrice !== null && rPrice !== undefined ? rPrice.toFixed(3) : '—'} 元）、近3日超卖极值、右侧收阳且收盘位于5日线容差之内`
+            + '、距上次执行≥3个交易日且实时仓位<30%',
           );
         }
       } else if (hasOpenExcess) {

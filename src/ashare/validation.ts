@@ -150,7 +150,9 @@ export interface FreezeProtocol { start: string; frozen_at: string; rule_hash: s
 export function openValidationDb(path: string, source: string) {
   assertSeparateFromLive(path, source);
   const db = new DatabaseSync(path);
-  db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS validation_freeze(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,protocol TEXT NOT NULL);
+  // busy_timeout first: switching to WAL needs a lock, and without the wait it fails at once
+  // when another process (e.g. the daily research run) holds the database.
+  db.exec(`PRAGMA busy_timeout=15000; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS validation_freeze(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,protocol TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS validation_observation(id TEXT PRIMARY KEY,freeze_id TEXT NOT NULL,date TEXT NOT NULL,created_at TEXT NOT NULL,type TEXT NOT NULL,content TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS validation_result(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,content TEXT NOT NULL);
     CREATE TRIGGER IF NOT EXISTS freeze_no_update BEFORE UPDATE ON validation_freeze BEGIN SELECT RAISE(ABORT,'immutable freeze'); END;
