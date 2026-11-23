@@ -14,23 +14,20 @@ delete process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES;
 delete process.env.ASHARE_V3_ADMISSION_DB;
 
 const { openPortfolioDb } = await import('../build/portfolio/db.js');
+const { importSnapshot } = await import('../build/portfolio/account.js');
+const { initBaseline, recordEvent } = await import('../build/portfolio/ledger.js');
 const {
   evaluateStrategyRouter,
   persistRiskAnchor,
   readRiskAnchor,
-  readNetExternalCashFlowCents,
 } = await import('../build/portfolio/strategyRouter.js');
 
-const DAY = {
-  anchor: '20260105',
-  d2: '20260106',
-  d3: '20260107',
-  d4: '20260108',
-};
+const DAY = { d0: '20260105', d1: '20260106', d2: '20260107', d3: '20260108' };
+const ACCOUNT = 'real-main';
 
 const regime = {
   schema: 'ashare-market-regime/1.0',
-  as_of_trade_date: DAY.d2,
+  as_of_trade_date: DAY.d0,
   available: true,
   regime: 'OFFENSIVE',
   raw_regime: 'OFFENSIVE',
@@ -50,211 +47,265 @@ const regime = {
   notes: [],
 };
 
-let dbSeq = 0;
-function freshDb() {
-  dbSeq += 1;
-  const name = `hwm-${dbSeq}-portfolio.sqlite`;
-  return openPortfolioDb(join(dir, name), { marketPath: join(dir, `hwm-${dbSeq}-market.sqlite`) });
+let seq = 0;
+/**
+ * 建一个带基线快照与最小行情表的账户。
+ * 行情只需 `daily(ts_code, trade_date, close)`：buildLedgerPriceTable 会读取它。
+ * 不给市价变动时，NAV 变化只来自现金流 —— 正是单位净值法的判定场景。
+ */
+function setupAccount({ name, startDay, positions, cashCents, prices }) {
+  seq += 1;
+  const marketPath = join(dir, `${name}-${seq}-market.sqlite`);
+  const marketDb = new DatabaseSync(marketPath);
+  marketDb.exec('CREATE TABLE daily (ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, close REAL NOT NULL)');
+  const insert = marketDb.prepare('INSERT INTO daily (ts_code, trade_date, close) VALUES (?,?,?)');
+  for (const [code, series] of Object.entries(prices ?? {})) {
+    for (const [day, close] of Object.entries(series)) insert.run(code, day, close);
+  }
+  const portfolioDb = openPortfolioDb(join(dir, `${name}-${seq}-portfolio.sqlite`), { marketPath });
+  const snapshotId = `snap-${name}-${seq}`;
+  const securities = positions.reduce((sum, p) => sum + p.market_value_cents, 0);
+  importSnapshot(portfolioDb, {
+    snapshot_id: snapshotId,
+    as_of: startDay,
+    source: 'test',
+    note: name,
+    warnings: [],
+    is_current: false,
+    positions,
+    totals: {
+      total_assets_cents: securities + cashCents,
+      securities_mv_cents: securities,
+      cash_cents: cashCents,
+      wealth_cents: 0,
+      unrealized_pnl_cents: 0,
+    },
+  });
+  initBaseline(portfolioDb, ACCOUNT, { asOf: startDay, snapshotId });
+  portfolioDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)')
+    .run(`initial_principal_cents:${ACCOUNT}`, String(securities + cashCents));
+  return { portfolioDb, marketDb };
 }
 
-function setPrincipal(db, accountId, cents) {
-  db.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)')
-    .run(`initial_principal_cents:${accountId}`, String(cents));
-}
-
-function setAnchor(db, accountId, cents, date) {
-  db.prepare(`
-    INSERT OR REPLACE INTO account_risk_anchor
-      (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, circuit_breaker_status, locked_until_trade_date, updated_at)
-    VALUES (?,?,?,?, 'NORMAL', NULL, ?)
-  `).run(accountId, 10_000_000, cents, date, date);
-}
-
-function addCashFlow(db, { id, accountId = 'real-main', type = 'CASH_WITHDRAW', day, cents }) {
-  db.prepare(`
-    INSERT INTO account_event
-      (event_id, account_id, event_type, occurred_on, cash_delta_cents, source, note, recorded_at)
-    VALUES (?,?,?,?,?, 'synthetic', '', '2026-01-01T00:00:00.000Z')
-  `).run(id, accountId, type, day, cents);
-}
-
-function evaluate(db, { asOf, nav, accountId = 'real-main', deconcentrationActive = false }) {
+function evaluate(portfolioDb, marketDb, { asOf, nav, deconcentrationActive = false }) {
   return evaluateStrategyRouter({
-    portfolioDb: db,
-    marketDb: null,
-    accountId,
+    portfolioDb,
+    marketDb,
+    accountId: ACCOUNT,
     asOf,
     currentNavCents: nav,
-    fallbackBaselineNavCents: 10_000_000,
+    fallbackBaselineNavCents: nav,
     marketRegime: regime,
     deconcentrationActive,
   });
 }
 
-test('P1-2: 出金不触发 L2 熔断，且回撤按流水调整后的高水位计算', () => {
-  const db = freshDb();
+function recordCash(portfolioDb, { id, type, day, cents }) {
+  const result = recordEvent(portfolioDb, {
+    event_id: id,
+    account_id: ACCOUNT,
+    event_type: type,
+    occurred_on: day,
+    cash_delta_cents: cents,
+    source: 'broker_statement',
+  });
+  assert.equal(result.status, 'RECORDED');
+}
+
+function position(code, quantity, priceMilli, name = '测试标的') {
+  return {
+    ts_code: code,
+    name,
+    quantity,
+    ref_price_milli: priceMilli,
+    ref_cost_milli: priceMilli,
+    market_value_cents: Math.round(quantity * priceMilli / 10),
+  };
+}
+
+test('P1-2 单位净值法：入金 90 把 NAV 90 抬到 180，回撤仍为 10%（不是加法的 5.26%）', () => {
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'deposit',
+    startDay: DAY.d0,
+    positions: [position('600519.SH', 100, 10_000)],
+    cashCents: 0,
+    prices: { '600519.SH': { [DAY.d0]: 10.0, [DAY.d1]: 9.0 } },
+  });
   try {
-    setPrincipal(db, 'real-main', 10_000_000);
-    setAnchor(db, 'real-main', 10_000_000, DAY.anchor);
-    addCashFlow(db, { id: 'out-1', day: DAY.d2, cents: -2_000_000 });
+    const atAnchor = evaluate(portfolioDb, marketDb, { asOf: DAY.d0, nav: 100_000 });
+    assert.equal(persistRiskAnchor(portfolioDb, atAnchor), true);
+    recordCash(portfolioDb, { id: 'dep-90k', type: 'CASH_DEPOSIT', day: DAY.d1, cents: 90_000 });
 
-    assert.equal(readNetExternalCashFlowCents(db, 'real-main', DAY.anchor, DAY.d2), -2_000_000);
-
-    const out = evaluate(db, { asOf: DAY.d2, nav: 8_000_000 });
-    assert.equal(out.anchor_snapshot.hwm_cash_flow_adjustment_cents, -2_000_000);
-    assert.equal(out.anchor_snapshot.hwm_nav_cents, 8_000_000);
-    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0);
-    assert.equal(out.circuit_breaker_status, 'NORMAL', '单纯出金不得被当成净值回撤');
-    assert.equal(out.should_advance_hwm, false);
-
-    // 持久锚点不得被现金流调整值改写（否则下一轮会重复扣减同一笔流水）。
-    assert.equal(persistRiskAnchor(db, out), true);
-    const anchor = readRiskAnchor(db, 'real-main');
-    assert.equal(anchor.hwm_nav_cents, 10_000_000);
-    assert.equal(anchor.hwm_date, DAY.anchor);
-
-    // 同日重跑：仍为 0 回撤（不重复扣减）。
-    const rerun = evaluate(db, { asOf: DAY.d2, nav: 8_000_000 });
-    assert.equal(rerun.anchor_snapshot.hwm_nav_cents, 8_000_000);
-    assert.equal(rerun.anchor_snapshot.hwm_drawdown_bps, 0);
-    assert.equal(rerun.circuit_breaker_status, 'NORMAL');
-  } finally {
-    db.close();
-  }
-});
-
-test('P1-2: 入金抬高比较基准，市值被亏损抵消后仍按真实回撤进入 L1', () => {
-  const db = freshDb();
-  try {
-    setPrincipal(db, 'real-main', 10_000_000);
-    setAnchor(db, 'real-main', 10_000_000, DAY.anchor);
-    // 入金 +15,000 元，同期市值亏损 15,000 元：总资产仍为 10 万元。
-    addCashFlow(db, { id: 'in-1', type: 'CASH_DEPOSIT', day: DAY.d2, cents: 1_500_000 });
-
-    const out = evaluate(db, { asOf: DAY.d2, nav: 10_000_000 });
-    assert.equal(out.anchor_snapshot.hwm_cash_flow_adjustment_cents, 1_500_000);
-    assert.equal(out.anchor_snapshot.hwm_nav_cents, 11_500_000);
-    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1304, '回撤应相对入金调整后的 11.5 万元计算');
-    assert.equal(out.anchor_snapshot.lifeline_nav_cents, Math.round(11_500_000 * 0.85));
+    const out = evaluate(portfolioDb, marketDb, { asOf: DAY.d1, nav: 180_000 });
+    assert.equal(out.anchor_snapshot.hwm_nav_basis, 'UNIT_NAV');
+    assert.ok(Math.abs(out.anchor_snapshot.hwm_unit_nav_ratio - 0.9) < 1e-6);
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 200_000, '单位净值口径的等效高水位 = 180000 / 0.9');
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1000, '入金不得摊薄真实 10% 回撤');
+    assert.equal(out.anchor_snapshot.lifeline_nav_cents, 170_000);
     assert.equal(out.circuit_breaker_status, 'L1_WARN');
     assert.equal(out.should_advance_hwm, false);
+
+    // 未创新高：持久锚点保持原值，下一轮重新按单位净值重算，不会叠加。
+    assert.equal(persistRiskAnchor(portfolioDb, out), true);
+    const anchor = readRiskAnchor(portfolioDb, ACCOUNT);
+    assert.equal(anchor.hwm_nav_cents, 100_000);
+    assert.equal(anchor.hwm_date, DAY.d0);
   } finally {
-    db.close();
+    marketDb.close();
+    portfolioDb.close();
   }
 });
 
-test('P1-2: 连续多日运行不重复计算同一笔入金', () => {
-  const db = freshDb();
+test('P1-2 单位净值法：出金 45 把 NAV 90 降到 45，回撤仍为 10% 且不误触 L2', () => {
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'withdraw',
+    startDay: DAY.d0,
+    positions: [position('600519.SH', 1000, 1000)],
+    cashCents: 0,
+    prices: { '600519.SH': { [DAY.d0]: 1.0, [DAY.d1]: 0.9 } },
+  });
   try {
-    setPrincipal(db, 'real-main', 10_000_000);
-    setAnchor(db, 'real-main', 10_000_000, DAY.anchor);
-    addCashFlow(db, { id: 'in-daily', type: 'CASH_DEPOSIT', day: DAY.d2, cents: 1_200_000 });
+    const atAnchor = evaluate(portfolioDb, marketDb, { asOf: DAY.d0, nav: 100_000 });
+    assert.equal(persistRiskAnchor(portfolioDb, atAnchor), true);
+    recordCash(portfolioDb, { id: 'wd-45k', type: 'CASH_WITHDRAW', day: DAY.d1, cents: -45_000 });
 
-    for (const asOf of [DAY.d2, DAY.d3, DAY.d4]) {
-      const out = evaluate(db, { asOf, nav: 11_200_000 });
-      assert.equal(out.anchor_snapshot.hwm_cash_flow_adjustment_cents, 1_200_000, `${asOf} 只能计一次流水`);
-      assert.equal(out.anchor_snapshot.hwm_nav_cents, 11_200_000);
-      assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0);
-      assert.equal(out.circuit_breaker_status, 'NORMAL', `${asOf} 不得因重复扣减流水而误触熔断`);
-      persistRiskAnchor(db, out);
-      const anchor = readRiskAnchor(db, 'real-main');
-      assert.equal(anchor.hwm_nav_cents, 10_000_000, '未创新高时不得改写持久高水位');
-      assert.equal(anchor.hwm_date, DAY.anchor);
+    const out = evaluate(portfolioDb, marketDb, { asOf: DAY.d1, nav: 45_000 });
+    assert.equal(out.anchor_snapshot.hwm_nav_basis, 'UNIT_NAV');
+    assert.ok(Math.abs(out.anchor_snapshot.hwm_unit_nav_ratio - 0.9) < 1e-6);
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 50_000, '单位净值口径的等效高水位 = 45000 / 0.9');
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1000);
+    assert.equal(out.circuit_breaker_status, 'L1_WARN');
+    assert.notEqual(out.circuit_breaker_status, 'L2_LOCKED', '出金不得被误判为 18.2% 回撤触发 L2');
+  } finally {
+    marketDb.close();
+    portfolioDb.close();
+  }
+});
+
+test('P1-2 单位净值法：真实单位净值新高必须落库，即使名义 NAV 低于旧高水位（70 -> 63）', () => {
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'unit-high',
+    startDay: DAY.d0,
+    positions: [position('600519.SH', 1000, 700)],
+    cashCents: 0,
+    prices: {
+      '600519.SH': { [DAY.d0]: 0.70, [DAY.d1]: 0.77, [DAY.d2]: 0.77 },
+    },
+  });
+  try {
+    const atAnchor = evaluate(portfolioDb, marketDb, { asOf: DAY.d0, nav: 70_000 });
+    assert.equal(persistRiskAnchor(portfolioDb, atAnchor), true);
+    // 市值 +10% 后出金 14,000：名义净值 63,000 < 旧高水位 70,000，但单位净值 1.1 是真实新高。
+    recordCash(portfolioDb, { id: 'wd-14k', type: 'CASH_WITHDRAW', day: DAY.d2, cents: -14_000 });
+
+    const out = evaluate(portfolioDb, marketDb, { asOf: DAY.d2, nav: 63_000 });
+    assert.equal(out.anchor_snapshot.hwm_nav_basis, 'UNIT_NAV');
+    assert.ok(Math.abs(out.anchor_snapshot.hwm_unit_nav_ratio - 1.1) < 1e-6);
+    assert.equal(out.should_advance_hwm, true);
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 63_000);
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0);
+
+    assert.equal(persistRiskAnchor(portfolioDb, out), true);
+    const anchor = readRiskAnchor(portfolioDb, ACCOUNT);
+    assert.equal(anchor.hwm_nav_cents, 63_000, '单位净值新高必须写库，不能被名义净值下降挡住');
+    assert.equal(anchor.hwm_date, DAY.d2);
+  } finally {
+    marketDb.close();
+    portfolioDb.close();
+  }
+});
+
+test('P1-2 单位净值法：连续多日运行不重复计算同一笔流水', () => {
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'repeat',
+    startDay: DAY.d0,
+    positions: [position('600519.SH', 100, 10_000)],
+    cashCents: 0,
+    prices: { '600519.SH': { [DAY.d0]: 10.0, [DAY.d1]: 9.0, [DAY.d2]: 9.0, [DAY.d3]: 9.0 } },
+  });
+  try {
+    assert.equal(persistRiskAnchor(portfolioDb, evaluate(portfolioDb, marketDb, { asOf: DAY.d0, nav: 100_000 })), true);
+    recordCash(portfolioDb, { id: 'dep-repeat', type: 'CASH_DEPOSIT', day: DAY.d1, cents: 90_000 });
+
+    for (const asOf of [DAY.d1, DAY.d2, DAY.d3]) {
+      const out = evaluate(portfolioDb, marketDb, { asOf, nav: 180_000 });
+      assert.equal(out.anchor_snapshot.hwm_nav_basis, 'UNIT_NAV');
+      assert.ok(Math.abs(out.anchor_snapshot.hwm_unit_nav_ratio - 0.9) < 1e-6, `${asOf} 单位净值比应恒为 0.9`);
+      assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1000, `${asOf} 不得因重复折算把回撤放大`);
+      assert.equal(out.circuit_breaker_status, 'L1_WARN');
+      persistRiskAnchor(portfolioDb, out);
+      const anchor = readRiskAnchor(portfolioDb, ACCOUNT);
+      assert.equal(anchor.hwm_nav_cents, 100_000);
+      assert.equal(anchor.hwm_date, DAY.d0);
     }
   } finally {
-    db.close();
+    marketDb.close();
+    portfolioDb.close();
   }
 });
 
-test('P1-2: 流水之后创出真新高才推进锚点，后续回撤从新锚点起算', () => {
-  const db = freshDb();
+test('P1-2 生命线按当前生效的 L2 触发档位计算（前置 12% / 常态 15%）', () => {
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'lifeline',
+    startDay: DAY.d0,
+    positions: [position('600519.SH', 100, 10_000)],
+    cashCents: 0,
+    prices: { '600519.SH': { [DAY.d0]: 10.0, [DAY.d1]: 9.0 } },
+  });
   try {
-    setPrincipal(db, 'real-main', 10_000_000);
-    setAnchor(db, 'real-main', 10_000_000, DAY.anchor);
-    addCashFlow(db, { id: 'in-new-high', type: 'CASH_DEPOSIT', day: DAY.d2, cents: 1_000_000 });
+    assert.equal(persistRiskAnchor(portfolioDb, evaluate(portfolioDb, marketDb, { asOf: DAY.d0, nav: 100_000 })), true);
+    recordCash(portfolioDb, { id: 'dep-life', type: 'CASH_DEPOSIT', day: DAY.d1, cents: 90_000 });
 
-    const newHigh = evaluate(db, { asOf: DAY.d2, nav: 12_000_000 });
-    assert.equal(newHigh.anchor_snapshot.hwm_cash_flow_adjustment_cents, 1_000_000);
-    assert.equal(newHigh.anchor_snapshot.hwm_nav_cents, 12_000_000);
-    assert.equal(newHigh.anchor_snapshot.hwm_drawdown_bps, 0);
-    assert.equal(newHigh.should_advance_hwm, true);
-    assert.equal(persistRiskAnchor(db, newHigh), true);
-    const anchor = readRiskAnchor(db, 'real-main');
-    assert.equal(anchor.hwm_nav_cents, 12_000_000);
-    assert.equal(anchor.hwm_date, DAY.d2);
-
-    const next = evaluate(db, { asOf: DAY.d3, nav: 11_400_000 });
-    assert.equal(next.anchor_snapshot.hwm_cash_flow_adjustment_cents, 0, '新锚点日之后的流水区间为空');
-    assert.equal(next.anchor_snapshot.hwm_nav_cents, 12_000_000);
-    assert.equal(next.anchor_snapshot.hwm_drawdown_bps, 500);
-  } finally {
-    db.close();
-  }
-});
-
-test('P1-2: 已撤销的出入金流水不计入高水位调整', () => {
-  const db = freshDb();
-  try {
-    setPrincipal(db, 'real-main', 10_000_000);
-    setAnchor(db, 'real-main', 10_000_000, DAY.anchor);
-    addCashFlow(db, { id: 'out-reversed', day: DAY.d2, cents: -2_000_000 });
-    db.prepare("UPDATE account_event SET reversed_by = 'reverse-1' WHERE event_id = 'out-reversed'").run();
-
-    assert.equal(readNetExternalCashFlowCents(db, 'real-main', DAY.anchor, DAY.d2), 0);
-    const out = evaluate(db, { asOf: DAY.d2, nav: 8_000_000 });
-    assert.equal(out.anchor_snapshot.hwm_cash_flow_adjustment_cents, 0);
-    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 2000);
-  } finally {
-    db.close();
-  }
-});
-
-test('P1-2: 生命线按当前生效的 L2 触发档位计算（前置 12% / 常态 15%）', () => {
-  const db = freshDb();
-  try {
-    setPrincipal(db, 'real-main', 10_000_000);
-    setAnchor(db, 'real-main', 10_000_000, DAY.anchor);
-
-    const normal = evaluate(db, { asOf: DAY.d2, nav: 10_000_000, deconcentrationActive: false });
+    const normal = evaluate(portfolioDb, marketDb, { asOf: DAY.d1, nav: 180_000, deconcentrationActive: false });
     assert.equal(normal.l2_trigger_drawdown_bps, 1500);
-    assert.equal(normal.anchor_snapshot.lifeline_nav_cents, 8_500_000);
-    assert.match(normal.circuit_breaker_label_zh, /15% 熔断生命线/);
+    assert.equal(normal.anchor_snapshot.lifeline_nav_cents, Math.round(200_000 * 0.85));
 
-    const preemptive = evaluate(db, { asOf: DAY.d2, nav: 10_000_000, deconcentrationActive: true });
+    const preemptive = evaluate(portfolioDb, marketDb, { asOf: DAY.d1, nav: 180_000, deconcentrationActive: true });
     assert.equal(preemptive.l2_trigger_drawdown_bps, 1200);
-    assert.equal(preemptive.anchor_snapshot.lifeline_nav_cents, 8_800_000);
-    assert.match(preemptive.circuit_breaker_label_zh, /12%/);
+    assert.equal(preemptive.anchor_snapshot.lifeline_nav_cents, Math.round(200_000 * 0.88));
   } finally {
-    db.close();
+    marketDb.close();
+    portfolioDb.close();
   }
 });
 
-test('P1-2: 账本/锚点表缺失时容忍为 0 且不抛错', () => {
-  const empty = new DatabaseSync(':memory:');
+test('P1-2 无账本基线时退化为名义净值比较（不适用加法折入）', () => {
+  seq += 1;
+  const portfolioDb = openPortfolioDb(join(dir, `no-baseline-${seq}-portfolio.sqlite`), {
+    marketPath: join(dir, `no-baseline-${seq}-market.sqlite`),
+  });
   try {
-    assert.equal(readNetExternalCashFlowCents(empty, 'real-main', DAY.anchor, DAY.d2), 0);
+    portfolioDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${ACCOUNT}`, '100000');
+    portfolioDb.prepare(`
+      INSERT INTO account_risk_anchor
+        (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, circuit_breaker_status, locked_until_trade_date, updated_at)
+      VALUES (?,?,?,?, 'NORMAL', NULL, ?)
+    `).run(ACCOUNT, 100_000, 100_000, DAY.d0, DAY.d0);
+
     const out = evaluateStrategyRouter({
-      portfolioDb: empty,
+      portfolioDb,
       marketDb: null,
-      accountId: 'real-main',
-      asOf: DAY.d2,
-      currentNavCents: 10_000_000,
-      fallbackBaselineNavCents: 10_000_000,
+      accountId: ACCOUNT,
+      asOf: DAY.d1,
+      currentNavCents: 90_000,
       marketRegime: regime,
     });
-    assert.equal(out.circuit_breaker_status, 'NORMAL');
-    assert.equal(out.anchor_snapshot.hwm_cash_flow_adjustment_cents, 0);
+    assert.equal(out.anchor_snapshot.hwm_nav_basis, 'RAW_NAV');
+    assert.equal(out.anchor_snapshot.hwm_unit_nav_ratio, null);
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 100_000);
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1000);
 
-    const nullDb = evaluateStrategyRouter({
+    const noDb = evaluateStrategyRouter({
       portfolioDb: null,
       marketDb: null,
-      accountId: 'real-main',
-      asOf: DAY.d2,
-      currentNavCents: 10_000_000,
+      accountId: ACCOUNT,
+      asOf: DAY.d1,
+      currentNavCents: 90_000,
       marketRegime: regime,
     });
-    assert.equal(nullDb.circuit_breaker_status, 'NORMAL');
+    assert.equal(noDb.circuit_breaker_status, 'NORMAL');
+    assert.equal(noDb.anchor_snapshot.hwm_nav_basis, 'RAW_NAV');
   } finally {
-    empty.close();
+    portfolioDb.close();
   }
 });

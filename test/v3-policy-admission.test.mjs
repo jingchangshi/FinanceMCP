@@ -93,10 +93,13 @@ function suspendRelease(store, release = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0) {
   }, { reason: 'test suspend' });
 }
 
-test('P1-3: 覆盖文件缺失/非法 JSON 一律抛错，不静默回退', () => {
+test('P1-3: 覆盖路径缺失回退内嵌签名版本（不阻断日报）；非法 JSON 仍抛错', () => {
   process.env.ASHARE_V3_POLICY_RELEASE_PATH = join(dir, 'does-not-exist.json');
   try {
-    assert.throws(() => loadApprovedV3Policy(), /v3_policy_override_unreadable/);
+    const fallback = loadApprovedV3Policy();
+    assert.equal(fallback.content_hash, V3_POLICY_EXPECTED_HASH, '未部署覆盖文件时使用内嵌 v3.2.0');
+    assert.equal(fallback.version, 'v3.2.0');
+
     const bad = join(dir, 'invalid.json');
     writeFileSync(bad, '{ this is not json');
     process.env.ASHARE_V3_POLICY_RELEASE_PATH = bad;

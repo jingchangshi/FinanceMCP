@@ -5,6 +5,8 @@ import {
   type MarketRegimeTier,
 } from '../ashare/marketRegime.js';
 import { portfolioTableExists } from './db.js';
+import { buildNavSeries, readBaseline } from './ledger.js';
+import { buildLedgerPriceTable } from './riskPolicy.js';
 import { loadApprovedV3Policy } from './v3Policy.js';
 
 export type CircuitBreakerStatus = 'NORMAL' | 'L1_WARN' | 'L2_LOCKED';
@@ -43,8 +45,10 @@ export interface StrategyRouterResult {
     recovery_needed_pct: number;
     hwm_nav_cents: number;
     hwm_date: string;
-    /** 持久锚点之后 `(hwm_date, asOf]` 区间内的外部净现金流（分）：正 = 净入金，负 = 净出金。 */
-    hwm_cash_flow_adjustment_cents: number;
+    /** hwm_date → asOf 的单位净值比（1 = 无真实盈亏；<1 = 回撤）。单位净值不可用时为 null。 */
+    hwm_unit_nav_ratio: number | null;
+    /** UNIT_NAV = 已按单位净值折算出入金；RAW_NAV = 缺少账本/估值，退化为名义净值比较。 */
+    hwm_nav_basis: 'UNIT_NAV' | 'RAW_NAV';
     hwm_drawdown_bps: number;
     hwm_drawdown_pct: number;
     lifeline_nav_cents: number;
@@ -128,36 +132,117 @@ export function readRiskAnchor(
   return row ?? null;
 }
 
+interface UnitSharePair {
+  /** hwm_date 当日单位份额数（buildNavSeries 的 units 口径）。 */
+  from_units: number;
+  /** asOf 当日单位份额数。 */
+  to_units: number;
+}
+
 /**
- * 读取 `(fromExclusiveYmd, toInclusiveYmd]` 区间内已入账的外部净现金流（分）。
+ * 计算 `hwmDate → asOf` 的单位份额对（复用 `buildNavSeries` 的日终现金流单位化口径）。
  *
- * 口径：只统计未撤销的 `CASH_DEPOSIT` / `CASH_WITHDRAW`（`cash_delta_cents` 出金为负）。
- * 成交、分红与费用属于账户内部变动，不是外部出入金，不计入高水位调整。
- * 账本表缺失（只读库/未迁移库）或查询失败时返回 0：高水位退化为原始口径，绝不阻断日报。
+ * 出入金按流水日扣流前估值折算份额：入金增加份额、出金减少份额，单位净值本身不因流水改变。
+ * 回撤 = 1 − (当前净值 / 持久高水位) × (hwm_date 份额 / asOf 份额)，
+ * 因此入金不会摊薄回撤，出金不会放大回撤；持久高水位仍是名义净值的唯一锚。
+ * 缺少基线、流水日/目标日无法单位化时返回 null，调用方退化为名义净值比较（不做加法折入）。
  */
-export function readNetExternalCashFlowCents(
+function readUnitSharePair(
   portfolioDb: DatabaseSync | null | undefined,
+  marketDb: DatabaseSync | null | undefined,
   accountId: string,
-  fromExclusiveYmd: string,
-  toInclusiveYmd: string,
-): number {
-  if (!portfolioDb || fromExclusiveYmd >= toInclusiveYmd) return 0;
-  if (!portfolioTableExists(portfolioDb, 'account_event')) return 0;
+  fromDate: string,
+  toDate: string,
+): UnitSharePair | null {
+  if (!portfolioDb || fromDate >= toDate) return null;
   try {
-    const row = portfolioDb.prepare(`
-      SELECT COALESCE(SUM(cash_delta_cents), 0) AS net
-      FROM account_event
-      WHERE account_id = ?
-        AND event_type IN ('CASH_DEPOSIT', 'CASH_WITHDRAW')
-        AND reversed_by IS NULL
-        AND occurred_on > ?
-        AND occurred_on <= ?
-    `).get(accountId, fromExclusiveYmd, toInclusiveYmd) as { net?: number } | undefined;
-    const net = Number(row?.net ?? 0);
-    return Number.isSafeInteger(net) ? net : 0;
+    const baseline = readBaseline(portfolioDb, accountId);
+    if (!baseline || baseline.as_of > fromDate) return null;
+    const prices = buildLedgerPriceTable(portfolioDb, marketDb ?? null, accountId, baseline.as_of, toDate);
+    const series = buildNavSeries(portfolioDb, accountId, { from: fromDate, to: toDate, prices });
+    const fromPoint = series.points.find(point => point.date === fromDate);
+    const toPoint = series.points.find(point => point.date === toDate);
+    // nav_per_unit 为 null 表示当日无法可靠单位化（unitisation_skipped），此时份额不可信。
+    if (fromPoint?.nav_per_unit === null || fromPoint?.nav_per_unit === undefined) return null;
+    if (toPoint?.nav_per_unit === null || toPoint?.nav_per_unit === undefined) return null;
+    if (!(fromPoint.units > 0) || !(toPoint.units > 0)) return null;
+    return { from_units: fromPoint.units, to_units: toPoint.units };
   } catch {
-    return 0;
+    return null;
   }
+}
+
+interface HwmEvaluation {
+  effectiveHwmCents: number;
+  effectiveHwmDate: string;
+  unitNavRatio: number | null;
+  basis: 'UNIT_NAV' | 'RAW_NAV';
+  shouldAdvanceHwm: boolean;
+  shouldPersistAnchor: boolean;
+}
+
+/**
+ * 高水位判定：有账本基线与估值时按“单位份额折算后的净值比”比较（出入金不改变净值），
+ * 否则退化为名义净值比较。单位净值创新高时把锚点推进到当日名义净值——
+ * 即使该名义值低于旧高水位（出金后 70 -> 63 的场景）。
+ */
+function evaluateHwm(
+  input: EvaluateStrategyRouterInput,
+  existing: PersistedRiskAnchor | null,
+): HwmEvaluation {
+  if (!existing) {
+    return {
+      effectiveHwmCents: Math.max(input.fallbackBaselineNavCents ?? input.currentNavCents, input.currentNavCents),
+      effectiveHwmDate: input.asOf,
+      unitNavRatio: null,
+      basis: 'RAW_NAV',
+      shouldAdvanceHwm: true,
+      shouldPersistAnchor: true,
+    };
+  }
+
+  const shares = readUnitSharePair(input.portfolioDb, input.marketDb, input.accountId, existing.hwm_date, input.asOf);
+  if (shares && existing.hwm_nav_cents > 0) {
+    const ratio = (input.currentNavCents / existing.hwm_nav_cents) * (shares.from_units / shares.to_units);
+    // 单位份额按 1e-6 精度取整；用极小容差避免无流水日因舍入抖动推进锚点。
+    if (input.asOf >= existing.hwm_date && ratio > 1 + 1e-6) {
+      return {
+        effectiveHwmCents: input.currentNavCents,
+        effectiveHwmDate: input.asOf,
+        unitNavRatio: ratio,
+        basis: 'UNIT_NAV',
+        shouldAdvanceHwm: true,
+        shouldPersistAnchor: true,
+      };
+    }
+    return {
+      effectiveHwmCents: Math.round(input.currentNavCents / ratio),
+      effectiveHwmDate: existing.hwm_date,
+      unitNavRatio: ratio,
+      basis: 'UNIT_NAV',
+      shouldAdvanceHwm: false,
+      shouldPersistAnchor: input.asOf >= existing.hwm_date,
+    };
+  }
+
+  if (input.asOf >= existing.hwm_date && input.currentNavCents > existing.hwm_nav_cents) {
+    return {
+      effectiveHwmCents: input.currentNavCents,
+      effectiveHwmDate: input.asOf,
+      unitNavRatio: null,
+      basis: 'RAW_NAV',
+      shouldAdvanceHwm: true,
+      shouldPersistAnchor: true,
+    };
+  }
+  return {
+    effectiveHwmCents: existing.hwm_nav_cents,
+    effectiveHwmDate: existing.hwm_date,
+    unitNavRatio: null,
+    basis: 'RAW_NAV',
+    shouldAdvanceHwm: false,
+    shouldPersistAnchor: input.asOf >= existing.hwm_date,
+  };
 }
 
 function targetBucketsFor(regime: MarketRegimeTier): StrategyRouterResult['targets'] {
@@ -178,41 +263,13 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     ?? input.fallbackBaselineNavCents
     ?? input.currentNavCents;
 
-  let effectiveHwmCents = input.currentNavCents;
-  let effectiveHwmDate = input.asOf;
-  let hwmCashFlowAdjustmentCents = 0;
-  let shouldAdvanceHwm = false;
-  let shouldPersistAnchor = false;
-
-  if (existing) {
-    // 外部现金流只调整“比较基准”，不直接改写持久锚点：
-    // 每轮都用持久锚点 + (hwm_date, asOf] 区间净流水重算，因此同一笔流水只折入一次。
-    hwmCashFlowAdjustmentCents = readNetExternalCashFlowCents(
-      input.portfolioDb,
-      input.accountId,
-      existing.hwm_date,
-      input.asOf,
-    );
-    const flowAdjustedHwmCents = existing.hwm_nav_cents + hwmCashFlowAdjustmentCents;
-    if (input.asOf >= existing.hwm_date && input.currentNavCents > flowAdjustedHwmCents) {
-      // 真新高：把期间外部流水一次性折入新锚点（hwm = 当前净值，hwm_date = asOf）。
-      // 下一次运行的区间从 asOf 之后开始，不会再次计入同一笔流水。
-      effectiveHwmCents = input.currentNavCents;
-      effectiveHwmDate = input.asOf;
-      shouldAdvanceHwm = true;
-      shouldPersistAnchor = true;
-    } else {
-      // 未创新高：只在内存里用调整后的高水位算回撤，不写回数据库。
-      effectiveHwmCents = flowAdjustedHwmCents;
-      effectiveHwmDate = existing.hwm_date;
-      shouldPersistAnchor = input.asOf >= existing.hwm_date;
-    }
-  } else {
-    effectiveHwmCents = Math.max(input.fallbackBaselineNavCents ?? input.currentNavCents, input.currentNavCents);
-    effectiveHwmDate = input.asOf;
-    shouldAdvanceHwm = true;
-    shouldPersistAnchor = true;
-  }
+  const hwm = evaluateHwm(input, existing);
+  const effectiveHwmCents = hwm.effectiveHwmCents;
+  const effectiveHwmDate = hwm.effectiveHwmDate;
+  const unitNavRatio = hwm.unitNavRatio;
+  const navBasis = hwm.basis;
+  const shouldAdvanceHwm = hwm.shouldAdvanceHwm;
+  let shouldPersistAnchor = hwm.shouldPersistAnchor;
 
   const v3Policy = loadApprovedV3Policy();
   const deconcActive = Boolean(input.deconcentrationActive);
@@ -323,7 +380,8 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
       recovery_needed_pct: recoveryNeededPct,
       hwm_nav_cents: effectiveHwmCents,
       hwm_date: effectiveHwmDate,
-      hwm_cash_flow_adjustment_cents: hwmCashFlowAdjustmentCents,
+      hwm_unit_nav_ratio: unitNavRatio,
+      hwm_nav_basis: navBasis,
       hwm_drawdown_bps: hwmDrawdownBps,
       hwm_drawdown_pct: hwmDrawdownPct,
       lifeline_nav_cents: lifelineNavCents,
@@ -355,8 +413,8 @@ export function persistRiskAnchor(
   if (!portfolioDb || !router.should_persist_anchor) return false;
   if (!portfolioTableExists(portfolioDb, 'account_risk_anchor')) return false;
   try {
-    // 只有真新高（should_advance_hwm）才允许改写高水位锚点。现金流调整后的高水位只在内存中
-    // 用于回撤计算；若把它写回旧 hwm_date，下一轮会把同一笔流水再叠加一次。
+    // 只有真新高（should_advance_hwm）才允许改写高水位锚点。单位净值新高时名义净值可能
+    // 低于旧锚点（出金后 70 -> 63），因此这里不能用名义大小做写入条件。
     const advance = router.should_advance_hwm ? 1 : 0;
     portfolioDb.prepare(`
       INSERT INTO account_risk_anchor (
@@ -366,12 +424,12 @@ export function persistRiskAnchor(
       ON CONFLICT(account_id) DO UPDATE SET
         initial_principal_cents = excluded.initial_principal_cents,
         hwm_nav_cents = CASE
-          WHEN ? = 1 AND excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
           THEN excluded.hwm_nav_cents
           ELSE account_risk_anchor.hwm_nav_cents
         END,
         hwm_date = CASE
-          WHEN ? = 1 AND excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
           THEN excluded.hwm_date
           ELSE account_risk_anchor.hwm_date
         END,

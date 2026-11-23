@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { StrategyAdmissionStore, type AdmissionAction } from '../ashare/strategyAdmission.js';
 import { validateStrategyRelease, type StrategyRelease } from '../ashare/strategyRelease.js';
 
@@ -384,8 +384,9 @@ function loadRuntimeAdmission(
 /**
  * Load and verify the approved V3 offensive policy release (v3.2.0).
  *
- * `ASHARE_V3_POLICY_RELEASE_PATH` 是可选的运行时覆盖：一旦设置，文件缺失、不可读、
- * JSON 非法、哈希不在白名单或策略/市场/环境不匹配都会抛错（fail closed），绝不静默回退。
+ * `ASHARE_V3_POLICY_RELEASE_PATH` 是可选的运行时覆盖。路径不存在时按“未部署覆盖文件”
+ * 处理并回退内嵌签名版本（不让部署缺失阻断日报）；文件存在但不可读、JSON 非法、
+ * 哈希不在白名单或策略/市场/环境不匹配都会抛错，绝不接受坏文件或未批准文件。
  * 白名单由 `ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES`（逗号分隔）控制，未设置时只允许
  * 内嵌的 `V3_POLICY_EXPECTED_HASH`。
  */
@@ -397,7 +398,7 @@ export function loadApprovedV3Policy(): ApprovedV3Policy {
   }
 
   const overridePath = process.env.ASHARE_V3_POLICY_RELEASE_PATH?.trim();
-  const { release, hash: verifiedHash } = overridePath
+  const { release, hash: verifiedHash } = overridePath && existsSync(overridePath)
     ? loadOverrideRelease(overridePath, embedded)
     : { release: embedded, hash: embeddedHash };
 
