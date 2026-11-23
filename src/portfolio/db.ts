@@ -208,6 +208,7 @@ CREATE TABLE IF NOT EXISTS position_stop_tracker (
   initial_stop_milli INTEGER NOT NULL,
   current_stop_milli INTEGER NOT NULL,
   trailing_ma20_armed INTEGER NOT NULL DEFAULT 0,
+  entry_adj_factor REAL,
   status TEXT NOT NULL DEFAULT 'OPEN',
   updated_at TEXT NOT NULL,
   PRIMARY KEY (account_id, ts_code)
@@ -255,6 +256,15 @@ export function ensurePortfolioV3Schema(db: DatabaseSync): void {
   ];
   for (const [col, ddl] of migrations) {
     if (!cols.has(col)) db.exec(ddl);
+  }
+  // 止损跟踪早于复权基准列：旧库补 nullable 列（NULL 表示历史未记录，按不缩放处理）。
+  const trackerCols = new Set(
+    (db.prepare('PRAGMA table_info(position_stop_tracker)').all() as Array<{ name?: string }>)
+      .map(c => c.name)
+      .filter((n): n is string => Boolean(n)),
+  );
+  if (!trackerCols.has('entry_adj_factor')) {
+    db.exec('ALTER TABLE position_stop_tracker ADD COLUMN entry_adj_factor REAL;');
   }
 }
 
@@ -318,7 +328,7 @@ export function openPortfolioDb(path = portfolioDbPath(), options: { writable?: 
     db.exec(PORTFOLIO_LEDGER_SCHEMA);
     db.exec(PORTFOLIO_COMPLETENESS_SCHEMA);
     db.exec(PORTFOLIO_RISK_POLICY_DDL);
-    db.exec(PORTFOLIO_V3_SCHEMA);
+    ensurePortfolioV3Schema(db);
     return db;
   }
   const db = new DatabaseSync(resolved, { readOnly: true });

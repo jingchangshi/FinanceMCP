@@ -199,6 +199,8 @@ export interface Tradability {
 export function inferBoard(code: string): string | undefined {
   const digits = code.split('.')[0].replace(/[^0-9]/g, '');
   if (digits.length !== 6) return undefined;
+  // 北交所新代码段 920xxx 以及所有 .BJ 后缀一律归入 920，避免 920xxx.BJ 落到 main 绕过受限板块。
+  if (/\.BJ$/i.test(code) || digits.startsWith('920')) return '920';
   if (digits.startsWith('688') || digits.startsWith('689')) return '688';
   if (digits.startsWith('300') || digits.startsWith('301')) return '300';
   if (digits.startsWith('8')) return '8';
@@ -206,7 +208,7 @@ export function inferBoard(code: string): string | undefined {
   return 'main';
 }
 
-const RESTRICTED_BOARDS = new Set(['688', '689', '300', '301', '8', '4']);
+const RESTRICTED_BOARDS = new Set(['688', '689', '300', '301', '8', '4', '920']);
 
 /**
  * PRD §4：个股的可执行买入建议限于沪深主板 A 股；创业板(300)、科创板(688)、

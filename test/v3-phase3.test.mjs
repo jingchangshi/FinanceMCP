@@ -101,6 +101,7 @@ function seedPhase3StockMarket(name, asOfOpt) {
     { ts_code: '601004.SH', symbol: '601004', name: '百元高价测试', industry: '强行业', mode: 'BP1_PASS', scale: 6, ocf: 85, annDate: '20260820' },
     { ts_code: '601005.SH', symbol: '601005', name: '低现金流测试', industry: '强行业', mode: 'BP1_PASS', scale: 1, ocf: 30, annDate: '20260820' },
     { ts_code: '601006.SH', symbol: '601006', name: '未来财报测试', industry: '强行业', mode: 'BP1_PASS', scale: 1, ocf: 85, annDate: '20991231' },
+    { ts_code: '920001.BJ', symbol: '920001', name: '北交所回踩', industry: '强行业', mode: 'BP1_PASS', scale: 1, ocf: 85, annDate: '20260820' },
   ];
 
   const allBasic = [
@@ -311,6 +312,7 @@ test('T2: 个股波段选股器仅启用 BP1_PULLBACK+QualityCore 并淘汰 BP2 
     assert.equal(res.bp2_status, 'DROPPED_NEGATIVE_OOS');
     const codes = res.candidates.map(c => c.ts_code);
     assert.deepEqual(codes, ['601001.SH'], `仅优质主板回踩股应入围，实际=${JSON.stringify(codes)}`);
+    assert.ok(!codes.includes('920001.BJ'), '北交所 920xxx.BJ 属于受限板块，不得进入可交易候选');
     const c = res.candidates[0];
     assert.equal(c.setup, 'BP1_PULLBACK');
     assert.ok(c.stop_loss_pct >= -8.01 && c.stop_loss_pct < 0, `硬止损比例应在 -8% 以内: ${c.stop_loss_pct}`);
