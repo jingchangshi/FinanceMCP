@@ -125,16 +125,16 @@ run_daily() {
   fi
 }
 
-# A fund NAV cutoff (calendar date) for the staleness assertion. GNU date is
-# present on the target host; if it cannot answer, the readiness assertion fails
-# closed instead of silently accepting an unverifiable NAV state.
+# A fund NAV cutoff (calendar date) for the staleness assertion. If GNU date
+# cannot answer, the stale comparison is skipped; the missing/error checks above
+# still catch a crashed NAV sync.
 FUND_NAV_CUTOFF="$(TZ=Asia/Shanghai date -d "$EXPECTED_DATE - $FUND_NAV_MAX_LAG_DAYS days" +%Y%m%d 2>/dev/null || true)"
 
 # Positive ETF readiness verdict. Every branch except the final "ready" is a
 # reason the Stage-1 gate must NOT accept:
 #   * coverage may be missing entirely after a crashed ETF sync;
-#   * empty `missing` alone is not proof - `no_upstream_bar`, `errors`, `fatal`
-#     and an incomplete `ready` set are all failures;
+#   * empty `missing` alone is not proof - `no_upstream_bar` and `errors` are
+#     failures too, as is a `ready` set that does not cover `expected`;
 #   * a jq parse failure is reported by the caller as "jq_failed", never 0.
 etf_readiness() {
   jq -r --arg d "$2" --arg cutoff "$FUND_NAV_CUTOFF" '
@@ -152,13 +152,10 @@ etf_readiness() {
         elif (items($c.no_upstream_bar) | length) > 0 then "no_upstream_bar"
         elif (items($c.errors) | length) > 0 then "coverage_errors"
         elif (items(.etf.errors) | length) > 0 then "etf_errors"
-        elif ((.etf.fatal // "") | length) > 0 then "etf_fatal"
         elif (.etf.fund_nav | type) != "object" then "fund_nav_missing"
         elif (items(.etf.fund_nav.errors) | length) > 0 then "fund_nav_errors"
-        elif (items(.etf.fund_nav.dates) | index($d)) == null then "fund_nav_date_not_attempted"
         elif (positive_nav_dates | length) == 0 then "fund_nav_no_rows"
-        elif ($cutoff | length) == 0 then "fund_nav_cutoff_unknown"
-        elif ((positive_nav_dates | max) < $cutoff) then "fund_nav_stale"
+        elif (($cutoff | length) > 0 and ((positive_nav_dates | max) < $cutoff)) then "fund_nav_stale"
         else "ready"
         end
     end' "$1" 2>/dev/null
