@@ -1,9 +1,16 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { EASTMONEY_SUPER_ETF_CODES, ETF_CANDIDATE_DECLARATIONS } from '../ashare/etfDeclarations.js';
+import {
+  EASTMONEY_SUPER_ETF_CODES,
+  ETF_CANDIDATE_DECLARATIONS,
+  V3_SUPER_ETF_DEFENSIVE_BUCKET,
+  V3_SUPER_ETF_GROWTH_BUCKET,
+  V3_SUPER_ETF_VALUE_BUCKET,
+} from '../ashare/etfDeclarations.js';
 import type { EtfCandidateRow, EtfCandidateScreenResult } from '../ashare/etfUniverse.js';
 import {
   evaluateMarketRegime,
   type MarketRegimeResult,
+  type MarketRegimeTier,
   type MarketStyleTier,
 } from '../ashare/marketRegime.js';
 import {
@@ -322,6 +329,63 @@ function buildSuperEtfViews(
   return { allEligible: eligible, views };
 }
 
+interface SuperEtfBucketSpec {
+  key: 'growth' | 'value' | 'defensive';
+  label_zh: string;
+  codes: readonly string[];
+  share_bps: number;
+}
+
+/**
+ * V3-01 风格桶权重（TactiCore exp_v3_01_regime_super_etf.py:150-195）：
+ * DEFENSIVE 档权益全部进入防御红利桶；其余档按风格拆成成长/价值两桶。
+ */
+function superEtfBucketSpecs(regime: MarketRegimeTier, style: MarketStyleTier): SuperEtfBucketSpec[] {
+  if (regime === 'DEFENSIVE') {
+    return [{ key: 'defensive', label_zh: '防御红利', codes: V3_SUPER_ETF_DEFENSIVE_BUCKET, share_bps: 10000 }];
+  }
+  const growthShareBps = style === 'GROWTH_LEADING' ? 6500 : style === 'VALUE_LEADING' ? 3500 : 5000;
+  return [
+    { key: 'growth', label_zh: '成长', codes: V3_SUPER_ETF_GROWTH_BUCKET, share_bps: growthShareBps },
+    { key: 'value', label_zh: '价值', codes: V3_SUPER_ETF_VALUE_BUCKET, share_bps: 10000 - growthShareBps },
+  ];
+}
+
+interface SizedEtfBuy {
+  shares: number;
+  gross_cents: number;
+  fees_cents: number;
+  net_cents: number;
+}
+
+/**
+ * ETF 买单定量：整数手、单腿最低毛额、总成本不超过可用现金。
+ * 返回 null 表示预算内连一手都满足不了门槛，调用方必须跳过而不是把份额折到别的标的。
+ */
+function sizeEtfBuy(input: {
+  priceMilli: number;
+  budgetCents: number;
+  availableCashCents: number;
+  rules: ReturnType<typeof resolveFeeRules>;
+  minGrossCents: number;
+}): SizedEtfBuy | null {
+  const priceCents = input.priceMilli / 10;
+  if (!(priceCents > 0) || input.budgetCents <= 0 || input.availableCashCents <= 0) return null;
+  let shares = Math.floor(Math.min(input.budgetCents, input.availableCashCents) / priceCents / 100) * 100;
+  while (shares >= 100) {
+    const grossCents = roundCent(shares * priceCents);
+    const fees = calculateFees(grossCents, 'buy', input.rules);
+    if (
+      grossCents >= input.minGrossCents
+      && grossCents + fees.total_cents <= input.availableCashCents
+    ) {
+      return { shares, gross_cents: grossCents, fees_cents: fees.total_cents, net_cents: grossCents + fees.total_cents };
+    }
+    shares -= 100;
+  }
+  return null;
+}
+
 function buildCrossBorderMonitor(candidates: EtfCandidateScreenResult | null | undefined): CrossBorderMonitorView[] {
   const rows = (candidates?.candidates ?? []).filter(r => r.category === 'cross_border');
   return rows.map(row => {
@@ -466,6 +530,14 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
   const blockers: string[] = [];
   const actions: ActionEnginePlan[] = [];
   const stopTrackerUpdates: StopTrackerRow[] = [];
+
+  // 运行时策略准入（默认未配置 = 不阻断）。SUSPEND/REVOKE 只冻结新增买入，
+  // 止损、止盈与减仓卖出一律照常生成。
+  const policy = loadApprovedV3Policy();
+  const runtimeCanOpen = policy.runtime_can_open;
+  if (!runtimeCanOpen) {
+    blockers.push('策略准入状态为暂停/撤销（SUSPEND/REVOKE 仍在有效期）：本次不生成任何新增买入；止损、止盈与现有减仓计划照常执行。');
+  }
 
   const { allEligible: superEligible, views: superViews } = buildSuperEtfViews(input.candidates, regime.style);
   const crossBorderMonitor = buildCrossBorderMonitor(input.candidates);
@@ -764,6 +836,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     && deconcentration.plan_mode === 'BOTTOM_GRIND_25'
     && deconcentration.recommended_buy_shares >= 100
     && router.circuit_breaker_status === 'NORMAL'
+    && runtimeCanOpen
   ) {
     const h159558 = holding159558;
     const buyPriceMilli = h159558?.price_milli ?? deconcentration.current_close_milli ?? 0;
@@ -819,9 +892,8 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     }
   }
 
-  // -------------------------------- P3: 个股波段先锋开仓 + 底盘超级 ETF 对齐与减仓回款轮动（熔断/防守期禁止新开多）
-  if (router.circuit_breaker_status !== 'L2_LOCKED' && router.effective_regime !== 'DEFENSIVE') {
-    const policy = loadApprovedV3Policy();
+  // -------------------------------- P3: 个股波段先锋开仓 + 底盘超级 ETF 风格桶 + 国债防御蓄水池（熔断期禁止新开多）
+  if (router.circuit_breaker_status !== 'L2_LOCKED') {
     const minStockOrderCents = policy.stock_min_order_cny * 100;
     let postEquityCents = input.holdings.reduce((sum, h) => {
       if (!isRiskEquityHolding(h.ts_code)) return sum;
@@ -831,7 +903,12 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     const targetMaxEquityCents = Math.round(input.totalAssetsCents * (router.targets.target_equity_bps / 10000));
     const targetDefensiveCashCents = Math.round(input.totalAssetsCents * (router.targets.defensive_cash_bps / 10000));
 
-    if (router.sub_strategies.s_stock_swing === 'ACTIVE' && stockSwingCandidates.length > 0) {
+    if (
+      runtimeCanOpen
+      && router.effective_regime !== 'DEFENSIVE'
+      && router.sub_strategies.s_stock_swing === 'ACTIVE'
+      && stockSwingCandidates.length > 0
+    ) {
       let openStockCount = input.holdings.filter(
         h => !isEtfCode(h.ts_code) && (workingQty.get(h.ts_code) ?? h.quantity) > 0,
       ).length;
@@ -902,63 +979,184 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       }
     }
 
-    const equityGapCents = targetMaxEquityCents - postEquityCents;
-    const cashRoomCents = workingCashCents - targetDefensiveCashCents;
-    const deployBudgetCents = Math.min(equityGapCents, cashRoomCents);
+    if (runtimeCanOpen) {
+      // ---- 权益部署预算按 V3-01 风格桶等权拆分（DEFENSIVE 档全部进入防御红利桶）
+      const equityGapCents = targetMaxEquityCents - postEquityCents;
+      const cashRoomCents = workingCashCents - targetDefensiveCashCents;
+      const deployBudgetCents = Math.max(0, Math.min(equityGapCents, cashRoomCents));
+      if (deployBudgetCents > 0 && deployBudgetCents < 100_000) {
+        blockers.push('权益部署预算低于单腿最低毛额门槛，本次不新开超级 ETF 仓位。');
+      }
+      if (deployBudgetCents >= 100_000 && superEligible.length > 0) {
+        const superByCode = new Map(superEligible.map(row => [row.ts_code, row]));
+        const bucketSpecs = superEtfBucketSpecs(router.effective_regime, regime.style);
+        for (const spec of bucketSpecs) {
+          const bucketBudgetCents = Math.floor(deployBudgetCents * spec.share_bps / 10000);
+          const members = spec.codes
+            .map(code => superByCode.get(code))
+            .filter((row): row is EtfCandidateRow => Boolean(row))
+            .filter(row => {
+              if (row.category !== 'industry_theme') return true;
+              const heldVal = (workingQty.get(row.ts_code) ?? 0) * ((row.data.latest_close_milli ?? 0) / 10);
+              return (heldVal / input.totalAssetsCents) < 0.18;
+            });
+          if (members.length === 0) {
+            blockers.push(
+              `${spec.label_zh}桶无合格超级 ETF 成员（未入选、禁买或已触及行业主题集中度上限），本次跳过，预算份额不集中到单一 ETF。`,
+            );
+            continue;
+          }
+          const perMemberBudgetCents = Math.floor(bucketBudgetCents / members.length);
+          const legs: ActionEngineLeg[] = [];
+          const skippedCodes: string[] = [];
+          let feesEstimated = false;
+          for (const row of members) {
+            const priceMilli = row.data.latest_close_milli!;
+            const rules = feeFor(row.ts_code, 'ETF');
+            const sized = sizeEtfBuy({
+              priceMilli,
+              budgetCents: perMemberBudgetCents,
+              availableCashCents: workingCashCents - 10_000,
+              rules,
+              minGrossCents: 100_000,
+            });
+            if (!sized) {
+              skippedCodes.push(row.ts_code);
+              continue;
+            }
+            workingCashCents -= sized.net_cents;
+            workingQty.set(row.ts_code, (workingQty.get(row.ts_code) ?? 0) + sized.shares);
+            postEquityCents += sized.gross_cents;
+            feesEstimated = feesEstimated || Boolean(rules.fee_model?.estimated);
+            legs.push({
+              side: 'BUY',
+              ts_code: row.ts_code,
+              name: row.name,
+              quantity: sized.shares,
+              lot_size: 100,
+              lots: sized.shares / 100,
+              price_milli: priceMilli,
+              gross_cents: sized.gross_cents,
+              fees_cents: sized.fees_cents,
+              net_cents: sized.net_cents,
+              quote_trade_date: row.data.latest_bar_date,
+              executable: true,
+              reason: `P3_SUPER_ETF_BUCKET_${spec.key.toUpperCase()}`,
+            });
+          }
+          if (legs.length === 0) {
+            blockers.push(
+              `${spec.label_zh}桶按等权拆分后单腿不足最低手数或最低毛额，本次跳过，预算份额不集中到单一 ETF。`,
+            );
+            continue;
+          }
+          if (skippedCodes.length > 0) {
+            blockers.push(`${spec.label_zh}桶 ${skippedCodes.join('、')} 因单腿低于最低毛额门槛跳过，其预算份额不重分配。`);
+          }
+          const legText = legs.map(leg => `${leg.ts_code} ${leg.quantity} 份`).join('、');
+          actions.push({
+            priority: 'P3',
+            code: `P3-SUPER-ETF-BUCKET-${spec.key.toUpperCase()}`,
+            kind: 'ROTATE',
+            rank: actions.length + 1,
+            title: `${spec.label_zh}超级 ETF 风格桶等权配置：买入 ${legs.length} 只`,
+            reasons: [
+              `当前处于${regime.regime_label_zh}且${regime.style_label_zh}，权益仓位低于目标水位；按 V3-01 风格桶等权部署超额现金，不按启发式得分把预算集中到单一 ETF。`,
+              `桶内买入 ${legText}，均为东财免五超级 ETF 且通过流动性、折溢价与可交易性门槛。`,
+            ],
+            counter_evidence: ['若市场次日跌破风格锚，需随环境切档缩减仓位；桶内等权不保证短期相对收益。'],
+            legs,
+            fees_cents: legs.reduce((sum, leg) => sum + leg.fees_cents, 0),
+            fees_estimated: feesEstimated,
+            triggers: legs.map(leg => `次日限价买入 ${leg.quantity} 份 ${leg.ts_code}，参考价 ${(leg.price_milli / 1000).toFixed(3)} 元`),
+            invalidation_conditions: ['次日高开超过 +2% 或跨境品种盘中溢价超 +2.5%'],
+            risk_impact: [`提升组合向${spec.label_zh}风格的分散度，单桶等权避免押注单一 ETF，保留防御现金防线`],
+          });
+        }
+      }
 
-    if (deployBudgetCents >= 100_000 && superEligible.length > 0) {
-      const target = superEligible.find(cand => {
-        if (cand.category !== 'industry_theme') return true;
-        const heldVal = (workingQty.get(cand.ts_code) ?? 0) * ((cand.data.latest_close_milli ?? 0) / 10);
-        return (heldVal / input.totalAssetsCents) < 0.18;
-      });
-      if (target && (target.data.latest_close_milli ?? 0) > 0) {
-        const buyPriceMilli = target.data.latest_close_milli!;
-        const buyPriceCents = buyPriceMilli / 10;
-        const rules = feeFor(target.ts_code, 'ETF');
-        let buyShares = Math.floor((deployBudgetCents / buyPriceCents) / 100) * 100;
-        while (buyShares >= 100) {
-          const grossCents = roundCent(buyShares * buyPriceCents);
-          const fees = calculateFees(grossCents, 'buy', rules);
-          if (grossCents + fees.total_cents <= workingCashCents - 10_000) {
-            if (grossCents >= 100_000) {
-              workingCashCents -= grossCents + fees.total_cents;
+      // ---- 防御现金蓄水池：目标防御桶中尚未配置到国债 ETF 的部分（保留 100 元现金缓冲）
+      const cashBufferCents = 10_000;
+      const reservoirCode = policy.defensive_bond_reservoir_etf;
+      const reservoirRow = (input.candidates?.candidates ?? []).find(row => row.ts_code === reservoirCode);
+      const reservoirHolding = input.holdings.find(h => h.ts_code === reservoirCode);
+      const reservoirQty = workingQty.get(reservoirCode) ?? 0;
+      const quotePriceMilli = reservoirRow && (reservoirRow.data.latest_close_milli ?? 0) > 0
+        ? reservoirRow.data.latest_close_milli!
+        : 0;
+      const valuationPriceMilli = quotePriceMilli > 0 ? quotePriceMilli : (reservoirHolding?.price_milli ?? 0);
+      const reservoirHeldCents = reservoirQty > 0
+        ? (valuationPriceMilli > 0 ? roundCent(reservoirQty * (valuationPriceMilli / 10)) : null)
+        : 0;
+      if (reservoirHeldCents === null) {
+        blockers.push(`${reservoirCode} 国债 ETF 防御蓄水池持仓缺少可用报价，无法计算防御桶余额，本次跳过且不臆造价格。`);
+      } else {
+        const reservoirTargetCents = Math.max(
+          0,
+          targetDefensiveCashCents - reservoirHeldCents - cashBufferCents,
+        );
+        const reservoirBudgetCents = Math.min(workingCashCents - cashBufferCents, reservoirTargetCents);
+        if (reservoirBudgetCents >= 500_000) {
+          if (!reservoirRow || quotePriceMilli <= 0 || reservoirRow.data.buy_blocked) {
+            blockers.push(`${reservoirCode} 国债 ETF 防御蓄水池缺少当日可交易报价或已被禁买，本次跳过且不臆造价格。`);
+          } else {
+            const rules = feeFor(reservoirCode, 'ETF');
+            const sized = sizeEtfBuy({
+              priceMilli: quotePriceMilli,
+              budgetCents: reservoirBudgetCents,
+              availableCashCents: workingCashCents - cashBufferCents,
+              rules,
+              minGrossCents: 500_000,
+            });
+            if (!sized) {
+              blockers.push('国债 ETF 防御蓄水池订单不足最低毛额门槛（最低佣金摊薄不经济），本次跳过。');
+            } else {
+              workingCashCents -= sized.net_cents;
+              workingQty.set(reservoirCode, (workingQty.get(reservoirCode) ?? 0) + sized.shares);
               actions.push({
                 priority: 'P3',
-                code: `P3-SUPER-ETF-BUY-${target.ts_code}`,
+                code: `P3-BOND-RESERVOIR-BUY-${reservoirCode}`,
                 kind: 'ROTATE',
                 rank: actions.length + 1,
-                title: `底盘配置东财超级 ETF：买入 ${target.name ?? target.ts_code}（${target.ts_code}）`,
+                title: `防御现金转入国债 ETF 蓄水池：买入 ${reservoirRow.name ?? reservoirCode}（${reservoirCode}）`,
                 reasons: [
-                  `当前处于${regime.regime_label_zh}且${regime.style_label_zh}，权益仓位低于目标水位，可用超额现金配置东财免五超级 ETF。`,
-                  `标的佣金率万分之 0.5 且免 5 元最低消费，无折溢价禁买阻断。`,
+                  '防御桶中尚未配置到国债 ETF 的闲置资金转入蓄水池，保留日常现金缓冲；该仓位只属于防御桶，不增加权益风险敞口。',
+                  'EXP-V3-01 结果显示国债 ETF 蓄水池的历史最大回撤优于纯现金，且不改变权益风险预算。',
                 ],
-                counter_evidence: ['若市场次日跌破风格锚，需随环境切档缩减仓位。'],
+                counter_evidence: ['若利率快速上行，国债 ETF 可能出现阶段性回撤；该仓位仍计入防御桶，不参与权益风险预算。'],
                 legs: [{
                   side: 'BUY',
-                  ts_code: target.ts_code,
-                  name: target.name,
-                  quantity: buyShares,
+                  ts_code: reservoirCode,
+                  name: reservoirRow.name,
+                  quantity: sized.shares,
                   lot_size: 100,
-                  lots: buyShares / 100,
-                  price_milli: buyPriceMilli,
-                  gross_cents: grossCents,
-                  fees_cents: fees.total_cents,
-                  net_cents: grossCents + fees.total_cents,
-                  quote_trade_date: target.data.latest_bar_date,
+                  lots: sized.shares / 100,
+                  price_milli: quotePriceMilli,
+                  gross_cents: sized.gross_cents,
+                  fees_cents: sized.fees_cents,
+                  net_cents: sized.net_cents,
+                  quote_trade_date: reservoirRow.data.latest_bar_date,
                   executable: true,
-                  reason: 'P3_SUPER_ETF_ALIGNMENT',
+                  reason: 'P3_DEFENSIVE_BOND_RESERVOIR',
                 }],
-                fees_cents: fees.total_cents,
+                fees_cents: sized.fees_cents,
                 fees_estimated: Boolean(rules.fee_model?.estimated),
-                triggers: [`次日限价买入 ${buyShares} 份 ${target.ts_code}，参考价 ${(buyPriceMilli / 1000).toFixed(3)} 元`],
-                invalidation_conditions: ['次日高开超过 +2% 或跨境品种盘中溢价超 +2.5%'],
-                risk_impact: ['提升组合向占优风格宽基的分散度，保留防御现金防线'],
+                triggers: [`次日限价买入 ${sized.shares} 份 ${reservoirCode}，参考价 ${(quotePriceMilli / 1000).toFixed(3)} 元，保留 ${(cashBufferCents / 100).toFixed(0)} 元现金缓冲`],
+                invalidation_conditions: ['国债 ETF 当日无可用行情或被禁买时不下单'],
+                risk_impact: ['把闲置防御现金转为国债 ETF，降低纯现金拖累，同时不提高权益风险暴露'],
               });
             }
-            break;
           }
-          buyShares -= 100;
+        } else if (reservoirTargetCents > 0) {
+          const affordableCents = Math.max(
+            0,
+            Math.min(workingCashCents - cashBufferCents, reservoirTargetCents),
+          );
+          if (affordableCents > 0) {
+            blockers.push(
+              '国债 ETF 防御蓄水池待配置金额不足最低单腿门槛（最低佣金摊薄不经济），本次跳过。',
+            );
+          }
         }
       }
     }

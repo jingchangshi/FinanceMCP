@@ -43,6 +43,8 @@ export interface StrategyRouterResult {
     recovery_needed_pct: number;
     hwm_nav_cents: number;
     hwm_date: string;
+    /** 持久锚点之后 `(hwm_date, asOf]` 区间内的外部净现金流（分）：正 = 净入金，负 = 净出金。 */
+    hwm_cash_flow_adjustment_cents: number;
     hwm_drawdown_bps: number;
     hwm_drawdown_pct: number;
     lifeline_nav_cents: number;
@@ -126,6 +128,38 @@ export function readRiskAnchor(
   return row ?? null;
 }
 
+/**
+ * 读取 `(fromExclusiveYmd, toInclusiveYmd]` 区间内已入账的外部净现金流（分）。
+ *
+ * 口径：只统计未撤销的 `CASH_DEPOSIT` / `CASH_WITHDRAW`（`cash_delta_cents` 出金为负）。
+ * 成交、分红与费用属于账户内部变动，不是外部出入金，不计入高水位调整。
+ * 账本表缺失（只读库/未迁移库）或查询失败时返回 0：高水位退化为原始口径，绝不阻断日报。
+ */
+export function readNetExternalCashFlowCents(
+  portfolioDb: DatabaseSync | null | undefined,
+  accountId: string,
+  fromExclusiveYmd: string,
+  toInclusiveYmd: string,
+): number {
+  if (!portfolioDb || fromExclusiveYmd >= toInclusiveYmd) return 0;
+  if (!portfolioTableExists(portfolioDb, 'account_event')) return 0;
+  try {
+    const row = portfolioDb.prepare(`
+      SELECT COALESCE(SUM(cash_delta_cents), 0) AS net
+      FROM account_event
+      WHERE account_id = ?
+        AND event_type IN ('CASH_DEPOSIT', 'CASH_WITHDRAW')
+        AND reversed_by IS NULL
+        AND occurred_on > ?
+        AND occurred_on <= ?
+    `).get(accountId, fromExclusiveYmd, toInclusiveYmd) as { net?: number } | undefined;
+    const net = Number(row?.net ?? 0);
+    return Number.isSafeInteger(net) ? net : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function targetBucketsFor(regime: MarketRegimeTier): StrategyRouterResult['targets'] {
   if (regime === 'OFFENSIVE') {
     return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.OFFENSIVE, base_super_etf_bps: 3750, pioneer_bps: 4750, defensive_cash_bps: 1500 };
@@ -146,17 +180,30 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
 
   let effectiveHwmCents = input.currentNavCents;
   let effectiveHwmDate = input.asOf;
+  let hwmCashFlowAdjustmentCents = 0;
   let shouldAdvanceHwm = false;
   let shouldPersistAnchor = false;
 
   if (existing) {
-    if (input.asOf >= existing.hwm_date && input.currentNavCents > existing.hwm_nav_cents) {
+    // 外部现金流只调整“比较基准”，不直接改写持久锚点：
+    // 每轮都用持久锚点 + (hwm_date, asOf] 区间净流水重算，因此同一笔流水只折入一次。
+    hwmCashFlowAdjustmentCents = readNetExternalCashFlowCents(
+      input.portfolioDb,
+      input.accountId,
+      existing.hwm_date,
+      input.asOf,
+    );
+    const flowAdjustedHwmCents = existing.hwm_nav_cents + hwmCashFlowAdjustmentCents;
+    if (input.asOf >= existing.hwm_date && input.currentNavCents > flowAdjustedHwmCents) {
+      // 真新高：把期间外部流水一次性折入新锚点（hwm = 当前净值，hwm_date = asOf）。
+      // 下一次运行的区间从 asOf 之后开始，不会再次计入同一笔流水。
       effectiveHwmCents = input.currentNavCents;
       effectiveHwmDate = input.asOf;
       shouldAdvanceHwm = true;
       shouldPersistAnchor = true;
     } else {
-      effectiveHwmCents = existing.hwm_nav_cents;
+      // 未创新高：只在内存里用调整后的高水位算回撤，不写回数据库。
+      effectiveHwmCents = flowAdjustedHwmCents;
       effectiveHwmDate = existing.hwm_date;
       shouldPersistAnchor = input.asOf >= existing.hwm_date;
     }
@@ -166,6 +213,16 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     shouldAdvanceHwm = true;
     shouldPersistAnchor = true;
   }
+
+  const v3Policy = loadApprovedV3Policy();
+  const deconcActive = Boolean(input.deconcentrationActive);
+  const l2TriggerBps = deconcActive
+    ? v3Policy.l2_preemptive_deconcentration_trigger_drawdown_bps
+    : v3Policy.l2_normal_trigger_drawdown_bps;
+  const postBreakerEquityBps = deconcActive
+    ? v3Policy.l2_deconcentration_post_breaker_equity_bps
+    : v3Policy.l2_normal_post_breaker_equity_bps;
+  const l2TriggerPct = l2TriggerBps / 100;
 
   const cumulativePnlCents = input.currentNavCents - initialPrincipalCents;
   const cumulativeReturnPct = initialPrincipalCents > 0
@@ -179,20 +236,11 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     ? Math.max(0, Math.round(((effectiveHwmCents - input.currentNavCents) / effectiveHwmCents) * 10000))
     : 0;
   const hwmDrawdownPct = r2(hwmDrawdownBps / 100);
-  const lifelineNavCents = Math.round(effectiveHwmCents * 0.85);
+  const lifelineNavCents = Math.round(effectiveHwmCents * (10000 - l2TriggerBps) / 10000);
   const lifelineBufferCents = input.currentNavCents - lifelineNavCents;
   const lifelineBufferPct = effectiveHwmCents > 0
     ? r2(((input.currentNavCents - lifelineNavCents) / effectiveHwmCents) * 100)
     : 0;
-
-  const v3Policy = loadApprovedV3Policy();
-  const deconcActive = Boolean(input.deconcentrationActive);
-  const l2TriggerBps = deconcActive
-    ? v3Policy.l2_preemptive_deconcentration_trigger_drawdown_bps
-    : v3Policy.l2_normal_trigger_drawdown_bps;
-  const postBreakerEquityBps = deconcActive
-    ? v3Policy.l2_deconcentration_post_breaker_equity_bps
-    : v3Policy.l2_normal_post_breaker_equity_bps;
 
   let circuitBreakerStatus: CircuitBreakerStatus = 'NORMAL';
   let lockedUntil: string | null = null;
@@ -238,13 +286,13 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
 
   const breakerLabelZh = circuitBreakerStatus === 'L2_LOCKED'
     ? deconcActive
-      ? `二级熔断锁定（重仓换马期回撤达 12% 前置保护触发，风险权益清零防守至 ${lockedUntil}）`
-      : `二级熔断锁定（高水位回撤达 15%，防守冷静期至 ${lockedUntil}）`
+      ? `二级熔断锁定（重仓换马期回撤达 ${l2TriggerPct.toFixed(0)}% 前置保护触发，风险权益清零防守至 ${lockedUntil}）`
+      : `二级熔断锁定（高水位回撤达 ${l2TriggerPct.toFixed(0)}%，防守冷静期至 ${lockedUntil}）`
     : circuitBreakerStatus === 'L1_WARN'
       ? '一级回撤警戒（高水位回撤超 10%，冻结个股新开仓）'
       : deconcActive
-        ? '正常受控（重仓换马期启用 12% 前置熔断保护，守卫 15% 生命线）'
-        : '正常受控（位于 15% 熔断生命线之上）';
+        ? `正常受控（重仓换马期启用 ${l2TriggerPct.toFixed(0)}% 前置熔断保护，守卫 ${l2TriggerPct.toFixed(0)}% 生命线）`
+        : `正常受控（位于 ${l2TriggerPct.toFixed(0)}% 熔断生命线之上）`;
 
   const stockSwingLabelZh = sStockSwing === 'STOP_ONLY'
     ? '仅允许执行存量止损或止盈，禁止新开仓'
@@ -275,6 +323,7 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
       recovery_needed_pct: recoveryNeededPct,
       hwm_nav_cents: effectiveHwmCents,
       hwm_date: effectiveHwmDate,
+      hwm_cash_flow_adjustment_cents: hwmCashFlowAdjustmentCents,
       hwm_drawdown_bps: hwmDrawdownBps,
       hwm_drawdown_pct: hwmDrawdownPct,
       lifeline_nav_cents: lifelineNavCents,
@@ -306,6 +355,9 @@ export function persistRiskAnchor(
   if (!portfolioDb || !router.should_persist_anchor) return false;
   if (!portfolioTableExists(portfolioDb, 'account_risk_anchor')) return false;
   try {
+    // 只有真新高（should_advance_hwm）才允许改写高水位锚点。现金流调整后的高水位只在内存中
+    // 用于回撤计算；若把它写回旧 hwm_date，下一轮会把同一笔流水再叠加一次。
+    const advance = router.should_advance_hwm ? 1 : 0;
     portfolioDb.prepare(`
       INSERT INTO account_risk_anchor (
         account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
@@ -314,12 +366,12 @@ export function persistRiskAnchor(
       ON CONFLICT(account_id) DO UPDATE SET
         initial_principal_cents = excluded.initial_principal_cents,
         hwm_nav_cents = CASE
-          WHEN excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          WHEN ? = 1 AND excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
           THEN excluded.hwm_nav_cents
           ELSE account_risk_anchor.hwm_nav_cents
         END,
         hwm_date = CASE
-          WHEN excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          WHEN ? = 1 AND excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
           THEN excluded.hwm_date
           ELSE account_risk_anchor.hwm_date
         END,
@@ -334,6 +386,8 @@ export function persistRiskAnchor(
       router.circuit_breaker_status,
       router.locked_until_trade_date,
       router.as_of_trade_date,
+      advance,
+      advance,
     );
     return true;
   } catch (err: any) {

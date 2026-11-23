@@ -1,8 +1,12 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { StrategyAdmissionStore, type AdmissionAction } from '../ashare/strategyAdmission.js';
 import { validateStrategyRelease, type StrategyRelease } from '../ashare/strategyRelease.js';
 
 export const V3_POLICY_V3_1_0_HASH = 'eeacd72de68d463a045a1be1159bede7b3dbae13da92f9b05e68983995e4e008';
 export const V3_POLICY_EXPECTED_HASH = '05346a961e01f746055143e0bb5790caa9d6460aa579bb26c085cca20d77b55f';
+
+/** 已批准的 V3 进攻型低频系统策略 ID（运行时覆盖文件必须与之一致）。 */
+export const V3_OFFENSIVE_STRATEGY_ID = 'V3_OFFENSIVE_LOW_FREQ_SYSTEM';
 
 /**
  * Signed V3 Offensive Policy Release v3.1.0 (archived baseline contract, retained for audit compatibility).
@@ -234,12 +238,26 @@ export const V3_OFFENSIVE_POLICY_RELEASE_V3_2_0: StrategyRelease = {
   content_hash: V3_POLICY_EXPECTED_HASH,
 };
 
+export interface RuntimeAdmissionState {
+  /** 是否配置了 ASHARE_V3_ADMISSION_DB（未配置时准入开关不生效）。 */
+  configured: boolean;
+  /** 准入库是否可打开；不存在/不可读/权限不符均为 false，此时不阻断。 */
+  store_available: boolean;
+  /** 对应策略/版本/账户/市场/环境的最新准入动作；无事件或不可读时为 null。 */
+  latest_action: AdmissionAction | null;
+  /** 最新动作当前是否仍在有效期内。 */
+  latest_in_validity: boolean;
+}
+
 export interface ApprovedV3Policy {
   release: StrategyRelease;
   approved: boolean;
   strategy_id: string;
   version: string;
   content_hash: string;
+  /** 准入账本允许新开仓时为 true；未配置/不可读/无事件时保持 true（不得成为隐性封锁）。 */
+  runtime_can_open: boolean;
+  runtime_admission: RuntimeAdmissionState;
   bp1_pullback_enabled: boolean;
   bp2_breakout_enabled: boolean;
   bp2_breakout_status: string;
@@ -271,22 +289,119 @@ function intParam(params: Record<string, string>, key: string, fallback: number)
   return Number.isSafeInteger(n) ? n : fallback;
 }
 
-/**
- * Load and verify the approved V3 offensive policy release (v3.2.0).
- * Supports optional ASHARE_V3_POLICY_RELEASE_PATH runtime override while verifying canonical StrategyRelease hash.
- */
-export function loadApprovedV3Policy(): ApprovedV3Policy {
-  let release: StrategyRelease = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0;
-  const overridePath = process.env.ASHARE_V3_POLICY_RELEASE_PATH?.trim();
-  const isCustomOverride = Boolean(overridePath && existsSync(overridePath));
-  if (isCustomOverride && overridePath) {
-    release = JSON.parse(readFileSync(overridePath, 'utf8')) as StrategyRelease;
+/** 读取并校验运行时策略覆盖文件；任何失败均抛错，绝不静默回退到内嵌版本。 */
+function loadOverrideRelease(overridePath: string, embedded: StrategyRelease): { release: StrategyRelease; hash: string } {
+  let raw: string;
+  try {
+    raw = readFileSync(overridePath, 'utf8');
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`v3_policy_override_unreadable:${overridePath}:${detail}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`v3_policy_override_invalid_json:${overridePath}`);
+  }
+  // 自洽性只是最低门槛：还必须命中受控哈希白名单，绝不接受“仅仅是自洽”的文件。
+  const verifiedHash = validateStrategyRelease(parsed);
+  const allowRaw = process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES?.trim();
+  const allowlisted = allowRaw
+    ? allowRaw.split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
+    : [V3_POLICY_EXPECTED_HASH];
+  if (!allowlisted.includes(verifiedHash)) {
+    throw new Error(`v3_policy_override_hash_not_allowed:${verifiedHash}`);
   }
 
-  const verifiedHash = validateStrategyRelease(release);
-  if (!isCustomOverride && verifiedHash !== V3_POLICY_EXPECTED_HASH) {
-    throw new Error(`v3_policy_hash_mismatch:${verifiedHash}`);
+  const release = parsed as StrategyRelease;
+  if (release.strategy.id !== V3_OFFENSIVE_STRATEGY_ID || release.strategy.id !== embedded.strategy.id) {
+    throw new Error(`v3_policy_override_strategy_mismatch:${release.strategy.id}`);
   }
+  if (release.applicability.market !== embedded.applicability.market) {
+    throw new Error(`v3_policy_override_market_mismatch:${release.applicability.market}`);
+  }
+  if (release.applicability.environment !== embedded.applicability.environment) {
+    throw new Error(`v3_policy_override_environment_mismatch:${release.applicability.environment}`);
+  }
+  return { release, hash: verifiedHash };
+}
+
+/**
+ * 可选运行时准入：仅当 `ASHARE_V3_ADMISSION_DB` 显式配置时才读取。
+ *
+ * 语义（按审计要求放行“未建库不得成为隐性封锁”）：
+ * - 准入库不存在/不可读/权限不符 → 不阻断；
+ * - 无对应事件 → 不阻断；
+ * - 最新事件为 SUSPEND/REVOKE 且仍在有效期 → 阻断新开仓（止损与减仓不受影响）。
+ */
+function loadRuntimeAdmission(
+  release: StrategyRelease,
+  releaseHash: string,
+): { canOpen: boolean; state: RuntimeAdmissionState } {
+  const dbPath = process.env.ASHARE_V3_ADMISSION_DB?.trim();
+  const state: RuntimeAdmissionState = {
+    configured: Boolean(dbPath),
+    store_available: false,
+    latest_action: null,
+    latest_in_validity: false,
+  };
+  if (!dbPath) return { canOpen: true, state };
+
+  let store: StrategyAdmissionStore | null = null;
+  try {
+    store = new StrategyAdmissionStore(dbPath, { readOnly: true });
+    state.store_available = true;
+    const scope = {
+      account: process.env.ASHARE_ACCOUNT_ID?.trim() || 'real-main',
+      market: release.applicability.market,
+      environment: release.applicability.environment,
+    };
+    const latest = store.history()
+      .filter(event => event.strategy_id === release.strategy.id
+        && event.version === release.strategy.version
+        && event.release_hash === releaseHash
+        && event.account === scope.account
+        && event.market === scope.market
+        && event.environment === scope.environment)
+      .sort((a, b) => b.seq - a.seq)[0];
+    if (!latest) return { canOpen: true, state };
+    state.latest_action = latest.action;
+    const now = new Date().toISOString();
+    state.latest_in_validity = latest.valid_from <= now && now < latest.valid_until;
+    if ((latest.action === 'SUSPEND' || latest.action === 'REVOKE') && state.latest_in_validity) {
+      return { canOpen: false, state };
+    }
+    return { canOpen: true, state };
+  } catch {
+    // 打不开/读不出不是“暂停”证据：按未配置处理，保持新开仓可用。
+    return { canOpen: true, state: { ...state, store_available: false } };
+  } finally {
+    try { store?.close(); } catch { /* 关闭失败不影响已得到的准入结论 */ }
+  }
+}
+
+/**
+ * Load and verify the approved V3 offensive policy release (v3.2.0).
+ *
+ * `ASHARE_V3_POLICY_RELEASE_PATH` 是可选的运行时覆盖：一旦设置，文件缺失、不可读、
+ * JSON 非法、哈希不在白名单或策略/市场/环境不匹配都会抛错（fail closed），绝不静默回退。
+ * 白名单由 `ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES`（逗号分隔）控制，未设置时只允许
+ * 内嵌的 `V3_POLICY_EXPECTED_HASH`。
+ */
+export function loadApprovedV3Policy(): ApprovedV3Policy {
+  const embedded = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0;
+  const embeddedHash = validateStrategyRelease(embedded);
+  if (embeddedHash !== V3_POLICY_EXPECTED_HASH) {
+    throw new Error(`v3_policy_hash_mismatch:${embeddedHash}`);
+  }
+
+  const overridePath = process.env.ASHARE_V3_POLICY_RELEASE_PATH?.trim();
+  const { release, hash: verifiedHash } = overridePath
+    ? loadOverrideRelease(overridePath, embedded)
+    : { release: embedded, hash: embeddedHash };
+
+  const runtime = loadRuntimeAdmission(release, verifiedHash);
 
   const p = release.parameters;
   const approved = release.production_admission === 'APPROVED_FOR_ACCOUNT';
@@ -297,6 +412,8 @@ export function loadApprovedV3Policy(): ApprovedV3Policy {
     strategy_id: release.strategy.id,
     version: release.strategy.version.startsWith('v') ? release.strategy.version : `v${release.strategy.version}`,
     content_hash: verifiedHash,
+    runtime_can_open: runtime.canOpen,
+    runtime_admission: runtime.state,
     bp1_pullback_enabled: p.bp1_pullback_status === 'ENABLED',
     bp2_breakout_enabled: p.bp2_breakout_status === 'ENABLED',
     bp2_breakout_status: p.bp2_breakout_status ?? 'DROPPED_NEGATIVE_OOS',
