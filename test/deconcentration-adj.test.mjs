@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { after } from 'node:test';
@@ -15,6 +16,7 @@ const { openAshareDb, upsertRows } = await import('../build/ashare/db.js');
 const { openPortfolioDb } = await import('../build/portfolio/db.js');
 const {
   ensureDeconcentrationPlan,
+  calibrateDeconcentrationPlan,
   evaluateDeconcentrationPlan,
   persistDeconcentrationUpdates,
   computeEtfGrindIndicators,
@@ -86,6 +88,67 @@ function evaluate(portfolioDb, marketDb, asOf, closeMilli, shares = 35000) {
 
 function planRow(portfolioDb) {
   return portfolioDb.prepare('SELECT * FROM deconcentration_plan WHERE account_id = ?').get('acc');
+}
+
+// 标准四批换马计划：锚定价 2000 厘 → 目标保留 9000 份，超额 16000 份拆成 4×4000。
+function newAnchorPlan(portfolioDb, {
+  anchorPriceMilli,
+  anchorTradeDate = DAYS[0],
+  initialShares = 25000,
+  navCents = 10_000_000,
+  targetKeepBps = 1800,
+  created_at = DAYS[0],
+} = {}) {
+  return ensureDeconcentrationPlan(portfolioDb, {
+    account_id: 'acc',
+    ts_code: CODE,
+    initial_shares: initialShares,
+    nav_cents: navCents,
+    target_keep_bps: targetKeepBps,
+    anchor_price_milli: anchorPriceMilli,
+    ...(anchorTradeDate === null ? {} : { anchor_trade_date: anchorTradeDate }),
+    total_tranches: 4,
+    created_at,
+  });
+}
+
+function evaluateStandard(portfolioDb, marketDb, asOf, closeMilli, { shares = 25000, navCents = 10_000_000 } = {}) {
+  return evaluateDeconcentrationPlan({
+    portfolioDb,
+    marketDb,
+    accountId: 'acc',
+    asOf,
+    currentShares: shares,
+    sellableShares: shares,
+    currentCloseMilli: closeMilli,
+    navCents,
+    marketRegime: 'STRUCTURAL',
+  });
+}
+
+/** 构造缺少 anchor_trade_date 列的历史账户库（旧 schema + 一条 legacy 行）。 */
+function makeLegacyPortfolio(name, { anchorMilli = 2000, createdAt = DAYS[0] } = {}) {
+  seq += 1;
+  const marketPath = join(dir, `${name}-${seq}-market.sqlite`);
+  const portfolioPath = join(dir, `${name}-${seq}-portfolio.sqlite`);
+  const marketDb = openAshareDb(marketPath);
+  const portfolioDb = openPortfolioDb(portfolioPath, { marketPath });
+  portfolioDb.exec('PRAGMA journal_mode = DELETE;');
+  portfolioDb.exec('ALTER TABLE deconcentration_plan DROP COLUMN anchor_trade_date;');
+  portfolioDb.prepare(`
+    INSERT INTO deconcentration_plan (
+      plan_id, account_id, ts_code, initial_shares, target_keep_bps, anchor_price_milli,
+      support_floor_milli, last_exec_price_milli, last_exec_date, plan_mode, tactical_slot_bps,
+      tactical_shares, tactical_entry_price_milli, tactical_entry_date, completed_swing_count,
+      status, created_at
+    ) VALUES (?,?,?,?,?,?,NULL,NULL,NULL,'STANDARD',1000,0,NULL,NULL,0,'ACTIVE',?)
+  `).run(`legacy-${name}`, 'acc', CODE, 25000, 1800, anchorMilli, createdAt);
+  portfolioDb.close();
+  return { marketPath, portfolioPath, marketDb };
+}
+
+function fileSha256(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
 test('P2-2: 战术买入后拆股，重放时按 asOf 复权基准折算，不误触发止盈且可跨次评估幂等', () => {
@@ -345,4 +408,245 @@ test('P2-2: 右侧止稳按实际公式 c > prevClose 且 c >= MA5×0.995（非�
   // 收盘 0.742 已跌破 0.995 容差 → 不满足。
   const below = computeEtfGrindIndicators({ ...base, currentCloseMilli: 742 });
   assert.equal(below.guards.right_side_turn_ready, false);
+});
+
+// ---------------------------------------------------------------- 锚定价价格基准日（除权重基准）
+
+test('anchor: 2:1 拆股后按基准日复权一次性换算，只有真实 +8% 反弹才触发，且不回写原始锚定价', () => {
+  const { marketDb, portfolioDb } = makeDbs('anchor-split');
+  try {
+    // 前复权因子 1.0 → 2.0：DAYS[4] 起 2:1 拆股，原始价 2.000 → 1.000。
+    seedEtfBars(marketDb, [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06], { factorFrom: 4, factor: 2 });
+    newAnchorPlan(portfolioDb, { anchorPriceMilli: 2000, anchorTradeDate: DAYS[0] });
+    assert.equal(planRow(portfolioDb).anchor_price_milli, 2000, '新计划原子记录原始锚定价');
+    assert.equal(planRow(portfolioDb).anchor_trade_date, DAYS[0], '新计划原子记录价格基准交易日');
+
+    const preSplit = evaluateStandard(portfolioDb, marketDb, DAYS[3], 1900);
+    assert.equal(preSplit.reference_price_milli, 2000);
+    assert.equal(preSplit.rebound_trigger_milli, 2160);
+    assert.equal(preSplit.recommended_sell_shares, 0);
+    assert.equal(preSplit.anchor_basis_note_zh, null, '因子完整时无需披露');
+
+    // 拆股后 1.070 元相对拆股前基准 2.000 元仍是下跌，不能触发 +8%。
+    const falseRebound = evaluateStandard(portfolioDb, marketDb, DAYS[6], 1070);
+    assert.equal(falseRebound.reference_price_milli, 1000, '2000 × adj(基准日 1.0)/adj(asOf 2.0) = 1000');
+    assert.equal(falseRebound.rebound_trigger_milli, 1080);
+    assert.equal(falseRebound.recommended_sell_shares, 0, '1.070 < 1.080 不得误触发反弹减仓');
+    assert.equal(falseRebound.anchor_trade_date, DAYS[0]);
+    assert.equal(planRow(portfolioDb).anchor_price_milli, 2000, '评估不得把复权价写回数据库');
+    assert.equal(planRow(portfolioDb).anchor_trade_date, DAYS[0]);
+
+    const trueRebound = evaluateStandard(portfolioDb, marketDb, DAYS[6], 1080);
+    assert.equal(trueRebound.active_trigger_reason, 'REBOUND_8PCT');
+    assert.equal(trueRebound.recommended_sell_shares, 4000, '真实反弹 +8% 才卖出第一批');
+    assert.match(trueRebound.status_summary_zh, /反弹满 \+8%/);
+  } finally {
+    portfolioDb.close();
+    marketDb.close();
+  }
+});
+
+test('anchor: 现金分红（复权因子 1.02）同样按基准日折算锚定价与 +8% 反弹线', () => {
+  const { marketDb, portfolioDb } = makeDbs('anchor-dividend');
+  try {
+    seedEtfBars(marketDb, [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0], { factorFrom: 4, factor: 1.02 });
+    newAnchorPlan(portfolioDb, { anchorPriceMilli: 2000, anchorTradeDate: DAYS[0] });
+
+    const noTrigger = evaluateStandard(portfolioDb, marketDb, DAYS[6], 2110);
+    assert.equal(noTrigger.reference_price_milli, 1961, '2000 / 1.02 四舍五入到整数厘');
+    assert.equal(noTrigger.rebound_trigger_milli, 2118);
+    assert.equal(noTrigger.recommended_sell_shares, 0, '2.110 < 2.118 不触发');
+
+    const trigger = evaluateStandard(portfolioDb, marketDb, DAYS[6], 2118);
+    assert.equal(trigger.active_trigger_reason, 'REBOUND_8PCT');
+    assert.equal(trigger.recommended_sell_shares, 4000);
+  } finally {
+    portfolioDb.close();
+    marketDb.close();
+  }
+});
+
+test('anchor: 人工改锚定价必须显式给出有效基准日并原子写入；无关校准原样保留两者', () => {
+  const { marketDb, portfolioDb } = makeDbs('anchor-calibrate');
+  try {
+    seedEtfBars(marketDb, [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06], { factorFrom: 4, factor: 2 });
+    newAnchorPlan(portfolioDb, { anchorPriceMilli: 2000, anchorTradeDate: DAYS[0] });
+
+    const changed = calibrateDeconcentrationPlan(portfolioDb, {
+      account_id: 'acc',
+      ts_code: CODE,
+      anchor_price_milli: 2100,
+      anchor_trade_date: DAYS[2],
+      reset_triggered: false,
+    });
+    assert.equal(changed.anchor_price_milli, 2100);
+    assert.equal(changed.anchor_trade_date, DAYS[2]);
+    assert.equal(planRow(portfolioDb).anchor_price_milli, 2100);
+    assert.equal(planRow(portfolioDb).anchor_trade_date, DAYS[2], '价格与基准日必须同一条 UPDATE 落库');
+
+    // 无关校准（只改目标底仓比例）不得清空或改写锚定价/基准日。
+    const unrelated = calibrateDeconcentrationPlan(portfolioDb, {
+      account_id: 'acc',
+      ts_code: CODE,
+      target_keep_bps: 2000,
+      reset_triggered: false,
+    });
+    assert.equal(unrelated.anchor_price_milli, 2100);
+    assert.equal(unrelated.anchor_trade_date, DAYS[2]);
+    assert.equal(planRow(portfolioDb).anchor_price_milli, 2100);
+    assert.equal(planRow(portfolioDb).anchor_trade_date, DAYS[2]);
+
+    // 缺基准日 / 非法基准日必须拒绝，且不得产生半写。
+    assert.throws(() => calibrateDeconcentrationPlan(portfolioDb, {
+      account_id: 'acc', ts_code: CODE, anchor_price_milli: 2200, reset_triggered: false,
+    }), /anchor-trade-date/);
+    assert.throws(() => calibrateDeconcentrationPlan(portfolioDb, {
+      account_id: 'acc', ts_code: CODE, anchor_price_milli: 2200, anchor_trade_date: '20260231', reset_triggered: false,
+    }), /有效的 YYYYMMDD/);
+    assert.throws(() => calibrateDeconcentrationPlan(portfolioDb, {
+      account_id: 'acc', ts_code: CODE, anchor_price_milli: 2200, anchor_trade_date: '2026-01-05', reset_triggered: false,
+    }), /有效的 YYYYMMDD/);
+    assert.equal(planRow(portfolioDb).anchor_price_milli, 2100);
+    assert.equal(planRow(portfolioDb).anchor_trade_date, DAYS[2], '拒绝的校准不得部分落库');
+  } finally {
+    portfolioDb.close();
+    marketDb.close();
+  }
+});
+
+test('anchor: later last-exec 价格优先于锚定价，且不因锚定基准缺失而披露', () => {
+  const { marketDb, portfolioDb } = makeDbs('anchor-last-exec');
+  try {
+    seedEtfBars(marketDb, [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06], { factorFrom: 4, factor: 2 });
+    // 若用锚定价 2000 → 拆股后 1000；last-exec 1800 → 900，必须取后者。
+    newAnchorPlan(portfolioDb, { anchorPriceMilli: 2000, anchorTradeDate: DAYS[0] });
+    portfolioDb.prepare('UPDATE deconcentration_plan SET last_exec_price_milli = 1800, last_exec_date = ? WHERE account_id = ?')
+      .run(DAYS[2], 'acc');
+
+    const out = evaluateStandard(portfolioDb, marketDb, DAYS[6], 1000);
+    assert.equal(out.reference_price_milli, 900, '1800 × adj(执行日 1.0)/adj(asOf 2.0) = 900');
+    assert.equal(out.rebound_trigger_milli, 972);
+    assert.equal(out.anchor_basis_note_zh, null, '锚定价未被使用时不产生披露');
+    assert.equal(out.anchor_trade_date, DAYS[0], '仍原样暴露计划记录的基准日供审计');
+  } finally {
+    portfolioDb.close();
+    marketDb.close();
+  }
+});
+
+test('anchor: legacy NULL 基准日或缺复权因子时保留原始价、输出本地化披露且不阻断报告', () => {
+  const legacy = makeDbs('anchor-legacy-null');
+  try {
+    seedEtfBars(legacy.marketDb, [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06], { factorFrom: 4, factor: 2 });
+    newAnchorPlan(legacy.portfolioDb, { anchorPriceMilli: 2000, anchorTradeDate: null });
+    assert.equal(planRow(legacy.portfolioDb).anchor_trade_date, null, '未显式给基准日时保持 NULL，不从 created_at 回填');
+
+    const out = evaluateStandard(legacy.portfolioDb, legacy.marketDb, DAYS[6], 1030);
+    assert.equal(out.plan_present, true, '不得阻断报告');
+    assert.equal(out.reference_price_milli, 2000, '缺基准日时保留原始价');
+    assert.equal(out.anchor_trade_date, null);
+    assert.match(out.anchor_basis_note_zh, /未记录价格基准日/);
+    assert.ok(out.status_summary_zh.includes(out.anchor_basis_note_zh), '本地化披露必须随状态摘要输出');
+  } finally {
+    legacy.portfolioDb.close();
+    legacy.marketDb.close();
+  }
+
+  const noAdj = makeDbs('anchor-no-factor');
+  try {
+    // 只有行情，没有 fund_adj 记录：基准日存在但因子缺失。
+    upsertRows(noAdj.marketDb, 'fund_daily', ['ts_code', 'trade_date', 'close'],
+      DAYS.map((trade_date, i) => ({ ts_code: CODE, trade_date, close: [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06][i] })));
+    newAnchorPlan(noAdj.portfolioDb, { anchorPriceMilli: 2000, anchorTradeDate: DAYS[0] });
+
+    const out = evaluateStandard(noAdj.portfolioDb, noAdj.marketDb, DAYS[6], 2000);
+    assert.equal(out.plan_present, true);
+    assert.equal(out.reference_price_milli, 2000, '因子缺失时不得臆造换算');
+    assert.match(out.anchor_basis_note_zh, /缺少可用复权因子/);
+    assert.ok(out.status_summary_zh.includes(out.anchor_basis_note_zh));
+  } finally {
+    noAdj.portfolioDb.close();
+    noAdj.marketDb.close();
+  }
+});
+
+test('anchor: 同日重跑每轮都从原始锚定价换算，结果幂等且数据库不被改写', () => {
+  const { marketDb, portfolioDb } = makeDbs('anchor-rerun');
+  try {
+    seedEtfBars(marketDb, [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06], { factorFrom: 4, factor: 2 });
+    newAnchorPlan(portfolioDb, { anchorPriceMilli: 2000, anchorTradeDate: DAYS[0] });
+
+    const first = evaluateStandard(portfolioDb, marketDb, DAYS[6], 1080);
+    assert.equal(first.reference_price_milli, 1000);
+    assert.equal(first.rebound_trigger_milli, 1080);
+    assert.equal(first.active_trigger_reason, 'REBOUND_8PCT');
+
+    persistDeconcentrationUpdates(portfolioDb, first);
+    assert.equal(planRow(portfolioDb).anchor_price_milli, 2000, '同日写回不得保存复权后的锚定价');
+    assert.equal(planRow(portfolioDb).anchor_trade_date, DAYS[0]);
+
+    const second = evaluateStandard(portfolioDb, marketDb, DAYS[6], 1080);
+    assert.equal(second.reference_price_milli, 1000, '重复评估不得对已换算价再次缩放');
+    assert.equal(second.rebound_trigger_milli, 1080);
+    assert.equal(second.recommended_sell_shares, 4000);
+    assert.equal(planRow(portfolioDb).anchor_price_milli, 2000);
+  } finally {
+    portfolioDb.close();
+    marketDb.close();
+  }
+});
+
+test('anchor: 旧库缺列时幂等迁移，legacy 行保持 NULL 且绝不从 created_at 回填', () => {
+  const { marketPath, portfolioPath, marketDb } = makeLegacyPortfolio('legacy-migrate');
+  try {
+    const db1 = openPortfolioDb(portfolioPath, { marketPath });
+    try {
+      const cols = db1.prepare('PRAGMA table_info(deconcentration_plan)').all();
+      assert.equal(cols.filter(c => c.name === 'anchor_trade_date').length, 1, '迁移后恰好一列');
+      const row = db1.prepare('SELECT * FROM deconcentration_plan WHERE account_id = ?').get('acc');
+      assert.equal(row.anchor_trade_date, null, 'legacy 行不得用 created_at 回填');
+      assert.equal(row.created_at, DAYS[0]);
+    } finally {
+      db1.close();
+    }
+
+    const db2 = openPortfolioDb(portfolioPath, { marketPath });
+    try {
+      const cols = db2.prepare('PRAGMA table_info(deconcentration_plan)').all();
+      assert.equal(cols.filter(c => c.name === 'anchor_trade_date').length, 1, '重复打开保持幂等');
+      const row = db2.prepare('SELECT * FROM deconcentration_plan WHERE account_id = ?').get('acc');
+      assert.equal(row.anchor_trade_date, null);
+      assert.equal(row.anchor_price_milli, 2000);
+    } finally {
+      db2.close();
+    }
+  } finally {
+    marketDb.close();
+  }
+});
+
+test('anchor: 只读库缺列可正常评估且不写库（持久化安全返回 0）', () => {
+  const { marketPath, portfolioPath, marketDb } = makeLegacyPortfolio('legacy-readonly');
+  try {
+    seedEtfBars(marketDb, [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06], { factorFrom: 4, factor: 2 });
+    const shaBefore = fileSha256(portfolioPath);
+    const sizeBefore = statSync(portfolioPath).size;
+
+    const readOnlyDb = openPortfolioDb(portfolioPath, { writable: false, marketPath });
+    try {
+      const out = evaluateStandard(readOnlyDb, marketDb, DAYS[6], 1030);
+      assert.equal(out.plan_present, true, '只读旧库缺列也必须能评估');
+      assert.equal(out.reference_price_milli, 2000);
+      assert.match(out.anchor_basis_note_zh, /未记录价格基准日/);
+      const changed = persistDeconcentrationUpdates(readOnlyDb, out);
+      assert.equal(changed, 0, '只读库持久化必须安全返回 0');
+    } finally {
+      readOnlyDb.close();
+    }
+
+    assert.equal(fileSha256(portfolioPath), shaBefore, '只读评估不得改变数据库文件');
+    assert.equal(statSync(portfolioPath).size, sizeBefore);
+  } finally {
+    marketDb.close();
+  }
 });
