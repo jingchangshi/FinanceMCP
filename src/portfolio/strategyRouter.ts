@@ -7,7 +7,7 @@ import {
 import { portfolioTableExists } from './db.js';
 import { buildNavSeries, readBaseline } from './ledger.js';
 import { buildLedgerPriceTable } from './riskPolicy.js';
-import { loadApprovedV3Policy } from './v3Policy.js';
+import { loadApprovedV3Policy, type ApprovedV3Policy } from './v3Policy.js';
 
 export type CircuitBreakerStatus = 'NORMAL' | 'L1_WARN' | 'L2_LOCKED';
 export type SubStrategyStatus = 'ACTIVE' | 'STOP_ONLY' | 'REDUCE_ONLY' | 'LOCKED_PENDING_VALIDATION';
@@ -85,6 +85,8 @@ export interface EvaluateStrategyRouterInput {
   /** True when a concentrated sector ETF deconcentration plan is active (triggers preemptive -12%->0% L2). */
   deconcentrationActive?: boolean;
   deconcentrationMode?: 'STANDARD' | 'BOTTOM_GRIND_25';
+  /** 调用方已加载的策略（一次加载传给 router/screen/engine）；缺省时按实际 accountId/asOf 自行加载。 */
+  policy?: ApprovedV3Policy;
 }
 
 const r2 = (v: number): number => Math.round(v * 100) / 100;
@@ -172,9 +174,37 @@ function readUnitSharePair(
   }
 }
 
+/**
+ * 读取目标交易日当天的未撤销外部净现金流（分）。仅用于锚点日与目标日相同、无法单位化的
+ * 同日场景：用扣流前 NAV 比较，避免当日入/出金触发假熔断。
+ */
+function readSameDayNetExternalFlowCents(
+  portfolioDb: DatabaseSync | null | undefined,
+  accountId: string,
+  day: string,
+): number {
+  if (!portfolioDb || !portfolioTableExists(portfolioDb, 'account_event')) return 0;
+  try {
+    const row = portfolioDb.prepare(`
+      SELECT COALESCE(SUM(cash_delta_cents), 0) AS net
+      FROM account_event
+      WHERE account_id = ?
+        AND event_type IN ('CASH_DEPOSIT', 'CASH_WITHDRAW')
+        AND reversed_by IS NULL
+        AND occurred_on = ?
+    `).get(accountId, day) as { net?: number } | undefined;
+    const net = Number(row?.net ?? 0);
+    return Number.isSafeInteger(net) ? net : 0;
+  } catch {
+    return 0;
+  }
+}
+
 interface HwmEvaluation {
   effectiveHwmCents: number;
   effectiveHwmDate: string;
+  /** 用于回撤/生命线缓冲的比较 NAV（同日外部流水场景下为扣流前 NAV）。 */
+  comparisonNavCents: number;
   unitNavRatio: number | null;
   basis: 'UNIT_NAV' | 'RAW_NAV';
   shouldAdvanceHwm: boolean;
@@ -194,6 +224,7 @@ function evaluateHwm(
     return {
       effectiveHwmCents: Math.max(input.fallbackBaselineNavCents ?? input.currentNavCents, input.currentNavCents),
       effectiveHwmDate: input.asOf,
+      comparisonNavCents: input.currentNavCents,
       unitNavRatio: null,
       basis: 'RAW_NAV',
       shouldAdvanceHwm: true,
@@ -209,6 +240,7 @@ function evaluateHwm(
       return {
         effectiveHwmCents: input.currentNavCents,
         effectiveHwmDate: input.asOf,
+        comparisonNavCents: input.currentNavCents,
         unitNavRatio: ratio,
         basis: 'UNIT_NAV',
         shouldAdvanceHwm: true,
@@ -218,6 +250,7 @@ function evaluateHwm(
     return {
       effectiveHwmCents: Math.round(input.currentNavCents / ratio),
       effectiveHwmDate: existing.hwm_date,
+      comparisonNavCents: input.currentNavCents,
       unitNavRatio: ratio,
       basis: 'UNIT_NAV',
       shouldAdvanceHwm: false,
@@ -225,10 +258,38 @@ function evaluateHwm(
     };
   }
 
+  // 锚点日 == 目标日（同日建锚或重跑）且无法单位化：用扣流前 NAV 比较，
+  // 避免当日入金/出金被当成真实盈亏触发假熔断。
+  if (existing.hwm_date === input.asOf) {
+    const sameDayFlowCents = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
+    const preFlowNavCents = input.currentNavCents - sameDayFlowCents;
+    if (preFlowNavCents > existing.hwm_nav_cents) {
+      return {
+        effectiveHwmCents: input.currentNavCents,
+        effectiveHwmDate: input.asOf,
+        comparisonNavCents: input.currentNavCents,
+        unitNavRatio: null,
+        basis: 'RAW_NAV',
+        shouldAdvanceHwm: true,
+        shouldPersistAnchor: true,
+      };
+    }
+    return {
+      effectiveHwmCents: existing.hwm_nav_cents,
+      effectiveHwmDate: existing.hwm_date,
+      comparisonNavCents: preFlowNavCents,
+      unitNavRatio: null,
+      basis: 'RAW_NAV',
+      shouldAdvanceHwm: false,
+      shouldPersistAnchor: true,
+    };
+  }
+
   if (input.asOf >= existing.hwm_date && input.currentNavCents > existing.hwm_nav_cents) {
     return {
       effectiveHwmCents: input.currentNavCents,
       effectiveHwmDate: input.asOf,
+      comparisonNavCents: input.currentNavCents,
       unitNavRatio: null,
       basis: 'RAW_NAV',
       shouldAdvanceHwm: true,
@@ -238,6 +299,7 @@ function evaluateHwm(
   return {
     effectiveHwmCents: existing.hwm_nav_cents,
     effectiveHwmDate: existing.hwm_date,
+    comparisonNavCents: input.currentNavCents,
     unitNavRatio: null,
     basis: 'RAW_NAV',
     shouldAdvanceHwm: false,
@@ -266,12 +328,13 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
   const hwm = evaluateHwm(input, existing);
   const effectiveHwmCents = hwm.effectiveHwmCents;
   const effectiveHwmDate = hwm.effectiveHwmDate;
+  const comparisonNavCents = hwm.comparisonNavCents;
   const unitNavRatio = hwm.unitNavRatio;
   const navBasis = hwm.basis;
   const shouldAdvanceHwm = hwm.shouldAdvanceHwm;
   let shouldPersistAnchor = hwm.shouldPersistAnchor;
 
-  const v3Policy = loadApprovedV3Policy();
+  const v3Policy = input.policy ?? loadApprovedV3Policy({ accountId: input.accountId, asOf: input.asOf });
   const deconcActive = Boolean(input.deconcentrationActive);
   const l2TriggerBps = deconcActive
     ? v3Policy.l2_preemptive_deconcentration_trigger_drawdown_bps
@@ -290,13 +353,13 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     : 0;
 
   const hwmDrawdownBps = effectiveHwmCents > 0
-    ? Math.max(0, Math.round(((effectiveHwmCents - input.currentNavCents) / effectiveHwmCents) * 10000))
+    ? Math.max(0, Math.round(((effectiveHwmCents - comparisonNavCents) / effectiveHwmCents) * 10000))
     : 0;
   const hwmDrawdownPct = r2(hwmDrawdownBps / 100);
   const lifelineNavCents = Math.round(effectiveHwmCents * (10000 - l2TriggerBps) / 10000);
-  const lifelineBufferCents = input.currentNavCents - lifelineNavCents;
+  const lifelineBufferCents = comparisonNavCents - lifelineNavCents;
   const lifelineBufferPct = effectiveHwmCents > 0
-    ? r2(((input.currentNavCents - lifelineNavCents) / effectiveHwmCents) * 100)
+    ? r2(((comparisonNavCents - lifelineNavCents) / effectiveHwmCents) * 100)
     : 0;
 
   let circuitBreakerStatus: CircuitBreakerStatus = 'NORMAL';

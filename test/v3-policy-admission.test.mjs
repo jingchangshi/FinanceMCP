@@ -9,7 +9,6 @@ const dir = mkdtempSync(join(tmpdir(), 'ashare-v3-policy-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'ashare.sqlite');
 process.env.ASHARE_PORTFOLIO_DB_PATH = join(dir, 'portfolio.sqlite');
-process.env.ASHARE_ACCOUNT_ID = 'real-main';
 delete process.env.ASHARE_V3_POLICY_RELEASE_PATH;
 delete process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES;
 delete process.env.ASHARE_V3_ADMISSION_DB;
@@ -26,6 +25,7 @@ const { openPortfolioDb } = await import('../build/portfolio/db.js');
 const { runActionEngine } = await import('../build/portfolio/actionEngine.js');
 
 const ASOF = '20261120';
+const ACCOUNT = 'real-main';
 
 const regime = {
   schema: 'ashare-market-regime/1.0',
@@ -64,6 +64,9 @@ function writeRelease(name, release) {
   writeFileSync(path, JSON.stringify(release));
   return path;
 }
+function load(options = {}) {
+  return loadApprovedV3Policy({ accountId: ACCOUNT, asOf: ASOF, ...options });
+}
 
 function privateAdmissionPath(name) {
   const admissionDir = join(dir, `private-${name}`);
@@ -73,61 +76,89 @@ function privateAdmissionPath(name) {
   return join(admissionDir, 'admission.sqlite');
 }
 
-function grantRelease(store, release = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0) {
-  store.record('GRANT', release, {
-    account: 'real-main',
+function scopeOf(release = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, account = ACCOUNT) {
+  return {
+    account,
     market: release.applicability.market,
     environment: release.applicability.environment,
-  }, {
+  };
+}
+
+function grantRelease(store, release = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0) {
+  store.record('GRANT', release, scopeOf(release), {
     reason: 'test grant',
     validFrom: '2020-01-01T00:00:00.000Z',
     validUntil: '2099-01-01T00:00:00.000Z',
   });
 }
 
-function suspendRelease(store, release = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0) {
-  store.record('SUSPEND', release, {
-    account: 'real-main',
-    market: release.applicability.market,
-    environment: release.applicability.environment,
-  }, { reason: 'test suspend' });
+function recordAction(path, action, release = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0) {
+  const store = new StrategyAdmissionStore(path);
+  try {
+    store.record(action, release, scopeOf(release), { reason: `test ${action}` });
+  } finally {
+    store.close();
+  }
 }
 
-test('P1-3: 覆盖路径缺失回退内嵌签名版本（不阻断日报）；非法 JSON 仍抛错', () => {
-  process.env.ASHARE_V3_POLICY_RELEASE_PATH = join(dir, 'does-not-exist.json');
+test('P1-3: 覆盖路径缺失/非法 JSON 回退内嵌基线并停新增买入，但不抛错', () => {
   try {
-    const fallback = loadApprovedV3Policy();
-    assert.equal(fallback.content_hash, V3_POLICY_EXPECTED_HASH, '未部署覆盖文件时使用内嵌 v3.2.0');
-    assert.equal(fallback.version, 'v3.2.0');
+    process.env.ASHARE_V3_POLICY_RELEASE_PATH = join(dir, 'does-not-exist.json');
+    const missing = load();
+    assert.equal(missing.content_hash, V3_POLICY_EXPECTED_HASH);
+    assert.equal(missing.version, 'v3.2.0');
+    assert.ok(missing.override_diagnostics.some(line => line.includes('v3_policy_override_missing')));
+    assert.equal(missing.runtime_can_open, true, '未部署覆盖文件不得阻断');
 
     const bad = join(dir, 'invalid.json');
     writeFileSync(bad, '{ this is not json');
     process.env.ASHARE_V3_POLICY_RELEASE_PATH = bad;
-    assert.throws(() => loadApprovedV3Policy(), /v3_policy_override_invalid_json/);
+    const invalid = load();
+    assert.equal(invalid.content_hash, V3_POLICY_EXPECTED_HASH, '坏文件回退内嵌签名基线');
+    assert.ok(invalid.override_diagnostics.some(line => line.includes('v3_policy_override_invalid_json')));
+    assert.equal(invalid.runtime_can_open, false, '坏覆盖文件只停新增买入');
   } finally {
     delete process.env.ASHARE_V3_POLICY_RELEASE_PATH;
   }
 });
 
-test('P1-3: 内容哈希被篡改或不在白名单时拒绝加载', () => {
+test('P1-3: 篡改哈希/未列白名单/身份不符均回退内嵌基线并停新增买入', () => {
   try {
     const tampered = { ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, content_hash: 'f'.repeat(64) };
     process.env.ASHARE_V3_POLICY_RELEASE_PATH = writeRelease('tampered-hash.json', tampered);
-    assert.throws(() => loadApprovedV3Policy(), /invalid_strategy_release/);
+    const tamperedPolicy = load();
+    assert.equal(tamperedPolicy.content_hash, V3_POLICY_EXPECTED_HASH);
+    assert.ok(tamperedPolicy.override_diagnostics.some(line => line.includes('v3_policy_override_invalid_release')));
+    assert.equal(tamperedPolicy.runtime_can_open, false);
 
-    // 自洽文件也不行：未列入 ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES 的 v3.1.0 必须拒绝。
     process.env.ASHARE_V3_POLICY_RELEASE_PATH = writeRelease('v310.json', V3_OFFENSIVE_POLICY_RELEASE_V3_1_0);
-    assert.throws(() => loadApprovedV3Policy(), /v3_policy_override_hash_not_allowed/);
+    const notAllowed = load();
+    assert.equal(notAllowed.content_hash, V3_POLICY_EXPECTED_HASH);
+    assert.ok(notAllowed.override_diagnostics.some(line => line.includes('v3_policy_override_hash_not_allowed')));
+    assert.equal(notAllowed.runtime_can_open, false);
+
+    const wrongStrategy = {
+      ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0,
+      strategy: { ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.strategy, id: 'OTHER_STRATEGY' },
+    };
+    const strategyHash = resign(wrongStrategy);
+    process.env.ASHARE_V3_POLICY_RELEASE_PATH = writeRelease('wrong-strategy.json', { ...wrongStrategy, content_hash: strategyHash });
+    process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES = strategyHash;
+    const wrong = load();
+    assert.equal(wrong.content_hash, V3_POLICY_EXPECTED_HASH);
+    assert.ok(wrong.override_diagnostics.some(line => line.includes('v3_policy_override_strategy_mismatch')));
+    assert.equal(wrong.runtime_can_open, false);
   } finally {
     delete process.env.ASHARE_V3_POLICY_RELEASE_PATH;
     delete process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES;
   }
 });
 
-test('P1-3: 内嵌 v3.2.0 无需覆盖即通过白名单校验', () => {
-  const policy = loadApprovedV3Policy();
+test('P1-3: 内嵌 v3.2.0 无需覆盖即通过哈希校验', () => {
+  const policy = load();
   assert.equal(policy.content_hash, V3_POLICY_EXPECTED_HASH);
   assert.equal(policy.version, 'v3.2.0');
+  assert.deepEqual(policy.override_diagnostics, []);
   assert.equal(policy.runtime_can_open, true);
   assert.equal(policy.runtime_admission.configured, false);
 });
@@ -135,48 +166,25 @@ test('P1-3: 内嵌 v3.2.0 无需覆盖即通过白名单校验', () => {
 test('P1-3: 命中白名单的覆盖文件按文件内容加载（v3.2.0 与 v3.1.0）', () => {
   try {
     process.env.ASHARE_V3_POLICY_RELEASE_PATH = writeRelease('v320.json', V3_OFFENSIVE_POLICY_RELEASE_V3_2_0);
-    const v320 = loadApprovedV3Policy();
+    const v320 = load();
     assert.equal(v320.version, 'v3.2.0');
     assert.equal(v320.content_hash, V3_POLICY_EXPECTED_HASH);
+    assert.deepEqual(v320.override_diagnostics, []);
+    assert.equal(v320.runtime_can_open, true);
 
     process.env.ASHARE_V3_POLICY_RELEASE_PATH = writeRelease('v310-allowlisted.json', V3_OFFENSIVE_POLICY_RELEASE_V3_1_0);
     process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES = `${V3_POLICY_EXPECTED_HASH},${V3_POLICY_V3_1_0_HASH}`;
-    const v310 = loadApprovedV3Policy();
+    const v310 = load();
     assert.equal(v310.version, 'v3.1.0');
     assert.equal(v310.content_hash, V3_POLICY_V3_1_0_HASH);
+    assert.equal(v310.runtime_can_open, true);
   } finally {
     delete process.env.ASHARE_V3_POLICY_RELEASE_PATH;
     delete process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES;
   }
 });
 
-test('P1-3: 即使哈希可被白名单放行，策略 ID / 市场 / 环境不一致也必须拒绝', () => {
-  try {
-    const wrongStrategy = {
-      ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0,
-      strategy: { ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.strategy, id: 'OTHER_STRATEGY' },
-    };
-    const strategyHash = resign(wrongStrategy);
-    const strategyFile = writeRelease('wrong-strategy.json', { ...wrongStrategy, content_hash: strategyHash });
-    process.env.ASHARE_V3_POLICY_RELEASE_PATH = strategyFile;
-    process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES = strategyHash;
-    assert.throws(() => loadApprovedV3Policy(), /v3_policy_override_strategy_mismatch/);
-
-    const wrongMarket = {
-      ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0,
-      applicability: { ...V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.applicability, market: 'US_EQ' },
-    };
-    const marketHash = resign(wrongMarket);
-    process.env.ASHARE_V3_POLICY_RELEASE_PATH = writeRelease('wrong-market.json', { ...wrongMarket, content_hash: marketHash });
-    process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES = marketHash;
-    assert.throws(() => loadApprovedV3Policy(), /v3_policy_override_market_mismatch/);
-  } finally {
-    delete process.env.ASHARE_V3_POLICY_RELEASE_PATH;
-    delete process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES;
-  }
-});
-
-test('P1-3: 准入账本 GRANT/SUSPEND/RESUME/REVOKE 驱动 runtime_can_open', () => {
+test('P1-3: 准入账本按实际 accountId/asOf 评估 GRANT/SUSPEND/RESUME/REVOKE', () => {
   const path = privateAdmissionPath('lifecycle');
   const store = new StrategyAdmissionStore(path, { create: true });
   try {
@@ -186,47 +194,30 @@ test('P1-3: 准入账本 GRANT/SUSPEND/RESUME/REVOKE 驱动 runtime_can_open', (
   }
   process.env.ASHARE_V3_ADMISSION_DB = path;
   try {
-    const granted = loadApprovedV3Policy();
+    const granted = load();
     assert.equal(granted.runtime_admission.store_available, true);
     assert.equal(granted.runtime_admission.latest_action, 'GRANT');
+    assert.equal(granted.runtime_admission.evaluated_as_of, '2026-11-20T23:59:59.999Z');
     assert.equal(granted.runtime_can_open, true);
 
-    const writer = new StrategyAdmissionStore(path);
-    try {
-      suspendRelease(writer);
-    } finally {
-      writer.close();
-    }
-    const suspended = loadApprovedV3Policy();
+    recordAction(path, 'SUSPEND');
+    const suspended = load();
     assert.equal(suspended.runtime_admission.latest_action, 'SUSPEND');
     assert.equal(suspended.runtime_admission.latest_in_validity, true);
     assert.equal(suspended.runtime_can_open, false);
 
-    const resume = new StrategyAdmissionStore(path);
-    try {
-      resume.record('RESUME', V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, {
-        account: 'real-main',
-        market: V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.applicability.market,
-        environment: V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.applicability.environment,
-      }, { reason: 'test resume' });
-    } finally {
-      resume.close();
-    }
-    assert.equal(loadApprovedV3Policy().runtime_can_open, true);
+    recordAction(path, 'RESUME');
+    assert.equal(load().runtime_can_open, true);
 
-    const revoke = new StrategyAdmissionStore(path);
-    try {
-      revoke.record('REVOKE', V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, {
-        account: 'real-main',
-        market: V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.applicability.market,
-        environment: V3_OFFENSIVE_POLICY_RELEASE_V3_2_0.applicability.environment,
-      }, { reason: 'test revoke' });
-    } finally {
-      revoke.close();
-    }
-    const revoked = loadApprovedV3Policy();
+    recordAction(path, 'REVOKE');
+    const revoked = load();
     assert.equal(revoked.runtime_admission.latest_action, 'REVOKE');
     assert.equal(revoked.runtime_can_open, false);
+
+    // 实际账户不同 → 该账户没有事件，不阻断。
+    assert.equal(load({ accountId: 'other-account' }).runtime_can_open, true);
+    // 未提供实际账户/日期 → 跳过准入评估，不使用环境变量或墙钟。
+    assert.equal(loadApprovedV3Policy().runtime_can_open, true);
   } finally {
     delete process.env.ASHARE_V3_ADMISSION_DB;
   }
@@ -238,7 +229,7 @@ test('P1-3: 准入库不存在/无事件时不阻断新开仓', () => {
   empty.close();
   process.env.ASHARE_V3_ADMISSION_DB = emptyPath;
   try {
-    const noEvent = loadApprovedV3Policy();
+    const noEvent = load();
     assert.equal(noEvent.runtime_can_open, true, '无事件不得阻断');
     assert.equal(noEvent.runtime_admission.latest_action, null);
   } finally {
@@ -247,7 +238,7 @@ test('P1-3: 准入库不存在/无事件时不阻断新开仓', () => {
 
   process.env.ASHARE_V3_ADMISSION_DB = join(dir, 'missing-admission.sqlite');
   try {
-    const missing = loadApprovedV3Policy();
+    const missing = load();
     assert.equal(missing.runtime_can_open, true, '库不存在不得阻断');
     assert.equal(missing.runtime_admission.store_available, false);
   } finally {
@@ -260,7 +251,7 @@ test('P1-3: SUSPEND 只冻结新增买入，P1 止损卖单照常生成', () => 
   const store = new StrategyAdmissionStore(path, { create: true });
   try {
     grantRelease(store);
-    suspendRelease(store);
+    store.record('SUSPEND', V3_OFFENSIVE_POLICY_RELEASE_V3_2_0, scopeOf(), { reason: 'test suspend' });
   } finally {
     store.close();
   }
@@ -298,7 +289,7 @@ test('P1-3: SUSPEND 只冻结新增买入，P1 止损卖单照常生成', () => 
   const run = () => runActionEngine({
     portfolioDb: db,
     marketDb: null,
-    accountId: 'real-main',
+    accountId: ACCOUNT,
     asOf: ASOF,
     holdings,
     cashCents: 9_100_000,
@@ -307,7 +298,6 @@ test('P1-3: SUSPEND 只冻结新增买入，P1 止损卖单照常生成', () => 
     stockSwingScreen,
   });
   try {
-    // 未配置准入库：行为与修复前一致，P3 个股买单正常出现。
     delete process.env.ASHARE_V3_ADMISSION_DB;
     const open = run();
     assert.equal(open.router.circuit_breaker_status, 'NORMAL');
