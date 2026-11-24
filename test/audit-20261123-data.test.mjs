@@ -14,7 +14,8 @@ const { isRateLimit } = await import('../build/ashare/fetch.js');
 const { TdxSession } = await import('../build/ashare/providers/tdxClient.js');
 const { fetchTencentDailyBars, parseTencentQuoteLine } = await import('../build/ashare/providers/tencentClient.js');
 const { clearFreeProviderCache, fetchFreeDataset, isFinalAshareClose } = await import('../build/ashare/providers/freeProviderRouter.js');
-const { weekdays } = await import('./ashare-fixture.mjs');
+const { runHotspotPipeline } = await import('../build/ashare/hotspotPipeline.js');
+const { weekdays, seedMarket } = await import('./ashare-fixture.mjs');
 
 const originalFetch = globalThis.fetch;
 
@@ -538,6 +539,36 @@ test('P2-4: free mode discloses unusable daily_basic/adj_factor instead of trust
       db.close();
     }
   });
+});
+
+test('P2-4 addendum: hotspotPipeline publishes with isolated bad OHLC and blocks only on market-level price defects', () => {
+  const db = openAshareDb(':memory:');
+  try {
+    const days = weekdays('20250101', 100);
+    const asOf = days.at(-1);
+    seedMarket(db, days);
+
+    // One isolated NULL open on the as-of bar: the pipeline gate reads dataState → the same
+    // isolated-defect policy as checkDataReadiness, so the snapshot must still be written.
+    db.prepare("UPDATE daily SET open = NULL WHERE ts_code = '600000.SH' AND trade_date = ?").run(asOf);
+    const isolated = runHotspotPipeline(db, asOf, { etfCodes: [] });
+    assert.equal(isolated.readiness.status, 'DEGRADED', isolated.readiness.reason);
+    assert.match(String(isolated.readiness.reason), /价格字段非法 1 只（600000\.SH）/);
+    assert.ok(isolated.saved, 'isolated bad OHLC must not block the hotspot snapshot write');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM hotspot_snapshot WHERE as_of = ?').get(asOf).n, 1);
+
+    // Six price-defective symbols is market-level: the same gate must refuse to persist.
+    const massCodes = Array.from({ length: 6 }, (_, i) => `${600000 + i}.SH`);
+    const corrupt = db.prepare('UPDATE daily SET close = 0 WHERE ts_code = ? AND trade_date = ?');
+    for (const code of massCodes) corrupt.run(code, asOf);
+    const mass = runHotspotPipeline(db, asOf, { etfCodes: [] });
+    assert.equal(mass.readiness.status, 'NOT_READY');
+    assert.match(String(mass.readiness.reason), /价格字段非法 6 只.*大面积坏条/);
+    assert.equal(mass.saved, null, 'market-level price defects must not persist a snapshot');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM hotspot_snapshot WHERE as_of = ?').get(asOf).n, 1, 'the earlier valid snapshot is untouched');
+  } finally {
+    db.close();
+  }
 });
 
 // ---------------------------------------------------------------- P2-5 regime lookback + breadth universe
