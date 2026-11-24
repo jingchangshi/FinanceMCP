@@ -305,13 +305,58 @@ test('h. the V2 pool advances from its stored state on the next snapshot', () =>
   } finally { snap.close(); }
 });
 
-test('i. horizon below 2 and malformed dates are rejected before any write', () => {
+function snapshotCount(date) {
+  if (!existsSync(SNAPSHOT_DB)) return 0;
+  const db = new DatabaseSync(SNAPSHOT_DB, { readOnly: true });
+  try { return db.prepare('SELECT COUNT(*) n FROM snapshot WHERE trade_date = ?').get(date).n; } finally { db.close(); }
+}
+
+test('i. snapshot boundary inherits checkQuality: isolated bad bars publish, market-level bad bars or a short page do not', () => {
+  const isolatedDate = after(1);
+  const marketDate = after(2);
+  const shortDate = after(3);
+  const corrupt = (date, codes) => live.prepare(
+    `UPDATE daily SET high = close * 0.5 WHERE trade_date = ? AND ts_code IN (${codes.map(() => '?').join(',')})`,
+  ).run(date, ...codes);
+
+  // 1..5 isolated bad bars: the formal report publishes DEGRADED and the snapshot proceeds.
+  // Corrupt before generating, so the stored stock_score and the snapshot's V1 parity
+  // recomputation both see the same (bad) bars.
+  corrupt(isolatedDate, STOCKS.slice(0, 5).map(s => s.ts_code));
+  const isolatedReport = generateReport(live, isolatedDate, 'live');
+  assert.equal(isolatedReport.meta.status, 'DEGRADED');
+  const isolated = runResearchSnapshot({ date: isolatedDate, dbPath: SNAPSHOT_DB });
+  assert.equal(isolated.status, 'ORIGINAL', JSON.stringify(isolated));
+  assert.equal(isolated.quality_status, 'DEGRADED');
+  assert.equal(isolated.report_status, 'DEGRADED');
+  assert.equal(snapshotCount(isolatedDate), 1);
+
+  // Six bad bars are a market-level failure: NOT_READY and no row.
+  corrupt(marketDate, STOCKS.slice(0, 6).map(s => s.ts_code));
+  generateReport(live, marketDate, 'live');
+  const market = runResearchSnapshot({ date: marketDate, dbPath: SNAPSHOT_DB });
+  assert.equal(market.status, 'NOT_READY', JSON.stringify(market));
+  assert.ok(market.reasons.some(reason => /行情异常/.test(reason)), JSON.stringify(market.reasons));
+  assert.equal(snapshotCount(marketDate), 0);
+
+  // One bad bar plus a same-day page below 97% of the previous day is NOT_READY, no row.
+  corrupt(shortDate, STOCKS.slice(0, 1).map(s => s.ts_code));
+  live.prepare(`DELETE FROM daily WHERE trade_date = ? AND ts_code IN (${STOCKS.slice(10, 13).map(() => '?').join(',')})`)
+    .run(shortDate, ...STOCKS.slice(10, 13).map(s => s.ts_code));
+  generateReport(live, shortDate, 'live');
+  const short = runResearchSnapshot({ date: shortDate, dbPath: SNAPSHOT_DB });
+  assert.equal(short.status, 'NOT_READY', JSON.stringify(short));
+  assert.ok(short.reasons.some(reason => /97%/.test(reason)), JSON.stringify(short.reasons));
+  assert.equal(snapshotCount(shortDate), 0);
+});
+
+test('j. horizon below 2 and malformed dates are rejected before any write', () => {
   assert.throws(() => runResearchSnapshot({ date: DATE, dbPath: SNAPSHOT_DB, horizon: 1 }), /horizon/);
   assert.throws(() => runResearchSnapshot({ date: '2026-13-01', dbPath: SNAPSHOT_DB }), /--date/);
   assert.throws(() => runResearchEvaluate({ date: DATE, dbPath: SNAPSHOT_DB, horizon: 0 }), /horizon/);
   const db = new DatabaseSync(SNAPSHOT_DB, { readOnly: true });
   try {
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM snapshot').get().n, 3, 'only ORIGINAL + REVISED + next day');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM snapshot').get().n, 4, 'ORIGINAL + REVISED + next day + isolated-boundary day');
   } finally { db.close(); }
 });
 

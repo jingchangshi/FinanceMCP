@@ -307,70 +307,199 @@ test('P1-3: a stock with missing adjustment factors gets no score and no signals
 
 // ---------------------------------------------------------------- acceptance
 
-function fakeLiveDay(db, date, runs, { fetches = 2, refreshStatus = 'REFRESH_OK' } = {}) {
+/**
+ * One synthetic live day. `runs` are [Beijing HH:MM, status, run_mode?,
+ * generated_at?]; `fetches` are [Beijing HH:MM, refresh_status, rows?].
+ * The optional explicit generated_at models a next-day catch-up.
+ */
+function fakeLiveDay(db, date, runs = [], fetches = []) {
   const d = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
   mkdirSync(join(dir, 'reports', date), { recursive: true });
-  runs.forEach(([time, status, mode = 'live'], i) => {
+  runs.forEach(([time, status, mode = 'live', generatedAt], i) => {
     const id = `ASR-${date}-${i}-${mode}`;
+    const at = generatedAt ?? `${d}T${time}:00.000+08:00`;
     const path = join('reports', date, `${id}.json`);
     writeFileSync(join(dir, path), JSON.stringify({
-      report_id: id, run_mode: mode, status, generated_at: `${d}T${time}:00.000+08:00`,
+      report_id: id, run_mode: mode, status, generated_at: at,
       data: { quality: { reasons: status === 'DEGRADED' ? ['涨跌停价覆盖率 0.9 < 0.95'] : [] } },
       watchlist: { previous_date: null, added: [], removed: [] },
     }));
     db.prepare('INSERT INTO report (report_id, trade_date, status, generated_at, path, run_mode) VALUES (?,?,?,?,?,?)')
-      .run(id, date, status, `${d}T${time}:00.000+08:00`, path, mode);
+      .run(id, date, status, at, path, mode);
   });
-  for (let i = 0; i < fetches; i++) {
-    db.prepare("INSERT INTO sync_history (dataset, key, rows, status, message, synced_at, refresh_status) VALUES ('daily', ?, 5500, 'ok', 'refresh', ?, ?)")
-      .run(date, `${d}T${i ? '13:10' : '10:40'}:30.000Z`, refreshStatus);
+  for (const [time, refreshStatus, rows = 5500] of fetches) {
+    db.prepare("INSERT INTO sync_history (dataset, key, rows, status, message, synced_at, refresh_status) VALUES ('daily', ?, ?, 'ok', 'refresh', ?, ?)")
+      .run(date, rows, new Date(`${d}T${time}:00+08:00`).toISOString(), refreshStatus);
   }
 }
 
-test('P1-2: acceptance distinguishes READY, DEGRADED, missing runs and missing re-checks', () => {
-  const db = openAshareDb(':memory:');
-  upsertRows(db, 'trade_cal', ['cal_date', 'is_open'], ['20261016', '20261019', '20261020', '20261021', '20261022'].map(c => ({ cal_date: c, is_open: 1 })));
-  fakeLiveDay(db, '20261019', [['18:41', 'NOT_READY'], ['21:11', 'READY']]);
-  fakeLiveDay(db, '20261020', [['18:41', 'READY'], ['21:11', 'DEGRADED']]);
-  fakeLiveDay(db, '20261021', [['21:11', 'READY']], { fetches: 1 });
-  fakeLiveDay(db, '20261022', [['18:41', 'READY'], ['21:11', 'READY'], ['23:59', 'READY', 'replay']]);
-  upsertRows(db, 'trade_cal', ['cal_date', 'is_open'], [{ cal_date: '20261023', is_open: 1 }]);
-  // Two requests that both came back short (or failed) are not a re-check.
-  fakeLiveDay(db, '20261023', [['18:41', 'DEGRADED'], ['21:11', 'DEGRADED']], { refreshStatus: 'REFRESH_INCOMPLETE' });
-  const now = new Date('2026-10-24T02:00:00Z');
-  assert.ok(acceptanceDay(db, '20261023', { now, allowDegraded: true }).failed.includes('data_rechecked'));
+const ACCEPT_DAYS = ['20261019', '20261020', '20261021', '20261022', '20261023', '20261026', '20261027', '20261028', '20261029', '20261030', '20261102', '20261103'];
+const openAcceptDays = db => upsertRows(db, 'trade_cal', ['cal_date', 'is_open'], ACCEPT_DAYS.map(c => ({ cal_date: c, is_open: 1 })));
+const LATER = new Date('2026-11-03T02:00:00Z'); // 10:00 Beijing after every fixture day
 
-  const ok = acceptanceDay(db, '20261019', { now });
-  assert.deepEqual(ok.failed.filter(f => f !== 'watchlist_continuous'), []);
-  const degraded = acceptanceDay(db, '20261020', { now });
-  assert.ok(degraded.failed.includes('final_status'), 'DEGRADED is not READY');
-  const allowed = acceptanceDay(db, '20261020', { now, allowDegraded: true });
-  assert.ok(!allowed.failed.includes('final_status'));
-  const single = acceptanceDay(db, '20261021', { now });
-  assert.ok(single.failed.includes('scheduled_runs') && single.failed.includes('data_rechecked'));
-  const withReplay = acceptanceDay(db, '20261022', { now });
-  assert.ok(!withReplay.failed.includes('mcp_consistent'), 'a later replay does not replace the served live report');
-  assert.equal(withReplay.mcp_report_id, 'ASR-20261022-1-live');
-  const pending = acceptanceDay(db, '20261022', { now: new Date('2026-10-22T12:00:00Z') });
-  assert.equal(pending.result, 'PENDING');
-  assert.equal(acceptance(db, '20261021', 3, { now }).passed, false);
+test('P1-2: one live report plus one post-close REFRESH_OK passes; retries may recover, late checks do not count', () => {
+  const db = openAshareDb(':memory:');
+  openAcceptDays(db);
+
+  // Free provider: one complete daily fetch is enough (the retired rule required two runs and two refreshes).
+  fakeLiveDay(db, '20261019', [['19:40', 'READY']], [['19:35', 'REFRESH_OK']]);
+  const single = acceptanceDay(db, '20261019', { now: LATER });
+  assert.equal(single.result, 'PASS', JSON.stringify(single.failed));
+  assert.deepEqual(single.failed, []);
+  assert.equal(single.final.report_id, 'ASR-20261019-0-live');
+  assert.equal(single.mcp_report_id, single.final.report_id);
+  assert.equal(single.late_recovery, false);
+
+  // The first attempt returned a short page; the later REFRESH_OK before the selected report satisfies the check.
+  fakeLiveDay(db, '20261020', [['19:30', 'NOT_READY'], ['20:10', 'READY']], [['19:20', 'REFRESH_INCOMPLETE'], ['20:05', 'REFRESH_OK']]);
+  const retried = acceptanceDay(db, '20261020', { now: LATER });
+  assert.equal(retried.result, 'PASS', JSON.stringify(retried.failed));
+  assert.equal(retried.final.report_id, 'ASR-20261020-1-live');
+  assert.equal(retried.daily_fetches.find(f => f.refresh_status === 'REFRESH_INCOMPLETE').eligible, false);
+
+  // Failed-only requests are not a re-check.
+  fakeLiveDay(db, '20261021', [['19:40', 'READY']], [['19:35', 'REFRESH_FAILED']]);
+  const failedOnly = acceptanceDay(db, '20261021', { now: LATER });
+  assert.equal(failedOnly.result, 'FAIL');
+  assert.ok(failedOnly.failed.includes('data_rechecked'));
+
+  // A good refresh AFTER the selected report cannot prove the report was built from it.
+  fakeLiveDay(db, '20261030', [['19:40', 'READY']], [['20:00', 'REFRESH_OK']]);
+  const afterReport = acceptanceDay(db, '20261030', { now: LATER });
+  assert.equal(afterReport.result, 'FAIL');
+  assert.ok(afterReport.failed.includes('data_rechecked'));
+  assert.equal(afterReport.daily_fetches[0].before_report, false);
+
+  // Pre-close records are not post-close evidence.
+  fakeLiveDay(db, '20261102', [['14:00', 'READY']], [['14:05', 'REFRESH_OK']]);
+  const preClose = acceptanceDay(db, '20261102', { now: LATER });
+  assert.equal(preClose.result, 'FAIL');
+  assert.ok(preClose.failed.includes('live_report'));
+  assert.ok(preClose.failed.includes('data_rechecked'));
+
+  assert.equal(acceptance(db, '20261019', 1, { now: LATER }).passed, true);
+  const summary = acceptance(db, '20261021', 3, { now: LATER });
+  assert.equal(summary.passed, false);
+  assert.deepEqual(summary.criteria, ['live_report', 'data_rechecked', 'final_status', 'mcp_consistent', 'on_time']);
   db.close();
 });
 
-test('P1-2: a fully passing live day on real pipeline output', () => {
-  // Two live runs of the fixture's last day, each after a recorded refresh of the day's quotes.
+test('P1-2: DEGRADED is PASS_DEGRADED by default; --strict-ready fails it and --allow-degraded is a compatibility alias', async () => {
+  const db = openAshareDb(':memory:');
+  openAcceptDays(db);
+  fakeLiveDay(db, '20261022', [['19:40', 'DEGRADED']], [['19:35', 'REFRESH_OK']]);
+
+  const byDefault = acceptanceDay(db, '20261022', { now: LATER });
+  assert.equal(byDefault.result, 'PASS_DEGRADED');
+  assert.deepEqual(byDefault.failed, []);
+  const strict = acceptanceDay(db, '20261022', { now: LATER, strictReady: true });
+  assert.equal(strict.result, 'FAIL');
+  assert.ok(strict.failed.includes('final_status'));
+  const alias = acceptanceDay(db, '20261022', { now: LATER, allowDegraded: true });
+  assert.equal(alias.result, 'PASS_DEGRADED');
+
+  // NOT_READY is never publishable, even with the alias.
+  fakeLiveDay(db, '20261023', [['19:40', 'NOT_READY']], [['19:35', 'REFRESH_OK']]);
+  const notReady = acceptanceDay(db, '20261023', { now: LATER, allowDegraded: true });
+  assert.equal(notReady.result, 'FAIL');
+  assert.ok(notReady.failed.includes('final_status'));
+
+  // The CLI keeps the default and both spellings.
+  const run = async flags => {
+    const x = helpers({ days: '1', end: '20261022', ...flags });
+    await runCommand(db, 'acceptance', x.h);
+    return x.out[0];
+  };
+  assert.equal((await run({})).checks[0].result, 'PASS_DEGRADED');
+  assert.equal((await run({ 'allow-degraded': true })).checks[0].result, 'PASS_DEGRADED');
+  const strictRun = await run({ 'strict-ready': true });
+  assert.equal(strictRun.checks[0].result, 'FAIL');
+  assert.equal(strictRun.strict_ready, true);
+  db.close();
+});
+
+test('P1-2: wrong-day, replay, ID mismatch, late recovery and the 21:15 PENDING boundary', () => {
+  const db = openAshareDb(':memory:');
+  openAcceptDays(db);
+
+  // A next-day catch-up is not the assessed day's evidence.
+  fakeLiveDay(db, '20261023', [['19:40', 'READY', 'live', '2026-10-26T08:00:00.000+08:00']], [['19:35', 'REFRESH_OK']]);
+  const catchUp = acceptanceDay(db, '20261023', { now: LATER });
+  assert.equal(catchUp.result, 'FAIL');
+  assert.ok(catchUp.failed.includes('live_report'));
+  assert.ok(catchUp.failed.includes('on_time'));
+  assert.equal(catchUp.late_recovery, true);
+
+  // A replay for the target day is never live evidence, even when it is what the tools serve.
+  fakeLiveDay(db, '20261026', [['20:00', 'READY', 'replay']], [['19:35', 'REFRESH_OK']]);
+  const replay = acceptanceDay(db, '20261026', { now: LATER });
+  assert.equal(replay.result, 'FAIL');
+  assert.equal(replay.final, null);
+  assert.equal(replay.live_runs.length, 0);
+  assert.ok(replay.failed.includes('live_report'));
+  assert.ok(replay.failed.includes('mcp_consistent'));
+
+  // Reports generated after the assessment time are invisible; MCP still serves one, so the IDs differ.
+  fakeLiveDay(db, '20261027', [['19:40', 'READY'], ['22:00', 'READY']], [['19:35', 'REFRESH_OK']]);
+  const mismatch = acceptanceDay(db, '20261027', { now: new Date('2026-10-27T20:00:00+08:00') });
+  assert.equal(mismatch.result, 'PENDING', 'before 21:15 the incomplete MCP check is PENDING');
+  assert.equal(mismatch.final.report_id, 'ASR-20261027-0-live');
+  assert.notEqual(mismatch.mcp_report_id, mismatch.final.report_id);
+  assert.ok(mismatch.failed.includes('mcp_consistent'));
+
+  // Incomplete before 21:15 is PENDING; after 21:15 it is FAIL.
+  fakeLiveDay(db, '20261028', [['19:40', 'READY']], [['19:35', 'REFRESH_INCOMPLETE']]);
+  const pending = acceptanceDay(db, '20261028', { now: new Date('2026-10-28T21:00:00+08:00') });
+  assert.equal(pending.result, 'PENDING');
+  assert.ok(pending.failed.includes('data_rechecked'));
+  const failed = acceptanceDay(db, '20261028', { now: new Date('2026-10-28T21:20:00+08:00') });
+  assert.equal(failed.result, 'FAIL');
+
+  // A same-day recovery after the deadline is complete but is not on-time SLA.
+  fakeLiveDay(db, '20261029', [['19:40', 'NOT_READY'], ['21:30', 'READY']], [['19:35', 'REFRESH_OK']]);
+  const late = acceptanceDay(db, '20261029', { now: new Date('2026-10-29T21:45:00+08:00') });
+  assert.equal(late.result, 'FAIL');
+  assert.ok(late.failed.includes('on_time'));
+  assert.equal(late.checks.live_report, true);
+  assert.equal(late.checks.data_rechecked, true);
+  assert.equal(late.checks.final_status, true, 'the latest same-day report is READY');
+  assert.equal(late.late_recovery, true);
+  db.close();
+});
+
+test('P1-2: a next-day catch-up is served by MCP but is not evidence; an on-time report still passes', () => {
+  const db = openAshareDb(':memory:');
+  openAcceptDays(db);
+  fakeLiveDay(db, '20261103', [
+    ['19:40', 'READY'],
+    ['08:00', 'READY', 'live', '2026-11-04T08:00:00.000+08:00'],
+  ], [['19:35', 'REFRESH_OK']]);
+  const result = acceptanceDay(db, '20261103', { now: new Date('2026-11-05T02:00:00Z') });
+  assert.equal(result.result, 'PASS', JSON.stringify(result.failed));
+  assert.equal(result.final.report_id, 'ASR-20261103-0-live', 'the on-time report is the evidence');
+  assert.equal(result.mcp_report_id, 'ASR-20261103-1-live', 'MCP serves the latest live target-day report');
+  assert.equal(result.checks.mcp_consistent, true);
+  assert.equal(result.late_recovery, false, 'the day was already ready on time; nothing was recovered late');
+  db.close();
+});
+
+test('P1-2: a real live report is served, and watchlist continuity is a diagnostic rather than a gate', () => {
   const date = LIVE_DAYS.at(-1);
   const d = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
-  for (const t of ['10:41', '13:11']) {
-    live.prepare("INSERT INTO sync_history (dataset, key, rows, status, message, synced_at, refresh_status) VALUES ('daily', ?, 60, 'ok', 'refresh', ?, 'REFRESH_OK')").run(date, `${d}T${t}:00.000Z`);
-  }
-  const ids = [generateReport(live, date, 'live').meta.report_id, generateReport(live, date, 'live').meta.report_id];
-  // generated_at is "now"; judge same-day against the clock the reports were written with.
-  const result = acceptanceDay(live, date, { now: new Date('2030-01-01T00:00:00Z') });
-  assert.equal(result.mcp_report_id, ids[1]);
-  assert.ok(!result.failed.includes('mcp_consistent'));
-  assert.ok(!result.failed.includes('final_status'));
-  assert.ok(!result.failed.includes('watchlist_continuous'), JSON.stringify(result.watchlist));
+  const { meta } = generateReport(live, date, 'live');
+  // Pin the fixture report to its trade day; generated_at otherwise carries the
+  // wall clock, which is not that 2026 fixture date when the suite runs later.
+  live.prepare("UPDATE report SET generated_at = ? WHERE trade_date = ? AND run_mode = 'live' AND report_id != ?")
+    .run(`${d}T19:30:00.000+08:00`, date, meta.report_id);
+  live.prepare('UPDATE report SET generated_at = ? WHERE report_id = ?').run(`${d}T19:40:00.000+08:00`, meta.report_id);
+  live.prepare("INSERT INTO sync_history (dataset, key, rows, status, message, synced_at, refresh_status) VALUES ('daily', ?, 60, 'ok', 'refresh', ?, 'REFRESH_OK')")
+    .run(date, new Date(`${d}T19:35:00+08:00`).toISOString());
+  const result = acceptanceDay(live, date, { now: new Date(`${d}T20:00:00+08:00`) });
+  assert.equal(result.result, 'PASS', JSON.stringify(result.failed));
+  assert.deepEqual(result.failed, []);
+  assert.equal(result.mcp_report_id, meta.report_id);
+  assert.equal(result.final.report_id, meta.report_id);
+  assert.equal(result.watchlist?.continuous, true);
 });
 
 // ---------------------------------------------------------------- MCP tools

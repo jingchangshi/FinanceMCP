@@ -15,7 +15,8 @@ const USAGE = `用法: finance-ashare <command> [options]
   etf-sync --start YYYYMMDD [--end YYYYMMDD] [--refresh]         同步五只 ETF 的基础信息/日线/复权/份额（独立 fund_* 表）
   etf-status [--date YYYYMMDD]                                   ETF 数据状态（最新日线、逐只就绪度、份额可得性）
   etf-quotes [--codes a,b] [--start YYYYMMDD] [--end YYYYMMDD] [--adjust none|qfq|hfq]   ETF 行情快照（含单位换算、复权、份额、质量标记与 fee 基金费率块）
-  acceptance [--days 3] [--end YYYYMMDD] [--allow-degraded]      连续真实交易日验收（两次定时运行、当日复查行情、最终 READY、MCP 一致、股票池连续）
+  acceptance [--days 3] [--end YYYYMMDD] [--strict-ready] [--allow-degraded]
+                                                                 连续真实交易日验收（当日 15:00 后 live 报告、同日后收盘 REFRESH_OK、MCP 一致、21:15 前就绪；DEGRADED 默认 PASS_DEGRADED，--strict-ready 时失败，--allow-degraded 为兼容别名）
   quality --date YYYYMMDD                                        重新执行数据质量检查
   audit [--start YYYYMMDD] [--end YYYYMMDD] [--fix]              历史缓存缺口审计（停牌/退市/真实缺口），--fix 只补齐缺失部分
   research-snapshot --date YYYYMMDD [--db PATH] [--revise] [--horizon 10]
