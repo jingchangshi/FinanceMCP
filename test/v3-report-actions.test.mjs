@@ -24,6 +24,7 @@ const {
 } = await import('../build/portfolio/ledger.js');
 const { ensureDeconcentrationPlan } = await import('../build/portfolio/deconcentrationPlan.js');
 const { buildDailyReport } = await import('../build/portfolio/dailyReport.js');
+const { buildInvestmentResearchBundle } = await import('../build/portfolio/researchBundle.js');
 const { weekdays } = await import('./ashare-fixture.mjs');
 
 const DAYS = weekdays('20260401', 145);
@@ -331,6 +332,60 @@ test('日报门控：已确认账户+当前快照但从未声明完整性只进 
     const anchor = pDb.prepare('SELECT hwm_nav_cents FROM account_risk_anchor WHERE account_id = ?').get(acc);
     assert.ok(anchor, 'V3 高水位锚点必须持久化');
     assert.ok(anchor.hwm_nav_cents > 0);
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('研究事实包：目标日报告缺失时 execution_plan 与最终状态同源不可执行（保留数量）', () => {
+  const mDb = seedMarket('bundle-missing');
+  const pDb = openPortfolioDb(join(dir, 'bundle-missing-portfolio.sqlite'), { marketPath: join(dir, 'bundle-missing-market.sqlite') });
+  const acc = 'real-bundle';
+  try {
+    const pos = [
+      { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 20_000, ref_price_milli: 900, ref_cost_milli: 900, market_value_cents: 1_800_000 },
+      { ts_code: '600519.SH', name: '止损测试股', quantity: 100, ref_price_milli: 10_000, ref_cost_milli: 10_000, market_value_cents: 100_000 },
+    ];
+    importSnapshot(pDb, snapshotData({ id: 'snap-bundle-d0', asOf: D0, positions: pos, cashCents: 8_100_000 }));
+    initBaseline(pDb, acc, { asOf: D0, snapshotId: 'snap-bundle-d0' });
+    markSnapshotCurrent(pDb, 'snap-bundle-d0', { confirmedBy: 'test' });
+    confirmRealAccount(pDb, acc, { confirm: true, note: 'test' });
+    setAccountCompleteness(pDb, acc, { as_of: D1, reported_events_through: D1, unreported_trade_risk: false }, { confirm: true, recordedBy: 'test' });
+
+    const buildBundle = () => buildInvestmentResearchBundle({
+      portfolioDb: pDb, marketDb: mDb, accountId: acc, asOfTradeDate: D1,
+      now: new Date('2026-10-21T01:00:00Z'),
+    });
+    const before = buildBundle();
+    assert.ok(before.portfolio?.execution_plan?.count >= 4, `前置事实包应有完整执行清单，实际 ${before.portfolio?.execution_plan?.count}`);
+    assert.ok(
+      before.portfolio.execution_plan.actions.some(action => action.legs.some(leg => leg.executable === true)),
+      '前置事实包应至少有一条可执行腿',
+    );
+    const beforeCount = before.portfolio.execution_plan.count;
+    const beforeQuantity = before.portfolio.execution_plan.actions
+      .flatMap(action => action.legs)
+      .reduce((sum, leg) => sum + (leg.quantity ?? 0), 0);
+
+    // 删除目标日市场报告 → coreReady=false，最终状态 DATA_INSUFFICIENT。
+    mDb.prepare('DELETE FROM report WHERE trade_date = ?').run(D1);
+    const missing = buildBundle();
+    assert.equal(missing.status, 'DATA_INSUFFICIENT');
+    assert.equal(missing.portfolio.status, 'DATA_INSUFFICIENT');
+    assert.equal(missing.portfolio.actionable, false);
+    assert.equal(missing.portfolio.first_section.actions.length, 0);
+    assert.equal(missing.portfolio.execution_plan.count, beforeCount, '执行清单数量应保留供参考');
+    assert.ok(
+      missing.portfolio.execution_plan.actions.every(action => action.legs.every(leg => leg.executable === false)),
+      '最终状态不可执行时 execution_plan 的腿必须全部不可执行',
+    );
+    assert.equal(missing.portfolio.execution_plan.count, missing.portfolio.execution_plan.actions.length);
+    const afterQuantity = missing.portfolio.execution_plan.actions
+      .flatMap(action => action.legs)
+      .reduce((sum, leg) => sum + (leg.quantity ?? 0), 0);
+    assert.ok(afterQuantity > 0, '数量应保留供参考');
+    assert.ok(beforeQuantity > 0);
   } finally {
     pDb.close();
     mDb.close();

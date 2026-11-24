@@ -354,12 +354,14 @@ test('P0-3: DEF→OFF 时卖出超额 511010 作为权益融资腿，并保留�
       holdings,
       candidateRows: [ROWS.growth1, ROWS.growth2, ROWS.growth3, ROWS.value, ROWS.reservoir],
     });
-    const action = rebalance(out);
-    assert.ok(action, 'DEF→OFF 应生成再平衡 action');
-    const funding = sellLegs(action).find(leg => leg.ts_code === '511010.SH');
+    const fundingAction = out.actions.find(action => action.code === 'P3-BOND-RESERVOIR-FUNDING');
+    assert.ok(fundingAction, 'DEF→OFF 应生成独立融资 action');
+    const funding = sellLegs(fundingAction).find(leg => leg.ts_code === '511010.SH');
     assert.ok(funding, '应卖出超额国债 ETF 作为融资腿');
     assert.equal(funding.reason, 'P3_DEFENSIVE_RESERVOIR_FUNDING');
     assert.ok(funding.gross_cents >= 500_000);
+    const action = rebalance(out);
+    assert.ok(action, 'DEF→OFF 应生成再平衡买入 action');
     const growthLegs = buyLegs(action).filter(leg => ['159205.SZ', '159337.SZ', '589850.SH'].includes(leg.ts_code));
     assert.ok(growthLegs.length > 0, '融资后应能买入成长桶');
     assert.equal(buyLegs(action).some(leg => leg.ts_code === '511010.SH'), false, '防御目标仍充足时不应再买国债 ETF');
@@ -421,9 +423,9 @@ test('P0-3: 蓄水池卖出只有旧报价时改用持仓参考价并明确告�
       holdings,
       candidateRows: [ROWS.growth1, ROWS.growth2, ROWS.growth3, ROWS.value, staleReservoir],
     });
-    const action = rebalance(out);
-    assert.ok(action);
-    const funding = sellLegs(action).find(leg => leg.ts_code === '511010.SH');
+    const fundingAction = out.actions.find(item => item.code === 'P3-BOND-RESERVOIR-FUNDING');
+    assert.ok(fundingAction, '仍应生成融资卖出腿');
+    const funding = sellLegs(fundingAction).find(leg => leg.ts_code === '511010.SH');
     assert.ok(funding, '仍应生成融资卖出腿');
     assert.equal(funding.price_milli, 100_000, '旧报价 50 元不得用于卖出，应使用持仓参考价 100 元');
     assert.ok(
@@ -474,9 +476,12 @@ test('P0-3: 底盘已满但个股先锋需要资金时，仍卖出超额 511010 
       stockCandidates: [stockCandidate],
     });
     assert.ok(out.actions.some(action => action.code === 'P3-STOCK-SWING-BUY-601001.SH'), '应形成个股买入腿');
-    const action = rebalance(out);
-    assert.ok(action, '融资卖出应附着在再平衡 action 上');
-    assert.ok(sellLegs(action).some(leg => leg.ts_code === '511010.SH' && leg.reason === 'P3_DEFENSIVE_RESERVOIR_FUNDING'));
+    const fundingAction = out.actions.find(action => action.code === 'P3-BOND-RESERVOIR-FUNDING');
+    assert.ok(fundingAction, '应生成独立融资 action');
+    assert.ok(sellLegs(fundingAction).some(leg => leg.ts_code === '511010.SH' && leg.reason === 'P3_DEFENSIVE_RESERVOIR_FUNDING'));
+    const fundingIdx = out.actions.findIndex(action => action.code === 'P3-BOND-RESERVOIR-FUNDING');
+    const stockIdx = out.actions.findIndex(action => action.code === 'P3-STOCK-SWING-BUY-601001.SH');
+    assert.ok(fundingIdx < stockIdx, '融资 SELL 必须排在其依赖的买入腿之前');
   } finally {
     dbWithStock.close();
   }
@@ -493,8 +498,93 @@ test('P0-3: 底盘已满但个股先锋需要资金时，仍卖出超额 511010 
       stockCandidates: [],
     });
     assert.equal(out.actions.some(action => action.legs.some(leg => leg.side === 'SELL')), false);
+    assert.equal(out.actions.some(action => action.code === 'P3-BOND-RESERVOIR-FUNDING'), false);
     assert.equal(out.actions.some(action => action.code === 'P3-SUPER-ETF-REBALANCE'), false);
   } finally {
     dbNoBuys.close();
+  }
+});
+
+test('P0-3 融资按实际整手买入净额：仅价值桶可买时不得按整块底盘缺口卖债', () => {
+  const db = freshDb();
+  try {
+    const holdings = [
+      {
+        ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 15_000, sellable_quantity: 15_000,
+        weight: 0.15, market_value_cents: 1_500_000, price_milli: 1000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 1000,
+      },
+      {
+        ts_code: '511010.SH', name: '国债ETF', quantity: 850_000, sellable_quantity: 850_000,
+        weight: 0.85, market_value_cents: 8_500_000, price_milli: 10_000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 10_000,
+      },
+    ];
+    const reservoirRow = candidateRow({ code: '511010.SH', name: '国债ETF', closeMilli: 10_000, category: 'bond' });
+    const out = run(db, {
+      marketRegime: regime('OFFENSIVE', 'GROWTH_LEADING'),
+      cashCents: 10_000,
+      totalAssetsCents: 10_000_000,
+      holdings,
+      // 仅价值桶有合格成员，成长桶缺席。
+      candidateRows: [ROWS.value, reservoirRow],
+    });
+    const fundingAction = out.actions.find(action => action.code === 'P3-BOND-RESERVOIR-FUNDING');
+    assert.ok(fundingAction, '应按实际价值桶净缺口生成融资卖出');
+    const sell = sellLegs(fundingAction)[0];
+    assert.ok(sell.gross_cents >= 1_250_000, `融资应覆盖价值桶净缺口，实际 ${sell.gross_cents}`);
+    assert.ok(sell.gross_cents <= 1_500_000, `融资不得按整块底盘缺口 2,250,000 卖债，实际 ${sell.gross_cents}`);
+    const action = rebalance(out);
+    assert.ok(action);
+    assert.ok(legOf(action, '159330.SZ'), '价值桶应买入');
+    assert.equal(buyLegs(action).some(leg => ['159205.SZ', '159337.SZ', '589850.SH'].includes(leg.ts_code)), false);
+  } finally {
+    db.close();
+  }
+});
+
+test('P0-3 仅个股可买时融资按股票实际净额，且 SELL 在 BUY 之前', () => {
+  const stockCandidate = {
+    ts_code: '601001.SH', name: '测试回踩', trade_date: ASOF,
+    entry_ref_price_milli: 10_000, hard_stop_price_milli: 9_200,
+    entry_ref_price_cny: 10, max_chase_price_cny: 10.2, hard_stop_price_cny: 9.2,
+    stop_loss_pct: -8, setup_label_zh: '缩量回踩 20 日均线', reasons_zh: ['测试候选'],
+  };
+  const db = freshDb();
+  try {
+    const holdings = [
+      {
+        ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 37_500, sellable_quantity: 37_500,
+        weight: 0.375, market_value_cents: 3_750_000, price_milli: 1000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 1000,
+      },
+      {
+        ts_code: '511010.SH', name: '国债ETF', quantity: 624, sellable_quantity: 624,
+        weight: 0.624, market_value_cents: 6_240_000, price_milli: 100_000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 100_000,
+      },
+    ];
+    const out = run(db, {
+      marketRegime: regime('OFFENSIVE', 'GROWTH_LEADING'),
+      cashCents: 10_000,
+      totalAssetsCents: 10_000_000,
+      holdings,
+      candidateRows: [ROWS.value, ROWS.reservoir],
+      stockCandidates: [stockCandidate],
+    });
+    const fundingAction = out.actions.find(action => action.code === 'P3-BOND-RESERVOIR-FUNDING');
+    assert.ok(fundingAction, '仅个股可买时也应融资');
+    const sell = sellLegs(fundingAction)[0];
+    assert.ok(sell.gross_cents >= 1_500_000, `融资应覆盖股票净额，实际 ${sell.gross_cents}`);
+    assert.ok(sell.gross_cents <= 2_200_000, `融资不得按整块股权缺口卖债，实际 ${sell.gross_cents}`);
+    const stockAction = out.actions.find(action => action.code === 'P3-STOCK-SWING-BUY-601001.SH');
+    assert.ok(stockAction);
+    assert.ok(
+      out.actions.indexOf(fundingAction) < out.actions.indexOf(stockAction),
+      '融资 SELL 必须排在依赖的股票 BUY 之前',
+    );
+    assert.equal(out.actions.some(action => action.code === 'P3-SUPER-ETF-REBALANCE'), false);
+  } finally {
+    db.close();
   }
 });
