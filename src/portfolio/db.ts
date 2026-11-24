@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS deconcentration_plan (
   initial_shares INTEGER NOT NULL,
   target_keep_bps INTEGER NOT NULL,
   anchor_price_milli INTEGER NOT NULL,
+  anchor_trade_date TEXT,
   support_floor_milli INTEGER,
   last_exec_price_milli INTEGER,
   last_exec_date TEXT,
@@ -264,6 +265,8 @@ export function ensurePortfolioV3Schema(db: DatabaseSync): void {
       .filter((n): n is string => Boolean(n)),
   );
   const migrations: Array<[string, string]> = [
+    // 价格基准日与原始锚定价同存；旧库补 nullable 列（NULL 表示历史未记录，绝不从 created_at 回填）。
+    ['anchor_trade_date', 'ALTER TABLE deconcentration_plan ADD COLUMN anchor_trade_date TEXT;'],
     ['support_floor_milli', 'ALTER TABLE deconcentration_plan ADD COLUMN support_floor_milli INTEGER;'],
     ['plan_mode', "ALTER TABLE deconcentration_plan ADD COLUMN plan_mode TEXT NOT NULL DEFAULT 'STANDARD';"],
     ['tactical_slot_bps', 'ALTER TABLE deconcentration_plan ADD COLUMN tactical_slot_bps INTEGER NOT NULL DEFAULT 1000;'],

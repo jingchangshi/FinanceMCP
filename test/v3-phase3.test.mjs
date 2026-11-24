@@ -678,6 +678,7 @@ test('T6: 159558 BOTTOM_GRIND_25 校准拆分、2日防守确认、四门槛磨�
       nav_cents: 6_860_690,
       target_keep_bps: 1800,
       anchor_price_milli: 819,
+      anchor_trade_date: createdDay,
       support_floor_milli: 780,
       total_tranches: 4,
       created_at: createdDay,
@@ -716,6 +717,12 @@ test('T6: 159558 BOTTOM_GRIND_25 校准拆分、2日防守确认、四门槛磨�
       [8200, 'PENDING'],
       [8100, 'PENDING'],
     ]);
+    // 只改模式/目标底仓的无关校准必须原样保留原始锚定价与价格基准日（不得清空、不得从 created_at 推断）。
+    const planAfterUnrelatedCal = pDb.prepare(
+      'SELECT anchor_price_milli, anchor_trade_date FROM deconcentration_plan WHERE account_id = ?',
+    ).get(accCal);
+    assert.equal(planAfterUnrelatedCal.anchor_price_milli, 819);
+    assert.equal(planAfterUnrelatedCal.anchor_trade_date, createdDay);
 
     // 取消低位 MONTHLY_SCHEDULE：即便来到月初且间隔 >=12 交易日，不触发强卖
     const evMonthlyBlocked = evaluateDeconcentrationPlan({
