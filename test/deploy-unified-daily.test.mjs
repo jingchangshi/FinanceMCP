@@ -202,7 +202,7 @@ test('U2b DEGRADED on first pass counts as ready (isolated defects disclose, the
     dailyPayloads: [
       {
         report: { trade_date: TRADE_DATE, status: 'DEGRADED' },
-        etf: { coverage: { [TRADE_DATE]: { missing: [] } } },
+        ...readyEtf(),
       },
     ],
   });
