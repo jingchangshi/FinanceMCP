@@ -153,7 +153,7 @@ const TRIGGER_REASON_ZH: Record<TrancheTriggerReason, string> = {
   REBOUND_8PCT: '自前次锚定价反弹满 +8% 加速兑现',
   BREAKDOWN_MA60: '空头防守期连续两日有效跌破60日均线保护减仓',
   BREAKDOWN_SUPPORT_FLOOR: '收盘跌破磨底箱体防守位保护减仓',
-  GRIND_OVERSOLD_RELOAD: '25%底仓磨底回补护栏满足：60日均线走平+深折价超卖+右侧止稳+距上次执行≥3个交易日，且实时仓位<30%，触发10%降本回补',
+  GRIND_OVERSOLD_RELOAD: '25%底仓磨底回补条件满足：60日均线走平+深折价超卖+右侧止稳；系统附加护栏（距上次执行≥3个交易日、仓位<30%，非EXP-V3-04签发条件）亦满足，触发10%降本回补',
   GRIND_TACTICAL_TAKE_PROFIT: '磨底降本机动槽达到止盈兑现条件，高抛降本回归25%核心底仓',
   GRIND_OVERWEIGHT_DRIFT_HARVEST: '持仓占比被动漂移达34%以上且短线滞涨，获利兑现超额部分回归25%底仓',
 };
@@ -697,7 +697,7 @@ export function computeEtfGrindIndicators(input: {
   // 是 c > prevClose && c >= MA5*0.995，不是严格的 close > MA5。
   const rightSideTurnReady = prevCloseMilli !== null && ma5Milli !== null
     && cMilli > prevCloseMilli && cVal >= ma5T! * 0.995;
-  // 冷却期（TS 侧附加护栏）：距上次卖出/战术执行至少 3 个交易日。
+  // 冷却期（系统附加护栏，非 EXP-V3-04 签发条件）：距上次卖出/战术执行至少 3 个交易日。
   const cooldownReady = !lastExecDate || tradeDaysSinceLast >= 3;
   const inBullTrend = ma60T !== null && ma20T !== null && cVal > ma60T && ma20T > ma60T;
   const supportBreakdown2d = supportFloorMilli !== null && (
@@ -1057,14 +1057,16 @@ export function evaluateDeconcentrationPlan(input: {
         ) {
           tacticalShares = tacQty;
           tacticalEntryPriceRaw = tacEntryPxRaw;
-          tacticalEntryPriceMilli = tacEntryPxAdj;
           tacticalEntryDate = tacEntryDt;
           completedSwingCount = swings;
           lastExecPriceRaw = replayLastSellPxRaw;
-          lastExecPriceMilli = replayLastSellPx;
           lastExecDate = replayLastSellDt;
           planMutated = true;
         }
+        // 决策口径每轮都采用同一 asOf 基准的 replay 加权均价：多笔跨除权买入时，
+        // 它与「原始加权均价按首笔日期一次性折算」不同；落库仍只保存事件日原始价。
+        tacticalEntryPriceMilli = tacEntryPxAdj;
+        lastExecPriceMilli = replayLastSellPx;
       }
     }
     if (input.currentShares === 0 && tacticalShares > 0) {
@@ -1200,8 +1202,9 @@ export function evaluateDeconcentrationPlan(input: {
         tacticalShares === 0
         && pending.length === 0
         && (input.circuitBreakerStatus ?? 'NORMAL') === 'NORMAL'
-        // 回补护栏：实时仓位必须 <30%（weightBps < 3000）；all_reload_guards_ready 已含
-        // 距上次执行 >=3 个交易日冷却期、MA60 10日斜率>=0、折价达标、近3日超卖、右侧止稳。
+        // EXP-V3-04 回补条件（MA60 走平、折价、超卖、右侧止稳）之外，系统附加两道 TS 护栏：
+        // 实时仓位必须 <30%（weightBps < 3000）且距上次执行 >=3 个交易日（含在
+        // all_reload_guards_ready 内）。二者都不是 EXP-V3-04/MASTER 的签发条件，是否保留由所有者决策。
         && (weightBps === null || weightBps < 3000)
         && guards.all_reload_guards_ready
         && input.navCents
@@ -1237,7 +1240,7 @@ export function evaluateDeconcentrationPlan(input: {
   let statusSummaryZh: string;
   if (planMode === 'BOTTOM_GRIND_25') {
     if (recommendedBuyShares >= 100 && activeReason === 'GRIND_OVERSOLD_RELOAD') {
-      statusSummaryZh = `${tsCode} 通过25%底仓磨底降本全部护栏验收（MA60走平、折价超卖、右侧止稳、冷却≥3个交易日、仓位<30%），建议战术回补 ${recommendedBuyShares} 份（目标仓位封顶 ${maxGrindWeightPct.toFixed(0)}%，回补后按 +7.5% 或牛市均线追踪止盈）。`;
+      statusSummaryZh = `${tsCode} 通过25%底仓磨底降本 EXP-V3-04 回补条件（MA60走平、折价超卖、右侧止稳），并满足系统附加护栏（冷却≥3个交易日、仓位<30%，非 EXP-V3-04 签发条件），建议战术回补 ${recommendedBuyShares} 份（目标仓位封顶 ${maxGrindWeightPct.toFixed(0)}%，回补后按 +7.5% 或牛市均线追踪止盈）。`;
     } else if (recommendedSellShares >= 100 && (activeReason === 'GRIND_TACTICAL_TAKE_PROFIT' || activeReason === 'GRIND_OVERWEIGHT_DRIFT_HARVEST')) {
       statusSummaryZh = `${tsCode} 已触发${TRIGGER_REASON_ZH[activeReason]}，建议卖出 ${recommendedSellShares} 份回归 ${targetKeepPct.toFixed(0)}% 核心底仓。`;
     } else if (triggered.length > 0 && recommendedSellShares >= 100) {

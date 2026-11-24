@@ -144,6 +144,38 @@ test('P2-2: 现金分红（复权因子 1.02）同样折算战术入场价', () 
   }
 });
 
+test('P2-2: 多笔跨除权回补每轮都用 asOf 基准 replay 加权均价（不退回 3.75 元假止盈）', () => {
+  const { marketDb, portfolioDb } = makeDbs('multi-fill');
+  try {
+    seedEtfBars(marketDb, [2.0, 2.0, 2.0, 2.0, 1.0, 1.03, 1.06], { factorFrom: 4, factor: 2 });
+    newGrindPlan(portfolioDb);
+    // 两笔同 raw 7.500 元：拆股前（factor 1）买 10,000 份，拆股后（factor 2）买 5,000 份。
+    seedBuyEvent(portfolioDb, 'acc', { eventId: 'tac-buy-a', occurredOn: DAYS[2], quantity: 10000, priceMilli: 7500 });
+    seedBuyEvent(portfolioDb, 'acc', { eventId: 'tac-buy-b', occurredOn: DAYS[5], quantity: 5000, priceMilli: 7500 });
+
+    // 正确加权复权均价 = (10000×7500×1/2 + 5000×7500×2/2) / 15000 = 5000 厘（5.000 元）。
+    // 若按首笔日期对原始加权均价一次性折算，会得到 7500×1/2 = 3750 厘（3.750 元）。
+    const round1 = evaluate(portfolioDb, marketDb, DAYS[6], 4100);
+    assert.equal(round1.tactical_entry_price_cny, 5);
+    assert.equal(round1.tactical_take_profit_cny, 5.375);
+    assert.equal(round1.recommended_sell_shares, 0, '4.100 元不得按 3.750 元口径误触发止盈');
+    persistDeconcentrationUpdates(portfolioDb, round1);
+    assert.equal(planRow(portfolioDb).tactical_entry_price_milli, 7500, '落库保存事件日原始加权价');
+
+    const round2 = evaluate(portfolioDb, marketDb, DAYS[6], 4100);
+    assert.equal(round2.tactical_entry_price_cny, 5, 'raw 字段未变的第二轮仍必须采用 replay 加权复权均价');
+    assert.equal(round2.tactical_take_profit_cny, 5.375);
+    assert.equal(round2.recommended_sell_shares, 0, '不得退回 3.750 元口径产生假止盈');
+
+    const takeProfit = evaluate(portfolioDb, marketDb, DAYS[6], 5400);
+    assert.equal(takeProfit.active_trigger_reason, 'GRIND_TACTICAL_TAKE_PROFIT');
+    assert.equal(takeProfit.recommended_sell_shares, 15000);
+  } finally {
+    portfolioDb.close();
+    marketDb.close();
+  }
+});
+
 test('P2-2: 历史 last_exec 价格按 asOf 复权基准折算，驱动 +8% 反弹线与折价目标', () => {
   const { marketDb, portfolioDb } = makeDbs('last-exec');
   try {
@@ -189,7 +221,7 @@ test('P2-2: 缺少 adj_factor 时保持旧行为（原始价，不臆造因子�
   }
 });
 
-// ---------------------------------------------------------------- 冷却期 / 仓位护栏 / MA5 公式
+// ---------------------------------------------------------------- 系统附加护栏 / MA5 公式
 
 function grindSeries(n = 80) {
   const endIdx = n - 1;
@@ -206,7 +238,7 @@ function grindSeries(n = 80) {
   return closes;
 }
 
-test('P2-2: 3 个交易日冷却期是回补的硬护栏（2 日不满足，3 日满足）', () => {
+test('P2-2: 3 个交易日冷却期是系统附加护栏（非 EXP-V3-04 签发条件；2 日不满足，3 日满足）', () => {
   const days = weekdays('20260105', 80);
   const qfq = { dates: days, closes: grindSeries(80) };
   const base = {
@@ -224,14 +256,14 @@ test('P2-2: 3 个交易日冷却期是回补的硬护栏（2 日不满足，3 �
   assert.equal(two.guards.oversold_3d_ready, true);
   assert.equal(two.guards.right_side_turn_ready, true);
   assert.equal(two.guards.cooldown_ready, false);
-  assert.equal(two.guards.all_reload_guards_ready, false, '冷却期未满时不得回补');
+  assert.equal(two.guards.all_reload_guards_ready, false, '系统附加冷却护栏未满时不得回补');
 
   const three = computeEtfGrindIndicators({ ...base, tradeDaysSinceLast: 3 });
   assert.equal(three.guards.cooldown_ready, true);
   assert.equal(three.guards.all_reload_guards_ready, true);
 });
 
-test('P2-2: 实时仓位 30% 是回补的硬上限，冷却期按交易日历精确计算', () => {
+test('P2-2: 实时仓位 30% 是系统附加护栏（非 EXP-V3-04 签发条件），冷却期按交易日历精确计算', () => {
   const { marketDb, portfolioDb } = makeDbs('gates');
   try {
     const days = weekdays('20260105', 80);
@@ -282,12 +314,12 @@ test('P2-2: 实时仓位 30% 是回补的硬上限，冷却期按交易日历精
     const cooldownOk = evalAt(25000);
     assert.equal(cooldownOk.trade_days_since_last, 3);
     assert.equal(cooldownOk.grind_guards?.cooldown_ready, true);
-    assert.ok(cooldownOk.recommended_buy_shares >= 100, '冷却期与其余护栏均满足时应回补');
+    assert.ok(cooldownOk.recommended_buy_shares >= 100, '系统附加护栏与 EXP-V3-04 条件均满足时应回补');
 
-    // 仓位护栏：30.55% ≥ 30% 时禁止回补。
+    // 系统附加仓位护栏：30.55% ≥ 30% 时禁止回补（非 EXP-V3-04 签发条件）。
     const overweight = evalAt(41000);
     assert.equal(overweight.live_weight_pct, 30.55);
-    assert.equal(overweight.recommended_buy_shares, 0, '实时仓位 >=30% 不得回补');
+    assert.equal(overweight.recommended_buy_shares, 0, '实时仓位 >=30%（系统附加护栏）不得回补');
   } finally {
     portfolioDb.close();
     marketDb.close();

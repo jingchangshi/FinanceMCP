@@ -1981,7 +1981,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           v3Triggers.push(
             `159558.SZ 25%战略底仓震荡磨底回补护栏：60日均线10日斜率走平（当前 ${dec.grind_guards?.ma60_slope10_pct?.toFixed(2) ?? '—'}%）`
             + `、较前次卖出折价7%（${rPrice !== null && rPrice !== undefined ? rPrice.toFixed(3) : '—'} 元）、近3日超卖极值、右侧收阳且收盘位于5日线容差之内`
-            + '、距上次执行≥3个交易日且实时仓位<30%',
+            + '（系统附加护栏：距上次执行≥3个交易日且实时仓位<30%，非 EXP-V3-04 签发条件）',
           );
         }
       } else if (hasOpenExcess) {
