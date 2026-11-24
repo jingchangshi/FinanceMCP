@@ -177,6 +177,9 @@ export function screenStockSwingCandidates(
   const preQualified: PreQualifiedStock[] = [];
 
   const scan = scanMarket(db, asOf, {
+    // The stock-swing strategy follows the TactiCore experiment's PIT rule (latest announcement
+    // on or before asOf); the public financialsAsOf default stays period-first.
+    fundamentals_order: 'announcement-first',
     onStock: (code, bars, x, i, row) => {
       const adjMissing = bars.adjMissing ?? 0;
       if (adjMissing > 0) return;

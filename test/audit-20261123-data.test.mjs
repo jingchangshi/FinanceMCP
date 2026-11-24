@@ -443,36 +443,68 @@ function seedReadinessDay(db, date, codes, overridesByCode = {}) {
 
 const codesOf = n => Array.from({ length: n }, (_, i) => `${600000 + i}.SH`);
 
-test('P2-4: short page, bad close and NULL OHLC are NOT_READY, not just DEGRADED', async () => {
+test('P2-4: market-level short pages and mass bad bars block; isolated bad bars are excluded by symbol and disclosed', async () => {
   await withEnv({ ASHARE_DATA_PROVIDER: 'free' }, async () => {
-    const db = openAshareDb(':memory:');
+    // 1) short same-day page: 90 of the previous day's 100 names -> market-level -> NOT_READY.
+    const shortDb = openAshareDb(':memory:');
     try {
-      upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [
+      upsertRows(shortDb, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [
         { cal_date: '20261117', is_open: 1, pretrade_date: '20261116' },
         { cal_date: '20261118', is_open: 1, pretrade_date: '20261117' },
       ]);
-      // 1) short same-day page: 90 of the previous day's 100 names.
-      seedReadinessDay(db, '20261117', codesOf(100));
-      seedReadinessDay(db, '20261118', codesOf(90));
-      const short = checkDataReadiness(db, '20261118');
+      seedReadinessDay(shortDb, '20261117', codesOf(100));
+      seedReadinessDay(shortDb, '20261118', codesOf(90));
+      const short = checkDataReadiness(shortDb, '20261118');
       assert.equal(short.status, 'NOT_READY');
       assert.match(short.reason, /97%/);
-
-      // 2) invalid close (close <= 0).
-      seedReadinessDay(db, '20261119', codesOf(10), { '600000.SH': { close: 0 } });
-      upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: '20261119', is_open: 1, pretrade_date: '20261118' }]);
-      const badClose = checkDataReadiness(db, '20261119');
-      assert.equal(badClose.status, 'NOT_READY');
-      assert.match(badClose.reason, /bad_close=1/);
-
-      // 3) NULL open with a valid close -> null_ohlc.
-      seedReadinessDay(db, '20261120', codesOf(10), { '600000.SH': { open: null } });
-      upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: '20261120', is_open: 1, pretrade_date: '20261119' }]);
-      const nullOhlc = checkDataReadiness(db, '20261120');
-      assert.equal(nullOhlc.status, 'NOT_READY');
-      assert.match(nullOhlc.reason, /null_ohlc=1/);
     } finally {
-      db.close();
+      shortDb.close();
+    }
+
+    // 2) one bad close / one NULL OHLC out of 10: isolated -> DEGRADED + symbol disclosure.
+    const isolatedDb = openAshareDb(':memory:');
+    try {
+      upsertRows(isolatedDb, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: '20261118', is_open: 1, pretrade_date: null }]);
+      seedReadinessDay(isolatedDb, '20261118', codesOf(10), { '600000.SH': { close: 0 } });
+      const badClose = checkDataReadiness(isolatedDb, '20261118');
+      assert.equal(badClose.status, 'DEGRADED', 'one bad close must not block the whole snapshot');
+      assert.match(badClose.reason, /价格字段非法 1 只（600000\.SH）/);
+      assert.match(badClose.reason, /已按 symbol 剔除/);
+      assert.match(badClose.reason, /不阻断日报/);
+
+      isolatedDb.exec("UPDATE daily SET close = 10, open = NULL WHERE ts_code = '600000.SH' AND trade_date = '20261118'");
+      const nullOhlc = checkDataReadiness(isolatedDb, '20261118');
+      assert.equal(nullOhlc.status, 'DEGRADED');
+      assert.match(nullOhlc.reason, /价格字段非法 1 只/);
+    } finally {
+      isolatedDb.close();
+    }
+
+    // 3) six of ten price-invalid bars is a market-level failure -> NOT_READY.
+    const massDb = openAshareDb(':memory:');
+    try {
+      upsertRows(massDb, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: '20261118', is_open: 1, pretrade_date: null }]);
+      const overrides = Object.fromEntries(codesOf(6).map(code => [code, { close: 0 }]));
+      seedReadinessDay(massDb, '20261118', codesOf(10), overrides);
+      const mass = checkDataReadiness(massDb, '20261118');
+      assert.equal(mass.status, 'NOT_READY');
+      assert.match(mass.reason, /价格字段非法 6 只.*大面积坏条/);
+    } finally {
+      massDb.close();
+    }
+
+    // 4) an auxiliary dataset gap (<97%) is disclosed, not a block.
+    const auxDb = openAshareDb(':memory:');
+    try {
+      upsertRows(auxDb, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: '20261118', is_open: 1, pretrade_date: null }]);
+      seedReadinessDay(auxDb, '20261118', codesOf(10));
+      auxDb.exec("DELETE FROM stk_limit WHERE ts_code = '600009.SH'");
+      const aux = checkDataReadiness(auxDb, '20261118');
+      assert.equal(aux.status, 'DEGRADED', 'auxiliary dataset gaps must not block the report');
+      assert.match(aux.reason, /stk_limit=9 < daily=10/);
+      assert.match(aux.reason, /不阻断日报/);
+    } finally {
+      auxDb.close();
     }
   });
 });
@@ -510,12 +542,14 @@ test('P2-4: free mode discloses unusable daily_basic/adj_factor instead of trust
 
 // ---------------------------------------------------------------- P2-5 regime lookback + breadth universe
 
-test('P2-5: a crash lock older than 5 days survives the default 20-day regime window', async () => {
+test('P2-5: the confirmed regime is carried from the last crash, not re-seeded by the display window', async () => {
   const db = openAshareDb(':memory:');
   try {
-    const days = weekdays('20260701', 80);
+    const days = weekdays('20260302', 110);
     const asOf = days.at(-1);
-    const crashIdx = days.length - 7;
+    // 30 trading days before asOf: outside the default 20-day DISPLAY window, inside the
+    // bounded 60-day STATE replay window. The crash lock must still hold.
+    const crashIdx = days.length - 30;
     upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'],
       days.map((d, i) => ({ cal_date: d, is_open: 1, pretrade_date: days[i - 1] ?? null })));
 
@@ -561,18 +595,22 @@ test('P2-5: a crash lock older than 5 days survives the default 20-day regime wi
     }
 
     const held = evaluateMarketRegime(db, asOf, { pctAboveMa60ByDate: pctMap });
-    assert.equal(held.crash_override, false, 'the crash itself is 6 trading days before asOf');
-    assert.equal(held.regime, 'DEFENSIVE', 'the 20-day default keeps the older crash lock');
+    assert.equal(held.crash_override, false, 'the crash itself is 30 trading days before asOf');
+    assert.equal(held.regime, 'DEFENSIVE', 'the state machine inherits the crash lock from outside the display window');
     assert.equal(held.hysteresis_held, true);
+    assert.equal(held.history.length, 20, 'display history stays bounded at the default 20 days');
 
-    const short = evaluateMarketRegime(db, asOf, { hysteresisLookbackDays: 5, pctAboveMa60ByDate: pctMap });
-    assert.notEqual(short.regime, 'DEFENSIVE', 'a 5-day window has already forgotten the crash lock');
+    // The display lookback no longer controls the carried state: even a 5-day display keeps it.
+    const shortDisplay = evaluateMarketRegime(db, asOf, { hysteresisLookbackDays: 5, pctAboveMa60ByDate: pctMap });
+    assert.equal(shortDisplay.regime, 'DEFENSIVE', 'a short display window must not forget the crash');
+    assert.equal(shortDisplay.history.length, 5);
+    assert.equal(shortDisplay.history.at(-1).confirmed_regime, 'DEFENSIVE');
   } finally {
     db.close();
   }
 });
 
-test('P2-5: scanMarket breadth excludes .BJ and stocks without a valid MA60', () => {
+test('P2-5: scanMarket breadth excludes .BJ, missing MA60 and price-defective symbols; no valid MA yields null', () => {
   const db = openAshareDb(':memory:');
   try {
     const days = weekdays('20260701', 70);
@@ -586,6 +624,7 @@ test('P2-5: scanMarket breadth excludes .BJ and stocks without a valid MA60', ()
       { ts_code: '920001.BJ', name: '北交所C' },
       { ts_code: '600004.SH', name: '短历史D', bars: 30 },
       { ts_code: '600005.SH', name: '下降E' },
+      { ts_code: '600006.SH', name: '坏价格F' },
     ];
     upsertRows(db, 'stock_basic', ['ts_code', 'symbol', 'name', 'industry', 'list_date', 'list_status'],
       universe.map(s => ({ ts_code: s.ts_code, symbol: s.ts_code.slice(0, 6), name: s.name, industry: '测试', list_date: '20180101', list_status: 'L' })));
@@ -596,8 +635,12 @@ test('P2-5: scanMarket breadth excludes .BJ and stocks without a valid MA60', ()
       const offset = days.length - (s.bars ?? days.length);
       days.slice(offset).forEach((trade_date, k) => {
         const rising = s.ts_code !== '600005.SH';
+        const defect = s.ts_code === '600006.SH' && trade_date === asOf;
         const close = rising ? 10 + k * 0.2 : 30 - k * 0.2;
-        daily.push({ ts_code: s.ts_code, trade_date, open: close, high: close * 1.01, low: close * 0.99, close, pre_close: close, pct_chg: 0, vol: 1000, amount: 1000 });
+        daily.push({
+          ts_code: s.ts_code, trade_date, open: close, high: close * 1.01, low: close * 0.99,
+          close: defect ? 0 : close, pre_close: close, pct_chg: 0, vol: 1000, amount: 1000,
+        });
         factors.push({ ts_code: s.ts_code, trade_date, adj_factor: 1 });
       });
     }
@@ -605,13 +648,41 @@ test('P2-5: scanMarket breadth excludes .BJ and stocks without a valid MA60', ()
     upsertRows(db, 'adj_factor', ['ts_code', 'trade_date', 'adj_factor'], factors);
 
     const scan = scanMarket(db, asOf);
-    // MA60 universe: 600001 (above), 600002 (above), 600005 (below). .BJ and the 30-bar stock excluded.
+    // MA60 universe: 600001 (above), 600002 (above), 600005 (below). .BJ, the 30-bar stock and
+    // the price-defective symbol are excluded.
     assert.ok(Math.abs(scan.pct_above_ma60 - 2 / 3) < 1e-9, `pct_above_ma60=${scan.pct_above_ma60}`);
-    // MA20 universe adds the 30-bar stock (valid MA20, above), still excludes .BJ.
+    // MA20 universe adds the 30-bar stock (valid MA20, above), still excludes .BJ and the defect.
     assert.ok(Math.abs(scan.pct_above_ma20 - 3 / 4) < 1e-9, `pct_above_ma20=${scan.pct_above_ma20}`);
     assert.notEqual(scan.pct_above_ma60, 0.6, 'the old all-rows denominator would report 3/5');
+
+    const defective = scan.rows.find(r => r.ts_code === '600006.SH');
+    assert.equal(defective.signals.length, 0, 'a price-defective symbol must not emit signals');
+    assert.ok(defective.risk_flags.some(f => f.includes('价格字段非法')), JSON.stringify(defective.risk_flags));
   } finally {
     db.close();
+  }
+
+  // No valid MA60 anywhere -> null (unknown), never 0% (which reads as maximally weak).
+  const shortDb = openAshareDb(':memory:');
+  try {
+    const days = weekdays('20260701', 30);
+    const asOf = days.at(-1);
+    upsertRows(shortDb, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'],
+      days.map((d, i) => ({ cal_date: d, is_open: 1, pretrade_date: days[i - 1] ?? null })));
+    upsertRows(shortDb, 'stock_basic', ['ts_code', 'symbol', 'name', 'industry', 'list_date', 'list_status'], [
+      { ts_code: '600001.SH', symbol: '600001', name: '短历史', industry: '测试', list_date: '20180101', list_status: 'L' },
+    ]);
+    upsertRows(shortDb, 'daily', DAILY_COLS, days.map((trade_date, k) => ({
+      ts_code: '600001.SH', trade_date, open: 10 + k * 0.2, high: 10.3 + k * 0.2, low: 9.9 + k * 0.2,
+      close: 10 + k * 0.2, pre_close: 10 + k * 0.2, pct_chg: 0, vol: 1000, amount: 1000,
+    })));
+    upsertRows(shortDb, 'adj_factor', ['ts_code', 'trade_date', 'adj_factor'],
+      days.map(trade_date => ({ ts_code: '600001.SH', trade_date, adj_factor: 1 })));
+    const scan = scanMarket(shortDb, asOf);
+    assert.equal(scan.pct_above_ma60, null, 'no MA60 anywhere is unknown, not 0%');
+    assert.ok(Number.isFinite(scan.pct_above_ma20), 'MA20 is still measured when available');
+  } finally {
+    shortDb.close();
   }
 });
 
@@ -672,23 +743,52 @@ test('P2-3: a cashflow endpoint failure surfaces instead of nulling the whole ma
   }
 });
 
-test('P2-3: financial selection picks the latest announcement on or before as-of (TactiCore PIT order)', () => {
+test('P2-3: announcement-first PIT selection is opt-in; the public default stays period-first', () => {
   const db = openAshareDb(':memory:');
   try {
     upsertRows(db, 'fina_indicator', ['ts_code', 'end_date', 'ann_date', 'roe'], [
       // Q1 2026 announced 04-28 ...
       { ts_code: '000001.SZ', end_date: '20260331', ann_date: '20260428', roe: 2.5 },
-      // ... then FY2025 was re-announced 04-30: that is the latest information the market had.
+      // ... then FY2025 was re-announced 04-30.
       { ts_code: '000001.SZ', end_date: '20251231', ann_date: '20260430', roe: 9 },
     ]);
-    const asOf = financialsAsOf(db, '20260501').get('000001.SZ');
-    assert.equal(asOf.end_date, '20251231', 'a late re-announcement of an older period wins');
-    assert.equal(asOf.ann_date, '20260430');
-    // Without a later correction the newest period is still selected.
-    const early = financialsAsOf(db, '20260429').get('000001.SZ');
-    assert.equal(early.end_date, '20260331');
+    const byPeriod = financialsAsOf(db, '20260501').get('000001.SZ');
+    assert.equal(byPeriod.end_date, '20260331', 'public default: the newest period wins');
+    const byAnnouncement = financialsAsOf(db, '20260501', 'announcement-first').get('000001.SZ');
+    assert.equal(byAnnouncement.end_date, '20251231', 'stock-swing PIT: a late re-announcement of an older period wins');
+    assert.equal(byAnnouncement.ann_date, '20260430');
+    // Without a later correction both orders select the newest period.
+    assert.equal(financialsAsOf(db, '20260429').get('000001.SZ').end_date, '20260331');
+    assert.equal(financialsAsOf(db, '20260429', 'announcement-first').get('000001.SZ').end_date, '20260331');
   } finally {
     db.close();
+  }
+
+  // The scan hook wiring: only the stock-swing screener opts into announcement-first.
+  const scanDb = openAshareDb(':memory:');
+  try {
+    const days = weekdays('20260105', 90);
+    const asOf = days.at(-1);
+    upsertRows(scanDb, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'],
+      days.map((d, i) => ({ cal_date: d, is_open: 1, pretrade_date: days[i - 1] ?? null })));
+    upsertRows(scanDb, 'stock_basic', ['ts_code', 'symbol', 'name', 'industry', 'list_date', 'list_status'], [
+      { ts_code: '000001.SZ', symbol: '000001', name: '测试', industry: '银行', list_date: '20180101', list_status: 'L' },
+    ]);
+    upsertRows(scanDb, 'daily', DAILY_COLS, days.map((trade_date, k) => ({
+      ts_code: '000001.SZ', trade_date, open: 10 + k * 0.05, high: 10.2 + k * 0.05, low: 9.9 + k * 0.05,
+      close: 10 + k * 0.05, pre_close: 10 + k * 0.05, pct_chg: 0, vol: 1000, amount: 1000,
+    })));
+    upsertRows(scanDb, 'adj_factor', ['ts_code', 'trade_date', 'adj_factor'],
+      days.map(trade_date => ({ ts_code: '000001.SZ', trade_date, adj_factor: 1 })));
+    upsertRows(scanDb, 'fina_indicator', ['ts_code', 'end_date', 'ann_date', 'roe'], [
+      { ts_code: '000001.SZ', end_date: '20260331', ann_date: '20260428', roe: 2.5 },
+      { ts_code: '000001.SZ', end_date: '20251231', ann_date: '20260430', roe: 9 },
+    ]);
+    const pick = hooks => scanMarket(scanDb, asOf, hooks).rows.find(r => r.ts_code === '000001.SZ')?.fundamentals;
+    assert.equal(pick().end_date, '20260331', 'scanMarket default follows the public period-first rule');
+    assert.equal(pick({ fundamentals_order: 'announcement-first' }).end_date, '20251231', 'the stock-swing hook selects by announcement');
+  } finally {
+    scanDb.close();
   }
 });
 

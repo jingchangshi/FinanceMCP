@@ -71,16 +71,23 @@ export interface MarketRegimeResult {
 
 export interface EvaluateMarketRegimeOptions {
   /**
-   * 可选：历史回溯确认窗口长度（默认 20 个交易日）。
+   * 可选：返回的 history / 名义确认窗口长度（默认 20 个交易日）。
    *
-   * 窗口起点决定状态机的初始 confirmed（窗口首日直接取 raw），并把窗口内的
-   * crash 保护带进最终结论。5 日窗口会让 6 天前的暴跌保护与当时的档位一起被
-   * 遗忘；20 日窗口覆盖一个自然月，与 V3「低频」调仓节奏一致。
+   * 状态机的 confirmed 并不从该窗口首日重置：确认状态按 `STATE_LOOKBACK_DAYS` 的有界回溯
+   * 从最近一次 crash 或连续两日 raw 一致事件向后继承，否则 21 天交替 raw 就会把此前的
+   * DEFENSIVE 保护自行遗忘。history 仍按本参数截取，供报告显示。
    */
   hysteresisLookbackDays?: number;
   /** 可选（测试注入）：按交易日覆盖全市场站上 MA60 比例（0~1），避免在小样本单测里扫描全市场。 */
   pctAboveMa60ByDate?: Record<string, number>;
 }
+
+/**
+ * 状态机内部回溯上限（交易日）。有界回溯：最近一次 crash / 连续两日确认事件在 60 个交易日
+ * （约 3 个月）内都能被继承。超过该上限仍无确认事件时，确认状态会回到窗口首日 raw——
+ * 这是已知残余风险，换取向后继承的有界成本（研究库无报告广度时最坏 60 次市场扫描）。
+ */
+const STATE_LOOKBACK_DAYS = 60;
 
 const INDEX_STATE_ZH: Record<IndexTrendState, string> = {
   BULL: '多头',
@@ -354,12 +361,15 @@ export function evaluateMarketRegime(
     };
   }
 
-  const lookback = Math.max(2, opts.hysteresisLookbackDays ?? 20);
-  let dates = tableExists(db, 'trade_cal') ? recentTradeDays(db, asOf, lookback) : [];
+  const displayLookback = Math.max(2, opts.hysteresisLookbackDays ?? 20);
+  // Replay a bounded longer window to carry the confirmed state from the most recent event;
+  // only the tail is returned as `history`.
+  const stateLookback = Math.max(displayLookback, STATE_LOOKBACK_DAYS);
+  let dates = tableExists(db, 'trade_cal') ? recentTradeDays(db, asOf, stateLookback) : [];
   if (!dates.length) {
     dates = (db.prepare(
       "SELECT DISTINCT trade_date FROM index_daily WHERE ts_code = '000300.SH' AND trade_date <= ? ORDER BY trade_date DESC LIMIT ?",
-    ).all(asOf, lookback) as { trade_date: string }[]).map(row => row.trade_date).reverse();
+    ).all(asOf, stateLookback) as { trade_date: string }[]).map(row => row.trade_date).reverse();
   }
   if (!dates.length) dates = [asOf];
 
@@ -428,6 +438,8 @@ export function evaluateMarketRegime(
   const regime = lastPoint.confirmed_regime;
   const hysteresisHeld = regime !== rawRegime;
   const crashOverride = lastPoint.crash_override;
+  // Display history stays bounded; the confirmed state above is carried from the longer replay.
+  const displayHistory = history.slice(Math.max(0, history.length - displayLookback));
 
   const styleSpread = latestGrowthRet20 !== null && latestValue.ret20_pct !== null
     ? r2(latestGrowthRet20 - latestValue.ret20_pct)
@@ -489,7 +501,7 @@ export function evaluateMarketRegime(
       down: latestBreadth.down,
       limit_down: latestBreadth.limitDown,
     },
-    history,
+    history: displayHistory,
     regime_label_zh: REGIME_LABELS_ZH[regime],
     style_label_zh: STYLE_LABELS_ZH[style],
     summary_zh: summaryZh,

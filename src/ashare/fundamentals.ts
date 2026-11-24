@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { financialsAsOf } from './data.js';
+import { financialsAsOf, type FinancialSelectionOrder } from './data.js';
 
 export interface Fundamentals {
   ts_code: string;
@@ -18,8 +18,12 @@ export interface Fundamentals {
 }
 
 /** Announcement-date constrained financials for every stock (see financialsAsOf in data.ts). */
-export function fundamentalsAsOf(db: DatabaseSync, asOf: string): Map<string, Fundamentals> {
-  return financialsAsOf(db, asOf) as unknown as Map<string, Fundamentals>;
+export function fundamentalsAsOf(
+  db: DatabaseSync,
+  asOf: string,
+  order?: FinancialSelectionOrder,
+): Map<string, Fundamentals> {
+  return financialsAsOf(db, asOf, order) as unknown as Map<string, Fundamentals>;
 }
 
 export interface FundamentalRisk {
