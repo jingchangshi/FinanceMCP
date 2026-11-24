@@ -265,12 +265,15 @@ export async function fetchEastmoneyFinancials(period: string): Promise<Eastmone
       isoPeriod,
       'SECUCODE,DEBT_ASSET_RATIO',
     ).catch(() => []),
+    // 现金流请求失败必须向上抛出：之前用 `.catch(() => [])` 吞掉异常，会让全市场
+    // ocf_to_profit 静默变成 null，质量核心的现金流条件整体失效。上抛后由
+    // resolveFinancials 回退到本地已缓存报告期，或由同步层记录 REFRESH_FAILED。
     fetchDatacenterReport(
       'RPT_DMSK_FN_CASHFLOW',
       'REPORT_DATE',
       isoPeriod,
       'SECUCODE,NETCASH_OPERATE',
-    ).catch(() => []),
+    ),
   ]);
 
   const debtMap = new Map<string, number>();
@@ -301,6 +304,10 @@ export async function fetchEastmoneyFinancials(period: string): Promise<Eastmone
       if (netProfit > 0) ocfToProfit = roundTo((netOcf / netProfit) * 100, 4);
       else ocfToProfit = netOcf < 0 ? roundTo(-Math.abs(netOcf / netProfit) * 100, 4) : 0;
     }
+    // 口径说明（已知上游定义差异，不是 bug）：本字段 = 经营活动现金净流量 / 归母净利润 × 100，
+    // 与 V3 规格「OCF / 归母净利」一致；TactiCore 快照里的同名 `ocf_to_profit` 来自
+    // Tushare fina_indicator（经营净收益口径），两者分母不同，跨源比较阈值时须注意。
+    // 在没有回归测试锁定前，绝不静默改变这个公开字段的含义。
     out.push({
       ts_code: tsCode,
       ann_date: annDate,

@@ -53,7 +53,11 @@ export type CadenceSkipReason =
   | 'not_enough_history'
   | 'no_candidates'
   | 'diagnosis_unavailable'
-  | 'review_unavailable';
+  | 'review_unavailable'
+  /** The monthly cadence runs daily; only the month's last trading day may produce a review. */
+  | 'not_month_end'
+  /** The calendar could not prove the as-of is the month's last trading day. */
+  | 'month_end_unverified';
 
 export interface CadenceRunResult {
   schema: string;

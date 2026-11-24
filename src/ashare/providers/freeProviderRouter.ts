@@ -9,7 +9,7 @@ import {
   type EastmoneyFundNavRow,
 } from './eastmoneyClient.js';
 import { fetchSwIndexDailyFree, fetchThsIndexDailyFree } from './hotspotFreeClient.js';
-import { TdxSession, withTdxSession, type TdxQuote, type TdxSecurityItem } from './tdxClient.js';
+import { TdxSession, withTdxSession, type TdxQuote, type TdxSecurityItem, type TdxXdxrEvent } from './tdxClient.js';
 import { fetchTencentDailyBars, fetchTencentQuotes, type TencentQuoteRow } from './tencentClient.js';
 import {
   computeDefaultLimitPrices,
@@ -24,7 +24,11 @@ import {
 } from './types.js';
 
 // 中国证监会 / 上交所公开休市工作日（非周六日）对照表：用于未来日程推算；过去交易日以 000001.SH 真实 K 线为准。
-const STATIC_CLOSED_WEEKDAYS = new Set([
+//
+// 2027 年安排依据《国务院办公厅关于2027年部分节假日安排的通知》（国办发明电〔2026〕10号，
+// 2026-11-05 发布）。这里只列周一至周五的休市日；周末及调休上班的周六/周日由 isWeekend 处理，
+// A 股周末不交易。resolveTradeCal 对过去日期仍以真实指数 K 线自校正。
+export const STATIC_CLOSED_WEEKDAYS = new Set([
   // 2025
   '20250101', '20250128', '20250129', '20250130', '20250131', '20250203', '20250204',
   '20250404', '20250501', '20250502', '20250505', '20250602',
@@ -33,8 +37,14 @@ const STATIC_CLOSED_WEEKDAYS = new Set([
   '20260101', '20260102', '20260216', '20260217', '20260218', '20260219', '20260220', '20260223',
   '20260406', '20260501', '20260504', '20260505', '20260619', '20260925',
   '20261001', '20261002', '20261005', '20261006', '20261007',
-  // 2027 元旦
-  '20270101',
+  // 2027（国办发明电〔2026〕10号）
+  '20270101', // 元旦（周五）
+  '20270205', '20270208', '20270209', '20270210', '20270211', '20270212', // 春节（2/5 除夕至 2/13 周六）
+  '20270405', // 清明（4/3 周六至 4/5 周一）
+  '20270503', '20270504', '20270505', // 劳动节（5/1 周六至 5/5 周三）
+  '20270609', // 端午（周三）
+  '20270915', // 中秋（周三）
+  '20271001', '20271004', '20271005', '20271006', '20271007', // 国庆（10/1 周五至 10/7 周四）
 ]);
 
 interface NormalizedBar {
@@ -48,7 +58,8 @@ interface NormalizedBar {
   change: number | null;
   pct_chg: number | null;
   vol: number;
-  amount: number;
+  /** 千元；null = 上游未提供成交额（未知，不是 0）。 */
+  amount: number | null;
 }
 
 interface DayStockSnapshot {
@@ -74,6 +85,7 @@ const cachedStockDay = new Map<string, { at: number; data: DayStockSnapshot }>()
 const cachedFundDay = new Map<string, { at: number; data: DayFundSnapshot }>();
 const cachedFinaPeriod = new Map<string, { at: number; rows: Record<string, any>[] }>();
 let cachedNavByCode: { at: number; map: Map<string, EastmoneyFundNavRow[]> } | null = null;
+let xdxrUnavailableWarned = false;
 
 export function clearFreeProviderCache(): void {
   cachedTdxSecurities = null;
@@ -158,17 +170,40 @@ async function fetchBarsSingle(
   // 1) 优先 TDX 原生 TCP K线（股票/ETF/指数均最快、无反爬限制）
   if (parsed.tdxMarket !== null) {
     try {
-      const tdxBars = await withTdxSession(s => s.getBars(9, parsed.tdxMarket!, parsed.code, 0, 800, isIndex));
+      // 除权除息事件与 K 线同一会话取回：TDX 日 K 是不复权原始价，昨收取前一根原始收盘
+      // 会在除权日丢失参考价跳空，adj_factor 因而永远不会在除权日跳变。
+      const { bars: tdxBars, xdxr } = await withTdxSession(async s => {
+        const bars = await s.getBars(9, parsed.tdxMarket!, parsed.code, 0, 800, isIndex);
+        let events: TdxXdxrEvent[] = [];
+        if (!isIndex) {
+          try {
+            events = await s.getXdxrInfo(parsed.tdxMarket!, parsed.code);
+          } catch {
+            // 除权信息失败不编造参考价：保留原始前收（旧因子），并记录一次明确的数据质量警告。
+            if (!xdxrUnavailableWarned) {
+              xdxrUnavailableWarned = true;
+              console.warn('[ashare] TDX 除权除息信息不可用：除权日复权因子按原始前收保留旧值，不编造因子');
+            }
+            events = [];
+          }
+        }
+        return { bars, xdxr: events };
+      });
+      const xdxrByDate = new Map(xdxr.filter(e => e.category === 1).map(e => [e.date, e]));
       const filtered = tdxBars.filter(b => b.trade_date >= start && b.trade_date <= end && b.close > 0);
       if (filtered.length > 0) {
         const allFiltered = tdxBars.filter(b => b.trade_date <= end && b.close > 0);
         const out: NormalizedBar[] = [];
         for (let i = 0; i < allFiltered.length; i++) {
           const cur = allFiltered[i];
-          const prev = i > 0 ? allFiltered[i - 1].close : null;
+          const rawPrev = i > 0 ? allFiltered[i - 1].close : null;
           if (cur.trade_date < start) continue;
-          const change = prev !== null ? roundTo(cur.close - prev, 4) : null;
-          const pctChg = prev && prev > 0 ? roundTo(((cur.close - prev) / prev) * 100, 4) : null;
+          // 除权日：交易所参考价（昨收）由前收与除权事件推导；无事件或口径未知时保持前收。
+          const adjustedPrev = rawPrev !== null
+            ? (xdxrReferencePreClose(xdxrByDate.get(cur.trade_date), rawPrev) ?? rawPrev)
+            : null;
+          const change = adjustedPrev !== null ? roundTo(cur.close - adjustedPrev, 4) : null;
+          const pctChg = adjustedPrev && adjustedPrev > 0 ? roundTo(((cur.close - adjustedPrev) / adjustedPrev) * 100, 4) : null;
           out.push({
             ts_code: tsCode,
             trade_date: cur.trade_date,
@@ -176,7 +211,7 @@ async function fetchBarsSingle(
             high: Math.max(cur.high, cur.open, cur.close),
             low: Math.min(cur.low, cur.open, cur.close),
             close: cur.close,
-            pre_close: prev,
+            pre_close: adjustedPrev,
             change,
             pct_chg: pctChg,
             vol: cur.vol,
@@ -246,11 +281,13 @@ async function resolveTradeCal(db: DatabaseSync | null, start: string, end: stri
   }
 
   const barOpenDates = new Set<string>();
+  let firstBarDate = '';
   let latestBarDate = '';
   try {
     const bars = await fetchBarsSingle('000001.SH', minScan, end < today ? end : today, true);
     for (const b of bars) {
       barOpenDates.add(b.trade_date);
+      if (!firstBarDate || b.trade_date < firstBarDate) firstBarDate = b.trade_date;
       if (b.trade_date > latestBarDate) latestBarDate = b.trade_date;
     }
   } catch { /* fall back to existing/static */ }
@@ -272,14 +309,19 @@ async function resolveTradeCal(db: DatabaseSync | null, start: string, end: stri
   for (let d = minScan; d <= end; d = addYmdDays(d, 1)) {
     let isOpen: number;
     const prevKnown = existing.get(d);
+    // 真实指数 K 线覆盖的日期区间。只有落在区间内的日期，缺失才等于“未开市”；
+    // 区间之外（K 线未覆盖）不能据此判休市，否则会把整段历史误写成 0。
+    const barCovered = firstBarDate !== '' && d >= firstBarDate && d <= latestBarDate;
     if (d <= today && barOpenDates.has(d)) {
       isOpen = 1;
+    } else if (d <= today && barCovered) {
+      // K线已越过该日期但未出现在000001.SH中，说明当天确未开市。
+      // 该分支必须先于 prevKnown：此前按静态表/工作日推算写入的 is_open=1
+      // 会在指数 K 线证明休市后永久留存，只有真实 K 线证据可以纠正它。
+      isOpen = 0;
     } else if (prevKnown) {
       isOpen = prevKnown.is_open;
       if (lastOpen === null && prevKnown.pretrade_date) lastOpen = prevKnown.pretrade_date;
-    } else if (d <= today && latestBarDate >= d) {
-      // K线已越过该日期但未出现在000001.SH中，说明当天确未开市
-      isOpen = 0;
     } else {
       isOpen = isWeekend(d) || STATIC_CLOSED_WEEKDAYS.has(d) ? 0 : 1;
     }
@@ -397,6 +439,41 @@ function loadPrevFactorAndClose(
   return { factors, closes };
 }
 
+/**
+ * 交易所除权除息参考价（除权价，即除权日的“昨收”）。
+ *
+ * TDX category 1（除权除息）字段均按每 10 股计：fenhong=现金分红（元）、
+ * songzhuangu=送转股（股）、peigu=配股（股）、peigujia=配股价（元/股）：
+ *   参考价 = (前收 × 10 − fenhong + peigu × peigujia) / (10 + songzhuangu + peigu)
+ *
+ * 除 category 1 外的类别（11/12 扩缩股等）字段口径未经真实样本核验，返回 null，
+ * 调用方退回原始前收——绝不按猜测的公式编造复权因子。
+ */
+function xdxrReferencePreClose(event: TdxXdxrEvent | undefined, prevClose: number): number | null {
+  if (!event || event.category !== 1 || !(prevClose > 0)) return null;
+  const cash = Number.isFinite(event.fenhong) ? Math.max(0, event.fenhong as number) : 0;
+  const bonus = Number.isFinite(event.songzhuangu) ? Math.max(0, event.songzhuangu as number) : 0;
+  const rights = Number.isFinite(event.peigu) ? Math.max(0, event.peigu as number) : 0;
+  const rightsPrice = Number.isFinite(event.peigujia) ? Math.max(0, event.peigujia as number) : 0;
+  const denom = 10 + bonus + rights;
+  if (!(denom > 0)) return null;
+  const ref = (prevClose * 10 - cash + rights * rightsPrice) / denom;
+  if (!Number.isFinite(ref) || !(ref > 0)) return null;
+  return roundTo(ref, 4);
+}
+
+/**
+ * 当日收盘快照是否已经可用：A 股 15:00 收盘，留 5 分钟给收盘集合竞价与上游落库。
+ * 手动 daily 可能在盘中触发，此时腾讯/东财实时价是盘中价，绝不能当成收盘价写入。
+ * 非当日（历史日期）永远视为已完成。
+ */
+export function isFinalAshareClose(tradeDate: string, nowMs = Date.now()): boolean {
+  if (tradeDate !== shanghaiTodayYmd(nowMs)) return true;
+  const beijing = new Date(nowMs + 8 * 3600_000);
+  const minutes = beijing.getUTCHours() * 60 + beijing.getUTCMinutes();
+  return minutes >= 15 * 60 + 5;
+}
+
 function chainAdjFactor(
   prevFactor: number | undefined,
   prevClose: number | undefined,
@@ -483,7 +560,9 @@ async function buildHistoricalStockDay(
 
   for (const { tsCode, bar } of barResults) {
     const name = nameMap.get(tsCode) ?? null;
-    if (bar && bar.vol > 0 && bar.amount > 0 && bar.open > 0 && bar.close > 0) {
+    // 停牌判定只看成交量：腾讯日 K 不返回成交额（amount 未知），若要求 amount > 0，
+    // 腾讯兜底的一天会把全市场误标记为停牌。未知成交额写成 null，不伪造成 0。
+    if (bar && bar.vol > 0 && bar.open > 0 && bar.close > 0) {
       daily.push({
         ts_code: tsCode,
         trade_date: tradeDate,
@@ -494,7 +573,7 @@ async function buildHistoricalStockDay(
         pre_close: bar.pre_close,
         pct_chg: bar.pct_chg,
         vol: bar.vol,
-        amount: bar.amount,
+        amount: bar.amount !== null && bar.amount > 0 ? bar.amount : null,
       });
       daily_basic.push({
         ts_code: tsCode,
@@ -575,6 +654,15 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
     };
     return empty;
   }
+  // 当日尚未收盘（15:05 前）时实时行情仍是盘中价，绝不把盘中价写成收盘快照。
+  // 历史日期（tradeDate !== 今日）不受影响。
+  if (!isFinalAshareClose(tradeDate)) {
+    console.warn(`[ashare] ${tradeDate} 尚未收盘（A股 15:05 后才有最终收盘价），拒绝写入盘中快照`);
+    const empty: DayStockSnapshot = {
+      tradeDate, daily: [], daily_basic: [], adj_factor: [], stk_limit: [], suspend_d: [],
+    };
+    return empty;
+  }
 
   // 同日补全：对腾讯未返回或缺失的股票，并行用 TDX 行情 + 东财全市场截面补齐
   const missingCodes = listedSet.filter(c => {
@@ -608,12 +696,13 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
     const highRaw = matchTq?.high ?? matchEm?.high ?? tdx?.high ?? null;
     const lowRaw = matchTq?.low ?? matchEm?.low ?? tdx?.low ?? null;
     const vol = matchTq?.vol ?? matchEm?.vol ?? tdx?.vol ?? 0;
-    const amount = matchTq?.amount ?? matchEm?.amount ?? tdx?.amount ?? 0;
+    const amount = matchTq?.amount ?? matchEm?.amount ?? tdx?.amount ?? null;
 
+    // 停牌判定只看成交量：成交额未知（腾讯日K不返回）不是停牌证据。
     const validBar =
       close !== null && close > 0 &&
       open !== null && open > 0 &&
-      vol > 0 && amount > 0 &&
+      vol > 0 &&
       (matchTq !== null || matchEm !== null || tdx !== undefined);
 
     if (validBar) {
@@ -631,7 +720,7 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
         pre_close: preClose,
         pct_chg: pctChg,
         vol,
-        amount,
+        amount: amount !== null && amount > 0 ? amount : null,
       });
       daily_basic.push({
         ts_code: tsCode,
@@ -796,7 +885,8 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
     const barRows = await runPool(targetCodes, 8, async tsCode => {
       const bars = await fetchBarsSingle(tsCode, tradeDate, tradeDate, false);
       const b = bars.find(x => x.trade_date === tradeDate);
-      if (!b || b.vol <= 0 || b.amount <= 0 || b.open <= 0 || b.close <= 0) return null;
+      // 停牌只看成交量；成交额未知（腾讯兜底）不能当作停牌或 0。
+      if (!b || b.vol <= 0 || b.open <= 0 || b.close <= 0) return null;
       return {
         ts_code: tsCode,
         trade_date: tradeDate,
@@ -808,7 +898,7 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
         change: b.change,
         pct_chg: b.pct_chg,
         vol: b.vol,
-        amount: b.amount,
+        amount: b.amount !== null && b.amount > 0 ? b.amount : null,
       };
     });
     const rows = barRows.filter((r): r is NonNullable<typeof r> => r !== null);
@@ -816,6 +906,10 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
   }
 
   if (!observedDate || tradeDate > observedDate) {
+    return { tradeDate, rows: [], quoteMap: tencentMap };
+  }
+  if (!isFinalAshareClose(tradeDate)) {
+    console.warn(`[ashare] ${tradeDate} 尚未收盘（A股 15:05 后才有最终收盘价），拒绝写入盘中 ETF 快照`);
     return { tradeDate, rows: [], quoteMap: tencentMap };
   }
 
@@ -840,12 +934,12 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
     const highRaw = matchTq?.high ?? matchEm?.high ?? tdx?.high ?? null;
     const lowRaw = matchTq?.low ?? matchEm?.low ?? tdx?.low ?? null;
     const vol = matchTq?.vol ?? matchEm?.vol ?? tdx?.vol ?? 0;
-    const amount = matchTq?.amount ?? matchEm?.amount ?? tdx?.amount ?? 0;
+    const amount = matchTq?.amount ?? matchEm?.amount ?? tdx?.amount ?? null;
 
     if (
       close !== null && close > 0 &&
       open !== null && open > 0 &&
-      vol > 0 && amount > 0 &&
+      vol > 0 &&
       (matchTq !== null || matchEm !== null || tdx !== undefined)
     ) {
       const high = highRaw && highRaw > 0 ? Math.max(highRaw, open, close) : Math.max(open, close);
@@ -863,7 +957,7 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
         change,
         pct_chg: pctChg,
         vol,
-        amount,
+        amount: amount !== null && amount > 0 ? amount : null,
       });
     }
   }
@@ -908,9 +1002,11 @@ async function resolveFundAdj(
       continue;
     }
     const existing = byDate.get(bar.trade_date);
+    // 与股票一致使用 0.1% 门槛：ETF 分红多为 0.3%~1.5%，2% 的高门槛会把真实分红
+    // 全部漏掉，fund_adj 在除息日不跳变。
     const factor = existing && existing > 0
       ? existing
-      : chainAdjFactor(prevFactor, prevClose, bar.pre_close, 0.02);
+      : chainAdjFactor(prevFactor, prevClose, bar.pre_close, 0.001);
     prevFactor = factor;
     if (bar.close > 0) prevClose = bar.close;
     out.push({ ts_code: tsCode, trade_date: bar.trade_date, adj_factor: factor });
@@ -1004,17 +1100,29 @@ async function resolveFinancials(db: DatabaseSync | null, period: string): Promi
   if (cached && isFresh(cached)) return cached.rows;
 
   const existing = new Map<string, Record<string, any>>();
+  let storedRows: Record<string, any>[] = [];
   if (db) {
-    const rows = db.prepare('SELECT * FROM fina_indicator WHERE end_date = ?').all(period) as Record<string, any>[];
-    for (const r of rows) existing.set(`${r.ts_code}:${r.ann_date}`, r);
+    storedRows = db.prepare('SELECT * FROM fina_indicator WHERE end_date = ?').all(period) as Record<string, any>[];
+    for (const r of storedRows) existing.set(`${r.ts_code}:${r.ann_date}`, r);
     // 已披露完结的历史报告期直接复用本地完整库（> 3500 条且距今超 120 天），无需重复拉取
     const cutoff = addYmdDays(shanghaiTodayYmd(), -120);
-    if (rows.length >= 3500 && period < cutoff) {
-      return rows.map(r => ({ ...r, update_flag: '0' }));
+    if (storedRows.length >= 3500 && period < cutoff) {
+      return storedRows.map(r => ({ ...r, update_flag: '0' }));
     }
   }
 
-  const fresh = await fetchEastmoneyFinancials(period);
+  let fresh: Awaited<ReturnType<typeof fetchEastmoneyFinancials>>;
+  try {
+    fresh = await fetchEastmoneyFinancials(period);
+  } catch (error: any) {
+    // 现金流/利润接口失败时不能把全市场 ocf_to_profit 静默写成 null。
+    // 本地已有该报告期缓存则沿用缓存（并明确告警），否则让错误上抛，由同步层记录失败。
+    if (storedRows.length > 0) {
+      console.warn(`[ashare] fina_indicator ${period} 上游刷新失败，沿用本地 ${storedRows.length} 条缓存: ${String(error?.message ?? error).slice(0, 120)}`);
+      return storedRows.map(r => ({ ...r, update_flag: '0' }));
+    }
+    throw error;
+  }
   const merged = fresh.map(r => {
     const prev = existing.get(`${r.ts_code}:${r.ann_date}`);
     if (!prev) return r;

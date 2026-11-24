@@ -54,11 +54,15 @@ const ALIASES: Record<string, string[]> = {
   exchange: ['exchange', '市场', '交易市场'],
   quantity: ['quantity', '成交数量', '发生数量', '证券数量'],
   price: ['price', '成交价格', '成交均价'],
-  gross: ['gross', '成交金额', '发生金额'],
+  // 东方财富对账单同时有“成交金额”（毛额）和“发生金额”（含费用的现金变动）。
+  // “发生金额”过去同时被 gross 与 cash_delta 认领，导致 Ambiguous CSV columns；
+  // 现在它只作为 cash_delta，毛额只认“成交金额”。
+  gross: ['gross', '成交金额'],
   fee: ['fee', '佣金', '手续费'],
+  other_fee: ['other_fee', '规费', '其他费', '其他费用'],
   transfer: ['transfer', '过户费'],
   tax: ['tax', '印花税', '税费'],
-  cash_delta: ['cash_delta', '资金发生额', '资金发生数', '资金变动'],
+  cash_delta: ['cash_delta', '发生金额', '资金发生额', '资金发生数', '资金变动'],
   reverses_event_id: ['reverses_event_id', '撤销流水号'],
 };
 const TYPES: Record<string, string> = {
@@ -82,7 +86,16 @@ function securityCode(raw: string, exchange: string): string {
   throw new Error('CSV exchange cannot be resolved');
 }
 
-/** Broker exports are facts: missing trade fees fail closed, never replaced by estimates. */
+/**
+ * Parse a broker statement CSV into ledger events.
+ *
+ * Id migration: new rows use `broker:v2:<account>:<broker|unspecified>:<date>:<type>:<raw id>`
+ * (the v1 scheme omitted the date and therefore could collide across days).
+ * Rows imported under v1 keep their ids; `importEvents(..., { dedupeByContent: true })`
+ * matches a re-import against them by account/date/code/type/quantity/cash and the
+ * broker source id, so switching to v2 or adding/removing `--broker` never
+ * duplicates an existing fill. The CSV note format is `broker_csv/2`.
+ */
 export function parseTradeCsv(text: string, options: { accountId: string; brokerId?: string }): { events: LedgerEventInput[]; warnings: string[] } {
   const rows = parseCsv(text);
   if (rows.length < 2) throw new Error('CSV requires a header and event rows');
@@ -116,11 +129,18 @@ export function parseTradeCsv(text: string, options: { accountId: string; broker
         event.quantity = Math.abs(decimalToInteger(get('quantity'), 0, 'quantity'));
         event.price_milli = decimalToInteger(get('price'), 3, 'price');
         if (get('gross')) event.gross_cents = Math.abs(decimalToInteger(get('gross'), 2, 'gross'));
-        event.fee_cents = decimalToInteger(get('fee'), 2, 'fee') + (get('transfer') ? decimalToInteger(get('transfer'), 2, 'transfer') : 0);
+        event.fee_cents = decimalToInteger(get('fee'), 2, 'fee')
+          + (get('transfer') ? decimalToInteger(get('transfer'), 2, 'transfer') : 0)
+          + (get('other_fee') ? decimalToInteger(get('other_fee'), 2, 'other_fee') : 0);
         event.tax_cents = decimalToInteger(get('tax'), 2, 'tax');
       } else if (type === 'REVERSE') {
-        if (!get('reverses_event_id')) throw new Error('CORRECTION/REVERSE requires original event id; import replacement as a separate row');
-        event.reverses_event_id = `broker:${options.accountId}:${options.brokerId ?? 'unspecified'}:${get('reverses_event_id')}`;
+        const reversesRaw = get('reverses_event_id');
+        if (!reversesRaw) throw new Error('CORRECTION/REVERSE requires original event id; import replacement as a separate row');
+        // The v1-shaped id is kept only for backward compatibility. Importing a
+        // CSV reversal always resolves via the bare number + source broker, so a
+        // collision with an old same-numbered v1 row cannot reverse the wrong fill.
+        event.reverses_source_id = reversesRaw;
+        event.reverses_event_id = `broker:${options.accountId}:${options.brokerId ?? 'unspecified'}:${reversesRaw}`;
       } else {
         event.cash_delta_cents = decimalToInteger(get('cash_delta'), 2, 'cash_delta');
         if (type === 'CASH_WITHDRAW' || type === 'FEE') event.cash_delta_cents = -Math.abs(event.cash_delta_cents);
@@ -129,10 +149,14 @@ export function parseTradeCsv(text: string, options: { accountId: string; broker
       if (get('cash_delta') && (type === 'TRADE_BUY' || type === 'TRADE_SELL')) event.cash_delta_cents = decimalToInteger(get('cash_delta'), 2, 'cash_delta');
       const rawId = get('event_id');
       if (!rawId) throw new Error('A stable broker event/fill id is required; row numbers or content hashes can merge distinct identical fills');
-      event.event_id = `broker:${options.accountId}:${options.brokerId ?? 'unspecified'}:${rawId}`;
-      event.note = JSON.stringify({ format: 'broker_csv/1', broker: options.brokerId ?? null, source_id: rawId, order_id: get('order_id') || null,
+      // v2 id 只在**新**行使用：加入 occurred_on 与事件类型，避免券商按日复用的
+      // 成交序号在不同日期/不同事件间撞 id。历史上按 v1 导入的行保持原 id，
+      // importEvents 的 dedupeByContent 兼容路径负责识别它们（见 ledger.ts）。
+      event.event_id = `broker:v2:${options.accountId}:${options.brokerId ?? 'unspecified'}:${date}:${type}:${rawId}`;
+      event.note = JSON.stringify({ format: 'broker_csv/2', broker: options.brokerId ?? null, source_id: rawId, order_id: get('order_id') || null,
         commission_cents: get('fee') ? decimalToInteger(get('fee'), 2, 'fee') : null,
         transfer_fee_cents: get('transfer') ? decimalToInteger(get('transfer'), 2, 'transfer') : null,
+        other_fee_cents: get('other_fee') ? decimalToInteger(get('other_fee'), 2, 'other_fee') : null,
         source_row_hash: createHash('sha256').update(JSON.stringify(row)).digest('hex') });
       const content = JSON.stringify({ ...event, note: undefined });
       if (seen.has(event.event_id) && seen.get(event.event_id) !== content) throw new Error('Conflicting duplicate broker id within CSV');

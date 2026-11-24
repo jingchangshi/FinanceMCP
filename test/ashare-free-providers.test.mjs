@@ -17,7 +17,7 @@ const {
 } = await import('../build/ashare/providers/tdxClient.js');
 const { parseTencentQuoteLine } = await import('../build/ashare/providers/tencentClient.js');
 const { resolveDataProviderMode, computeDefaultLimitPrices } = await import('../build/ashare/providers/types.js');
-const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
+const { clearFreeProviderCache, STATIC_CLOSED_WEEKDAYS } = await import('../build/ashare/providers/freeProviderRouter.js');
 
 const originalFetch = globalThis.fetch;
 
@@ -450,5 +450,27 @@ test('FreeProviderRouter drives syncRange + syncEtfForDaily to READY and preserv
     if (prevHosts === undefined) delete process.env.ASHARE_TDX_HOSTS;
     else process.env.ASHARE_TDX_HOSTS = prevHosts;
     db.close();
+  }
+});
+
+test('2027 State Council holiday weekdays are in the static closed table', () => {
+  // 国办发明电〔2026〕10号：只列周一至周五休市日；调休上班的周六/周日由周末规则关闭。
+  const closedWeekdays = [
+    '20270101',
+    '20270205', '20270208', '20270209', '20270210', '20270211', '20270212',
+    '20270405',
+    '20270503', '20270504', '20270505',
+    '20270609',
+    '20270915',
+    '20271001', '20271004', '20271005', '20271006', '20271007',
+  ];
+  for (const date of closedWeekdays) {
+    const day = new Date(Date.UTC(+date.slice(0, 4), +date.slice(4, 6) - 1, +date.slice(6, 8))).getUTCDay();
+    assert.ok(day >= 1 && day <= 5, `${date} should be a weekday`);
+    assert.ok(STATIC_CLOSED_WEEKDAYS.has(date), `${date} must be statically closed`);
+  }
+  for (const date of ['20270131', '20270214', '20270508', '20270926', '20271009']) {
+    const day = new Date(Date.UTC(+date.slice(0, 4), +date.slice(4, 6) - 1, +date.slice(6, 8))).getUTCDay();
+    assert.ok(day === 0 || day === 6, `${date} is a weekend makeup day; weekends are closed by isWeekend`);
   }
 });

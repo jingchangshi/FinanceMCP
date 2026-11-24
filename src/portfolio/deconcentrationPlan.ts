@@ -153,7 +153,7 @@ const TRIGGER_REASON_ZH: Record<TrancheTriggerReason, string> = {
   REBOUND_8PCT: '自前次锚定价反弹满 +8% 加速兑现',
   BREAKDOWN_MA60: '空头防守期连续两日有效跌破60日均线保护减仓',
   BREAKDOWN_SUPPORT_FLOOR: '收盘跌破磨底箱体防守位保护减仓',
-  GRIND_OVERSOLD_RELOAD: '25%底仓四门槛满足：60日均线走平+深折价超卖+右侧止稳，触发10%降本回补',
+  GRIND_OVERSOLD_RELOAD: '25%底仓磨底回补条件满足：60日均线走平+深折价超卖+右侧止稳；系统附加护栏（距上次执行≥3个交易日、仓位<30%，非EXP-V3-04签发条件）亦满足，触发10%降本回补',
   GRIND_TACTICAL_TAKE_PROFIT: '磨底降本机动槽达到止盈兑现条件，高抛降本回归25%核心底仓',
   GRIND_OVERWEIGHT_DRIFT_HARVEST: '持仓占比被动漂移达34%以上且短线滞涨，获利兑现超额部分回归25%底仓',
 };
@@ -502,6 +502,39 @@ function loadEtfQfqCloses(
   };
 }
 
+/**
+ * 复权基准换算：把事件日的原始成交价折算到 asOf 的 qfq 基准。
+ * 基准与 `loadEtfQfqCloses` / `stockMa20Milli` 一致：事件日与 asOf 各取 <= 该日的最新
+ * `fund_adj.adj_factor`（carry-forward），返回 price × adj(事件日) / adj(asOf)，四舍五入到整数厘。
+ * 任一日缺可用复权因子时原样返回成交价（保持旧行为，不臆造因子）。
+ */
+function createAdjPriceConverter(
+  marketDb: DatabaseSync | null | undefined,
+  tsCode: string,
+  asOf: string,
+): ((priceMilli: number, fromDate: string | null | undefined) => number) | null {
+  if (!marketDb || !portfolioTableExists(marketDb, 'fund_adj')) return null;
+  const db = marketDb;
+  const factors = new Map<string, number | null>();
+  const factorAt = (date: string): number | null => {
+    if (factors.has(date)) return factors.get(date)!;
+    const row = db.prepare(
+      'SELECT adj_factor FROM fund_adj WHERE ts_code = ? AND trade_date <= ? AND adj_factor > 0 ORDER BY trade_date DESC LIMIT 1',
+    ).get(tsCode, date) as { adj_factor?: number } | undefined;
+    const factor = Number(row?.adj_factor);
+    const value = Number.isFinite(factor) && factor > 0 ? factor : null;
+    factors.set(date, value);
+    return value;
+  };
+  return (priceMilli, fromDate) => {
+    if (!fromDate || !Number.isFinite(priceMilli) || priceMilli <= 0) return priceMilli;
+    const from = factorAt(fromDate);
+    const to = factorAt(asOf);
+    if (from === null || to === null || from === to) return priceMilli;
+    return Math.round(priceMilli * (from / to));
+  };
+}
+
 function rollingMeanAt(series: number[], endIdx: number, window: number): number | null {
   if (endIdx < window - 1 || endIdx >= series.length) return null;
   let sum = 0;
@@ -660,8 +693,11 @@ export function computeEtfGrindIndicators(input: {
   const ma5Milli = ma5T !== null ? Math.round(ma5T * 1000) : null;
   const ma20Milli = ma20T !== null ? Math.round(ma20T * 1000) : null;
   const ma60Milli = ma60T !== null ? Math.round(ma60T * 1000) : null;
+  // 右侧止稳（第四护栏的实际公式）：当日收阳，且收盘不低于 MA5 的 99.5%——
+  // 是 c > prevClose && c >= MA5*0.995，不是严格的 close > MA5。
   const rightSideTurnReady = prevCloseMilli !== null && ma5Milli !== null
     && cMilli > prevCloseMilli && cVal >= ma5T! * 0.995;
+  // 冷却期（系统附加护栏，非 EXP-V3-04 签发条件）：距上次卖出/战术执行至少 3 个交易日。
   const cooldownReady = !lastExecDate || tradeDaysSinceLast >= 3;
   const inBullTrend = ma60T !== null && ma20T !== null && cVal > ma60T && ma20T > ma60T;
   const supportBreakdown2d = supportFloorMilli !== null && (
@@ -852,6 +888,9 @@ export function evaluateDeconcentrationPlan(input: {
   }
   const plan = normalizePlanRow(rawPlan);
   const planMode = plan.plan_mode;
+  // 决策/输出统一使用 asOf 复权基准；数据库仍保存事件日原始价（raw），避免跨日重复复权。
+  const adjustPrice = createAdjPriceConverter(input.marketDb, tsCode, input.asOf)
+    ?? ((priceMilli: number, _fromDate?: string | null): number => priceMilli);
 
   const rawTranches = input.portfolioDb.prepare(
     'SELECT * FROM deconcentration_tranche WHERE plan_id = ? ORDER BY tranche_no ASC',
@@ -859,12 +898,14 @@ export function evaluateDeconcentrationPlan(input: {
   const tranches = rawTranches.map(row => ({ ...row }));
   const updatedTranches: DeconcentrationTrancheRow[] = [];
 
-  let lastExecPriceMilli = plan.last_exec_price_milli;
+  let lastExecPriceRaw = plan.last_exec_price_milli;
   let lastExecDate = plan.last_exec_date;
+  let lastExecPriceMilli = lastExecPriceRaw !== null ? adjustPrice(lastExecPriceRaw, lastExecDate) : null;
   let planStatus: 'ACTIVE' | 'COMPLETED' | 'CANCELLED' = plan.status;
   let tacticalShares = plan.tactical_shares;
-  let tacticalEntryPriceMilli = plan.tactical_entry_price_milli;
+  let tacticalEntryPriceRaw = plan.tactical_entry_price_milli;
   let tacticalEntryDate = plan.tactical_entry_date;
+  let tacticalEntryPriceMilli = tacticalEntryPriceRaw !== null ? adjustPrice(tacticalEntryPriceRaw, tacticalEntryDate) : null;
   let completedSwingCount = plan.completed_swing_count;
   let planMutated = false;
 
@@ -883,11 +924,15 @@ export function evaluateDeconcentrationPlan(input: {
     if ((t.status === 'PENDING' || t.status === 'TRIGGERED') && input.currentShares <= expectedAfterTranche) {
       t.status = 'EXECUTED';
       t.executed_date = sellEvent?.occurred_on ?? input.asOf;
+      // 批次成交价保留事件日原始价归档；参考价在比较前折算到 asOf 复权基准。
       t.executed_price_milli = sellEvent?.price_milli ?? input.currentCloseMilli ?? t.executed_price_milli;
       updatedTranches.push({ ...t });
       if (!lastExecDate || (t.executed_date && t.executed_date >= lastExecDate)) {
         lastExecDate = t.executed_date;
-        if (t.executed_price_milli !== null) lastExecPriceMilli = t.executed_price_milli;
+        if (t.executed_price_milli !== null) {
+          lastExecPriceRaw = t.executed_price_milli;
+          lastExecPriceMilli = adjustPrice(t.executed_price_milli, t.executed_date);
+        }
         planMutated = true;
       }
     }
@@ -921,8 +966,9 @@ export function evaluateDeconcentrationPlan(input: {
   // 2) BOTTOM_GRIND_25 战术回补/止盈闭环对账（超额批次清零后生效）
   if (planMode === 'BOTTOM_GRIND_25') {
     if (hasOpenExcess) {
-      if (tacticalShares !== 0 || tacticalEntryPriceMilli !== null || tacticalEntryDate !== null) {
+      if (tacticalShares !== 0 || tacticalEntryPriceRaw !== null || tacticalEntryDate !== null) {
         tacticalShares = 0;
+        tacticalEntryPriceRaw = null;
         tacticalEntryPriceMilli = null;
         tacticalEntryDate = null;
         planMutated = true;
@@ -948,9 +994,12 @@ export function evaluateDeconcentrationPlan(input: {
       });
       if (hasTacticalActivity) {
         let tacQty = 0;
-        let tacEntryPx: number | null = null;
+        // 原始均价用于回写（事件日基准）；复权均价用于止盈/参考价比较（asOf 基准）。
+        let tacEntryPxRaw: number | null = null;
+        let tacEntryPxAdj: number | null = null;
         let tacEntryDt: string | null = null;
         let swings = 0;
+        let replayLastSellPxRaw = lastExecPriceRaw;
         let replayLastSellPx = lastExecPriceMilli;
         let replayLastSellDt = lastExecDate;
         for (const ev of events) {
@@ -958,16 +1007,20 @@ export function evaluateDeconcentrationPlan(input: {
           const qty = Math.max(0, Math.round(Number(ev.quantity) || 0));
           const px = Math.round(Number(ev.price_milli) || 0);
           if (qty <= 0 || px <= 0) continue;
+          const pxAdj = adjustPrice(px, ev.occurred_on);
           if (isBuy) {
             if (hasExecutedExcess && ev.occurred_on < excessEndDate) continue;
-            const totalCost: number = tacQty * (tacEntryPx ?? px) + qty * px;
+            const totalCostRaw: number = tacQty * (tacEntryPxRaw ?? px) + qty * px;
+            const totalCostAdj: number = tacQty * (tacEntryPxAdj ?? pxAdj) + qty * pxAdj;
             tacQty += qty;
-            tacEntryPx = tacQty > 0 ? Math.round(totalCost / tacQty) : px;
+            tacEntryPxRaw = tacQty > 0 ? Math.round(totalCostRaw / tacQty) : px;
+            tacEntryPxAdj = tacQty > 0 ? Math.round(totalCostAdj / tacQty) : pxAdj;
             if (!tacEntryDt) tacEntryDt = ev.occurred_on;
           } else if (tacQty > 0) {
             if (qty >= tacQty) {
               tacQty = 0;
-              tacEntryPx = null;
+              tacEntryPxRaw = null;
+              tacEntryPxAdj = null;
               tacEntryDt = null;
               swings += 1;
             } else {
@@ -975,42 +1028,50 @@ export function evaluateDeconcentrationPlan(input: {
             }
             if (!replayLastSellDt || ev.occurred_on >= replayLastSellDt) {
               replayLastSellDt = ev.occurred_on;
-              replayLastSellPx = px;
+              replayLastSellPxRaw = px;
+              replayLastSellPx = pxAdj;
             }
           } else if (!hasExecutedExcess || ev.occurred_on > excessEndDate) {
             if (!replayLastSellDt || ev.occurred_on >= replayLastSellDt) {
               replayLastSellDt = ev.occurred_on;
-              replayLastSellPx = px;
+              replayLastSellPxRaw = px;
+              replayLastSellPx = pxAdj;
             }
           }
         }
         if (input.currentShares < tacQty) {
           tacQty = Math.floor(Math.max(0, input.currentShares) / 100) * 100;
           if (tacQty === 0) {
-            tacEntryPx = null;
+            tacEntryPxRaw = null;
+            tacEntryPxAdj = null;
             tacEntryDt = null;
           }
         }
         if (
           tacQty !== tacticalShares
-          || tacEntryPx !== tacticalEntryPriceMilli
+          || tacEntryPxRaw !== tacticalEntryPriceRaw
           || tacEntryDt !== tacticalEntryDate
           || swings !== completedSwingCount
-          || replayLastSellPx !== lastExecPriceMilli
+          || replayLastSellPxRaw !== lastExecPriceRaw
           || replayLastSellDt !== lastExecDate
         ) {
           tacticalShares = tacQty;
-          tacticalEntryPriceMilli = tacEntryPx;
+          tacticalEntryPriceRaw = tacEntryPxRaw;
           tacticalEntryDate = tacEntryDt;
           completedSwingCount = swings;
-          lastExecPriceMilli = replayLastSellPx;
+          lastExecPriceRaw = replayLastSellPxRaw;
           lastExecDate = replayLastSellDt;
           planMutated = true;
         }
+        // 决策口径每轮都采用同一 asOf 基准的 replay 加权均价：多笔跨除权买入时，
+        // 它与「原始加权均价按首笔日期一次性折算」不同；落库仍只保存事件日原始价。
+        tacticalEntryPriceMilli = tacEntryPxAdj;
+        lastExecPriceMilli = replayLastSellPx;
       }
     }
     if (input.currentShares === 0 && tacticalShares > 0) {
       tacticalShares = 0;
+      tacticalEntryPriceRaw = null;
       tacticalEntryPriceMilli = null;
       tacticalEntryDate = null;
       planMutated = true;
@@ -1141,6 +1202,9 @@ export function evaluateDeconcentrationPlan(input: {
         tacticalShares === 0
         && pending.length === 0
         && (input.circuitBreakerStatus ?? 'NORMAL') === 'NORMAL'
+        // EXP-V3-04 回补条件（MA60 走平、折价、超卖、右侧止稳）之外，系统附加两道 TS 护栏：
+        // 实时仓位必须 <30%（weightBps < 3000）且距上次执行 >=3 个交易日（含在
+        // all_reload_guards_ready 内）。二者都不是 EXP-V3-04/MASTER 的签发条件，是否保留由所有者决策。
         && (weightBps === null || weightBps < 3000)
         && guards.all_reload_guards_ready
         && input.navCents
@@ -1176,7 +1240,7 @@ export function evaluateDeconcentrationPlan(input: {
   let statusSummaryZh: string;
   if (planMode === 'BOTTOM_GRIND_25') {
     if (recommendedBuyShares >= 100 && activeReason === 'GRIND_OVERSOLD_RELOAD') {
-      statusSummaryZh = `${tsCode} 通过25%底仓四门槛磨底降本验收，建议战术回补 ${recommendedBuyShares} 份（目标仓位封顶 ${maxGrindWeightPct.toFixed(0)}%，回补后按 +7.5% 或牛市均线追踪止盈）。`;
+      statusSummaryZh = `${tsCode} 通过25%底仓磨底降本 EXP-V3-04 回补条件（MA60走平、折价超卖、右侧止稳），并满足系统附加护栏（冷却≥3个交易日、仓位<30%，非 EXP-V3-04 签发条件），建议战术回补 ${recommendedBuyShares} 份（目标仓位封顶 ${maxGrindWeightPct.toFixed(0)}%，回补后按 +7.5% 或牛市均线追踪止盈）。`;
     } else if (recommendedSellShares >= 100 && (activeReason === 'GRIND_TACTICAL_TAKE_PROFIT' || activeReason === 'GRIND_OVERWEIGHT_DRIFT_HARVEST')) {
       statusSummaryZh = `${tsCode} 已触发${TRIGGER_REASON_ZH[activeReason]}，建议卖出 ${recommendedSellShares} 份回归 ${targetKeepPct.toFixed(0)}% 核心底仓。`;
     } else if (triggered.length > 0 && recommendedSellShares >= 100) {
@@ -1266,10 +1330,11 @@ export function evaluateDeconcentrationPlan(input: {
       plan_updates: planMutated ? {
         plan_id: plan.plan_id,
         status: planStatus,
-        last_exec_price_milli: lastExecPriceMilli,
+        // 回写事件日原始价：复权换算只在读取/比较时进行，避免跨日重复复权。
+        last_exec_price_milli: lastExecPriceRaw,
         last_exec_date: lastExecDate,
         tactical_shares: tacticalShares,
-        tactical_entry_price_milli: tacticalEntryPriceMilli,
+        tactical_entry_price_milli: tacticalEntryPriceRaw,
         tactical_entry_date: tacticalEntryDate,
         completed_swing_count: completedSwingCount,
       } : null,

@@ -1,5 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
+import { EASTMONEY_SUPER_ETF_CODES } from '../ashare/etfDeclarations.js';
+import { inPortfolioTransaction } from './db.js';
 import { DEFAULT_FEE_RULES, DEFAULT_STOCK_RULES, FEE_RULE_VERSION, type FeeRules } from './rules.js';
 
 export type FeeEvidence = 'CONFIRMED' | 'PUBLIC_REFERENCE' | 'ASSUMED' | 'UNKNOWN';
@@ -50,6 +52,9 @@ const CLASSES: FeeClass[] = ['STOCK', 'NORMAL_ETF', 'SUPER_ETF', 'OTHER_ETF'];
 const LEVELS: FeeEvidence[] = ['CONFIRMED', 'PUBLIC_REFERENCE', 'ASSUMED', 'UNKNOWN'];
 const DATE = /^\d{8}$/;
 const SUPER_ETF_OBSERVED = { commission_rate: 0.00005, commission_min_cents: 0 };
+const SUPER_ETF_WHITELIST = new Set<string>(EASTMONEY_SUPER_ETF_CODES);
+/** 东财超级 ETF 费率只属于东财账户；显式其他 broker 上下文不得套用。 */
+const EASTMONEY_BROKER_ID = /^(eastmoney|east_money|东方财富|东财)$/i;
 const keyFor = (accountId: string) => `fee_profiles:${accountId}`;
 
 export function validateFeeProfile(profile: FeeProfile): FeeProfile {
@@ -99,14 +104,17 @@ export function saveFeeProfile(db: DatabaseSync, accountId: string, profile: Fee
   validateFeeProfile(profile);
   if (profile.account_id && profile.account_id !== accountId) throw new Error('Fee profile account mismatch');
   const scoped = { ...profile, account_id: accountId };
-  const profiles = loadFeeContext(db, accountId, profile.effective_from).profiles;
-  const existing = profiles.find(p => p.id === scoped.id);
-  if (existing) {
-    if (JSON.stringify(existing) !== JSON.stringify(scoped)) throw new Error('Fee profile id already exists; append a new version');
-    return { created: false, profile: existing };
-  }
-  db.prepare('INSERT INTO account_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(keyFor(accountId), JSON.stringify([...profiles, scoped]));
-  return { created: true, profile: scoped };
+  // Read-modify-write must be atomic: two concurrent appends would otherwise drop one profile.
+  return inPortfolioTransaction(db, () => {
+    const profiles = loadFeeContext(db, accountId, profile.effective_from).profiles;
+    const existing = profiles.find(p => p.id === scoped.id);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(scoped)) throw new Error('Fee profile id already exists; append a new version');
+      return { created: false, profile: existing };
+    }
+    db.prepare('INSERT INTO account_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(keyFor(accountId), JSON.stringify([...profiles, scoped]));
+    return { created: true, profile: scoped };
+  });
 }
 
 /** Code > account/broker category > category default > conservative estimate. */
@@ -116,7 +124,15 @@ export function feeRulesFor(context: FeeContext, code: string, kind: 'ETF' | 'ST
     && (!p.effective_until || context.asOf <= p.effective_until));
   const specific = active.filter(p => p.code === code).sort((a, b) => a.effective_from.localeCompare(b.effective_from) || a.id.localeCompare(b.id));
   const classified = specific.filter(p => p.classification).at(-1)?.classification;
-  const classification: FeeClass = kind === 'STOCK' ? 'STOCK' : classified && classified !== 'STOCK' ? classified : 'NORMAL_ETF';
+  // 无显式代码级分类覆盖时，已核验的东财超级 ETF 白名单（33 只）在默认/东财 broker
+  // 上下文自动归入 SUPER_ETF；显式其他 broker 不套用。证据级别仍是 ASSUMED。
+  const eastmoneyContext = !context.brokerId || EASTMONEY_BROKER_ID.test(context.brokerId.trim());
+  const whitelistedSuperEtf = kind === 'ETF' && eastmoneyContext && SUPER_ETF_WHITELIST.has(code);
+  const classification: FeeClass = kind === 'STOCK'
+    ? 'STOCK'
+    : classified && classified !== 'STOCK'
+      ? classified
+      : whitelistedSuperEtf ? 'SUPER_ETF' : 'NORMAL_ETF';
   const category = active.filter(p => !p.code && p.classification === classification)
     .sort((a, b) => Number(!!a.broker_id) - Number(!!b.broker_id) || a.effective_from.localeCompare(b.effective_from) || a.id.localeCompare(b.id));
   const values: FeeRules = { ...(kind === 'STOCK' ? DEFAULT_STOCK_RULES.fees : DEFAULT_FEE_RULES) };
@@ -127,8 +143,8 @@ export function feeRulesFor(context: FeeContext, code: string, kind: 'ETF' | 'ST
     // Marked codes only: the observed discount tier has no 5-yuan floor. Never inferred for other ETFs.
     values.commission_rate = SUPER_ETF_OBSERVED.commission_rate;
     values.commission_min_cents = SUPER_ETF_OBSERVED.commission_min_cents;
-    evidence.commission_rate = { level: 'ASSUMED', source: 'Observed discount tier on explicitly marked codes; not a broker-confirmed category rate' };
-    evidence.commission_min_cents = { level: 'ASSUMED', source: 'Observed fills show no 5-yuan floor for marked codes; hidden billing unit unverified' };
+    evidence.commission_rate = { level: 'ASSUMED', source: 'Eastmoney verified super-ETF whitelist (EASTMONEY_SUPER_ETF_CODES, 33 codes); observed 0.5bp discount tier, broker confirmation pending' };
+    evidence.commission_min_cents = { level: 'ASSUMED', source: 'Eastmoney verified super-ETF whitelist (EASTMONEY_SUPER_ETF_CODES); observed fills show no 5-yuan floor for marked codes, hidden billing unit unverified' };
   }
   const applied = [...category, ...specific];
   for (const p of applied) for (const field of FIELDS) if (Object.hasOwn(p.values, field)) {

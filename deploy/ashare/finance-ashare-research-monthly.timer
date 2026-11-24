@@ -2,9 +2,13 @@
 Description=Run the FinanceMCP A-share monthly forward review (Asia/Shanghai)
 
 [Timer]
-# Friday after 21:40 so the 18:40 / 21:10 / 21:15 jobs and the ChatGPT task are never contended.
-# The monthly timer's day range 22..28 contains exactly one Friday per month.
-OnCalendar=Fri *-*-22..28 21:55:00 Asia/Shanghai
+# Fires daily after the weekly 21:50 window (the weekly diagnosis measured 555s on
+# 2026-10-23, so 22:15 leaves margin and never contends with it). Firing daily is
+# safe because the `research-cadence monthly` entry itself skips unless the as-of
+# date is the last trading day of the month; the date range 22..28 used to fire
+# 1-6 trading days early for months ending on the 29th-31st.
+# Manual run: deploy/ashare/run-research-cadence.sh monthly --force
+OnCalendar=Mon..Fri *-*-* 22:15:00 Asia/Shanghai
 Persistent=true
 RandomizedDelaySec=60
 

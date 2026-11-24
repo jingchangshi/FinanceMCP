@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { inferBoard } from '../portfolio/rules.js';
-import { loadApprovedV3Policy } from '../portfolio/v3Policy.js';
+import { loadApprovedV3Policy, type ApprovedV3Policy } from '../portfolio/v3Policy.js';
 import { scanMarket } from './analysis.js';
 import { addDays, recentTradeDays } from './ingest.js';
 import { rpsFromCloses } from './rps.js';
@@ -65,6 +65,8 @@ export interface ScreenStockSwingOptions {
   requireIndustryTop30?: boolean;
   /** When true, zero sector buckets fail closed; default skips sector ranking only when <5 stocks exist in every industry. */
   strictSectorGate?: boolean;
+  /** 调用方已加载的策略（与 router/engine 共用），避免重复读取覆盖文件/准入库。 */
+  policy?: ApprovedV3Policy;
 }
 
 interface PreQualifiedStock {
@@ -100,13 +102,16 @@ export function screenStockSwingCandidates(
   asOf: string,
   options: ScreenStockSwingOptions = {},
 ): StockSwingScreenResult {
-  const policy = loadApprovedV3Policy();
+  const policy = options.policy ?? loadApprovedV3Policy({ asOf });
   const maxCandidates = options.maxCandidates ?? policy.stock_max_positions;
   const priceCapCny = options.priceCapCny ?? policy.stock_price_cap_cny;
   const minAmount20Yi = options.minAmount20Yi ?? 1.5;
   const minCircMvYi = options.minCircMvYi ?? 50;
   const minRps = options.minRps ?? 80;
-  const requireIndustryTop30 = options.requireIndustryTop30 ?? true;
+  // 默认不强制行业前 30%：EXP-V3-02 OOS 证据（OOS_100K_BP1_QC 净 +2.329%，ind30=False）
+  // 优于行业过滤版（OOS_100K_QC_IND30_SENS 净 -0.131%），与 TactiCore
+  // research/ashare/experiments/exp_v3_02_stock_swing_rqalpha.py 的默认值保持一致。
+  const requireIndustryTop30 = options.requireIndustryTop30 ?? false;
 
   if (!db) {
     return {
@@ -177,6 +182,9 @@ export function screenStockSwingCandidates(
   const preQualified: PreQualifiedStock[] = [];
 
   const scan = scanMarket(db, asOf, {
+    // The stock-swing strategy follows the TactiCore experiment's PIT rule (latest announcement
+    // on or before asOf); the public financialsAsOf default stays period-first.
+    fundamentals_order: 'announcement-first',
     onStock: (code, bars, x, i, row) => {
       const adjMissing = bars.adjMissing ?? 0;
       if (adjMissing > 0) return;
@@ -371,7 +379,7 @@ export function screenStockSwingCandidates(
         `均线多头向上且近 3 日缩量（低于成交量 20 日均值的 0.8 倍）回踩 20 日均线（${item.ma20_cny.toFixed(2)} 元）企稳收阳`,
         `基本面合格：年化净资产收益率 ${item.roe_annualized_pct.toFixed(1)}%，现金流占净利比 ${item.ocf_to_profit_pct.toFixed(1)}%`,
       ],
-      trailing_exit_rule_zh: '跌破硬止损价无条件清仓；浮盈满 +15% 后上移至成本保本，并启用 20 日均线移动止盈。',
+      trailing_exit_rule_zh: '跌破硬止损价无条件清仓；浮盈满 +15% 后上移至成本保本；收盘跌破 20 日均线无条件离场。',
     });
   }
 

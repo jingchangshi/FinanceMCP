@@ -89,8 +89,8 @@ test('per-field evidence: min-fee observed does not confirm the 516080 proportio
   assert.equal(rules.commission_rate, 0.00025, 'unknown rate falls back to the conservative default, still flagged');
 });
 
-test('159241/159278 stay ordinary ETFs; marking is per code and never by fund family', () => {
-  for (const code of ['159241.SZ', '159278.SZ']) {
+test('159559/159279 stay ordinary ETFs; the whitelist marks exact codes, never a fund family', () => {
+  for (const code of ['159559.SZ', '159279.SZ']) {
     const rules = feeRulesFor(ctx, code, 'ETF');
     assert.equal(rules.fee_model.classification, 'NORMAL_ETF');
     assert.equal(rules.commission_rate, 0.00025);

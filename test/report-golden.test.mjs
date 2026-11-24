@@ -537,32 +537,30 @@ test('G3 市场数据未就绪：旧行情不冒充新行情、DATA_INSUFFICIENT
 
 // ================================================================ 场景 4：账户未对账
 
-test('G4 账户未对账：身份已确认但成交不完整 → 门控阻塞、风险披露不被吞掉', () => {
+test('G4 账户未对账：身份已确认且当前快照但未声明完整性 → 仅 warnings，风险披露不被吞掉', () => {
   seedMarket('account-unreconciled');
   // 身份已确认，但从未声明完整性（成交尚未核对）。
   seedAccount('account-unreconciled', { confirmed: true, completeness: false });
   const report = build('account-unreconciled', {
     scenario: { sellCode: '159558.SZ', sellQuantity: 1000, buyCode: '510300.SH', buyQuantity: 100 },
   });
-  // 门控如实反映未对账，不粉饰。
-  assert.equal(report.gate.satisfied, false, JSON.stringify(report.gate.reasons));
+  // SERVER_EXECUTION_WORK_ORDER §一.2：缺少完整性声明只进 warnings，不阻断既定规则执行。
+  assert.equal(report.gate.satisfied, true, JSON.stringify(report.gate.reasons));
   assert.equal(report.gate.unreported_trade_risk, true);
-  assert.ok(report.gate.reasons.some(r => r.code === 'account_completeness_undeclared'
-    || r.code === 'unreported_trade_risk'),
-  JSON.stringify(report.gate.reasons));
-  // 即使用户给了研究数量，也不能成为可执行数量。
-  for (const option of report.decision_comparison.options) assert.equal(option.executable, false);
-  for (const leg of report.first_section.actions.flatMap(a => a.legs)) assert.equal(leg.executable, false);
-  assert.notEqual(report.status, 'ACTIONABLE');
-  // 风险维度以独立状态披露：结论哪怕 NO_ACTION 也不吞掉“未确认”。
+  assert.ok(report.gate.warnings.some(w => w.code === 'account_completeness_undeclared'),
+    JSON.stringify(report.gate.warnings));
+  assert.ok(report.gate.warnings.some(w => w.code === 'unreported_trade_lag_warning'),
+    JSON.stringify(report.gate.warnings));
+  assert.equal(report.gate.reasons.some(r => r.code === 'account_completeness_undeclared'), false);
+  // 风险维度仍以独立状态披露：结论不吞掉“未确认”。
   assert.equal(report.data_quality.tiers.account_trade_completeness.status, 'UNCONFIRMED_RISK');
-  assert.equal(report.data_quality.tiers.trade_plan_executability.status, 'NOT_EXECUTABLE');
+  assert.notEqual(report.status, 'DATA_INSUFFICIENT');
 
   const rendered = render(report);
   if (rendered) {
     assertNoBannedTerms(rendered.user, 'G4');
     // 隐藏术语 ≠ 隐藏风险：必须以自然语言披露未对账。
-    assert.match(rendered.user, /成交核对未完成|尚未|核对|对账/,
+    assert.match(rendered.user, /尚未声明账本完整性|补录|核对|对账/,
       '账户未对账必须以自然语言披露，而不是省略');
     assertNumbersConsistent(rendered.user, rendered.attachment, 'G4');
   }

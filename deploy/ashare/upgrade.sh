@@ -32,6 +32,7 @@ CONTAINER="${ASHARE_CONTAINER:-finance-mcp-ashare}"
 DATA_DIR="${ASHARE_HOST_DATA_DIR:-$HOME/.local/share/finance-mcp-ashare}"
 PRIVATE_DIR="${ASHARE_PRIVATE_HOST_DIR:-$HOME/.local/share/ashare-private}"
 umask 077
+. "$HERE/ops-lock.sh"
 
 echo "== 0. preconditions =="
 echo "repo:     $REPO"
@@ -50,6 +51,16 @@ if [ "$DRY" -eq 1 ]; then
   echo "dry run: would build candidate, back up market/private/OAuth/research/config, verify restoration, then replace the existing service"
   exit 0
 fi
+# The daily timer fires at 19:30 and may still be running well past 19:51. A
+# rebuild while it runs replaces the container under an active sync. Refuse on a
+# live service (the check runs before the first mutation), and take the shared
+# ops lock so a daily/hotspot/account task cannot start during the rebuild.
+if command -v systemctl >/dev/null 2>&1 \
+  && systemctl --user is-active --quiet finance-ashare-daily.service 2>/dev/null; then
+  echo "finance-ashare-daily.service is active; refusing to upgrade while the daily pipeline runs. Retry after it finishes." >&2
+  exit 73
+fi
+acquire_ashare_ops_lock || exit $?
 # The running image must be captured and tagged BEFORE `docker compose build`: the build re-points
 # finance-mcp-ashare:local at the new image, after which the old image id can no longer be tagged
 # ("No such image") even though the container is still running it. That, not `|| true`, is why the

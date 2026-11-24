@@ -107,6 +107,21 @@ export const ETF_CANDIDATE_DECLARATIONS: readonly EtfCandidateDeclaration[] = [
   { ts_code: '588750.SH', category: 'industry_theme', name_hint: '汇添富上证科创板芯片ETF', benchmark_hint: '科创芯片', benchmark_index_code: null },
 ];
 
+/**
+ * EXP-V3-01 超级 ETF 风格桶（来源：TactiCore `research/ashare/experiments/exp_v3_01_regime_super_etf.py:80-84`）。
+ *
+ * OFFENSIVE/STRUCTURAL 档按风格把权益部署预算拆为成长/价值两桶
+ * （GROWTH_LEADING 65/35、VALUE_LEADING 35/65、其余 50/50），DEFENSIVE 档整体使用防御红利桶。
+ * 桶内等权，不按启发式得分把预算集中到单一 ETF。
+ */
+export const V3_SUPER_ETF_VALUE_BUCKET: readonly string[] = ['159330.SZ', '530050.SH', '510140.SH'] as const;
+
+export const V3_SUPER_ETF_GROWTH_BUCKET: readonly string[] = [
+  '159205.SZ', '159337.SZ', '589850.SH', '159290.SZ', '589060.SH', '589330.SH',
+] as const;
+
+export const V3_SUPER_ETF_DEFENSIVE_BUCKET: readonly string[] = ['159549.SZ', '159207.SZ'] as const;
+
 /** 已核验的东财超级 ETF 免五白名单（共 33 只，佣金万分之0.5，免5元最低消费）。 */
 export const EASTMONEY_SUPER_ETF_CODES: readonly string[] = [
   '159052.SZ', '159207.SZ', '158049.SZ', '159045.SZ', '588750.SH',

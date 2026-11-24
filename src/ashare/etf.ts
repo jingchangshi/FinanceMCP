@@ -728,6 +728,12 @@ export async function syncFundDailyCodes(
 /** 某交易日五只持仓的覆盖情况：哪些有合法 bar，哪些上游确认无行情（停牌）。 */
 export interface FundHoldingCoverage {
   date: string;
+  /**
+   * 本次覆盖检查期望的完整代码集合。运维就绪门（Stage 1）用它做**正向**断言：
+   * `ready` 必须覆盖这里的每一只，而不是只看 `missing` 是否为空——空集合、
+   * 崩溃后缺失的 coverage 条目都不能再被当作“就绪”。
+   */
+  expected: string[];
   ready: string[];
   /** 上游确认当日没有基金行情（停牌或未上市），不是同步失败。 */
   no_upstream_bar: string[];
@@ -739,7 +745,7 @@ export interface FundHoldingCoverage {
 export function fundHoldingCoverage(
   db: DatabaseSync, date: string, fetches: readonly FundHoldingFetch[] = [], codes: readonly string[] = ETF_UNIVERSE,
 ): FundHoldingCoverage {
-  const coverage: FundHoldingCoverage = { date, ready: [], no_upstream_bar: [], missing: [], errors: [] };
+  const coverage: FundHoldingCoverage = { date, expected: [...codes], ready: [], no_upstream_bar: [], missing: [], errors: [] };
   for (const code of codes) {
     const row = db.prepare('SELECT open, high, low, close, vol, amount FROM fund_daily WHERE ts_code = ? AND trade_date = ?').get(code, date) as any;
     const fetch = fetches.find(f => f.ts_code === code);

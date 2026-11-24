@@ -230,7 +230,7 @@ function writeDatasetCsv(
     if (value === null || value === undefined) return '';
     if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '';
     const text = String(value);
-    return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
   const lines = [columns.join(',')];
   for (const row of rows) lines.push(columns.map(name => escape(row[name])).join(','));

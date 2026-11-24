@@ -31,8 +31,9 @@ export const fetchStats = { calls: 0, retries: 0, rows: 0 };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-function isRateLimit(message: string): boolean {
-  return /每分钟|频次|频率|too many|rate/i.test(message);
+export function isRateLimit(message: string): boolean {
+  // "rate" 必须整词匹配：旧正则会把 "generate"/"accurate" 当成限流，白睡 61s 重试。
+  return /每分钟|频次|频率|限流|调用次数|too many|rate[\s_-]?limit|\brate\b/i.test(message);
 }
 
 function isPermanent(message: string): boolean {

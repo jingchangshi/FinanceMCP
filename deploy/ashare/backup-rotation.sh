@@ -31,22 +31,43 @@ umask 077
 say() { echo "[backup-rotation] $1"; }
 free_before="$(df --output=avail "$BACKUP_DIR" | tail -1 | tr -d ' ')K"
 
+# A backup counts only after it exists and passes integrity_check. The target is
+# removed on any failure — including an interrupted sqlite3 — together with the
+# rollback-journal / WAL siblings an online copy can leave behind, so a failed
+# attempt cannot be rotated in later as if it were a restore point.
+CURRENT_TARGET=""
+cleanup_partial() {
+  [ -n "$CURRENT_TARGET" ] || return 0
+  [ ! -f "$CURRENT_TARGET.ok" ] || return 0
+  rm -f -- "$CURRENT_TARGET" "$CURRENT_TARGET-journal" "$CURRENT_TARGET-wal" "$CURRENT_TARGET-shm"
+}
+trap cleanup_partial EXIT HUP INT TERM
+verify_db() {
+  [ -f "$1" ] && [ "$(sqlite3 "$1" 'PRAGMA integrity_check;' 2>/dev/null || true)" = ok ]
+}
+
 # --- 1. fresh online backups ---
 if [ "$DRY" -eq 1 ]; then
   say "dry-run: would back up market/private/OAuth/research/validation databases"
 else
   say "backing up databases ($STAMP)"
   ashare_target="$BACKUP_DIR/ashare.$STAMP.sqlite"
+  CURRENT_TARGET="$ashare_target"
   sqlite3 "$DATA_DIR/ashare.sqlite" "VACUUM INTO '$ashare_target';"
-  [ "$(sqlite3 "$ashare_target" 'PRAGMA integrity_check;')" = ok ] || { echo "ashare backup integrity_check failed" >&2; exit 4; }
+  verify_db "$ashare_target" || { echo "ashare backup integrity_check failed" >&2; exit 4; }
+  : > "$ashare_target.ok"
+  CURRENT_TARGET=""
   ln -sfn "$ashare_target" "$BACKUP_DIR/ashare.latest.sqlite"
   say "ashare: $ashare_target"
   for spec in "$PRIVATE_DIR/portfolio.sqlite:portfolio" "$PRIVATE_DIR/oauth.sqlite:oauth" "$DATA_DIR/research.sqlite:research" "$DATA_DIR/research-validation/validation.sqlite:validation"; do
     src="${spec%:*}"; label="${spec##*:}"
     [ -f "$src" ] || continue
     target="$BACKUP_DIR/$label.$STAMP.sqlite"
+    CURRENT_TARGET="$target"
     sqlite3 "$src" ".backup '$target'"
-    [ "$(sqlite3 "$target" 'PRAGMA integrity_check;')" = ok ] || { echo "$label backup integrity_check failed" >&2; exit 4; }
+    verify_db "$target" || { echo "$label backup integrity_check failed" >&2; exit 4; }
+    : > "$target.ok"
+    CURRENT_TARGET=""
     say "$label: $target"
   done
 fi
@@ -54,6 +75,12 @@ fi
 # --- 2. rotate ---
 # Only regular .sqlite files inside BACKUP_DIR; symlinks (ashare.latest.sqlite)
 # and the pre-V1.0 baseline are never deletion candidates.
+#
+# Every candidate is verified before it counts toward KEEP:
+#   - a new backup carries a .ok sidecar written only after integrity_check;
+#   - a legacy backup (no sidecar) is integrity-checked here, before it is counted;
+#   - a corrupt file is renamed to .corrupt and excluded, so it can neither be
+#     kept as a restore point nor displace a good one by occupying a KEEP slot.
 if [ "$BACKUP_ONLY" -eq 0 ]; then
 for label in ashare portfolio oauth research validation; do
   # NUL-delimited records preserve spaces and newlines in backup paths.
@@ -69,10 +96,19 @@ for label in ashare portfolio oauth research validation; do
   i=0
   for record in "${files[@]}"; do
     f="${record#* }"
+    if [ ! -f "$f.ok" ] && ! verify_db "$f"; then
+      if [ "$DRY" -eq 1 ]; then say "would quarantine corrupt backup: $f ($(du -h "$f" | cut -f1))"
+      else
+        mv -f -- "$f" "$f.corrupt"
+        rm -f -- "$f.ok" "$f-journal" "$f-wal" "$f-shm"
+        say "quarantined corrupt backup: $f -> $f.corrupt"
+      fi
+      continue
+    fi
     i=$((i + 1))
     if [ "$i" -gt "$KEEP" ]; then
       if [ "$DRY" -eq 1 ]; then say "would delete: $f ($(du -h "$f" | cut -f1))"
-      else rm -f -- "$f"; say "deleted: $f"; fi
+      else rm -f -- "$f" "$f.ok" "$f-journal" "$f-wal" "$f-shm"; say "deleted: $f"; fi
     fi
   done
 done

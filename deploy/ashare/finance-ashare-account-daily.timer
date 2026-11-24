@@ -3,12 +3,11 @@ Description=Run the account research report after the market pipeline (Asia/Shan
 
 [Timer]
 # RETIRED AS STANDALONE TIMER:
-# Consolidated into finance-ashare-daily.timer (17:20 CST -> run-daily-unified.sh),
+# Consolidated into finance-ashare-daily.timer (19:30 CST -> run-daily-unified.sh),
 # which invokes run-account-daily.sh immediately after market & hotspot readiness.
 # Kept only for manual reference; do not enable alongside finance-ashare-daily.timer.
+# No [Install] section on purpose: `systemctl --user enable` must fail rather than
+# install a second daily pipeline next to the unified timer.
 OnCalendar=Mon..Fri *-*-* 21:15:00 Asia/Shanghai
 Persistent=true
 RandomizedDelaySec=60
-
-[Install]
-WantedBy=timers.target

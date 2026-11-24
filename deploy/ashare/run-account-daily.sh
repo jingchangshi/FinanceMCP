@@ -7,6 +7,13 @@ PRIVATE_DIR="${ASHARE_PRIVATE_HOST_DIR:-$HOME/.local/share/ashare-private}"
 LOG_DIR="$PRIVATE_DIR/logs"
 mkdir -p "$LOG_DIR"
 chmod 700 "$LOG_DIR"
+if ! docker info >/dev/null 2>&1 && [ -z "${ASHARE_SG_REEXEC:-}" ] && getent group docker | cut -d: -f4 | tr ',' '\n' | grep -qx "$(id -un)"; then
+  ASHARE_SG_REEXEC=1 exec sg docker -c "ASHARE_SG_REEXEC=1 ASHARE_OPS_LOCK_HELD=${ASHARE_OPS_LOCK_HELD:-0} $0"
+fi
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+. "$HERE/ops-lock.sh"
+# Serialize against unified/daily/hotspot/upgrade; a busy lock exits 73 fast.
+acquire_ashare_ops_lock || exit $?
 STAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
 OUT="$LOG_DIR/account-daily-$STAMP.json"
 ERR="$LOG_DIR/account-daily-$STAMP.log"
@@ -21,10 +28,22 @@ fi
 REVIEW_OUT="$LOG_DIR/forward-review-$STAMP.json"
 REVIEW_ERR="$LOG_DIR/forward-review-$STAMP.log"
 record_code=0
-if docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record --require-current-snapshots >"$OUT" 2>"$ERR"; then
+# The unified pipeline pins the target trade date; the standalone account timer
+# keeps the CLI's default (latest closed day) when no date is supplied.
+if [ -n "${ASHARE_EXPECTED_TRADE_DATE:-}" ]; then
+  set +e
+  docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record --require-current-snapshots --date "$ASHARE_EXPECTED_TRADE_DATE" >"$OUT" 2>"$ERR"
+  record_code=$?
+  set -e
+else
+  set +e
+  docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record --require-current-snapshots >"$OUT" 2>"$ERR"
+  record_code=$?
+  set -e
+fi
+if [ "$record_code" -eq 0 ]; then
   printf 'finance-ashare account-daily ok (private log: %s)\n' "$OUT"
 else
-  record_code=$?
   printf 'finance-ashare account-daily FAILED (exit %s); see private log %s\n' "$record_code" "$ERR" >&2
 fi
 review_code=0
@@ -34,6 +53,11 @@ else
   review_code=$?
   printf 'finance-ashare forward-review FAILED (exit %s); see private log %s\n' "$review_code" "$REVIEW_ERR" >&2
 fi
+# Structured handoff for run-daily-unified.sh: the path this run attempted and
+# the research-record exit code. The old unified script guessed the newest file
+# with `ls -t`, which could publish yesterday's bundle as if it were today's.
+printf 'ACCOUNT_OUT=%s\n' "$OUT"
+printf 'RC=%s\n' "$record_code"
 [ "$record_code" -ne 0 ] && exit "$record_code"
 [ "$review_code" -ne 0 ] && exit 77
 exit 0

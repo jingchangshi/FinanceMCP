@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,6 +53,7 @@ def run_publish_and_notify(
     config: dict[str, Any],
     generated_at: str = "",
     data_delayed: bool = False,
+    deadline_hm: str = "2115",
     force_notify: bool = False,
     skip_notify: bool = False,
     dry_run: bool = False,
@@ -108,6 +110,7 @@ def run_publish_and_notify(
                 dry_pub_entry,
                 config,
                 data_delayed=data_delayed,
+                deadline_hm=deadline_hm,
                 force=force_notify,
                 dry_run=True,
                 runner=runner,
@@ -141,6 +144,7 @@ def run_publish_and_notify(
             pub_res,
             config,
             data_delayed=data_delayed,
+            deadline_hm=deadline_hm,
             force=force_notify,
             dry_run=False,
             runner=runner,
@@ -167,6 +171,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--generated-at", default="")
     parser.add_argument("--data-delayed", action="store_true")
+    parser.add_argument(
+        "--deadline-hm",
+        default=os.environ.get("ASHARE_READINESS_DEADLINE_HM", "2115"),
+        help="HHMM readiness deadline rendered in the delayed-data banner.",
+    )
     parser.add_argument("--force-notify", action="store_true")
     parser.add_argument("--skip-notify", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -180,6 +189,7 @@ def main() -> int:
         config=config,
         generated_at=args.generated_at,
         data_delayed=args.data_delayed,
+        deadline_hm=args.deadline_hm,
         force_notify=args.force_notify,
         skip_notify=args.skip_notify,
         dry_run=args.dry_run,

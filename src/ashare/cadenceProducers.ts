@@ -151,6 +151,58 @@ function ledgerPresent(db: DatabaseSync | null): boolean {
   return !!db;
 }
 
+/** Whether `asOf` is the last open session of its calendar month.
+ *
+ * The monthly unit fires daily (the old Friday 22..28 range ran 1-6 sessions
+ * early in months ending on the 29th-31st, and collided with the weekly run).
+ * The gate lives here, in the producer that already reads the market cache,
+ * rather than in the timer: systemd cannot know the SSE calendar.
+ *
+ * Returns `{ last: false }` when a later open day exists, `{ last: true }` when
+ * the calendar covers the rest of the month and has no later open day, and null
+ * when it cannot prove either (missing cache/table, no row for `asOf`, or a
+ * calendar that stops before month end). null is not "yes": the scheduled path
+ * skips, because an unverifiable month end is exactly the failure this gate
+ * exists to prevent. `--force` / `ASHARE_CADENCE_FORCE=1` bypasses it for a
+ * manual run.
+ */
+function lastTradingDayOfMonth(
+  db: DatabaseSync | null, asOf: string,
+): { last: boolean; lastSession?: string } | null {
+  if (!db) return null;
+  try {
+    const self = db.prepare('SELECT is_open FROM trade_cal WHERE cal_date = ?').get(asOf) as { is_open: number } | undefined;
+    if (!self) return null;
+    const year = Number(asOf.slice(0, 4));
+    const month = Number(asOf.slice(4, 6));
+    // Last *calendar* day of the month (Feb 28/29, Apr 30, ...), not a literal 31.
+    const lastCalendarDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    const monthEnd = `${asOf.slice(0, 6)}${String(lastCalendarDay).padStart(2, '0')}`;
+    const monthStart = `${asOf.slice(0, 6)}01`;
+    if (self.is_open !== 1) {
+      const row = db.prepare('SELECT MAX(cal_date) AS d FROM trade_cal WHERE is_open = 1 AND cal_date BETWEEN ? AND ?')
+        .get(monthStart, monthEnd) as { d: string | null };
+      return { last: false, ...(row?.d ? { lastSession: row.d } : {}) };
+    }
+    const laterOpen = Number((db.prepare('SELECT COUNT(*) AS n FROM trade_cal WHERE is_open = 1 AND cal_date > ? AND cal_date <= ?')
+      .get(asOf, monthEnd) as { n: number }).n);
+    if (laterOpen > 0) {
+      const row = db.prepare('SELECT MAX(cal_date) AS d FROM trade_cal WHERE is_open = 1 AND cal_date BETWEEN ? AND ?')
+        .get(monthStart, monthEnd) as { d: string | null };
+      return { last: false, ...(row?.d ? { lastSession: row.d } : {}) };
+    }
+    // Coverage, not proximity: a later closed day in the same month does not
+    // prove the calendar knows about the rest of it. The SSE trade_cal carries
+    // every calendar date (is_open 0/1), so a row at the month's last calendar
+    // day is the evidence that "no later open day" really means month end.
+    const covered = db.prepare('SELECT MAX(cal_date) AS d FROM trade_cal WHERE cal_date <= ?')
+      .get(monthEnd) as { d: string | null } | undefined;
+    return covered?.d === monthEnd ? { last: true } : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface CadenceProducersOptions {
   accountId?: string;
   marketDbPath?: string;
@@ -162,6 +214,8 @@ export interface CadenceProducersOptions {
   /** Monthly forward-review horizons. The default is `buildForwardReview`'s own. */
   horizons?: number[];
   outputDir?: string;
+  /** Monthly only: skip unless `asOf` is the month's last trading day. */
+  monthEndOnly?: boolean;
 }
 
 /**
@@ -244,9 +298,24 @@ export function cadenceProducers(options: CadenceProducersOptions = {}) {
         // account-scoped: substituting an account would silently change whose
         // performance is being reported, which is the one substitution a
         // research report must never make on the operator's behalf.
-        unavailable: (): { skip: CadenceSkipReason; detail?: string } | null => {
+        unavailable: (asOf: string): { skip: CadenceSkipReason; detail?: string } | null => {
           if (!portfolio) return { skip: 'review_unavailable', detail: `账户库不存在：${portfolioPath}` };
           if (!options.accountId) return { skip: 'review_unavailable', detail: '每月实验评审需要 account_id；不得默认账户' };
+          if (options.monthEndOnly) {
+            const month = lastTradingDayOfMonth(market, asOf);
+            if (!month) {
+              return {
+                skip: 'month_end_unverified',
+                detail: `无法从交易日历确认 ${asOf} 是否为月末最后一个交易日（行情缓存缺失或日历未覆盖整月）；手动运行可用 --force 或 ASHARE_CADENCE_FORCE=1`,
+              };
+            }
+            if (!month.last) {
+              return {
+                skip: 'not_month_end',
+                detail: `${asOf} 不是本月最后一个交易日${month.lastSession ? `（本月最后交易日 ${month.lastSession}）` : ''}；月度评审顺延，手动运行可用 --force 或 ASHARE_CADENCE_FORCE=1`,
+              };
+            }
+          }
           return null;
         },
         async produce(asOf: string) {

@@ -368,16 +368,34 @@ export interface FinancialRecord {
 }
 
 /**
- * Point-in-time financial indicators: for each stock, the latest report
- * period whose announcement date is on or before `asOf`, and within that
- * period the latest announcement on or before `asOf`. Reports older than
- * 18 months are treated as missing rather than stale-but-current. Records
- * announced before their period even ends are upstream errors and never used.
+ * Which financial record represents a stock on an as-of date.
+ *
+ * - `period-first` (default, public data contract): the latest report period whose announcement
+ *   date is on or before `asOf`, and within that period the latest announcement on or before
+ *   `asOf`. This is the historical `financialsAsOf` semantics and must not change silently for
+ *   general consumers. Reports older than 18 months are treated as missing rather than
+ *   stale-but-current; records announced before their period even ends are upstream errors and
+ *   never used.
+ * - `announcement-first`: the latest announcement on or before the as-of date wins regardless of
+ *   period (a later restatement of an older period supersedes an earlier newer-period report).
+ *   This is the TactiCore stock-swing experiment's PIT rule; only that strategy opts in.
  */
-export function financialsAsOf(db: DatabaseSync, asOf: string): Map<string, FinancialRecord> {
+export type FinancialSelectionOrder = 'period-first' | 'announcement-first';
+
+const FINANCIAL_ORDER_SQL: Record<FinancialSelectionOrder, string> = {
+  'period-first': 'end_date DESC, ann_date DESC',
+  'announcement-first': 'ann_date DESC, end_date DESC',
+};
+
+export function financialsAsOf(
+  db: DatabaseSync,
+  asOf: string,
+  order: FinancialSelectionOrder = 'period-first',
+): Map<string, FinancialRecord> {
+  const orderBy = FINANCIAL_ORDER_SQL[order];
   const rows = db.prepare(`
     SELECT * FROM (
-      SELECT f.*, ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY end_date DESC, ann_date DESC) rn
+      SELECT f.*, ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY ${orderBy}) rn
       FROM fina_indicator f
       WHERE ann_date <= ? AND end_date >= ? AND ann_date >= end_date
     ) WHERE rn = 1`).all(asOf, addDays(asOf, -550)) as any[];

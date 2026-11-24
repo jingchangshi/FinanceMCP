@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -99,9 +100,154 @@ def resolve_lark_bin() -> str:
     return "lark-cli"
 
 
-def run_lark(argv: list[str], cwd: Path) -> dict[str, Any]:
-    """Run ``lark-cli`` and parse its JSON envelope (duplicated pattern)."""
-    cmd = [resolve_lark_bin(), *argv[1:]] if argv and argv[0] == "lark-cli" else list(argv)
+class LarkError(RuntimeError):
+    """lark-cli failure carrying an explicit retry/fallback classification.
+
+    ``retryable`` is true only for transport timeouts, network errors and
+    HTTP 5xx/429 responses. Permission and other explicit 4xx rejections are
+    never retried and are the only failures allowed to fall through to the
+    next notification target.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status: int | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status = status
+        self.error_type = error_type
+        self.error_code = error_code
+
+
+_PERMISSION_ERROR_TOKENS = (
+    "permission",
+    "forbidden",
+    "lacks view or edit access",
+    "4030004",
+    "981004",
+    "access denied",
+    "not authorized",
+    "no permission",
+)
+_TRANSIENT_ERROR_TOKENS = (
+    "timeout",
+    "timed out",
+    "econnreset",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "network",
+    "temporarily unavailable",
+    "service unavailable",
+    "internal error",
+    "server error",
+    "rate limit",
+    "too many requests",
+    "try again",
+    "gateway timeout",
+    "bad gateway",
+)
+# A plain-text failure (no JSON envelope) is only safe to fall back on when it
+# names an explicit client-side rejection.
+_CLIENT_REJECTION_TOKENS = (
+    "invalid",
+    "bad request",
+    "not found",
+    "malformed",
+    "blocked",
+    "denied",
+)
+
+
+def _text_is_retryable(text: str) -> bool:
+    lowered = text.lower()
+    if any(token in lowered for token in _PERMISSION_ERROR_TOKENS):
+        return False
+    if any(token in lowered for token in _TRANSIENT_ERROR_TOKENS):
+        return True
+    return bool(re.search(r"\b(?:429|5\d\d)\b", lowered))
+
+
+def _status_from_error(error: dict[str, Any]) -> int | None:
+    for key in ("status", "http_status", "status_code"):
+        raw = error.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= value < 600:
+            return value
+    return None
+
+
+def is_non_retryable_client_error(exc: BaseException) -> bool:
+    """True only for an explicit 4xx/permission rejection (safe to fall back)."""
+    if isinstance(exc, LarkError):
+        if exc.retryable:
+            return False
+        if exc.status is not None and 400 <= exc.status < 500 and exc.status != 429:
+            return True
+    text = " ".join(
+        str(part or "")
+        for part in (
+            getattr(exc, "error_type", ""),
+            getattr(exc, "error_code", ""),
+            str(exc),
+        )
+    ).lower()
+    if any(token in text for token in _PERMISSION_ERROR_TOKENS):
+        return True
+    if re.search(r"\b4\d\d\b", text):
+        return True
+    return any(token in text for token in _CLIENT_REJECTION_TOKENS)
+
+
+def _retry_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("ASHARE_FEISHU_RETRY_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
+
+
+def _retry_base_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("ASHARE_FEISHU_RETRY_BASE_SECONDS", "0.5")))
+    except ValueError:
+        return 0.5
+
+
+def _lark_call_is_retryable(argv: list[str]) -> bool:
+    """Only reads, idempotent overwrites and keyed sends may be retried.
+
+    ``docs +create`` is deliberately excluded: after a timeout or 5xx the
+    document may already exist, and retrying could create a second orphan.
+    """
+    if len(argv) < 3:
+        return False
+    domain, verb = argv[1], argv[2]
+    if domain == "docs" and verb == "+fetch":
+        return True
+    if domain == "docs" and verb == "+update":
+        try:
+            return argv[argv.index("--command") + 1] == "overwrite"
+        except (ValueError, IndexError):
+            return False
+    if domain == "drive" and verb == "+update-title":
+        return True
+    if domain == "im" and verb == "+messages-send":
+        return "--idempotency-key" in argv
+    return False
+
+
+def _run_lark_once(cmd: list[str], cwd: Path) -> dict[str, Any]:
     completed = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True, timeout=180
     )
@@ -117,8 +263,12 @@ def run_lark(argv: list[str], cwd: Path) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
     if result is None:
-        raise RuntimeError(
-            f"lark-cli returned non-JSON output (exit={completed.returncode})"
+        # A 4xx from the gateway/CLI normally arrives as a JSON envelope; plain
+        # text is ambiguous, so retry only when it names a transport/5xx cause.
+        detail = (stderr or stdout or "no output")[:300]
+        raise LarkError(
+            f"lark-cli returned non-JSON output (exit={completed.returncode}): {detail}",
+            retryable=_text_is_retryable(detail),
         )
     if completed.returncode != 0 or not result.get("ok"):
         error = result.get("error") or {}
@@ -130,11 +280,66 @@ def run_lark(argv: list[str], cwd: Path) -> dict[str, Any]:
                 err_msg = "; ".join(str(item) for item in warnings if str(item).strip())
             elif data_obj.get("result"):
                 err_msg = str(data_obj.get("result"))
-        raise RuntimeError(
+        error_type = str(error.get("type") or "") or None
+        error_code = str(error.get("code") or "") or None
+        status = _status_from_error(error)
+        classification_text = " ".join(
+            part for part in (error_type or "", error_code or "", err_msg) if part
+        )
+        retryable = _text_is_retryable(classification_text) or (
+            status is not None and (status == 429 or 500 <= status < 600)
+        )
+        # An explicit permission rejection always wins over a numeric 5xx hint.
+        if any(token in classification_text.lower() for token in _PERMISSION_ERROR_TOKENS):
+            retryable = False
+        raise LarkError(
             f"Lark publish failed: {error.get('type') or 'unknown'}: "
-            f"{err_msg or 'no message'}"
+            f"{err_msg or 'no message'}",
+            retryable=retryable,
+            status=status,
+            error_type=error_type,
+            error_code=error_code,
         )
     return result
+
+
+def run_lark(argv: list[str], cwd: Path) -> dict[str, Any]:
+    """Run ``lark-cli`` with bounded exponential backoff for transient failures.
+
+    Only network/timeout failures and 5xx/429 responses are retried (3 attempts
+    by default, 0.5s then 1s). Explicit 4xx/permission rejections fail on the
+    first attempt so the caller can fall back without duplicating a delivery.
+    """
+    cmd = [resolve_lark_bin(), *argv[1:]] if argv and argv[0] == "lark-cli" else list(argv)
+    attempts = _retry_attempts() if _lark_call_is_retryable(argv) else 1
+    last_error: LarkError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_lark_once(cmd, cwd)
+        except FileNotFoundError as exc:
+            raise LarkError(f"lark-cli not found: {exc}", retryable=False) from exc
+        except PermissionError as exc:
+            raise LarkError(f"lark-cli cannot be executed: {exc}", retryable=False) from exc
+        except LarkError as exc:
+            if not exc.retryable or attempt >= attempts:
+                raise
+            last_error = exc
+        except subprocess.TimeoutExpired as exc:
+            wrapped = LarkError(
+                f"lark-cli timed out after {exc.timeout}s", retryable=True
+            )
+            if attempt >= attempts:
+                raise wrapped from exc
+            last_error = wrapped
+        except OSError as exc:
+            wrapped = LarkError(f"lark-cli transport failure: {exc}", retryable=True)
+            if attempt >= attempts:
+                raise wrapped from exc
+            last_error = wrapped
+        delay = min(_retry_base_seconds() * (2 ** (attempt - 1)), 8.0)
+        if delay > 0:
+            time.sleep(delay)
+    raise last_error or LarkError("lark-cli failed", retryable=False)
 
 
 def resolve_folder_token(config: dict[str, Any], env: dict[str, str] | None = None) -> str:
@@ -225,6 +430,33 @@ def write_incident(path: Path, incident: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def _record_create_unconfirmed(
+    root: Path, trade_date: str, report_hash: str, exc: BaseException
+) -> None:
+    """Record an unknown-outcome Docx create for manual verification.
+
+    Only an explicit client rejection is a known failure; a timeout/5xx means
+    the document may exist, so the operator must check Feishu before retrying.
+    """
+    if is_non_retryable_client_error(exc):
+        return
+    write_incident(
+        root / LEDGER_DIR / INCIDENT_NAME,
+        {
+            "status": "create_unconfirmed",
+            "trade_date": trade_date,
+            "report_sha256": report_hash,
+            "renderer_version": RENDERER_VERSION,
+            "error": str(exc),
+            "note": (
+                "document creation outcome is unknown; a retry may create a "
+                "second document. Verify in Feishu before re-running."
+            ),
+            "at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
 def verify_readback(remote_content: Any, title: str, source_count: int) -> list[str]:
     """Checks on the fetched Docx XML. Returns problems; empty means accepted."""
     problems: list[str] = []
@@ -295,6 +527,7 @@ def publish(
     update_fallback: str | None = None
     previous_document_id: str | None = None
     recreated = False
+    created_new = False
     if document_id:
         try:
             result = runner(
@@ -326,6 +559,7 @@ def publish(
             document_id = None
             document_url = None
     if not document_id:
+        created_new = True
         try:
             result = runner(
                 [
@@ -344,16 +578,21 @@ def publish(
                 and ("permission" in msg or "parent location" in msg)
             )
             if not can_fallback:
+                _record_create_unconfirmed(root, trade_date, report_hash, exc)
                 raise
             parent_fallback = "bot_root_permission_denied"
-            result = runner(
-                [
-                    "lark-cli", "docs", "+create", "--as", identity,
-                    "--doc-format", "xml", "--content", f"@./{relative_xml}",
-                    "--format", "json",
-                ],
-                root,
-            )
+            try:
+                result = runner(
+                    [
+                        "lark-cli", "docs", "+create", "--as", identity,
+                        "--doc-format", "xml", "--content", f"@./{relative_xml}",
+                        "--format", "json",
+                    ],
+                    root,
+                )
+            except RuntimeError as retry_exc:
+                _record_create_unconfirmed(root, trade_date, report_hash, retry_exc)
+                raise
         document = (result.get("data") or {}).get("document") or {}
         document_id = document.get("document_id")
         document_url = document.get("url")
@@ -361,6 +600,35 @@ def publish(
         raise RuntimeError("Lark publish did not return a document_id")
     if not document_url:
         document_url = f"https://my.feishu.cn/docx/{document_id}"
+
+    if created_new:
+        # The document exists remotely from this moment on. Record it *before*
+        # the read-back: a read-back failure used to leave an orphan document
+        # with no ledger entry at all. The verified receipt below replaces this
+        # pending row on success; on failure the row (plus the incident log)
+        # makes the orphan discoverable and the next run updates it in place.
+        pending_entry = {
+            "trade_date": trade_date,
+            "document_id": document_id,
+            "document_url": document_url,
+            "file_name": file_name,
+            "report_sha256": report_hash,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "renderer_version": RENDERER_VERSION,
+            "identity": identity,
+            "format": "docx",
+            **({"parent_fallback": parent_fallback} if parent_fallback else {}),
+            **(
+                {
+                    "update_fallback": update_fallback,
+                    "previous_document_id": previous_document_id,
+                }
+                if update_fallback
+                else {}
+            ),
+        }
+        upsert_ledger(ledger_path, pending_entry)
 
     fetch_cmd = [
         "lark-cli", "docs", "+fetch", "--as", identity,

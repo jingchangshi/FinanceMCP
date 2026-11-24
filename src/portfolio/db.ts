@@ -163,6 +163,9 @@ CREATE TABLE IF NOT EXISTS account_risk_anchor (
   initial_principal_cents INTEGER NOT NULL,
   hwm_nav_cents INTEGER NOT NULL,
   hwm_date TEXT NOT NULL,
+  hwm_flows_applied_through TEXT,
+  hwm_applied_same_day_flow_cents INTEGER NOT NULL DEFAULT 0,
+  hwm_nav_scope TEXT NOT NULL DEFAULT 'TOTAL',
   circuit_breaker_status TEXT NOT NULL DEFAULT 'NORMAL',
   locked_until_trade_date TEXT,
   updated_at TEXT NOT NULL
@@ -208,6 +211,7 @@ CREATE TABLE IF NOT EXISTS position_stop_tracker (
   initial_stop_milli INTEGER NOT NULL,
   current_stop_milli INTEGER NOT NULL,
   trailing_ma20_armed INTEGER NOT NULL DEFAULT 0,
+  entry_adj_factor REAL,
   status TEXT NOT NULL DEFAULT 'OPEN',
   updated_at TEXT NOT NULL,
   PRIMARY KEY (account_id, ts_code)
@@ -239,6 +243,21 @@ export function ensurePortfolioLedgerSchema(db: DatabaseSync): void {
 
 export function ensurePortfolioV3Schema(db: DatabaseSync): void {
   db.exec(PORTFOLIO_V3_SCHEMA);
+  const anchorCols = new Set(
+    (db.prepare('PRAGMA table_info(account_risk_anchor)').all() as Array<{ name?: string }>)
+      .map(c => c.name)
+      .filter((n): n is string => Boolean(n)),
+  );
+  if (!anchorCols.has('hwm_flows_applied_through')) {
+    db.exec('ALTER TABLE account_risk_anchor ADD COLUMN hwm_flows_applied_through TEXT;');
+  }
+  if (!anchorCols.has('hwm_applied_same_day_flow_cents')) {
+    db.exec('ALTER TABLE account_risk_anchor ADD COLUMN hwm_applied_same_day_flow_cents INTEGER NOT NULL DEFAULT 0;');
+  }
+  if (!anchorCols.has('hwm_nav_scope')) {
+    // 迁移前的锚点是历史“总资产峰值”（含理财）；新锚点写 INVESTABLE。
+    db.exec("ALTER TABLE account_risk_anchor ADD COLUMN hwm_nav_scope TEXT NOT NULL DEFAULT 'TOTAL';");
+  }
   const cols = new Set(
     (db.prepare('PRAGMA table_info(deconcentration_plan)').all() as Array<{ name?: string }>)
       .map(c => c.name)
@@ -255,6 +274,15 @@ export function ensurePortfolioV3Schema(db: DatabaseSync): void {
   ];
   for (const [col, ddl] of migrations) {
     if (!cols.has(col)) db.exec(ddl);
+  }
+  // 止损跟踪早于复权基准列：旧库补 nullable 列（NULL 表示历史未记录，按不缩放处理）。
+  const trackerCols = new Set(
+    (db.prepare('PRAGMA table_info(position_stop_tracker)').all() as Array<{ name?: string }>)
+      .map(c => c.name)
+      .filter((n): n is string => Boolean(n)),
+  );
+  if (!trackerCols.has('entry_adj_factor')) {
+    db.exec('ALTER TABLE position_stop_tracker ADD COLUMN entry_adj_factor REAL;');
   }
 }
 
@@ -318,7 +346,7 @@ export function openPortfolioDb(path = portfolioDbPath(), options: { writable?: 
     db.exec(PORTFOLIO_LEDGER_SCHEMA);
     db.exec(PORTFOLIO_COMPLETENESS_SCHEMA);
     db.exec(PORTFOLIO_RISK_POLICY_DDL);
-    db.exec(PORTFOLIO_V3_SCHEMA);
+    ensurePortfolioV3Schema(db);
     return db;
   }
   const db = new DatabaseSync(resolved, { readOnly: true });

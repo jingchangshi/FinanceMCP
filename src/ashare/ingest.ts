@@ -389,6 +389,31 @@ export type InvalidBarKinds = Record<InvalidBarKind, number>;
 /** Union of {@link INVALID_BAR_KINDS}; the one definition used by every quality check. */
 export const INVALID_BAR_SQL = `(${Object.values(INVALID_BAR_KINDS).map(expr => `(${expr})`).join(' OR ')})`;
 
+/**
+ * The subset of {@link INVALID_BAR_KINDS} that makes the *price fields* unusable on their own
+ * (bad close, NULL OHLC, nonpositive/high<low). A missing amount is deliberately absent: the
+ * price bars are still readable, so only amount-consuming logic should react. Consumers use this
+ * to exclude a symbol from breadth / signal generation instead of blocking the whole day.
+ */
+export const PRICE_DEFECT_KINDS = ['null_open', 'null_high', 'null_low', 'null_close', 'nonpositive', 'high_low'] as const;
+export const PRICE_DEFECT_SQL = `(${PRICE_DEFECT_KINDS.map(k => `(${INVALID_BAR_KINDS[k]})`).join(' OR ')})`;
+
+/**
+ * Up to this many invalid bar records on one day are treated as isolated per-symbol defects:
+ * disclose them, exclude the symbols from breadth/signals, and still publish (DEGRADED).
+ * More than this is a market-level data failure and blocks READY. Consistent with the
+ * `ohlc_inconsistent > 5` tolerance that predates this policy; ~0.1% of a 5,500-name market.
+ */
+export const ISOLATED_BAR_DEFECT_LIMIT = 5;
+
+/** Symbols whose as-of bar has unusable price fields (bad close / NULL OHLC / nonpositive). */
+export function priceDefectSymbols(db: DatabaseSync, date: string): string[] {
+  try {
+    return (db.prepare(`SELECT ts_code FROM daily WHERE trade_date = ? AND ${PRICE_DEFECT_SQL} ORDER BY ts_code`)
+      .all(date) as { ts_code: string }[]).map(r => r.ts_code);
+  } catch { return []; }
+}
+
 export type QualityStatus = 'READY' | 'DEGRADED' | 'NOT_READY';
 export interface QualityReport {
   trade_date: string;
@@ -505,17 +530,24 @@ export function checkQuality(db: DatabaseSync, date: string, persist = true): Qu
   if (open === undefined) reasons.push(`交易日历缺少 ${date}`);
   if (counts.daily === 0) reasons.push('当日日线缺失');
   else if (counts.prev_daily && coverage.daily_vs_prev < 0.97) reasons.push(`当日日线条数 ${counts.daily} 低于前一交易日 ${counts.prev_daily} 的 97%`);
-  if (counts.daily && coverage.adj_factor_vs_daily < 0.97) reasons.push(`复权因子覆盖率 ${coverage.adj_factor_vs_daily} < 0.97`);
-  if (counts.daily && coverage.daily_basic_vs_daily < 0.95) reasons.push(`每日指标覆盖率 ${coverage.daily_basic_vs_daily} < 0.95`);
+  // Auxiliary datasets degrade the ranking inputs; they do not invalidate the price page.
+  // Missing adj factors already suppress the affected symbols' signals (scanMarket adjMissing).
+  if (counts.daily && coverage.adj_factor_vs_daily < 0.97) degraded.push(`复权因子覆盖率 ${coverage.adj_factor_vs_daily} < 0.97，相关股票信号已抑制`);
+  if (counts.daily && coverage.daily_basic_vs_daily < 0.95) degraded.push(`每日指标覆盖率 ${coverage.daily_basic_vs_daily} < 0.95，估值/流动性字段不完整`);
   const missingIdx = REQUIRED_INDICES.filter(c => !indices.includes(c));
   if (missingIdx.length) reasons.push(`核心指数缺失: ${missingIdx.join(',')}`);
-  if (anomalies.bad_close > 0 || anomalies.ohlc_inconsistent > 5) reasons.push(`行情异常: 无效收盘价 ${anomalies.bad_close}，OHLC 不一致 ${anomalies.ohlc_inconsistent}`);
-  // Any missing or invalid bar blocks READY: a NULL price or turnover is missing
-  // evidence, not a clean day, whatever the coverage ratios say.
-  if (anomalies.null_ohlc > 0) reasons.push(`行情异常: ${anomalies.null_ohlc} 条行情 OHLC 存在空值（NULL open/high/low/close）`);
-  if (anomalies.null_vol > 0) reasons.push(`行情异常: ${anomalies.null_vol} 条行情成交量为空值（NULL vol）`);
-  if (anomalies.null_amount > 0) reasons.push(`行情异常: ${anomalies.null_amount} 条行情成交额为空值（NULL amount）`);
-  if (anomalies.invalid_bar > 0) reasons.push(`行情异常: ${anomalies.invalid_bar} 条行情 OHLC/成交量/成交额非法（与审计同一判定）`);
+  // Isolated invalid bars are a per-symbol defect: disclose, exclude the symbol, publish.
+  // A market-level share of invalid records means the day's bars cannot be trusted.
+  // (bad_close / NULL OHLC / NULL vol / NULL amount / out-of-band are all kinds of this union.)
+  const badPrice = priceDefectSymbols(db, date);
+  if (anomalies.invalid_bar > ISOLATED_BAR_DEFECT_LIMIT) {
+    reasons.push(`行情异常: ${anomalies.invalid_bar} 条行情记录 OHLC/成交量/成交额非法（> ${ISOLATED_BAR_DEFECT_LIMIT}），属市场级坏条（无效收盘价 ${anomalies.bad_close}，OHLC 不一致 ${anomalies.ohlc_inconsistent}，空 OHLC ${anomalies.null_ohlc}，空成交额 ${anomalies.null_amount}）`);
+  } else if (anomalies.invalid_bar > 0) {
+    const sample = badPrice.length
+      ? `（${badPrice.slice(0, 10).join(',')}${badPrice.length > 10 ? ',…' : ''}）`
+      : '';
+    degraded.push(`行情异常: ${anomalies.invalid_bar} 条行情 OHLC/成交量/成交额非法${sample}，已按 symbol 剔除出市场宽度并抑制相关信号，不阻断日报`);
+  }
 
   if (counts.daily && coverage.stk_limit_vs_daily < 0.95) degraded.push(`涨跌停价覆盖率 ${coverage.stk_limit_vs_daily} < 0.95，涨跌停统计不完整`);
   const optionalMissing = Object.keys(CORE_INDICES).filter(c => !REQUIRED_INDICES.includes(c) && !indices.includes(c));

@@ -21,7 +21,9 @@ const { calculateFees, resolveFeeRules, saveFeeProfile } = await load('portfolio
 const days = Array.from({ length: 61 }, (_, i) => new Date(Date.UTC(2026, 6, 1 + i)).toISOString().slice(0, 10).replace(/-/g, ''));
 const asOf = days.at(-1);
 const baseline = days.at(-4);
-const SUPER = '159558.SZ', MIN_ONLY = '516080.SH', PLAIN = '159241.SZ';
+// PLAIN must not be on the verified EASTMONEY_SUPER_ETF_CODES whitelist (P1-7 auto-classification);
+// 159241.SZ was moved off this fixture when it became auto-SUPER_ETF.
+const SUPER = '159558.SZ', MIN_ONLY = '516080.SH', PLAIN = '159559.SZ';
 const CODES = [SUPER, MIN_ONLY, PLAIN];
 const evidence = level => ({ level, source: 'synthetic fee fixture' });
 let count = 0;

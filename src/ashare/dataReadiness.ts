@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { checkQuality, previousTradeDay, type QualityStatus } from './ingest.js';
+import {
+  checkQuality, previousTradeDay, ISOLATED_BAR_DEFECT_LIMIT, priceDefectSymbols, type QualityStatus,
+} from './ingest.js';
+import { resolveDataProviderMode } from './providers/types.js';
 
 /**
  * Data readiness and the data fingerprint that goes INTO the snapshot hash
@@ -84,6 +87,30 @@ function countOn(db: DatabaseSync, table: string, date: string): number {
   if (!tableExists(db, table)) return 0;
   try {
     return Number((db.prepare(`SELECT COUNT(*) c FROM ${table} WHERE trade_date = ?`).get(date) as { c: number }).c);
+  } catch { return 0; }
+}
+
+/** Floor for a same-day page relative to the previous trading day / the daily universe. */
+const COVERAGE_FLOOR = 0.97;
+
+/**
+ * Rows of `dataset` on `date` that actually carry a usable value for the daily bars that exist
+ * that day. Free mode backfills `daily_basic`/`adj_factor` one row per stock with NULL values,
+ * so the row count alone is always "complete" while the ranking inputs are empty. A row with
+ * NULL pe/pb/circ_mv, or a non-positive factor, is a row that cannot be used.
+ */
+function usableCoverageOn(db: DatabaseSync, dataset: 'daily_basic' | 'adj_factor', date: string): number {
+  if (!tableExists(db, 'daily') || !tableExists(db, dataset)) return 0;
+  const alias = dataset === 'daily_basic' ? 'b' : 'a';
+  const usable = dataset === 'daily_basic'
+    ? `(${alias}.pe_ttm IS NOT NULL OR ${alias}.pb IS NOT NULL OR ${alias}.circ_mv IS NOT NULL)`
+    : `(${alias}.adj_factor IS NOT NULL AND ${alias}.adj_factor > 0)`;
+  try {
+    return Number((db.prepare(`
+      SELECT COUNT(*) c
+      FROM daily d
+      JOIN ${dataset} ${alias} ON ${alias}.trade_date = d.trade_date AND ${alias}.ts_code = d.ts_code
+      WHERE d.trade_date = ? AND ${usable}`).get(date) as { c: number }).c);
   } catch { return 0; }
 }
 
@@ -194,25 +221,63 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
   const quality_ready = quality.status === 'READY';
   const financials_synced_today = financialsSyncedToday(db, asOf);
 
-  // The pool is ranked from these four datasets, and they are keyed per stock:
-  // if one of them covers fewer names than `daily`, the ranking inputs are
-  // partial even though the day exists. `listed` is deliberately NOT the
-  // yardstick — on real production data it is 5577 while `daily` is 5571
-  // (halts, new listings), so gating on it would refuse every real day.
+  // Auxiliary datasets (daily_basic / adj_factor / stk_limit) cover fewer names than `daily`.
+  // That degrades ranking inputs, but the price bars themselves are intact: DISCLOSE it instead
+  // of refusing the day. `listed` is deliberately NOT the yardstick — on real production data it
+  // is 5577 while `daily` is 5571 (halts, new listings), so gating on it would refuse every day.
   const counts = {
     daily, daily_basic: quality.counts.daily_basic ?? 0,
     adj_factor: quality.counts.adj_factor ?? 0, stk_limit: quality.counts.stk_limit ?? 0,
   };
-  const short = Object.entries(counts).filter(([k, n]) => k !== 'daily' && n < daily).map(([k, n]) => `${k}=${n}`);
-  if (short.length) {
+  const auxiliaryGaps = Object.entries(counts)
+    .filter(([k, n]) => k !== 'daily' && n < daily)
+    .map(([k, n]) => `${k}=${n} < daily=${daily}（辅助数据不足，按数据质量警告披露，不阻断日报）`);
+
+  // Free mode writes daily_basic/adj_factor rows 1:1 with daily — the historical backfill path
+  // writes every valuation field as NULL — so a row-count check passes on an empty sheet.
+  // Measure usable values and DISCLOSE the gap (same rationale as above). DEGRADED still
+  // publishes and carries this reason in `data_state.readiness`.
+  const freeCoverageIssues: string[] = [];
+  if (resolveDataProviderMode() === 'free') {
+    const floor = Math.ceil(daily * COVERAGE_FLOOR);
+    const usableBasic = usableCoverageOn(db, 'daily_basic', asOf);
+    const usableAdj = usableCoverageOn(db, 'adj_factor', asOf);
+    if (usableBasic < floor) {
+      freeCoverageIssues.push(`free 模式 daily_basic 有效值 ${usableBasic} < ${floor}（估值字段缺失，按数据质量警告披露，不阻断日报）`);
+    }
+    if (usableAdj < floor) {
+      freeCoverageIssues.push(`free 模式 adj_factor 正值 ${usableAdj} < ${floor}（复权因子缺失，按数据质量警告披露，不阻断日报）`);
+    }
+  }
+
+  // Price-field defects follow the same local/market policy as checkQuality: an isolated bad
+  // close/NULL OHLC is excluded by symbol (scanMarket keeps it out of breadth and suppresses its
+  // signals) and disclosed; only a market-level share of broken bars blocks the day. A short
+  // same-day page is likewise a market-level gap.
+  const invalidBars = Number(quality.anomalies.invalid_bar ?? 0);
+  const hardDefects: string[] = [];
+  if ((quality.counts.prev_daily ?? 0) > 0 && quality.coverage.daily_vs_prev < COVERAGE_FLOOR) {
+    hardDefects.push(`daily=${daily} 低于前一交易日 ${quality.counts.prev_daily} 的 97%`);
+  }
+  if (invalidBars > ISOLATED_BAR_DEFECT_LIMIT) {
+    hardDefects.push(`行情记录非法 ${invalidBars} 条（> ${ISOLATED_BAR_DEFECT_LIMIT}），属市场级坏条，阻止发布`);
+  }
+  if (hardDefects.length) {
     return {
       status: 'NOT_READY',
       checks: { bars_present, quality_ready, financials_synced_today },
-      reason: `bar datasets incomplete for ${asOf} (daily=${daily}): ${short.join(', ')}`,
+      reason: `行情数据硬缺陷 for ${asOf}: ${hardDefects.join(', ')}`,
     };
   }
 
-  const disclosed: string[] = [];
+  const disclosed: string[] = [...auxiliaryGaps, ...freeCoverageIssues];
+  if (invalidBars > 0) {
+    const badPrice = priceDefectSymbols(db, asOf);
+    const detail = badPrice.length
+      ? `价格字段非法 ${badPrice.length} 只（${badPrice.slice(0, 10).join(',')}${badPrice.length > 10 ? ',…' : ''}）`
+      : `行情记录非法 ${invalidBars} 条`;
+    disclosed.push(`${detail}：已按 symbol 剔除出市场宽度并抑制其技术信号，不阻断日报`);
+  }
   if (quality.status !== 'READY') {
     disclosed.push(`market quality ${quality.status}: ${quality.reasons.slice(0, 3).join('; ') || 'see checkQuality'}`);
   }

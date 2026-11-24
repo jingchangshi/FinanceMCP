@@ -70,11 +70,31 @@ export interface MarketRegimeResult {
 }
 
 export interface EvaluateMarketRegimeOptions {
-  /** 可选：历史回溯确认窗口长度（默认 5 个交易日）。 */
+  /**
+   * 可选：返回的 history / 名义确认窗口长度（默认 20 个交易日）。
+   *
+   * 状态机的 confirmed 并不从该窗口首日重置：确认状态按 `REPORT_EVENT_SCAN_DAYS` 的回溯
+   * （最近 `STATE_LOOKBACK_DAYS` 天允许市场扫描，更早只读已发布 report 广度）从最近一次
+   * crash 或连续两日 raw 一致事件向后继承，否则交替 raw 会把此前的 DEFENSIVE 保护自行遗忘。
+   * history 仍按本参数截取，供报告显示。
+   */
   hysteresisLookbackDays?: number;
   /** 可选（测试注入）：按交易日覆盖全市场站上 MA60 比例（0~1），避免在小样本单测里扫描全市场。 */
   pctAboveMa60ByDate?: Record<string, number>;
 }
+
+/**
+ * 状态机内部回溯上限（交易日）。有界回溯：最近一次 crash / 连续两日确认事件在 60 个交易日
+ * （约 3 个月）内都可继承，且这段时间允许市场扫描作为广度回退。
+ */
+const STATE_LOOKBACK_DAYS = 60;
+
+/**
+ * 状态机的总回溯上限（交易日）。更早的日期只读已发布 report 的广度（外加 index_daily /
+ * daily / stk_limit 的廉价查询），不再触发全市场 scanMarket；因此 >60 天的交替 raw 也能靠
+ * report 历史找到最近的决定性事件。超出该上限仍无确认事件时才回到窗口首日 raw（残余风险）。
+ */
+const REPORT_EVENT_SCAN_DAYS = 250;
 
 const INDEX_STATE_ZH: Record<IndexTrendState, string> = {
   BULL: '多头',
@@ -197,6 +217,7 @@ function resolveBreadthSnapshot(
   db: DatabaseSync,
   date: string,
   pctOverride: number | undefined,
+  allowMarketScan = true,
 ): {
   pctAboveMa60: number | null;
   amountYi: number | null;
@@ -254,7 +275,7 @@ function resolveBreadthSnapshot(
     }
   }
 
-  if (pctAboveMa60 === null && tableExists(db, 'daily') && tableExists(db, 'stock_basic')) {
+  if (allowMarketScan && pctAboveMa60 === null && tableExists(db, 'daily') && tableExists(db, 'stock_basic')) {
     try {
       const dateCountRow = db.prepare('SELECT COUNT(DISTINCT trade_date) n FROM daily WHERE trade_date <= ?').get(date) as { n?: number } | undefined;
       if ((dateCountRow?.n ?? 0) >= 65) {
@@ -348,14 +369,20 @@ export function evaluateMarketRegime(
     };
   }
 
-  const lookback = Math.max(2, opts.hysteresisLookbackDays ?? 5);
-  let dates = tableExists(db, 'trade_cal') ? recentTradeDays(db, asOf, lookback) : [];
+  const displayLookback = Math.max(2, opts.hysteresisLookbackDays ?? 20);
+  // Replay a bounded longer window to carry the confirmed state from the most recent event;
+  // only the tail is returned as `history`. Days older than STATE_LOOKBACK_DAYS use published
+  // report breadth (plus cheap daily/stk_limit queries) and never trigger a full market scan.
+  const stateLookback = Math.max(displayLookback, STATE_LOOKBACK_DAYS);
+  const eventLookback = Math.max(stateLookback, REPORT_EVENT_SCAN_DAYS);
+  let dates = tableExists(db, 'trade_cal') ? recentTradeDays(db, asOf, eventLookback) : [];
   if (!dates.length) {
     dates = (db.prepare(
       "SELECT DISTINCT trade_date FROM index_daily WHERE ts_code = '000300.SH' AND trade_date <= ? ORDER BY trade_date DESC LIMIT ?",
-    ).all(asOf, lookback) as { trade_date: string }[]).map(row => row.trade_date).reverse();
+    ).all(asOf, eventLookback) as { trade_date: string }[]).map(row => row.trade_date).reverse();
   }
   if (!dates.length) dates = [asOf];
+  const marketScanFrom = Math.max(0, dates.length - stateLookback);
 
   const notes: string[] = [];
   const history: DailyRegimePoint[] = [];
@@ -376,7 +403,7 @@ export function evaluateMarketRegime(
     const growthState = synthesizeGrowthState(csi500A, chinextA);
     const growthPctChg = averageFinite([csi500A.pct_chg, chinextA.pct_chg]);
     const growthRet20 = averageFinite([csi500A.ret20_pct, chinextA.ret20_pct]);
-    const b = resolveBreadthSnapshot(db, d, opts.pctAboveMa60ByDate?.[d]);
+    const b = resolveBreadthSnapshot(db, d, opts.pctAboveMa60ByDate?.[d], idx >= marketScanFrom);
     const raw = classifyRawRegime(valueA.state, growthState, b.pctAboveMa60, b.amountVsMa20);
 
     const crash = valueA.pct_chg !== null
@@ -422,6 +449,8 @@ export function evaluateMarketRegime(
   const regime = lastPoint.confirmed_regime;
   const hysteresisHeld = regime !== rawRegime;
   const crashOverride = lastPoint.crash_override;
+  // Display history stays bounded; the confirmed state above is carried from the longer replay.
+  const displayHistory = history.slice(Math.max(0, history.length - displayLookback));
 
   const styleSpread = latestGrowthRet20 !== null && latestValue.ret20_pct !== null
     ? r2(latestGrowthRet20 - latestValue.ret20_pct)
@@ -483,7 +512,7 @@ export function evaluateMarketRegime(
       down: latestBreadth.down,
       limit_down: latestBreadth.limitDown,
     },
-    history,
+    history: displayHistory,
     regime_label_zh: REGIME_LABELS_ZH[regime],
     style_label_zh: STYLE_LABELS_ZH[style],
     summary_zh: summaryZh,
