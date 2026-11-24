@@ -79,3 +79,13 @@ test('complete sentiment facts use real limits, median and prior 20-day amount',
     assert.equal(facts.amount_vs_ma20, 2);
   } finally { db.close(); }
 });
+
+test('private evidence DB opens in WAL mode with a busy timeout', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'news-pragma-'));
+  const path = join(dir, 'private', 'evidence.sqlite');
+  const db = openNewsEvidenceDb(path);
+  try {
+    assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+    assert.equal(db.prepare('PRAGMA busy_timeout').get().timeout, 15000);
+  } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+});

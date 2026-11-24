@@ -228,8 +228,9 @@ app.use(cors({
   ],
   exposedHeaders: ['Content-Type','Mcp-Session-Id','Mcp-Protocol-Version']
 }));
-// Tool calls are small JSON-RPC messages; deployments can lower the cap (e.g. MCP_BODY_LIMIT=64kb).
-app.use(express.json({ limit: process.env.MCP_BODY_LIMIT?.trim() || '10mb' }));
+// Tool calls are small JSON-RPC messages. Default cap is 64kb so the public anonymous /mcp
+// endpoint cannot force large synchronous parses on the event loop; override with MCP_BODY_LIMIT.
+app.use(express.json({ limit: process.env.MCP_BODY_LIMIT?.trim() || '64kb' }));
 
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'healthy', transport: 'streamable-http', activeSessions: sessions.size });
