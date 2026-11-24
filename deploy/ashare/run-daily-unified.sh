@@ -208,8 +208,12 @@ while :; do
     case "$daily_exit" in 0|76|79) daily_accepted=1 ;; esac
     etf_ok=0
     case "$ETF_STATE" in ready|ready_with_suspended) etf_ok=1 ;; esac
+    # DEGRADED publishes by contract (isolated bad bars / auxiliary gaps are disclosed in the
+    # report); only a genuine market-level NOT_READY keeps polling.
+    report_ok=0
+    case "$REPORT_STATUS" in READY|DEGRADED) report_ok=1 ;; esac
     if [ "$daily_accepted" = "1" ] && [ "$REPORT_DATE" = "$EXPECTED_DATE" ] \
-      && [ "$REPORT_STATUS" = "READY" ] && [ "$etf_ok" = "1" ]; then
+      && [ "$report_ok" = "1" ] && [ "$etf_ok" = "1" ]; then
       if [ "$ETF_STATE" = "ready_with_suspended" ]; then
         echo "finance-ashare unified WARNING: confirmed no upstream bar (suspended/not listed): $(jq -r --arg d "$REPORT_DATE" '.etf.coverage[$d].no_upstream_bar | join(",")' "$DAILY_JSON" 2>/dev/null || echo "?") - treated as verified" >&2
       fi
@@ -218,7 +222,7 @@ while :; do
         echo "finance-ashare unified note: fund_nav reported ${nav_errs} error(s); NAV lag is disclosed per code and does not block Stage 1" >&2
       fi
       DATA_DELAYED=0
-      echo "finance-ashare unified Stage 1 READY on attempt $attempt (trade_date=$REPORT_DATE etf_state=$ETF_STATE)"
+      echo "finance-ashare unified Stage 1 $REPORT_STATUS on attempt $attempt (trade_date=$REPORT_DATE etf_state=$ETF_STATE)"
       break
     fi
   else

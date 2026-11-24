@@ -197,6 +197,26 @@ test('U2 READY on first pass runs all stages sequentially without sleeping or de
   assert.doesNotMatch(pyCalls, /--data-delayed/);
 });
 
+test('U2b DEGRADED on first pass counts as ready (isolated defects disclose, they do not hold the pipeline)', t => {
+  const h = setupHarness(t, {
+    dailyPayloads: [
+      {
+        report: { trade_date: TRADE_DATE, status: 'DEGRADED' },
+        etf: { coverage: { [TRADE_DATE]: { missing: [] } } },
+      },
+    ],
+  });
+  const res = h.run();
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(h.getDailyCalls(), 1);
+  assert.match(res.stdout, /Stage 1 DEGRADED on attempt 1/);
+  assert.match(res.stdout, /finance-ashare feishu ok:/);
+
+  const pyCalls = h.readPythonLog();
+  assert.match(pyCalls, /publish_and_notify\.py/);
+  assert.doesNotMatch(pyCalls, /--data-delayed/);
+});
+
 test('U3 NOT_READY retries within poll window and proceeds once READY', t => {
   const h = setupHarness(t, {
     dailyPayloads: [

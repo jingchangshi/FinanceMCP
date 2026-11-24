@@ -111,15 +111,16 @@ for (const c of CASES) {
     assert.equal(day.invalid_bar_kinds[c.kind], 1, `${c.kind} count`);
     assert.ok(day.issues.some(issue => issue.includes(c.kind)), day.issues.join(' | '));
 
-    // b. The quality gate can no longer report READY.
+    // b. The quality gate can no longer report READY. One isolated bad bar is a per-symbol
+    //    defect (DEGRADED, symbol disclosed); only a market-level share blocks the day.
     const q = checkQuality(db, MUTATED, false);
-    assert.equal(q.status, 'NOT_READY');
-    assert.equal(q.cache_status, 'NOT_READY');
+    assert.equal(q.status, 'DEGRADED');
+    assert.equal(q.cache_status, 'DEGRADED');
     assert.ok(q.anomalies.invalid_bar >= 1, 'same predicate as the audit');
     assert.ok(q.reasons.some(reason => reason.includes('OHLC')), q.reasons.join(' | '));
+    assert.ok(q.reasons.some(reason => reason.includes(BAD) && reason.includes('已按 symbol 剔除')), q.reasons.join(' | '));
     if (c.kind.startsWith('null_') && c.kind !== 'null_vol' && c.kind !== 'null_amount') {
       assert.equal(q.anomalies.null_ohlc, 1, 'NULL OHLC is counted explicitly');
-      assert.ok(q.reasons.some(reason => reason.includes('空值')));
     }
 
     // c. Engine: technical observations are masked and signals suppressed, while
@@ -174,7 +175,7 @@ for (const c of CASES) {
   });
 }
 
-test('a day with NULL OHLC is NOT_READY even when every coverage ratio is fine', () => {
+test('an isolated NULL OHLC is DEGRADED with the symbol disclosed; six of them are NOT_READY', () => {
   const db = freshDb();
   const mid = DATES[100];
   const clean = checkQuality(db, mid, false);
@@ -185,14 +186,25 @@ test('a day with NULL OHLC is NOT_READY even when every coverage ratio is fine',
   }
   db.prepare('UPDATE daily SET low = NULL WHERE ts_code = ? AND trade_date = ?').run(STOCKS[8].ts_code, mid);
   const q = checkQuality(db, mid, false);
-  assert.equal(q.status, 'NOT_READY');
+  assert.equal(q.status, 'DEGRADED', 'one isolated bad bar must not block the day');
+  assert.equal(q.cache_status, 'DEGRADED');
   assert.equal(q.anomalies.null_ohlc, 1);
-  // Coverage is still perfect: only the anomaly forces the status.
+  assert.ok(q.reasons.some(reason => reason.includes(STOCKS[8].ts_code) && reason.includes('已按 symbol 剔除')), q.reasons.join(' | '));
+  // Coverage is still perfect: only the anomaly drives the status.
   assert.equal(q.coverage.daily_vs_listed, 1);
   assert.equal(q.coverage.daily_basic_vs_daily, 1);
   assert.equal(q.coverage.adj_factor_vs_daily, 1);
   assert.equal(q.coverage.stk_limit_vs_daily, 1);
   assert.ok(q.reasons.every(reason => !reason.includes('覆盖率')), 'no coverage reason is involved');
+
+  // A market-level share of bad bars still refuses the day.
+  for (const s of STOCKS.slice(0, 6)) {
+    db.prepare('UPDATE daily SET low = NULL WHERE ts_code = ? AND trade_date = ?').run(s.ts_code, mid);
+  }
+  const mass = checkQuality(db, mid, false);
+  assert.equal(mass.status, 'NOT_READY');
+  assert.equal(mass.anomalies.null_ohlc, 7);
+  assert.ok(mass.reasons.some(reason => reason.includes('市场级坏条')), mass.reasons.join(' | '));
 });
 
 test('volume/amount NULL policy is explicit and consistent between audit and quality', () => {
@@ -211,10 +223,12 @@ test('volume/amount NULL policy is explicit and consistent between audit and qua
   assert.equal(d.invalid_bar_kinds.null_amount, 1);
   assert.equal(d.invalid_bar_kinds.missing_amount, 1, 'vol > 0 with NULL amount');
   const q = checkQuality(db, day, false);
-  assert.equal(q.status, 'NOT_READY');
+  assert.equal(q.status, 'DEGRADED', 'two isolated bad bars are disclosed, not a whole-day block');
+  assert.equal(q.cache_status, 'DEGRADED');
   assert.equal(q.anomalies.null_vol, 1);
   assert.equal(q.anomalies.null_amount, 1);
   assert.equal(q.anomalies.invalid_bar, 2);
+  assert.ok(q.reasons.some(reason => reason.includes('OHLC/成交量/成交额非法')), q.reasons.join(' | '));
   assert.equal(db.prepare('SELECT COUNT(*) n FROM daily WHERE trade_date = ? AND (' + INVALID_BAR_SQL + ')').get(day).n, 2);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM daily WHERE ts_code = ? AND trade_date = ? AND (' + INVALID_BAR_SQL + ')').get(zeroBoth, day).n, 0,
     'vol = 0 with amount = 0 is not invalid');

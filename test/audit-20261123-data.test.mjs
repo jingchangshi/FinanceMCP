@@ -1,7 +1,10 @@
 // Audit 2026-11-23 workstream C: data-source findings P1-4, P1-5, P2-1, P2-3, P2-4, P2-5, P3-1.
 // All upstream I/O is mocked: no live network, no production DB.
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { deflateSync } from 'node:zlib';
 
@@ -10,11 +13,13 @@ const { checkDataReadiness } = await import('../build/ashare/dataReadiness.js');
 const { scanMarket } = await import('../build/ashare/analysis.js');
 const { evaluateMarketRegime } = await import('../build/ashare/marketRegime.js');
 const { financialsAsOf } = await import('../build/ashare/data.js');
+const { generateReport } = await import('../build/ashare/report.js');
 const { isRateLimit } = await import('../build/ashare/fetch.js');
 const { TdxSession } = await import('../build/ashare/providers/tdxClient.js');
 const { fetchTencentDailyBars, parseTencentQuoteLine } = await import('../build/ashare/providers/tencentClient.js');
 const { clearFreeProviderCache, fetchFreeDataset, isFinalAshareClose } = await import('../build/ashare/providers/freeProviderRouter.js');
-const { weekdays } = await import('./ashare-fixture.mjs');
+const { runHotspotPipeline } = await import('../build/ashare/hotspotPipeline.js');
+const { weekdays, seedMarket } = await import('./ashare-fixture.mjs');
 
 const originalFetch = globalThis.fetch;
 
@@ -488,7 +493,7 @@ test('P2-4: market-level short pages and mass bad bars block; isolated bad bars 
       seedReadinessDay(massDb, '20261118', codesOf(10), overrides);
       const mass = checkDataReadiness(massDb, '20261118');
       assert.equal(mass.status, 'NOT_READY');
-      assert.match(mass.reason, /价格字段非法 6 只.*大面积坏条/);
+      assert.match(mass.reason, /行情记录非法 6 条（> 5），属市场级坏条/);
     } finally {
       massDb.close();
     }
@@ -540,7 +545,127 @@ test('P2-4: free mode discloses unusable daily_basic/adj_factor instead of trust
   });
 });
 
+test('P2-4 addendum: hotspotPipeline publishes with isolated bad OHLC and blocks only on market-level price defects', () => {
+  const db = openAshareDb(':memory:');
+  try {
+    const days = weekdays('20250101', 100);
+    const asOf = days.at(-1);
+    seedMarket(db, days);
+
+    // One isolated NULL open on the as-of bar: the pipeline gate reads dataState → the same
+    // isolated-defect policy as checkDataReadiness, so the snapshot must still be written.
+    db.prepare("UPDATE daily SET open = NULL WHERE ts_code = '600000.SH' AND trade_date = ?").run(asOf);
+    const isolated = runHotspotPipeline(db, asOf, { etfCodes: [] });
+    assert.equal(isolated.readiness.status, 'DEGRADED', isolated.readiness.reason);
+    assert.match(String(isolated.readiness.reason), /价格字段非法 1 只（600000\.SH）/);
+    assert.ok(isolated.saved, 'isolated bad OHLC must not block the hotspot snapshot write');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM hotspot_snapshot WHERE as_of = ?').get(asOf).n, 1);
+
+    // Six price-defective symbols is market-level: the same gate must refuse to persist.
+    const massCodes = Array.from({ length: 6 }, (_, i) => `${600000 + i}.SH`);
+    const corrupt = db.prepare('UPDATE daily SET close = 0 WHERE ts_code = ? AND trade_date = ?');
+    for (const code of massCodes) corrupt.run(code, asOf);
+    const mass = runHotspotPipeline(db, asOf, { etfCodes: [] });
+    assert.equal(mass.readiness.status, 'NOT_READY');
+    assert.match(String(mass.readiness.reason), /行情记录非法 6 条（> 5），属市场级坏条/);
+    assert.equal(mass.saved, null, 'market-level price defects must not persist a snapshot');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM hotspot_snapshot WHERE as_of = ?').get(asOf).n, 1, 'the earlier valid snapshot is untouched');
+  } finally {
+    db.close();
+  }
+});
+
+test('P2-4 third-round: the real daily report entry publishes isolated bad OHLC and blocks market-level defects', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'audit-report-'));
+  const prevDataDir = process.env.ASHARE_DATA_DIR;
+  process.env.ASHARE_DATA_DIR = dir;
+  const db = openAshareDb(':memory:');
+  try {
+    const days = weekdays('20250101', 100);
+    const asOf = days.at(-1);
+    seedMarket(db, days);
+
+    // One isolated NULL open on the as-of bar: checkQuality classifies it as a per-symbol
+    // defect, so generateReport (the real daily/report entry) must still produce the market
+    // judgement and publish DEGRADED instead of short-circuiting on NOT_READY.
+    db.prepare("UPDATE daily SET open = NULL WHERE ts_code = '600000.SH' AND trade_date = ?").run(asOf);
+    const isolated = generateReport(db, asOf, 'live');
+    assert.equal(isolated.report.status, 'DEGRADED', JSON.stringify(isolated.report.data?.quality?.reasons));
+    assert.ok(isolated.report.market, 'the market judgement must still be produced');
+    assert.equal(isolated.report.not_ready, undefined);
+    assert.equal(isolated.report.data.quality.status, 'DEGRADED');
+    assert.match(
+      JSON.stringify(isolated.report.data.quality.reasons),
+      /600000\.SH.*已按 symbol 剔除/,
+      'the report discloses the excluded symbol',
+    );
+
+    // Six bad bars are market-level: the same entry returns to a NOT_READY report that carries
+    // no market judgement, never a silently degraded one.
+    const massCodes = Array.from({ length: 6 }, (_, i) => `${600000 + i}.SH`);
+    const corrupt = db.prepare('UPDATE daily SET close = 0 WHERE ts_code = ? AND trade_date = ?');
+    for (const code of massCodes) corrupt.run(code, asOf);
+    const mass = generateReport(db, asOf, 'live');
+    assert.equal(mass.report.status, 'NOT_READY');
+    assert.ok(mass.report.not_ready);
+    assert.equal(mass.report.market, undefined);
+  } finally {
+    db.close();
+    if (prevDataDir === undefined) delete process.env.ASHARE_DATA_DIR;
+    else process.env.ASHARE_DATA_DIR = prevDataDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------- P2-5 regime lookback + breadth universe
+
+/** Shared market fixture for the regime tests: a rising index trio with a one-day crash. */
+function seedRegimeMarket(db, days, crashIdx) {
+  upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'],
+    days.map((d, i) => ({ cal_date: d, is_open: 1, pretrade_date: days[i - 1] ?? null })));
+
+  const steady = (base, i) => base * (1 + 0.001 * i);
+  const indexSeries = base => i => (i === crashIdx ? steady(base, crashIdx - 1) * 0.95 : steady(base, i));
+  const pushIndex = (tsCode, base) => {
+    upsertRows(db, 'index_daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
+      days.map((trade_date, i) => {
+        const close = indexSeries(base)(i);
+        const prev = i > 0 ? indexSeries(base)(i - 1) : close;
+        return {
+          ts_code: tsCode, trade_date, open: close, high: close * 1.01, low: close * 0.99, close,
+          pre_close: prev, pct_chg: prev > 0 ? ((close / prev) - 1) * 100 : 0, vol: 1e6, amount: 1e6,
+        };
+      }));
+  };
+  pushIndex('000300.SH', 3000);
+  pushIndex('000905.SH', 5000);
+  pushIndex('399006.SZ', 2000);
+
+  // 100 names each day: flat except the crash day, where every name sits at its down limit.
+  const codes = codesOf(100);
+  const daily = [];
+  const limits = [];
+  for (let i = 0; i < days.length; i++) {
+    for (const code of codes) {
+      const crash = i === crashIdx;
+      daily.push({
+        ts_code: code, trade_date: days[i], open: 10, high: 10, low: crash ? 9 : 10,
+        close: crash ? 9 : 10, pre_close: 10, pct_chg: crash ? -10 : 0, vol: 1000, amount: 1000,
+      });
+      limits.push({ ts_code: code, trade_date: days[i], up_limit: 11, down_limit: 9 });
+    }
+  }
+  upsertRows(db, 'daily', DAILY_COLS, daily);
+  upsertRows(db, 'stk_limit', ['ts_code', 'trade_date', 'up_limit', 'down_limit'], limits);
+
+  // Breadth toggles the raw regime between OFFENSIVE and STRUCTURAL after the crash so that
+  // no two consecutive days agree; only the crash-set DEFENSIVE can survive.
+  const pctMap = {};
+  for (let i = 0; i < days.length; i++) {
+    pctMap[days[i]] = i <= crashIdx ? 0.6 : ((i - crashIdx) % 2 === 1 ? 0.6 : 0.38);
+  }
+  return pctMap;
+}
 
 test('P2-5: the confirmed regime is carried from the last crash, not re-seeded by the display window', async () => {
   const db = openAshareDb(':memory:');
@@ -550,49 +675,7 @@ test('P2-5: the confirmed regime is carried from the last crash, not re-seeded b
     // 30 trading days before asOf: outside the default 20-day DISPLAY window, inside the
     // bounded 60-day STATE replay window. The crash lock must still hold.
     const crashIdx = days.length - 30;
-    upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'],
-      days.map((d, i) => ({ cal_date: d, is_open: 1, pretrade_date: days[i - 1] ?? null })));
-
-    const steady = (base, i) => base * (1 + 0.001 * i);
-    const indexSeries = base => i => (i === crashIdx ? steady(base, crashIdx - 1) * 0.95 : steady(base, i));
-    const pushIndex = (tsCode, base) => {
-      upsertRows(db, 'index_daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
-        days.map((trade_date, i) => {
-          const close = indexSeries(base)(i);
-          const prev = i > 0 ? indexSeries(base)(i - 1) : close;
-          return {
-            ts_code: tsCode, trade_date, open: close, high: close * 1.01, low: close * 0.99, close,
-            pre_close: prev, pct_chg: prev > 0 ? ((close / prev) - 1) * 100 : 0, vol: 1e6, amount: 1e6,
-          };
-        }));
-    };
-    pushIndex('000300.SH', 3000);
-    pushIndex('000905.SH', 5000);
-    pushIndex('399006.SZ', 2000);
-
-    // 100 names each day: flat except the crash day, where every name sits at its down limit.
-    const codes = codesOf(100);
-    const daily = [];
-    const limits = [];
-    for (let i = 0; i < days.length; i++) {
-      for (const code of codes) {
-        const crash = i === crashIdx;
-        daily.push({
-          ts_code: code, trade_date: days[i], open: 10, high: 10, low: crash ? 9 : 10,
-          close: crash ? 9 : 10, pre_close: 10, pct_chg: crash ? -10 : 0, vol: 1000, amount: 1000,
-        });
-        limits.push({ ts_code: code, trade_date: days[i], up_limit: 11, down_limit: 9 });
-      }
-    }
-    upsertRows(db, 'daily', DAILY_COLS, daily);
-    upsertRows(db, 'stk_limit', ['ts_code', 'trade_date', 'up_limit', 'down_limit'], limits);
-
-    // Breadth toggles the raw regime between OFFENSIVE and STRUCTURAL after the crash so that
-    // no two consecutive days agree; only the crash-set DEFENSIVE can survive.
-    const pctMap = {};
-    for (let i = 0; i < days.length; i++) {
-      pctMap[days[i]] = i <= crashIdx ? 0.6 : ((i - crashIdx) % 2 === 1 ? 0.6 : 0.38);
-    }
+    const pctMap = seedRegimeMarket(db, days, crashIdx);
 
     const held = evaluateMarketRegime(db, asOf, { pctAboveMa60ByDate: pctMap });
     assert.equal(held.crash_override, false, 'the crash itself is 30 trading days before asOf');
@@ -605,6 +688,30 @@ test('P2-5: the confirmed regime is carried from the last crash, not re-seeded b
     assert.equal(shortDisplay.regime, 'DEFENSIVE', 'a short display window must not forget the crash');
     assert.equal(shortDisplay.history.length, 5);
     assert.equal(shortDisplay.history.at(-1).confirmed_regime, 'DEFENSIVE');
+  } finally {
+    db.close();
+  }
+});
+
+test('P2-5 third-round: the crash lock survives more than 60 trading days of alternating raw', async () => {
+  const db = openAshareDb(':memory:');
+  try {
+    const days = weekdays('20260105', 160);
+    const asOf = days.at(-1);
+    // 70 trading days before asOf: outside the 60-day state window. The report-backed replay
+    // extension must still find the crash event and carry DEFENSIVE to asOf.
+    const crashIdx = days.length - 70;
+    const pctMap = seedRegimeMarket(db, days, crashIdx);
+
+    const held = evaluateMarketRegime(db, asOf, { pctAboveMa60ByDate: pctMap });
+    assert.equal(held.crash_override, false, 'the crash is 70 trading days before asOf');
+    assert.equal(held.regime, 'DEFENSIVE', 'the >60-day event scan keeps the crash lock');
+    assert.equal(held.hysteresis_held, true);
+    assert.equal(held.history.length, 20);
+
+    const shortDisplay = evaluateMarketRegime(db, asOf, { hysteresisLookbackDays: 5, pctAboveMa60ByDate: pctMap });
+    assert.equal(shortDisplay.regime, 'DEFENSIVE');
+    assert.equal(shortDisplay.history.length, 5);
   } finally {
     db.close();
   }
