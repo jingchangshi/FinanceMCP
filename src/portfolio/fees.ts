@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
+import { EASTMONEY_SUPER_ETF_CODES } from '../ashare/etfDeclarations.js';
 import { DEFAULT_FEE_RULES, DEFAULT_STOCK_RULES, FEE_RULE_VERSION, type FeeRules } from './rules.js';
 
 export type FeeEvidence = 'CONFIRMED' | 'PUBLIC_REFERENCE' | 'ASSUMED' | 'UNKNOWN';
@@ -50,6 +51,7 @@ const CLASSES: FeeClass[] = ['STOCK', 'NORMAL_ETF', 'SUPER_ETF', 'OTHER_ETF'];
 const LEVELS: FeeEvidence[] = ['CONFIRMED', 'PUBLIC_REFERENCE', 'ASSUMED', 'UNKNOWN'];
 const DATE = /^\d{8}$/;
 const SUPER_ETF_OBSERVED = { commission_rate: 0.00005, commission_min_cents: 0 };
+const SUPER_ETF_WHITELIST = new Set<string>(EASTMONEY_SUPER_ETF_CODES);
 const keyFor = (accountId: string) => `fee_profiles:${accountId}`;
 
 export function validateFeeProfile(profile: FeeProfile): FeeProfile {
@@ -116,7 +118,14 @@ export function feeRulesFor(context: FeeContext, code: string, kind: 'ETF' | 'ST
     && (!p.effective_until || context.asOf <= p.effective_until));
   const specific = active.filter(p => p.code === code).sort((a, b) => a.effective_from.localeCompare(b.effective_from) || a.id.localeCompare(b.id));
   const classified = specific.filter(p => p.classification).at(-1)?.classification;
-  const classification: FeeClass = kind === 'STOCK' ? 'STOCK' : classified && classified !== 'STOCK' ? classified : 'NORMAL_ETF';
+  // 无显式代码级分类覆盖时，已核验的东财超级 ETF 白名单（33 只）自动归入 SUPER_ETF；
+  // 证据级别仍是 ASSUMED（等待券商对账单确认），显式 code profile 始终优先。
+  const whitelistedSuperEtf = kind === 'ETF' && SUPER_ETF_WHITELIST.has(code);
+  const classification: FeeClass = kind === 'STOCK'
+    ? 'STOCK'
+    : classified && classified !== 'STOCK'
+      ? classified
+      : whitelistedSuperEtf ? 'SUPER_ETF' : 'NORMAL_ETF';
   const category = active.filter(p => !p.code && p.classification === classification)
     .sort((a, b) => Number(!!a.broker_id) - Number(!!b.broker_id) || a.effective_from.localeCompare(b.effective_from) || a.id.localeCompare(b.id));
   const values: FeeRules = { ...(kind === 'STOCK' ? DEFAULT_STOCK_RULES.fees : DEFAULT_FEE_RULES) };
@@ -127,8 +136,8 @@ export function feeRulesFor(context: FeeContext, code: string, kind: 'ETF' | 'ST
     // Marked codes only: the observed discount tier has no 5-yuan floor. Never inferred for other ETFs.
     values.commission_rate = SUPER_ETF_OBSERVED.commission_rate;
     values.commission_min_cents = SUPER_ETF_OBSERVED.commission_min_cents;
-    evidence.commission_rate = { level: 'ASSUMED', source: 'Observed discount tier on explicitly marked codes; not a broker-confirmed category rate' };
-    evidence.commission_min_cents = { level: 'ASSUMED', source: 'Observed fills show no 5-yuan floor for marked codes; hidden billing unit unverified' };
+    evidence.commission_rate = { level: 'ASSUMED', source: 'Eastmoney verified super-ETF whitelist (EASTMONEY_SUPER_ETF_CODES, 33 codes); observed 0.5bp discount tier, broker confirmation pending' };
+    evidence.commission_min_cents = { level: 'ASSUMED', source: 'Eastmoney verified super-ETF whitelist (EASTMONEY_SUPER_ETF_CODES); observed fills show no 5-yuan floor for marked codes, hidden billing unit unverified' };
   }
   const applied = [...category, ...specific];
   for (const p of applied) for (const field of FIELDS) if (Object.hasOwn(p.values, field)) {

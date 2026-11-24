@@ -36,6 +36,8 @@ export interface StopTrackerRow {
   initial_stop_milli: number;
   current_stop_milli: number;
   trailing_ma20_armed: number;
+  /** As-of adj_factor 基准；NULL = 历史未记录（不缩放，并在下次运行补写）。 */
+  entry_adj_factor: number | null;
   status: 'OPEN' | 'CLOSED';
   updated_at: string;
 }
@@ -228,6 +230,20 @@ export function sizeStockSwingOrder(input: StockSwingOrderInput): StockSwingOrde
   };
 }
 
+/** 读取 asOf 当日或之前最后一个复权因子（carry-forward）；缺失/不可用时按 1 处理。 */
+function lastAdjFactorAt(
+  marketDb: DatabaseSync | null | undefined,
+  tsCode: string,
+  asOf: string,
+): number {
+  if (!marketDb || !portfolioTableExists(marketDb, 'adj_factor')) return 1;
+  const row = marketDb.prepare(
+    'SELECT adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date <= ? AND adj_factor > 0 ORDER BY trade_date DESC LIMIT 1',
+  ).get(tsCode, asOf) as { adj_factor?: number } | undefined;
+  const factor = Number(row?.adj_factor);
+  return Number.isFinite(factor) && factor > 0 ? factor : 1;
+}
+
 function stockMa20Milli(
   marketDb: DatabaseSync | null | undefined,
   tsCode: string,
@@ -239,13 +255,19 @@ function stockMa20Milli(
   ).all(tsCode, asOf) as { trade_date: string; close: number }[]).reverse();
   if (bars.length < 20) return null;
   const adjMap = new Map<string, number>();
+  let carry = 1;
   if (portfolioTableExists(marketDb, 'adj_factor')) {
+    // 窗口首日之前可能已有未变化的因子：先 carry 到首日，避免把窗口前的除权
+    // 基准当作 1 而扭曲前复权均线。
+    const prior = marketDb.prepare(
+      'SELECT adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date <= ? AND adj_factor > 0 ORDER BY trade_date DESC LIMIT 1',
+    ).get(tsCode, bars[0].trade_date) as { adj_factor?: number } | undefined;
+    if (prior && Number(prior.adj_factor) > 0) carry = Number(prior.adj_factor);
     const adjRows = marketDb.prepare(
       'SELECT trade_date, adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date BETWEEN ? AND ? ORDER BY trade_date ASC',
     ).all(tsCode, bars[0].trade_date, asOf) as { trade_date: string; adj_factor: number }[];
     for (const row of adjRows) if (Number(row.adj_factor) > 0) adjMap.set(String(row.trade_date), Number(row.adj_factor));
   }
-  let carry = 1;
   const adjs = bars.map(b => {
     const f = adjMap.get(b.trade_date);
     if (f && f > 0) carry = f;
@@ -472,7 +494,11 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
   const stockScreen = input.stockSwingScreen !== undefined
     ? input.stockSwingScreen
     : (router.sub_strategies.s_stock_swing === 'ACTIVE' && input.marketDb
-      ? screenStockSwingCandidates(input.marketDb, input.asOf)
+      // 候选池取 max(持仓上限, 10)：前 2 名若已被持仓/不可买（如 920 板块），仍有替补可评估；
+      // 实际新开仓数量仍由下方 policy.stock_max_positions 封顶。
+      ? screenStockSwingCandidates(input.marketDb, input.asOf, {
+          maxCandidates: Math.max(loadApprovedV3Policy().stock_max_positions, 10),
+        })
       : null);
   const stockSwingCandidates = stockScreen?.candidates ?? [];
 
@@ -578,7 +604,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     }
   }
 
-  // -------------------------------- P1: 个股 -8% 硬止损 / +15% 保本 / 跌破 MA20 移动止盈
+  // -------------------------------- P1: 个股 -8% 硬止损 / +15% 保本 / 收盘跌破 MA20 无条件离场（ETF 仍为武装后移动止盈）
   const trackerByCode = new Map<string, StopTrackerRow>();
   if (portfolioTableExists(input.portfolioDb, 'position_stop_tracker') && input.portfolioDb) {
     const rows = input.portfolioDb.prepare(
@@ -600,14 +626,28 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     let currentStopMilli = tracked?.current_stop_milli ?? initialStopMilli;
     let ma20Armed = tracked?.trailing_ma20_armed ?? 0;
 
-    if (h.price_milli >= Math.round(entryMilli * 1.15)) {
+    // 复权基准换算：tracker 内价格按 entry 基准（entry_adj_factor）存储。除权/拆股后
+    // adj_factor 上升而原始价下跌，因此历史价的 asOf 原始口径等价价 =
+    // stored × entryAdj / currentAdj（Tushare hfq 因子口径）。绝不对 h.price_milli 缩放。
+    // 旧行 entry_adj_factor 为 NULL 时不缩放，并在本次落库补写当前因子。
+    const currentAdj = lastAdjFactorAt(input.marketDb, h.ts_code, input.asOf);
+    const entryAdj = tracked?.entry_adj_factor ?? null;
+    const basisRatio = entryAdj !== null && entryAdj > 0 ? entryAdj / currentAdj : 1;
+    const scaledEntryMilli = Math.round(entryMilli * basisRatio);
+    let scaledCurrentStopMilli = Math.round(currentStopMilli * basisRatio);
+
+    if (h.price_milli >= Math.round(scaledEntryMilli * 1.15)) {
       ma20Armed = 1;
       currentStopMilli = Math.max(currentStopMilli, entryMilli);
+      scaledCurrentStopMilli = Math.round(currentStopMilli * basisRatio);
     }
 
     const ma20Milli = stockMa20Milli(input.marketDb, h.ts_code, input.asOf);
-    const hardStopHit = h.price_milli <= currentStopMilli;
-    const trailingExitHit = ma20Armed === 1 && ma20Milli !== null && h.price_milli < ma20Milli;
+    const hardStopHit = h.price_milli <= scaledCurrentStopMilli;
+    // EXP-V3-02（research/ashare/experiments/exp_v3_02_stock_swing_rqalpha.py）：
+    // 个股在硬止损之后，收盘价 < MA20 即无条件离场，不依赖 +15% 武装；ETF tracker
+    // 行保持既有“浮盈 +15% 后才启用 MA20 移动止盈”的语义。
+    const trailingExitHit = ma20Milli !== null && h.price_milli < ma20Milli && (isStock || ma20Armed === 1);
 
     stopTrackerUpdates.push({
       account_id: input.accountId,
@@ -617,6 +657,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       initial_stop_milli: initialStopMilli,
       current_stop_milli: currentStopMilli,
       trailing_ma20_armed: ma20Armed,
+      entry_adj_factor: entryAdj ?? currentAdj,
       status: hardStopHit || trailingExitHit ? 'CLOSED' : 'OPEN',
       updated_at: input.asOf,
     });
@@ -631,15 +672,18 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       workingQty.set(h.ts_code, Math.max(0, (workingQty.get(h.ts_code) ?? 0) - remSellable));
       workingSellable.set(h.ts_code, 0);
       workingCashCents += netCents;
+      const stockMa20Exit = isStock && trailingExitHit && ma20Armed !== 1;
       const reasonText = hardStopHit
-        ? `收盘价 ${(h.price_milli / 1000).toFixed(2)} 元跌破止损线 ${(currentStopMilli / 1000).toFixed(2)} 元，无条件执行止损。`
-        : `浮盈曾达 15% 后收盘跌破 20 日均线（${((ma20Milli ?? 0) / 1000).toFixed(2)} 元），执行移动止盈离场。`;
+        ? `收盘价 ${(h.price_milli / 1000).toFixed(2)} 元跌破止损线 ${(scaledCurrentStopMilli / 1000).toFixed(2)} 元，无条件执行止损。`
+        : stockMa20Exit
+          ? `收盘价 ${(h.price_milli / 1000).toFixed(2)} 元跌破 20 日均线（${((ma20Milli ?? 0) / 1000).toFixed(2)} 元），个股波段规则无条件离场（EXP-V3-02 口径）。`
+          : `浮盈曾达 15% 后收盘跌破 20 日均线（${((ma20Milli ?? 0) / 1000).toFixed(2)} 元），执行移动止盈离场。`;
       actions.push({
         priority: 'P1',
         code: `P1-STOP-SELL-${h.ts_code}`,
         kind: 'REDUCE',
         rank: actions.length + 1,
-        title: `${hardStopHit ? '触发硬止损清仓' : '触发移动止盈离场'}：卖出 ${h.name}（${h.ts_code}）`,
+        title: `${hardStopHit ? '触发硬止损清仓' : stockMa20Exit ? '个股跌破 20 日均线离场' : '触发移动止盈离场'}：卖出 ${h.name}（${h.ts_code}）`,
         reasons: [reasonText],
         counter_evidence: ['短期洗盘可能次日反包，但单笔严守止损是 10 万本金回本纪律核心。'],
         legs: [{
@@ -655,7 +699,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           net_cents: netCents,
           quote_trade_date: h.latest_bar_date,
           executable: true,
-          reason: hardStopHit ? 'P1_HARD_STOP_8PCT' : 'P1_TRAILING_MA20_STOP',
+          reason: hardStopHit ? 'P1_HARD_STOP_8PCT' : stockMa20Exit ? 'P1_MA20_EXIT' : 'P1_TRAILING_MA20_STOP',
         }],
         fees_cents: fees.total_cents,
         fees_estimated: Boolean(rules.fee_model?.estimated),
@@ -993,18 +1037,33 @@ export function syncAccountV3State(
       const stmt = portfolioDb.prepare(`
         INSERT INTO position_stop_tracker (
           account_id, ts_code, entry_date, entry_price_milli, initial_stop_milli,
-          current_stop_milli, trailing_ma20_armed, status, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?)
+          current_stop_milli, trailing_ma20_armed, entry_adj_factor, status, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(account_id, ts_code) DO UPDATE SET
-          current_stop_milli = MAX(position_stop_tracker.current_stop_milli, excluded.current_stop_milli),
-          trailing_ma20_armed = MAX(position_stop_tracker.trailing_ma20_armed, excluded.trailing_ma20_armed),
+          -- 已清仓（CLOSED）的旧行不得复活：重新买入时全部字段以本次为准；
+          -- 只有仍持仓（OPEN）时才保留 entry 基准并对止损/武装位取 MAX。
+          entry_date = CASE WHEN position_stop_tracker.status = 'CLOSED'
+            THEN excluded.entry_date ELSE position_stop_tracker.entry_date END,
+          entry_price_milli = CASE WHEN position_stop_tracker.status = 'CLOSED'
+            THEN excluded.entry_price_milli ELSE position_stop_tracker.entry_price_milli END,
+          initial_stop_milli = CASE WHEN position_stop_tracker.status = 'CLOSED'
+            THEN excluded.initial_stop_milli ELSE position_stop_tracker.initial_stop_milli END,
+          current_stop_milli = CASE WHEN position_stop_tracker.status = 'CLOSED'
+            THEN excluded.current_stop_milli
+            ELSE MAX(position_stop_tracker.current_stop_milli, excluded.current_stop_milli) END,
+          trailing_ma20_armed = CASE WHEN position_stop_tracker.status = 'CLOSED'
+            THEN excluded.trailing_ma20_armed
+            ELSE MAX(position_stop_tracker.trailing_ma20_armed, excluded.trailing_ma20_armed) END,
+          entry_adj_factor = CASE WHEN position_stop_tracker.status = 'CLOSED'
+            THEN excluded.entry_adj_factor
+            ELSE COALESCE(position_stop_tracker.entry_adj_factor, excluded.entry_adj_factor) END,
           status = excluded.status,
           updated_at = excluded.updated_at
       `);
       for (const s of output.stop_tracker_updates) {
         stmt.run(
           s.account_id, s.ts_code, s.entry_date, s.entry_price_milli, s.initial_stop_milli,
-          s.current_stop_milli, s.trailing_ma20_armed, s.status, s.updated_at,
+          s.current_stop_milli, s.trailing_ma20_armed, s.entry_adj_factor ?? null, s.status, s.updated_at,
         );
       }
     } catch (err: any) {
