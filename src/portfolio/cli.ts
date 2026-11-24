@@ -980,8 +980,21 @@ export function runScenario(db: DatabaseSync, action: string, h: PortfolioCliHel
   if (!Number.isFinite(fees.slippage_rate_per_side) || fees.slippage_rate_per_side < 0) throw new Error('--slippage 需要非负数');
   if (!Number.isFinite(stress.shock_pct) || stress.shock_pct > 0) throw new Error('--stress 需要非正数（如 -0.10）');
 
-  return {
-    ...buildScenario({
+  // 账户门控与 decision.ts 同源：原始未上报交易风险不能由本层自行解释成固定前置条件。
+  // 只在有效处置阻塞执行时加入前置原因；声明缺失/滞后被降级时保留原始披露。
+  const declaration = accountGate.declaration;
+  const accountBlockDetails: string[] = [];
+  if (!accountGate.ok) {
+    const codes = accountGate.reasons.map(reason => reason.code).join(', ');
+    accountBlockDetails.push(`Account ledger verification or state basis is insufficient${codes ? ` (${codes})` : ''}`);
+  }
+  if (declaration.blocks_execution && declaration.reason) {
+    accountBlockDetails.push(`Completeness disposition blocks execution (${declaration.risk_basis ?? 'unknown'}): ${declaration.reason.detail}`);
+  }
+  const accountPreconditions = accountBlockDetails.length > 0
+    ? [{ code: 'account_not_current' as const, detail: accountBlockDetails.join('; ') }]
+    : [];
+  const scenario = buildScenario({
       snapshot: summary,
       as_of_trade_date: tradeDate,
       quotes: bundle.quotes,
@@ -990,10 +1003,13 @@ export function runScenario(db: DatabaseSync, action: string, h: PortfolioCliHel
         && verifyTrustedRotation(db, { evidence_id: evidence.evidence_id, claim: evidence.basis, buyCode: scenarioAction.buy_code,
           sellCode: scenarioAction.sell_code, asOf: tradeDate }, trustedEvidencePolicy()).verified ? 'RESEARCH_VERIFIED' : 'UNVERIFIED' } : null,
       resolved: bundle.resolved,
-      preconditions: [...bundle.preconditions, ...(!accountGate.ok || accountGate.unreported_trade_risk ? [{ code: 'account_not_current' as const, detail: 'Account ledger completeness or verification is insufficient' }] : [])],
+      preconditions: [...bundle.preconditions, ...accountPreconditions],
       ...(!h.arg('commission') && !h.arg('slippage') ? { fee_context: loadFeeContext(db, accountId, tradeDate) } : {}),
       rules: { fees, stress },
-    }),
+    });
+  return {
+    ...scenario,
+    warnings: [...new Set([...scenario.warnings, ...declaration.warnings.map(w => w.code)])],
     quote_mode: bundle.mode,
   };
 }

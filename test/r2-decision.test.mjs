@@ -281,16 +281,33 @@ test('R2-9. 快照 is_current=true 但账本 gate PENDING → 不可执行', () 
 });
 
 // V1.0 改变了 R2 的"旧快照一律不可执行"：状态现在可以由账本按决策日重建。
-// 但旧快照本身仍然只发警告；**没有完整性声明**时依旧不可执行（保守方向）。
-test('R2-10. 旧快照 + 当前行情 + 未声明完整性 → 不可执行，且 stale 以警告出现', () => {
+// 完整性声明（2026-11 有效处置修订）：可执行依据成立时，声明缺失/滞后只作 warnings，
+// 不再硬阻塞；原始未上报交易风险仍照常披露。旧快照本身仍然只发警告。
+test('R2-10. 旧快照 + 账本可重建 + 未声明完整性 → 声明降为 warnings，stale 仍警告，可执行', () => {
   const status = decision.evaluateAccountStatus(portfolio, staleSummary, 'r2-stale', LAST);
-  assert.equal(status.ok, false);
-  assert.equal(status.state_basis, 'none');
+  assert.equal(status.ok, true, JSON.stringify(status.reasons));
+  assert.equal(status.state_basis, 'ledger_reconstruction');
   assert.ok(status.warnings.some(w => w.code === 'account_snapshot_stale'), JSON.stringify(status.warnings));
-  assert.ok(status.reasons.some(r => r.code === 'account_completeness_undeclared'), JSON.stringify(status.reasons));
+  assert.equal(status.reasons.some(r => r.code === 'account_completeness_undeclared'), false,
+    JSON.stringify(status.reasons));
+  // 原始风险与执行门控分离：raw=true 不表示阻塞。
+  assert.equal(status.unreported_trade_risk, true, '原始披露仍然存在');
+  assert.equal(status.declaration.risk_basis, 'undeclared');
+  assert.equal(status.declaration.blocks_execution, false);
+  assert.equal(status.declaration.execution_basis, 'ledger_reconstruction');
+  assert.ok(status.declaration.warnings.some(w => w.code === 'account_completeness_undeclared'));
+  assert.ok(status.declaration.warnings.some(w => w.code === 'unreported_trade_lag_warning'));
+
   const d = rotation({ account_id: 'r2-stale', snapshot: staleSummary });
-  assert.notEqual(d.status, 'ACTIONABLE');
-  assert.equal(rotateOf(d).executable, false);
+  assert.equal(d.status, 'ACTIONABLE', JSON.stringify(d.reasons));
+  assert.ok(d.warnings.includes('unreported_trade_risk'), JSON.stringify(d.warnings));
+  assert.ok(d.warnings.includes('unreported_trade_lag_warning'), JSON.stringify(d.warnings));
+  assert.equal(rotateOf(d).executable, true);
+  assert.equal(rotateOf(d).legs.length, 2);
+  assert.ok(rotateOf(d).legs.every(l => l.executable === true));
+  // 风险轨只反映有效处置：原始风险披露不阻塞。
+  assert.equal(d.decision_tracks.risk_track.gates_satisfied, true, JSON.stringify(d.decision_tracks.risk_track));
+  assert.deepEqual(d.decision_tracks.risk_track.blocked_by, []);
 });
 
 test('R2-10a. 旧快照 + 账本可重建 + 已声明完整性 → 经 ledger_reconstruction 可执行', () => {
@@ -582,46 +599,132 @@ test('R2-A2-2. 对账一致时决策正常；每个决策都披露完整性与�
   assert.equal(d.account_status.unreported_trade_risk, false);
 });
 
-test('R2-A1-3. 未声明完整性 → 不可执行；声明存在未上报风险 → 只能示意，不得 executable', () => {
+test('R2-A1-3. 未声明/同日滞后声明降为 warnings；显式声明存在未上报风险仍阻塞执行', () => {
   ledger.initBaseline(portfolio, 'r2-nocompleteness', { asOf: LAST, snapshotId: 'r2-current', note: 'fixture' });
   ledger.confirmRealAccount(portfolio, 'r2-nocompleteness', { confirm: true, note: 'r2 test fixture' });
   try {
+    // (a) 从未声明完整性：可执行依据成立（已存当前快照 + 重放成功）→ 只作 warnings。
     const status = decision.evaluateAccountStatus(portfolio, current, 'r2-nocompleteness', LAST);
-    assert.equal(status.ok, false);
-    assert.ok(status.reasons.some(r => r.code === 'account_completeness_undeclared'), JSON.stringify(status.reasons));
+    assert.equal(status.ok, true, JSON.stringify(status.reasons));
+    assert.equal(status.state_basis, 'same_day_snapshot');
+    assert.equal(status.unreported_trade_risk, true, '原始披露：缺失声明仍视为存在未上报交易风险');
+    assert.equal(status.declaration.risk_basis, 'undeclared');
+    assert.equal(status.declaration.blocks_execution, false, '可执行依据成立时不得硬阻塞');
+    assert.equal(status.declaration.execution_basis, 'same_day_snapshot');
+    assert.equal(status.reasons.some(r => r.code === 'account_completeness_undeclared'), false,
+      JSON.stringify(status.reasons));
+    assert.ok(status.declaration.warnings.some(w => w.code === 'account_completeness_undeclared'));
+    assert.ok(status.declaration.warnings.some(w => w.code === 'unreported_trade_lag_warning'));
+    assert.equal(status.account_verified, true);
+    assert.equal(status.same_day_snapshot_stored, true);
+    assert.equal(status.replay_ok, true);
 
-    // 声明"覆盖到决策日"，但缺省 unreported_trade_risk=true。
-    ledger.setAccountCompleteness(portfolio, 'r2-nocompleteness', { as_of: LAST }, { confirm: true, recordedBy: 'test-fixture' });
-    const risky = decision.evaluateAccountStatus(portfolio, current, 'r2-nocompleteness', LAST);
-    assert.equal(risky.ok, true, JSON.stringify(risky.reasons));
-    assert.equal(risky.unreported_trade_risk, true, '缺省即存在未上报交易风险');
-    assert.equal(risky.state_basis, 'same_day_snapshot');
-
-    // 可执行腿是对"当前现金/份额"的承诺，而未上报成交可能已改变它们：
-    // 交易类表达必须降级为 ILLUSTRATIVE，且所有腿 executable:false。
     const d = rotation({ account_id: 'r2-nocompleteness' });
-    assert.equal(d.status, 'ILLUSTRATIVE', JSON.stringify(d.reasons));
-    assert.equal(d.account_status.unreported_trade_risk, true);
-    assert.ok(d.warnings.some(w => /unreported_trade_risk/.test(w)), JSON.stringify(d.warnings));
-    assert.ok(d.reasons.some(r => r.code === 'unreported_trade_risk'), JSON.stringify(d.reasons));
-    const rotate = rotateOf(d);
-    assert.equal(rotate.executable, false);
-    assert.deepEqual(rotate.legs, []);
-    assert.ok(rotate.illustrative_legs.every(l => l.executable === false));
+    assert.equal(d.status, 'ACTIONABLE', JSON.stringify(d.reasons));
+    assert.ok(d.warnings.includes('unreported_trade_risk'), JSON.stringify(d.warnings));
+    assert.ok(d.warnings.includes('unreported_trade_lag_warning'), JSON.stringify(d.warnings));
+    assert.equal(rotateOf(d).executable, true);
+    assert.equal(d.decision_tracks.risk_track.gates_satisfied, true, JSON.stringify(d.decision_tracks.risk_track));
+    assert.deepEqual(d.decision_tracks.risk_track.blocked_by, []);
 
-    // 研究类（HOLD）不受影响：它不承诺任何数量。
-    const hold = buildDecision(base({ account_id: 'r2-nocompleteness', action: { type: 'HOLD' } }));
-    assert.ok(hold.warnings.some(w => /unreported_trade_risk/.test(w)));
+    // (b) 显式声明"存在未上报交易风险"（缺省 true）：即使同日快照 + 重放成功也必须阻塞。
+    ledger.setAccountCompleteness(portfolio, 'r2-nocompleteness', { as_of: LAST }, { confirm: true, recordedBy: 'test-fixture' });
+    const explicit = decision.evaluateAccountStatus(portfolio, current, 'r2-nocompleteness', LAST);
+    assert.equal(explicit.ok, true, JSON.stringify(explicit.reasons));
+    assert.equal(explicit.unreported_trade_risk, true);
+    assert.equal(explicit.declaration.risk_basis, 'explicit');
+    assert.equal(explicit.declaration.blocks_execution, true);
+    assert.equal(explicit.declaration.execution_basis, 'same_day_snapshot');
 
-    // 用户显式声明"已录入到决策日、无未上报风险"后才恢复可执行。
+    const blocked = rotation({ account_id: 'r2-nocompleteness' });
+    assert.equal(blocked.status, 'ILLUSTRATIVE', JSON.stringify(blocked.reasons));
+    assert.equal(blocked.account_status.declaration.blocks_execution, true);
+    assert.ok(blocked.reasons.some(r => r.code === 'unreported_trade_risk'), JSON.stringify(blocked.reasons));
+    const rotateBlocked = rotateOf(blocked);
+    assert.equal(rotateBlocked.executable, false);
+    assert.deepEqual(rotateBlocked.legs, []);
+    assert.ok(rotateBlocked.illustrative_legs.every(l => l.executable === false));
+    // 风险轨与有效处置同源：显式风险必须出现在 blocked_by。
+    assert.equal(blocked.decision_tracks.risk_track.gates_satisfied, false);
+    assert.ok(blocked.decision_tracks.risk_track.blocked_by.includes('unreported_trade_risk'),
+      JSON.stringify(blocked.decision_tracks.risk_track));
+
+    // (c) 同日推断滞后：声明覆盖到 PREV（未覆盖决策日 LAST），原始风险=true 但不阻塞。
+    ledger.setAccountCompleteness(portfolio, 'r2-nocompleteness', {
+      as_of: LAST, reported_events_through: PREV, unreported_trade_risk: false,
+    }, { confirm: true, recordedBy: 'test-fixture' });
+    const lag = decision.evaluateAccountStatus(portfolio, current, 'r2-nocompleteness', LAST);
+    assert.equal(lag.ok, true, JSON.stringify(lag.reasons));
+    assert.equal(lag.unreported_trade_risk, true);
+    assert.equal(lag.declaration.risk_basis, 'expired');
+    assert.equal(lag.declaration.blocks_execution, false);
+    assert.equal(lag.declaration.execution_basis, 'same_day_snapshot');
+
+    const lagDecision = rotation({ account_id: 'r2-nocompleteness' });
+    assert.equal(lagDecision.status, 'ACTIONABLE', JSON.stringify(lagDecision.reasons));
+    assert.equal(lagDecision.decision_tracks.risk_track.gates_satisfied, true);
+    assert.deepEqual(lagDecision.decision_tracks.risk_track.blocked_by, []);
+
+    // 显式 true 与同日推断滞后都是 raw=true、同一快照/日期/规则；有效处置不同，
+    // decision_id 必须随有效处置变化，不能只哈希原始布尔值。
+    assert.equal(blocked.account_status.unreported_trade_risk, lagDecision.account_status.unreported_trade_risk);
+    assert.notEqual(blocked.account_status.declaration.blocks_execution, lagDecision.account_status.declaration.blocks_execution);
+    assert.notEqual(blocked.decision_id, lagDecision.decision_id, '有效处置必须进入 decision_id');
+
+    // (d) 用户显式声明"已录入到决策日、无未上报风险"后原始风险清除。
     ledger.setAccountCompleteness(portfolio, 'r2-nocompleteness', {
       as_of: LAST, reported_events_through: LAST, unreported_trade_risk: false,
     }, { confirm: true, recordedBy: 'test-fixture' });
     const clean = rotation({ account_id: 'r2-nocompleteness' });
     assert.equal(clean.status, 'ACTIONABLE', JSON.stringify(clean.reasons));
     assert.equal(clean.account_status.unreported_trade_risk, false);
+    assert.equal(clean.account_status.declaration.risk_basis, null);
+    assert.equal(clean.account_status.declaration.blocks_execution, false);
   } finally {
     portfolio.prepare('DELETE FROM account_completeness WHERE account_id = ?').run('r2-nocompleteness');
+  }
+});
+
+test('R2-A1-3b. HOLD 请求附带的 reduce 对照腿是交易腿：有效处置阻塞时同样不得 executable', () => {
+  ledger.initBaseline(portfolio, 'r2-hold-reduce', { asOf: LAST, snapshotId: 'r2-current', note: 'fixture' });
+  ledger.confirmRealAccount(portfolio, 'r2-hold-reduce', { confirm: true, note: 'r2 test fixture' });
+  ledger.setAccountCompleteness(portfolio, 'r2-hold-reduce', { as_of: LAST }, { confirm: true, recordedBy: 'test-fixture' });
+  try {
+    const input = {
+      account_id: 'r2-hold-reduce',
+      action: { type: 'HOLD' },
+      reduce: { sell_code: '159558.SZ', sell_shares: 10000 },
+    };
+    const blocked = buildDecision(base(input));
+    // 顶层请求是 HOLD（不交易），但 reduce 对照腿必须被同一有效处置阻塞。
+    assert.equal(blocked.requested_action, 'HOLD');
+    assert.equal(blocked.status, 'NO_ACTION', JSON.stringify(blocked.reasons));
+    assert.ok(!blocked.reasons.some(r => r.code === 'unreported_trade_risk'), 'HOLD 本身不是交易请求');
+    assert.ok(blocked.warnings.includes('unreported_trade_risk'), JSON.stringify(blocked.warnings));
+    const reduceBlocked = blocked.options.find(o => o.action === 'REDUCE_EQUITY');
+    assert.equal(reduceBlocked.available, true);
+    assert.equal(reduceBlocked.status, 'ILLUSTRATIVE', JSON.stringify(reduceBlocked.reasons));
+    assert.equal(reduceBlocked.executable, false);
+    assert.deepEqual(reduceBlocked.legs, []);
+    assert.ok(reduceBlocked.illustrative_legs.length > 0);
+    assert.ok(reduceBlocked.illustrative_legs.every(l => l.executable === false));
+    assert.ok(reduceBlocked.reasons.some(r => r.code === 'unreported_trade_risk'), JSON.stringify(reduceBlocked.reasons));
+    assert.ok(blocked.decision_tracks.risk_track.blocked_by.includes('unreported_trade_risk'),
+      JSON.stringify(blocked.decision_tracks.risk_track));
+
+    // 同一 HOLD + reduce，改为明确无未上报风险后，对照腿才恢复可执行。
+    ledger.setAccountCompleteness(portfolio, 'r2-hold-reduce', {
+      as_of: LAST, reported_events_through: LAST, unreported_trade_risk: false,
+    }, { confirm: true, recordedBy: 'test-fixture' });
+    const clean = buildDecision(base(input));
+    const reduceClean = clean.options.find(o => o.action === 'REDUCE_EQUITY');
+    assert.equal(reduceClean.status, 'ACTIONABLE', JSON.stringify(reduceClean.reasons));
+    assert.equal(reduceClean.executable, true);
+    assert.equal(reduceClean.legs.length, 1);
+    assert.ok(reduceClean.legs.every(l => l.executable === true));
+    assert.deepEqual(clean.decision_tracks.risk_track.blocked_by, []);
+  } finally {
+    portfolio.prepare('DELETE FROM account_completeness WHERE account_id = ?').run('r2-hold-reduce');
   }
 });
 
@@ -740,11 +843,15 @@ test('R2-A1-5. 跨日估值不需要每天重新声明：声明覆盖到基线�
     assert.equal(later.state_basis, 'ledger_reconstruction');
     assert.equal(later.unreported_trade_risk, true, '声明未覆盖的日期必须视为存在未上报交易风险');
     assert.ok(later.warnings.some(w => w.code === 'account_snapshot_stale'), JSON.stringify(later.warnings));
+    // 有效处置：原始风险=true，但可执行依据（基线 + 重放）成立，声明滞后只作披露。
+    assert.equal(later.declaration.risk_basis, 'expired');
+    assert.equal(later.declaration.blocks_execution, false);
 
-    // 交易类表达因此只能是示意。
+    // 交易类表达在该日仍不可执行，但原因是合成交易日历不含 20261020，而不是原始风险布尔值。
     const d = rotation({ account_id: 'r2-crossday', as_of_trade_date: nextDay });
+    assert.ok(d.reasons.some(r => r.code === 'as_of_not_trading_day'), JSON.stringify(d.reasons));
+    assert.equal(d.account_status.declaration.blocks_execution, false);
     assert.notEqual(d.status, 'ACTIONABLE');
-    assert.equal(rotateOf(d).executable, false);
   } finally {
     portfolio.prepare('DELETE FROM account_completeness WHERE account_id = ?').run('r2-crossday');
     portfolio.prepare('DELETE FROM account_baseline WHERE account_id = ?').run('r2-crossday');
