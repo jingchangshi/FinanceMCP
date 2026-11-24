@@ -217,3 +217,81 @@ test('E10 equal cash but a different gross/fee/tax split is not deduplicated', (
     assert.equal(result.counts.recorded, 1);
   } finally { db.close(); }
 });
+
+function recordBrokerBuy(db, { id, date, sourceId, broker = null, code = '159999.SZ' }) {
+  recordEvent(db, {
+    event_id: id, account_id: 'synthetic', event_type: 'TRADE_BUY', occurred_on: date,
+    ts_code: code, quantity: 100, price_milli: 1250,
+    fee_cents: 1, tax_cents: 0, source: 'broker_statement',
+    note: JSON.stringify({ format: 'broker_csv/1', broker, source_id: sourceId }),
+  });
+}
+
+test('E11 old-day v1 X plus new-day v2 X is ambiguous, not an exact-id hit on the old row', () => {
+  const db = fixture();
+  try {
+    // The synthesized CSV target id is exactly this old v1 row's id.
+    recordBrokerBuy(db, { id: 'broker:synthetic:unspecified:X', date: '20261019', sourceId: 'X' });
+    recordBrokerBuy(db, { id: 'broker:v2:synthetic:unspecified:20261020:TRADE_BUY:X', date: '20261020', sourceId: 'X' });
+    const reverseCsv = '流水号,成交日期,业务名称,撤销流水号\nrev-X,2026-10-21,撤销,X\n';
+    const events = parseTradeCsv(reverseCsv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(result.aborted, true, JSON.stringify(result));
+    assert.match(result.abort_reason ?? '', /对应多笔事件/);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event WHERE reversed_by IS NOT NULL').get().n, 0,
+      'the old same-numbered v1 row must not be reversed by a bare number');
+  } finally { db.close(); }
+});
+
+test('E12 --broker narrows a same-number reversal to that broker; without it the number is ambiguous', () => {
+  const make = () => {
+    const db = fixture();
+    recordBrokerBuy(db, { id: 'brokerA-X', date: '20261019', sourceId: 'X', broker: 'brokerA' });
+    recordBrokerBuy(db, { id: 'brokerB-X', date: '20261020', sourceId: 'X', broker: 'brokerB' });
+    return db;
+  };
+  const reverseCsv = '流水号,成交日期,业务名称,撤销流水号\nrev-X,2026-10-21,撤销,X\n';
+  const db = make();
+  try {
+    const withBroker = parseTradeCsv(reverseCsv, { accountId: 'synthetic', brokerId: 'brokerB' }).events;
+    const ok = importEvents(db, 'synthetic', withBroker, { dedupeByContent: true });
+    assert.equal(ok.counts.recorded, 1, JSON.stringify(ok));
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM account_event WHERE event_id = 'brokerB-X' AND reversed_by IS NOT NULL").get().n, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM account_event WHERE event_id = 'brokerA-X' AND reversed_by IS NOT NULL").get().n, 0);
+  } finally { db.close(); }
+
+  const db2 = make();
+  try {
+    const withoutBroker = parseTradeCsv(reverseCsv, { accountId: 'synthetic' }).events;
+    const ambiguous = importEvents(db2, 'synthetic', withoutBroker, { dedupeByContent: true });
+    assert.equal(ambiguous.aborted, true);
+    assert.match(ambiguous.abort_reason ?? '', /对应多笔事件/);
+  } finally { db2.close(); }
+});
+
+test('E13 a same-CSV buy and reversal still resolves when --broker is supplied', () => {
+  const db = fixture();
+  try {
+    const header = '流水号,成交日期,业务名称,证券代码,成交数量,成交价格,成交金额,佣金,印花税,资金发生额,撤销流水号';
+    const csv = `${header}\n` +
+      'fill-1,2026-10-19,买入,159999,100,1.250,125.00,0.01,0,-125.01,\n' +
+      'rev-1,2026-10-20,撤销,,,,,,,,fill-1\n';
+    const events = parseTradeCsv(csv, { accountId: 'synthetic', brokerId: 'eastmoney' }).events;
+    const result = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 2, JSON.stringify(result));
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM account_event WHERE event_type = 'TRADE_BUY' AND reversed_by IS NOT NULL").get().n, 1);
+  } finally { db.close(); }
+});
+
+test('E14 a caller-provided full event id keeps exact-id semantics (no fuzzy resolution)', () => {
+  const db = fixture();
+  try {
+    recordBrokerBuy(db, { id: 'full-buy-1', date: '20261019', sourceId: 'full-1' });
+    const result = importEvents(db, 'synthetic', [{
+      event_id: 'full-rev-1', account_id: 'synthetic', event_type: 'REVERSE',
+      occurred_on: '20261020', reverses_event_id: 'full-buy-1', source: 'broker_statement',
+    }], { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 1, JSON.stringify(result));
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM account_event WHERE event_id = 'full-buy-1' AND reversed_by IS NOT NULL").get().n, 1);
+  } finally { db.close(); }
+});

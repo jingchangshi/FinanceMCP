@@ -134,8 +134,13 @@ export function parseTradeCsv(text: string, options: { accountId: string; broker
           + (get('other_fee') ? decimalToInteger(get('other_fee'), 2, 'other_fee') : 0);
         event.tax_cents = decimalToInteger(get('tax'), 2, 'tax');
       } else if (type === 'REVERSE') {
-        if (!get('reverses_event_id')) throw new Error('CORRECTION/REVERSE requires original event id; import replacement as a separate row');
-        event.reverses_event_id = `broker:${options.accountId}:${options.brokerId ?? 'unspecified'}:${get('reverses_event_id')}`;
+        const reversesRaw = get('reverses_event_id');
+        if (!reversesRaw) throw new Error('CORRECTION/REVERSE requires original event id; import replacement as a separate row');
+        // The v1-shaped id is kept only for backward compatibility. Importing a
+        // CSV reversal always resolves via the bare number + source broker, so a
+        // collision with an old same-numbered v1 row cannot reverse the wrong fill.
+        event.reverses_source_id = reversesRaw;
+        event.reverses_event_id = `broker:${options.accountId}:${options.brokerId ?? 'unspecified'}:${reversesRaw}`;
       } else {
         event.cash_delta_cents = decimalToInteger(get('cash_delta'), 2, 'cash_delta');
         if (type === 'CASH_WITHDRAW' || type === 'FEE') event.cash_delta_cents = -Math.abs(event.cash_delta_cents);
