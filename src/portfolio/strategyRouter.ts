@@ -5,6 +5,8 @@ import {
   type MarketRegimeTier,
 } from '../ashare/marketRegime.js';
 import { portfolioTableExists } from './db.js';
+import { buildNavSeries, readBaseline } from './ledger.js';
+import { buildLedgerPriceTable } from './riskPolicy.js';
 import { loadApprovedV3Policy } from './v3Policy.js';
 
 export type CircuitBreakerStatus = 'NORMAL' | 'L1_WARN' | 'L2_LOCKED';
@@ -43,6 +45,10 @@ export interface StrategyRouterResult {
     recovery_needed_pct: number;
     hwm_nav_cents: number;
     hwm_date: string;
+    /** hwm_date → asOf 的单位净值比（1 = 无真实盈亏；<1 = 回撤）。单位净值不可用时为 null。 */
+    hwm_unit_nav_ratio: number | null;
+    /** UNIT_NAV = 已按单位净值折算出入金；RAW_NAV = 缺少账本/估值，退化为名义净值比较。 */
+    hwm_nav_basis: 'UNIT_NAV' | 'RAW_NAV';
     hwm_drawdown_bps: number;
     hwm_drawdown_pct: number;
     lifeline_nav_cents: number;
@@ -126,6 +132,119 @@ export function readRiskAnchor(
   return row ?? null;
 }
 
+interface UnitSharePair {
+  /** hwm_date 当日单位份额数（buildNavSeries 的 units 口径）。 */
+  from_units: number;
+  /** asOf 当日单位份额数。 */
+  to_units: number;
+}
+
+/**
+ * 计算 `hwmDate → asOf` 的单位份额对（复用 `buildNavSeries` 的日终现金流单位化口径）。
+ *
+ * 出入金按流水日扣流前估值折算份额：入金增加份额、出金减少份额，单位净值本身不因流水改变。
+ * 回撤 = 1 − (当前净值 / 持久高水位) × (hwm_date 份额 / asOf 份额)，
+ * 因此入金不会摊薄回撤，出金不会放大回撤；持久高水位仍是名义净值的唯一锚。
+ * 缺少基线、流水日/目标日无法单位化时返回 null，调用方退化为名义净值比较（不做加法折入）。
+ */
+function readUnitSharePair(
+  portfolioDb: DatabaseSync | null | undefined,
+  marketDb: DatabaseSync | null | undefined,
+  accountId: string,
+  fromDate: string,
+  toDate: string,
+): UnitSharePair | null {
+  if (!portfolioDb || fromDate >= toDate) return null;
+  try {
+    const baseline = readBaseline(portfolioDb, accountId);
+    if (!baseline || baseline.as_of > fromDate) return null;
+    const prices = buildLedgerPriceTable(portfolioDb, marketDb ?? null, accountId, baseline.as_of, toDate);
+    const series = buildNavSeries(portfolioDb, accountId, { from: fromDate, to: toDate, prices });
+    const fromPoint = series.points.find(point => point.date === fromDate);
+    const toPoint = series.points.find(point => point.date === toDate);
+    // nav_per_unit 为 null 表示当日无法可靠单位化（unitisation_skipped），此时份额不可信。
+    if (fromPoint?.nav_per_unit === null || fromPoint?.nav_per_unit === undefined) return null;
+    if (toPoint?.nav_per_unit === null || toPoint?.nav_per_unit === undefined) return null;
+    if (!(fromPoint.units > 0) || !(toPoint.units > 0)) return null;
+    return { from_units: fromPoint.units, to_units: toPoint.units };
+  } catch {
+    return null;
+  }
+}
+
+interface HwmEvaluation {
+  effectiveHwmCents: number;
+  effectiveHwmDate: string;
+  unitNavRatio: number | null;
+  basis: 'UNIT_NAV' | 'RAW_NAV';
+  shouldAdvanceHwm: boolean;
+  shouldPersistAnchor: boolean;
+}
+
+/**
+ * 高水位判定：有账本基线与估值时按“单位份额折算后的净值比”比较（出入金不改变净值），
+ * 否则退化为名义净值比较。单位净值创新高时把锚点推进到当日名义净值——
+ * 即使该名义值低于旧高水位（出金后 70 -> 63 的场景）。
+ */
+function evaluateHwm(
+  input: EvaluateStrategyRouterInput,
+  existing: PersistedRiskAnchor | null,
+): HwmEvaluation {
+  if (!existing) {
+    return {
+      effectiveHwmCents: Math.max(input.fallbackBaselineNavCents ?? input.currentNavCents, input.currentNavCents),
+      effectiveHwmDate: input.asOf,
+      unitNavRatio: null,
+      basis: 'RAW_NAV',
+      shouldAdvanceHwm: true,
+      shouldPersistAnchor: true,
+    };
+  }
+
+  const shares = readUnitSharePair(input.portfolioDb, input.marketDb, input.accountId, existing.hwm_date, input.asOf);
+  if (shares && existing.hwm_nav_cents > 0) {
+    const ratio = (input.currentNavCents / existing.hwm_nav_cents) * (shares.from_units / shares.to_units);
+    // 单位份额按 1e-6 精度取整；用极小容差避免无流水日因舍入抖动推进锚点。
+    if (input.asOf >= existing.hwm_date && ratio > 1 + 1e-6) {
+      return {
+        effectiveHwmCents: input.currentNavCents,
+        effectiveHwmDate: input.asOf,
+        unitNavRatio: ratio,
+        basis: 'UNIT_NAV',
+        shouldAdvanceHwm: true,
+        shouldPersistAnchor: true,
+      };
+    }
+    return {
+      effectiveHwmCents: Math.round(input.currentNavCents / ratio),
+      effectiveHwmDate: existing.hwm_date,
+      unitNavRatio: ratio,
+      basis: 'UNIT_NAV',
+      shouldAdvanceHwm: false,
+      shouldPersistAnchor: input.asOf >= existing.hwm_date,
+    };
+  }
+
+  if (input.asOf >= existing.hwm_date && input.currentNavCents > existing.hwm_nav_cents) {
+    return {
+      effectiveHwmCents: input.currentNavCents,
+      effectiveHwmDate: input.asOf,
+      unitNavRatio: null,
+      basis: 'RAW_NAV',
+      shouldAdvanceHwm: true,
+      shouldPersistAnchor: true,
+    };
+  }
+  return {
+    effectiveHwmCents: existing.hwm_nav_cents,
+    effectiveHwmDate: existing.hwm_date,
+    unitNavRatio: null,
+    basis: 'RAW_NAV',
+    shouldAdvanceHwm: false,
+    shouldPersistAnchor: input.asOf >= existing.hwm_date,
+  };
+}
+
 function targetBucketsFor(regime: MarketRegimeTier): StrategyRouterResult['targets'] {
   if (regime === 'OFFENSIVE') {
     return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.OFFENSIVE, base_super_etf_bps: 3750, pioneer_bps: 4750, defensive_cash_bps: 1500 };
@@ -144,28 +263,23 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     ?? input.fallbackBaselineNavCents
     ?? input.currentNavCents;
 
-  let effectiveHwmCents = input.currentNavCents;
-  let effectiveHwmDate = input.asOf;
-  let shouldAdvanceHwm = false;
-  let shouldPersistAnchor = false;
+  const hwm = evaluateHwm(input, existing);
+  const effectiveHwmCents = hwm.effectiveHwmCents;
+  const effectiveHwmDate = hwm.effectiveHwmDate;
+  const unitNavRatio = hwm.unitNavRatio;
+  const navBasis = hwm.basis;
+  const shouldAdvanceHwm = hwm.shouldAdvanceHwm;
+  let shouldPersistAnchor = hwm.shouldPersistAnchor;
 
-  if (existing) {
-    if (input.asOf >= existing.hwm_date && input.currentNavCents > existing.hwm_nav_cents) {
-      effectiveHwmCents = input.currentNavCents;
-      effectiveHwmDate = input.asOf;
-      shouldAdvanceHwm = true;
-      shouldPersistAnchor = true;
-    } else {
-      effectiveHwmCents = existing.hwm_nav_cents;
-      effectiveHwmDate = existing.hwm_date;
-      shouldPersistAnchor = input.asOf >= existing.hwm_date;
-    }
-  } else {
-    effectiveHwmCents = Math.max(input.fallbackBaselineNavCents ?? input.currentNavCents, input.currentNavCents);
-    effectiveHwmDate = input.asOf;
-    shouldAdvanceHwm = true;
-    shouldPersistAnchor = true;
-  }
+  const v3Policy = loadApprovedV3Policy();
+  const deconcActive = Boolean(input.deconcentrationActive);
+  const l2TriggerBps = deconcActive
+    ? v3Policy.l2_preemptive_deconcentration_trigger_drawdown_bps
+    : v3Policy.l2_normal_trigger_drawdown_bps;
+  const postBreakerEquityBps = deconcActive
+    ? v3Policy.l2_deconcentration_post_breaker_equity_bps
+    : v3Policy.l2_normal_post_breaker_equity_bps;
+  const l2TriggerPct = l2TriggerBps / 100;
 
   const cumulativePnlCents = input.currentNavCents - initialPrincipalCents;
   const cumulativeReturnPct = initialPrincipalCents > 0
@@ -179,20 +293,11 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     ? Math.max(0, Math.round(((effectiveHwmCents - input.currentNavCents) / effectiveHwmCents) * 10000))
     : 0;
   const hwmDrawdownPct = r2(hwmDrawdownBps / 100);
-  const lifelineNavCents = Math.round(effectiveHwmCents * 0.85);
+  const lifelineNavCents = Math.round(effectiveHwmCents * (10000 - l2TriggerBps) / 10000);
   const lifelineBufferCents = input.currentNavCents - lifelineNavCents;
   const lifelineBufferPct = effectiveHwmCents > 0
     ? r2(((input.currentNavCents - lifelineNavCents) / effectiveHwmCents) * 100)
     : 0;
-
-  const v3Policy = loadApprovedV3Policy();
-  const deconcActive = Boolean(input.deconcentrationActive);
-  const l2TriggerBps = deconcActive
-    ? v3Policy.l2_preemptive_deconcentration_trigger_drawdown_bps
-    : v3Policy.l2_normal_trigger_drawdown_bps;
-  const postBreakerEquityBps = deconcActive
-    ? v3Policy.l2_deconcentration_post_breaker_equity_bps
-    : v3Policy.l2_normal_post_breaker_equity_bps;
 
   let circuitBreakerStatus: CircuitBreakerStatus = 'NORMAL';
   let lockedUntil: string | null = null;
@@ -238,13 +343,13 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
 
   const breakerLabelZh = circuitBreakerStatus === 'L2_LOCKED'
     ? deconcActive
-      ? `二级熔断锁定（重仓换马期回撤达 12% 前置保护触发，风险权益清零防守至 ${lockedUntil}）`
-      : `二级熔断锁定（高水位回撤达 15%，防守冷静期至 ${lockedUntil}）`
+      ? `二级熔断锁定（重仓换马期回撤达 ${l2TriggerPct.toFixed(0)}% 前置保护触发，风险权益清零防守至 ${lockedUntil}）`
+      : `二级熔断锁定（高水位回撤达 ${l2TriggerPct.toFixed(0)}%，防守冷静期至 ${lockedUntil}）`
     : circuitBreakerStatus === 'L1_WARN'
       ? '一级回撤警戒（高水位回撤超 10%，冻结个股新开仓）'
       : deconcActive
-        ? '正常受控（重仓换马期启用 12% 前置熔断保护，守卫 15% 生命线）'
-        : '正常受控（位于 15% 熔断生命线之上）';
+        ? `正常受控（重仓换马期启用 ${l2TriggerPct.toFixed(0)}% 前置熔断保护，守卫 ${l2TriggerPct.toFixed(0)}% 生命线）`
+        : `正常受控（位于 ${l2TriggerPct.toFixed(0)}% 熔断生命线之上）`;
 
   const stockSwingLabelZh = sStockSwing === 'STOP_ONLY'
     ? '仅允许执行存量止损或止盈，禁止新开仓'
@@ -275,6 +380,8 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
       recovery_needed_pct: recoveryNeededPct,
       hwm_nav_cents: effectiveHwmCents,
       hwm_date: effectiveHwmDate,
+      hwm_unit_nav_ratio: unitNavRatio,
+      hwm_nav_basis: navBasis,
       hwm_drawdown_bps: hwmDrawdownBps,
       hwm_drawdown_pct: hwmDrawdownPct,
       lifeline_nav_cents: lifelineNavCents,
@@ -306,6 +413,9 @@ export function persistRiskAnchor(
   if (!portfolioDb || !router.should_persist_anchor) return false;
   if (!portfolioTableExists(portfolioDb, 'account_risk_anchor')) return false;
   try {
+    // 只有真新高（should_advance_hwm）才允许改写高水位锚点。单位净值新高时名义净值可能
+    // 低于旧锚点（出金后 70 -> 63），因此这里不能用名义大小做写入条件。
+    const advance = router.should_advance_hwm ? 1 : 0;
     portfolioDb.prepare(`
       INSERT INTO account_risk_anchor (
         account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
@@ -314,12 +424,12 @@ export function persistRiskAnchor(
       ON CONFLICT(account_id) DO UPDATE SET
         initial_principal_cents = excluded.initial_principal_cents,
         hwm_nav_cents = CASE
-          WHEN excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
           THEN excluded.hwm_nav_cents
           ELSE account_risk_anchor.hwm_nav_cents
         END,
         hwm_date = CASE
-          WHEN excluded.hwm_nav_cents > account_risk_anchor.hwm_nav_cents AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
           THEN excluded.hwm_date
           ELSE account_risk_anchor.hwm_date
         END,
@@ -334,6 +444,8 @@ export function persistRiskAnchor(
       router.circuit_breaker_status,
       router.locked_until_trade_date,
       router.as_of_trade_date,
+      advance,
+      advance,
     );
     return true;
   } catch (err: any) {

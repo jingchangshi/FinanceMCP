@@ -42,9 +42,9 @@ function privatePath(path: string, create: boolean): void {
 /** The private directory and its owner are the local authority. This does not attest identity against that owner. */
 export class StrategyAdmissionStore {
   private db: DatabaseSync;
-  constructor(path: string, options: { create?: boolean } = {}) {
+  constructor(path: string, options: { create?: boolean; readOnly?: boolean } = {}) {
     privatePath(path, options.create === true);
-    this.db = new DatabaseSync(path);
+    this.db = new DatabaseSync(path, options.readOnly === true ? { readOnly: true } : {});
     try {
       this.db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON');
       if (options.create) this.db.exec(`

@@ -841,14 +841,14 @@ function renderSectionB(r: DailyReportResult): string {
     if (dec.plan_mode === 'BOTTOM_GRIND_25') {
       items.push(
         `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
-        + `${zh(dec.status_summary_zh)}，动态高水位 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+        + `${zh(dec.status_summary_zh)}，动态高水位 ${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
       );
     } else {
       const rebText = dec.rebound_trigger_cny !== null ? `${dec.rebound_trigger_cny.toFixed(3)} 元` : '—';
       const monText = dec.next_monthly_trigger_date ? ymd(dec.next_monthly_trigger_date) : '下一月度首日';
       items.push(
         `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
-        + `159558.SZ 四批换马下次观察位为反弹 +8%（${rebText}）或月度窗口 ${monText}，动态高水位 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+        + `159558.SZ 四批换马下次观察位为反弹 +8%（${rebText}）或月度窗口 ${monText}，动态高水位 ${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
       );
     }
   } else {
@@ -926,7 +926,7 @@ function renderSectionC(r: DailyReportResult, view: RenderView): string {
   if (r.v3_cockpit) {
     const c = r.v3_cockpit;
     lines.push(
-      `- **本金回本与动态高水位防线**：初始投入本金 ${yuan(c.principal.initial_principal_cents)} 元，距回本还差 ${yuan(Math.abs(c.principal.to_principal_gap_cents))} 元（需涨 ${c.principal.to_principal_return_needed_pct.toFixed(2)}%）；动态高水位 ${yuan(c.router.hwm_nav_cents)} 元（${ymd(c.router.hwm_date)}），15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）。`,
+      `- **本金回本与动态高水位防线**：初始投入本金 ${yuan(c.principal.initial_principal_cents)} 元，距回本还差 ${yuan(Math.abs(c.principal.to_principal_gap_cents))} 元（需涨 ${c.principal.to_principal_return_needed_pct.toFixed(2)}%）；动态高水位 ${yuan(c.router.hwm_nav_cents)} 元（${ymd(c.router.hwm_date)}），${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）。`,
     );
   }
   return lines.join('\n');
@@ -1244,7 +1244,7 @@ function renderSectionG(r: DailyReportResult, view: RenderView): string {
   if (r.v3_cockpit) {
     const c = r.v3_cockpit;
     lines.push(
-      `- **动态高水位熔断防线**：动态高水位 ${yuan(c.router.hwm_nav_cents)} 元对应 15% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）；新建个股严格执行单笔 -8% 硬止损与 +15% 保本上移。`,
+      `- **动态高水位熔断防线**：动态高水位 ${yuan(c.router.hwm_nav_cents)} 元对应 ${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）；新建个股严格执行单笔 -8% 硬止损与 +15% 保本上移。`,
     );
   }
   lines.push('- **口径提醒**：以上压力数字是预设情景不是收益预测；账户全历史最大回撤数据不足，不以观察窗口回撤冒充。');

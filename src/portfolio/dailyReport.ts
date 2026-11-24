@@ -2001,11 +2001,12 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       }
     }
     const anc = engineOut.router.anchor_snapshot;
+    const lifelinePct = (engineOut.router.l2_trigger_drawdown_bps / 100).toFixed(0);
     const preemptiveNote = engineOut.router.deconcentration_preemptive_active
-      ? '（存量重仓换马未完成期间启用 12% 前置熔断清零高波动权益保护）'
+      ? '（存量重仓换马未完成期间启用前置熔断保护）'
       : '';
     v3Triggers.push(
-      `账户 15% 高水位熔断生命线：动态高水位 ${(anc.hwm_nav_cents / 100).toFixed(2)} 元，`
+      `账户 ${lifelinePct}% 高水位熔断生命线：动态高水位 ${(anc.hwm_nav_cents / 100).toFixed(2)} 元，`
       + `生命线 ${(anc.lifeline_nav_cents / 100).toFixed(2)} 元（当前缓冲 ${anc.lifeline_buffer_pct.toFixed(2)}%）${preemptiveNote}`,
     );
     v3Triggers.push('跨境 ETF 买入红线：最新净值折溢价高于 +2.5% 或净值滞后超 3 个交易日一律拦截禁买');
