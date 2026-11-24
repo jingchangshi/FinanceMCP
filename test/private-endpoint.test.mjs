@@ -173,6 +173,14 @@ test('3. 正确令牌 → 200，且只列出账户工具', async () => {
     assert.equal(body.summary.totals.total_assets_cents, 7577653);
     assert.equal(body.summary.max_drawdown.available, false);
 
+    // 快速简报：缓存未命中时也必须快速返回 not_ready，不能因市场库缺 report 表抛异常。
+    const brief = await server.rpc('/private/mcp', 'tools/call', {
+      name: 'ashare_portfolio_daily_brief', arguments: { account_id: 'synthetic-private' },
+    }, auth);
+    assert.equal(brief.status, 200, brief.text);
+    const briefBody = JSON.parse(brief.body.result.content[0].text);
+    assert.ok(['cached', 'not_ready'].includes(briefBody.brief_source), JSON.stringify(briefBody));
+
     // 决策工具同样只在私有端点提供：无市场缓存时给出结构化 DATA_INSUFFICIENT/对照，
     // 而不是 "Unknown tool"。
     const decision = await server.rpc('/private/mcp', 'tools/call', { name: 'ashare_portfolio_decision', arguments: { action: 'hold' } }, auth);
