@@ -245,8 +245,10 @@ export interface RuntimeAdmissionState {
   store_available: boolean;
   /** 对应策略/版本/账户/市场/环境的最新准入动作；无事件或不可读时为 null。 */
   latest_action: AdmissionAction | null;
-  /** 最新动作当前是否仍在有效期内。 */
+  /** 最新动作在评估时点是否仍在有效期内。 */
   latest_in_validity: boolean;
+  /** 评估时点（目标交易日收盘，ISO）；未提供实际账户/日期时为 null。 */
+  evaluated_as_of: string | null;
 }
 
 export interface ApprovedV3Policy {
@@ -255,6 +257,8 @@ export interface ApprovedV3Policy {
   strategy_id: string;
   version: string;
   content_hash: string;
+  /** 覆盖文件加载诊断；空数组表示无覆盖或覆盖文件有效。 */
+  override_diagnostics: string[];
   /** 准入账本允许新开仓时为 true；未配置/不可读/无事件时保持 true（不得成为隐性封锁）。 */
   runtime_can_open: boolean;
   runtime_admission: RuntimeAdmissionState;
@@ -289,55 +293,102 @@ function intParam(params: Record<string, string>, key: string, fallback: number)
   return Number.isSafeInteger(n) ? n : fallback;
 }
 
-/** 读取并校验运行时策略覆盖文件；任何失败均抛错，绝不静默回退到内嵌版本。 */
-function loadOverrideRelease(overridePath: string, embedded: StrategyRelease): { release: StrategyRelease; hash: string } {
+interface OverrideLoadResult {
+  release: StrategyRelease | null;
+  hash: string | null;
+  diagnostics: string[];
+  /** 坏覆盖文件（存在但不可用）：只停新增买入，不打断日报。 */
+  blocksNewBuys: boolean;
+}
+
+/**
+ * 尝试读取运行时策略覆盖文件。任何失败都只返回诊断并回退内嵌基线：
+ * 日报、止损与减仓不因覆盖文件部署/权限/内容问题被打断。
+ */
+function tryLoadOverrideRelease(overridePath: string, embedded: StrategyRelease): OverrideLoadResult {
+  if (!existsSync(overridePath)) {
+    return { release: null, hash: null, diagnostics: [`v3_policy_override_missing:${overridePath}`], blocksNewBuys: false };
+  }
   let raw: string;
   try {
     raw = readFileSync(overridePath, 'utf8');
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`v3_policy_override_unreadable:${overridePath}:${detail}`);
+    return {
+      release: null,
+      hash: null,
+      diagnostics: [`v3_policy_override_unreadable:${overridePath}:${detail}`],
+      blocksNewBuys: true,
+    };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new Error(`v3_policy_override_invalid_json:${overridePath}`);
+    return { release: null, hash: null, diagnostics: [`v3_policy_override_invalid_json:${overridePath}`], blocksNewBuys: true };
   }
   // 自洽性只是最低门槛：还必须命中受控哈希白名单，绝不接受“仅仅是自洽”的文件。
-  const verifiedHash = validateStrategyRelease(parsed);
+  let verifiedHash: string;
+  try {
+    verifiedHash = validateStrategyRelease(parsed);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { release: null, hash: null, diagnostics: [`v3_policy_override_invalid_release:${detail}`], blocksNewBuys: true };
+  }
   const allowRaw = process.env.ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES?.trim();
   const allowlisted = allowRaw
     ? allowRaw.split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
     : [V3_POLICY_EXPECTED_HASH];
   if (!allowlisted.includes(verifiedHash)) {
-    throw new Error(`v3_policy_override_hash_not_allowed:${verifiedHash}`);
+    return {
+      release: null,
+      hash: null,
+      diagnostics: [`v3_policy_override_hash_not_allowed:${verifiedHash}`],
+      blocksNewBuys: true,
+    };
   }
 
   const release = parsed as StrategyRelease;
   if (release.strategy.id !== V3_OFFENSIVE_STRATEGY_ID || release.strategy.id !== embedded.strategy.id) {
-    throw new Error(`v3_policy_override_strategy_mismatch:${release.strategy.id}`);
+    return {
+      release: null,
+      hash: null,
+      diagnostics: [`v3_policy_override_strategy_mismatch:${release.strategy.id}`],
+      blocksNewBuys: true,
+    };
   }
   if (release.applicability.market !== embedded.applicability.market) {
-    throw new Error(`v3_policy_override_market_mismatch:${release.applicability.market}`);
+    return {
+      release: null,
+      hash: null,
+      diagnostics: [`v3_policy_override_market_mismatch:${release.applicability.market}`],
+      blocksNewBuys: true,
+    };
   }
   if (release.applicability.environment !== embedded.applicability.environment) {
-    throw new Error(`v3_policy_override_environment_mismatch:${release.applicability.environment}`);
+    return {
+      release: null,
+      hash: null,
+      diagnostics: [`v3_policy_override_environment_mismatch:${release.applicability.environment}`],
+      blocksNewBuys: true,
+    };
   }
-  return { release, hash: verifiedHash };
+  return { release, hash: verifiedHash, diagnostics: [], blocksNewBuys: false };
 }
 
 /**
- * 可选运行时准入：仅当 `ASHARE_V3_ADMISSION_DB` 显式配置时才读取。
+ * 可选运行时准入：仅当 `ASHARE_V3_ADMISSION_DB` 显式配置、且调用方给出实际
+ * `accountId` / `asOf` 时才读取与评估（不使用环境变量账户或墙钟）。
  *
- * 语义（按审计要求放行“未建库不得成为隐性封锁”）：
+ * 语义（未建库不得成为隐性封锁）：
  * - 准入库不存在/不可读/权限不符 → 不阻断；
  * - 无对应事件 → 不阻断；
- * - 最新事件为 SUSPEND/REVOKE 且仍在有效期 → 阻断新开仓（止损与减仓不受影响）。
+ * - 最新事件为 SUSPEND/REVOKE 且在目标交易日仍有效 → 阻断新开仓（止损与减仓不受影响）。
  */
 function loadRuntimeAdmission(
   release: StrategyRelease,
   releaseHash: string,
+  options: { accountId?: string; asOf?: string },
 ): { canOpen: boolean; state: RuntimeAdmissionState } {
   const dbPath = process.env.ASHARE_V3_ADMISSION_DB?.trim();
   const state: RuntimeAdmissionState = {
@@ -345,15 +396,22 @@ function loadRuntimeAdmission(
     store_available: false,
     latest_action: null,
     latest_in_validity: false,
+    evaluated_as_of: null,
   };
   if (!dbPath) return { canOpen: true, state };
+  const accountId = options.accountId?.trim();
+  const asOf = options.asOf?.trim();
+  if (!accountId || !/^\d{8}$/.test(asOf ?? '')) return { canOpen: true, state };
+
+  const evaluatedAt = `${asOf!.slice(0, 4)}-${asOf!.slice(4, 6)}-${asOf!.slice(6, 8)}T23:59:59.999Z`;
+  state.evaluated_as_of = evaluatedAt;
 
   let store: StrategyAdmissionStore | null = null;
   try {
     store = new StrategyAdmissionStore(dbPath, { readOnly: true });
     state.store_available = true;
     const scope = {
-      account: process.env.ASHARE_ACCOUNT_ID?.trim() || 'real-main',
+      account: accountId,
       market: release.applicability.market,
       environment: release.applicability.environment,
     };
@@ -367,8 +425,7 @@ function loadRuntimeAdmission(
       .sort((a, b) => b.seq - a.seq)[0];
     if (!latest) return { canOpen: true, state };
     state.latest_action = latest.action;
-    const now = new Date().toISOString();
-    state.latest_in_validity = latest.valid_from <= now && now < latest.valid_until;
+    state.latest_in_validity = latest.valid_from <= evaluatedAt && evaluatedAt < latest.valid_until;
     if ((latest.action === 'SUSPEND' || latest.action === 'REVOKE') && state.latest_in_validity) {
       return { canOpen: false, state };
     }
@@ -384,13 +441,16 @@ function loadRuntimeAdmission(
 /**
  * Load and verify the approved V3 offensive policy release (v3.2.0).
  *
- * `ASHARE_V3_POLICY_RELEASE_PATH` 是可选的运行时覆盖。路径不存在时按“未部署覆盖文件”
- * 处理并回退内嵌签名版本（不让部署缺失阻断日报）；文件存在但不可读、JSON 非法、
- * 哈希不在白名单或策略/市场/环境不匹配都会抛错，绝不接受坏文件或未批准文件。
+ * `ASHARE_V3_POLICY_RELEASE_PATH` 是可选的运行时覆盖。覆盖文件缺失、不可读、JSON 非法、
+ * 哈希不在白名单或策略/市场/环境不匹配时，一律回退内嵌已签基线并记录诊断；存在但不可用的
+ * 覆盖文件只停止新增买入（`runtime_can_open=false`），P0/P1 减仓与日报照常。
  * 白名单由 `ASHARE_V3_POLICY_RELEASE_ALLOWED_HASHES`（逗号分隔）控制，未设置时只允许
  * 内嵌的 `V3_POLICY_EXPECTED_HASH`。
+ *
+ * `options.accountId` / `options.asOf` 用于按实际账户与目标交易日评估可选准入库；
+ * 未提供时跳过准入评估（研究/筛选路径），不使用环境变量账户或墙钟。
  */
-export function loadApprovedV3Policy(): ApprovedV3Policy {
+export function loadApprovedV3Policy(options: { accountId?: string; asOf?: string } = {}): ApprovedV3Policy {
   const embedded = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0;
   const embeddedHash = validateStrategyRelease(embedded);
   if (embeddedHash !== V3_POLICY_EXPECTED_HASH) {
@@ -398,11 +458,21 @@ export function loadApprovedV3Policy(): ApprovedV3Policy {
   }
 
   const overridePath = process.env.ASHARE_V3_POLICY_RELEASE_PATH?.trim();
-  const { release, hash: verifiedHash } = overridePath && existsSync(overridePath)
-    ? loadOverrideRelease(overridePath, embedded)
-    : { release: embedded, hash: embeddedHash };
+  let release = embedded;
+  let verifiedHash = embeddedHash;
+  let overrideDiagnostics: string[] = [];
+  let overrideBlocksNewBuys = false;
+  if (overridePath) {
+    const override = tryLoadOverrideRelease(overridePath, embedded);
+    overrideDiagnostics = override.diagnostics;
+    overrideBlocksNewBuys = override.blocksNewBuys;
+    if (override.release && override.hash) {
+      release = override.release;
+      verifiedHash = override.hash;
+    }
+  }
 
-  const runtime = loadRuntimeAdmission(release, verifiedHash);
+  const runtime = loadRuntimeAdmission(release, verifiedHash, options);
 
   const p = release.parameters;
   const approved = release.production_admission === 'APPROVED_FOR_ACCOUNT';
@@ -413,7 +483,8 @@ export function loadApprovedV3Policy(): ApprovedV3Policy {
     strategy_id: release.strategy.id,
     version: release.strategy.version.startsWith('v') ? release.strategy.version : `v${release.strategy.version}`,
     content_hash: verifiedHash,
-    runtime_can_open: runtime.canOpen,
+    override_diagnostics: overrideDiagnostics,
+    runtime_can_open: runtime.canOpen && !overrideBlocksNewBuys,
     runtime_admission: runtime.state,
     bp1_pullback_enabled: p.bp1_pullback_status === 'ENABLED',
     bp2_breakout_enabled: p.bp2_breakout_status === 'ENABLED',

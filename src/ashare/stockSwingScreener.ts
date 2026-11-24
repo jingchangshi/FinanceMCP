@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { inferBoard } from '../portfolio/rules.js';
-import { loadApprovedV3Policy } from '../portfolio/v3Policy.js';
+import { loadApprovedV3Policy, type ApprovedV3Policy } from '../portfolio/v3Policy.js';
 import { scanMarket } from './analysis.js';
 import { addDays, recentTradeDays } from './ingest.js';
 import { rpsFromCloses } from './rps.js';
@@ -65,6 +65,8 @@ export interface ScreenStockSwingOptions {
   requireIndustryTop30?: boolean;
   /** When true, zero sector buckets fail closed; default skips sector ranking only when <5 stocks exist in every industry. */
   strictSectorGate?: boolean;
+  /** 调用方已加载的策略（与 router/engine 共用），避免重复读取覆盖文件/准入库。 */
+  policy?: ApprovedV3Policy;
 }
 
 interface PreQualifiedStock {
@@ -100,7 +102,7 @@ export function screenStockSwingCandidates(
   asOf: string,
   options: ScreenStockSwingOptions = {},
 ): StockSwingScreenResult {
-  const policy = loadApprovedV3Policy();
+  const policy = options.policy ?? loadApprovedV3Policy({ asOf });
   const maxCandidates = options.maxCandidates ?? policy.stock_max_positions;
   const priceCapCny = options.priceCapCny ?? policy.stock_price_cap_cny;
   const minAmount20Yi = options.minAmount20Yi ?? 1.5;

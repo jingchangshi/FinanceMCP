@@ -436,6 +436,17 @@ export interface V3CockpitSummary {
     bp1_pullback_enabled: boolean;
     bp2_breakout_enabled: boolean;
     bp2_status: string;
+    /** 覆盖文件回退诊断（空 = 无覆盖或覆盖有效）。 */
+    diagnostics: string[];
+    /** 准入账本是否允许新开仓（只停新增买入，不阻断报告/止损）。 */
+    runtime_can_open: boolean;
+    runtime_admission: {
+      configured: boolean;
+      store_available: boolean;
+      latest_action: string | null;
+      latest_in_validity: boolean;
+      evaluated_as_of: string | null;
+    };
   };
   principal: {
     initial_principal_cents: number;
@@ -1880,6 +1891,8 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   }
 
   let engineOut: V3ActionEngineOutput | null = null;
+  // 一次加载策略与准入状态，供 router / 个股筛选 / 动作引擎 / cockpit 共用同一份判断。
+  const v3Policy = loadApprovedV3Policy({ accountId, asOf });
   if (snapshot && summary?.portfolio && (summary.portfolio.total_assets_cents ?? 0) > 0 && marketDb) {
     const holdingsForEngine = (summary.holdings ?? []).map((holding: any) => {
       const sellableRow = accountEvaluation?.sellable?.[holding.ts_code];
@@ -1911,6 +1924,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       reportedEventsThrough: accountEvaluation?.reported_events_through ?? null,
       lastUserReconciledAt: accountEvaluation?.last_user_reconciled_at ?? null,
       candidates: screening,
+      policy: v3Policy,
     });
     if (engineOut.reconciliation_reminder.needs_reminder && engineOut.reconciliation_reminder.message_zh) {
       gateWarnings.push({
@@ -2179,7 +2193,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
 
   const v3Cockpit: V3CockpitSummary | undefined = engineOut
     ? (() => {
-        const approvedPolicy = loadApprovedV3Policy();
+        const approvedPolicy = v3Policy;
         return {
           schema: 'v3-offensive-cockpit/1.0',
           as_of_trade_date: asOf,
@@ -2191,6 +2205,9 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
             bp1_pullback_enabled: approvedPolicy.bp1_pullback_enabled,
             bp2_breakout_enabled: approvedPolicy.bp2_breakout_enabled,
             bp2_status: approvedPolicy.bp2_breakout_status,
+            diagnostics: approvedPolicy.override_diagnostics,
+            runtime_can_open: approvedPolicy.runtime_can_open,
+            runtime_admission: approvedPolicy.runtime_admission,
           },
           principal: {
           initial_principal_cents: engineOut.router.anchor_snapshot.initial_principal_cents,

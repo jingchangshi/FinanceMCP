@@ -112,6 +112,14 @@ function recordCash(portfolioDb, { id, type, day, cents }) {
   assert.equal(result.status, 'RECORDED');
 }
 
+function insertCashEvent(portfolioDb, { id, type, day, cents }) {
+  portfolioDb.prepare(`
+    INSERT INTO account_event
+      (event_id, account_id, event_type, occurred_on, cash_delta_cents, source, note, recorded_at)
+    VALUES (?,?,?,?,?, 'broker_statement', '', '2026-01-01T00:00:00.000Z')
+  `).run(id, ACCOUNT, type, day, cents);
+}
+
 function position(code, quantity, priceMilli, name = '测试标的') {
   return {
     ts_code: code,
@@ -305,6 +313,50 @@ test('P1-2 无账本基线时退化为名义净值比较（不适用加法折入
     });
     assert.equal(noDb.circuit_breaker_status, 'NORMAL');
     assert.equal(noDb.anchor_snapshot.hwm_nav_basis, 'RAW_NAV');
+  } finally {
+    portfolioDb.close();
+  }
+});
+
+test('P1-2 同日流水：锚点日==目标日且无法单位化时，当日出金不得触发假 L2', () => {
+  seq += 1;
+  const portfolioDb = openPortfolioDb(join(dir, `same-day-withdraw-${seq}-portfolio.sqlite`), {
+    marketPath: join(dir, `same-day-withdraw-${seq}-market.sqlite`),
+  });
+  try {
+    portfolioDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${ACCOUNT}`, '100000');
+    const atAnchor = evaluate(portfolioDb, null, { asOf: DAY.d0, nav: 100_000 });
+    assert.equal(persistRiskAnchor(portfolioDb, atAnchor), true);
+    insertCashEvent(portfolioDb, { id: 'same-day-wd', type: 'CASH_WITHDRAW', day: DAY.d0, cents: -90_000 });
+
+    const out = evaluate(portfolioDb, null, { asOf: DAY.d0, nav: 10_000 });
+    assert.equal(out.anchor_snapshot.hwm_nav_basis, 'RAW_NAV');
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0, '同日出金必须按扣流前 NAV 比较');
+    assert.equal(out.circuit_breaker_status, 'NORMAL');
+    assert.equal(out.should_advance_hwm, false);
+    const anchor = readRiskAnchor(portfolioDb, ACCOUNT);
+    assert.equal(anchor.hwm_nav_cents, 100_000);
+  } finally {
+    portfolioDb.close();
+  }
+});
+
+test('P1-2 同日流水：锚点日==目标日的当日入金不得被当成新高或回撤', () => {
+  seq += 1;
+  const portfolioDb = openPortfolioDb(join(dir, `same-day-deposit-${seq}-portfolio.sqlite`), {
+    marketPath: join(dir, `same-day-deposit-${seq}-market.sqlite`),
+  });
+  try {
+    portfolioDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${ACCOUNT}`, '100000');
+    const atAnchor = evaluate(portfolioDb, null, { asOf: DAY.d0, nav: 100_000 });
+    assert.equal(persistRiskAnchor(portfolioDb, atAnchor), true);
+    insertCashEvent(portfolioDb, { id: 'same-day-dep', type: 'CASH_DEPOSIT', day: DAY.d0, cents: 90_000 });
+
+    const out = evaluate(portfolioDb, null, { asOf: DAY.d0, nav: 190_000 });
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0);
+    assert.equal(out.circuit_breaker_status, 'NORMAL');
+    assert.equal(out.should_advance_hwm, false, '同日入金不是真实单位净值新高');
+    assert.equal(readRiskAnchor(portfolioDb, ACCOUNT).hwm_nav_cents, 100_000);
   } finally {
     portfolioDb.close();
   }
