@@ -52,6 +52,8 @@ const LEVELS: FeeEvidence[] = ['CONFIRMED', 'PUBLIC_REFERENCE', 'ASSUMED', 'UNKN
 const DATE = /^\d{8}$/;
 const SUPER_ETF_OBSERVED = { commission_rate: 0.00005, commission_min_cents: 0 };
 const SUPER_ETF_WHITELIST = new Set<string>(EASTMONEY_SUPER_ETF_CODES);
+/** 东财超级 ETF 费率只属于东财账户；显式其他 broker 上下文不得套用。 */
+const EASTMONEY_BROKER_ID = /^(eastmoney|east_money|东方财富|东财)$/i;
 const keyFor = (accountId: string) => `fee_profiles:${accountId}`;
 
 export function validateFeeProfile(profile: FeeProfile): FeeProfile {
@@ -118,9 +120,10 @@ export function feeRulesFor(context: FeeContext, code: string, kind: 'ETF' | 'ST
     && (!p.effective_until || context.asOf <= p.effective_until));
   const specific = active.filter(p => p.code === code).sort((a, b) => a.effective_from.localeCompare(b.effective_from) || a.id.localeCompare(b.id));
   const classified = specific.filter(p => p.classification).at(-1)?.classification;
-  // 无显式代码级分类覆盖时，已核验的东财超级 ETF 白名单（33 只）自动归入 SUPER_ETF；
-  // 证据级别仍是 ASSUMED（等待券商对账单确认），显式 code profile 始终优先。
-  const whitelistedSuperEtf = kind === 'ETF' && SUPER_ETF_WHITELIST.has(code);
+  // 无显式代码级分类覆盖时，已核验的东财超级 ETF 白名单（33 只）在默认/东财 broker
+  // 上下文自动归入 SUPER_ETF；显式其他 broker 不套用。证据级别仍是 ASSUMED。
+  const eastmoneyContext = !context.brokerId || EASTMONEY_BROKER_ID.test(context.brokerId.trim());
+  const whitelistedSuperEtf = kind === 'ETF' && eastmoneyContext && SUPER_ETF_WHITELIST.has(code);
   const classification: FeeClass = kind === 'STOCK'
     ? 'STOCK'
     : classified && classified !== 'STOCK'

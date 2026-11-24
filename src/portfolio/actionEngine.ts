@@ -43,7 +43,7 @@ export interface StopTrackerRow {
   initial_stop_milli: number;
   current_stop_milli: number;
   trailing_ma20_armed: number;
-  /** As-of adj_factor 基准；NULL = 历史未记录（不缩放，并在下次运行补写）。 */
+  /** 价格所属复权基准；NULL = 历史未记录（回查 entry_date 因子，查不到则不缩放并保持 NULL）。 */
   entry_adj_factor: number | null;
   status: 'OPEN' | 'CLOSED';
   updated_at: string;
@@ -237,18 +237,30 @@ export function sizeStockSwingOrder(input: StockSwingOrderInput): StockSwingOrde
   };
 }
 
-/** 读取 asOf 当日或之前最后一个复权因子（carry-forward）；缺失/不可用时按 1 处理。 */
+type AdjTable = 'adj_factor' | 'fund_adj';
+
+/** 读取 asOf 当日或之前最后一个复权因子（carry-forward）；缺失/不可用时返回 null。 */
+function adjFactorAt(
+  marketDb: DatabaseSync | null | undefined,
+  tsCode: string,
+  asOf: string,
+  table: AdjTable,
+): number | null {
+  if (!marketDb || !portfolioTableExists(marketDb, table)) return null;
+  const row = marketDb.prepare(
+    `SELECT adj_factor FROM ${table} WHERE ts_code = ? AND trade_date <= ? AND adj_factor > 0 ORDER BY trade_date DESC LIMIT 1`,
+  ).get(tsCode, asOf) as { adj_factor?: number } | undefined;
+  const factor = Number(row?.adj_factor);
+  return Number.isFinite(factor) && factor > 0 ? factor : null;
+}
+
+/** 股票复权因子（缺失按 1 处理）；ETF 走 fund_adj，见 adjFactorAt。 */
 function lastAdjFactorAt(
   marketDb: DatabaseSync | null | undefined,
   tsCode: string,
   asOf: string,
 ): number {
-  if (!marketDb || !portfolioTableExists(marketDb, 'adj_factor')) return 1;
-  const row = marketDb.prepare(
-    'SELECT adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date <= ? AND adj_factor > 0 ORDER BY trade_date DESC LIMIT 1',
-  ).get(tsCode, asOf) as { adj_factor?: number } | undefined;
-  const factor = Number(row?.adj_factor);
-  return Number.isFinite(factor) && factor > 0 ? factor : 1;
+  return adjFactorAt(marketDb, tsCode, asOf, 'adj_factor') ?? 1;
 }
 
 function stockMa20Milli(
@@ -262,14 +274,10 @@ function stockMa20Milli(
   ).all(tsCode, asOf) as { trade_date: string; close: number }[]).reverse();
   if (bars.length < 20) return null;
   const adjMap = new Map<string, number>();
-  let carry = 1;
+  let carry = lastAdjFactorAt(marketDb, tsCode, bars[0].trade_date);
   if (portfolioTableExists(marketDb, 'adj_factor')) {
-    // 窗口首日之前可能已有未变化的因子：先 carry 到首日，避免把窗口前的除权
-    // 基准当作 1 而扭曲前复权均线。
-    const prior = marketDb.prepare(
-      'SELECT adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date <= ? AND adj_factor > 0 ORDER BY trade_date DESC LIMIT 1',
-    ).get(tsCode, bars[0].trade_date) as { adj_factor?: number } | undefined;
-    if (prior && Number(prior.adj_factor) > 0) carry = Number(prior.adj_factor);
+    // carry 已从窗口首日或之前的真实因子起步，避免把窗口前的除权基准当作 1
+    // 而扭曲前复权均线。
     const adjRows = marketDb.prepare(
       'SELECT trade_date, adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date BETWEEN ? AND ? ORDER BY trade_date ASC',
     ).all(tsCode, bars[0].trade_date, asOf) as { trade_date: string; adj_factor: number }[];
@@ -566,13 +574,15 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
   const stockScreen = input.stockSwingScreen !== undefined
     ? input.stockSwingScreen
     : (router.sub_strategies.s_stock_swing === 'ACTIVE' && input.marketDb
-      // 候选池取 max(持仓上限, 10)：前 2 名若已被持仓/不可买（如 920 板块），仍有替补可评估；
+      // 内部候选池取 max(持仓上限, 10)：前 2 名若不可买（如已被持仓）仍有替补可评估；
       // 实际新开仓数量仍由下方 policy.stock_max_positions 封顶。
       ? screenStockSwingCandidates(input.marketDb, input.asOf, {
           maxCandidates: Math.max(loadApprovedV3Policy().stock_max_positions, 10),
         })
       : null);
-  const stockSwingCandidates = stockScreen?.candidates ?? [];
+  const screenedStockCandidates = stockScreen?.candidates ?? [];
+  // 对外披露仍只给 Top N（policy.stock_max_positions），仓位循环使用完整候选池。
+  const stockSwingCandidates = screenedStockCandidates.slice(0, loadApprovedV3Policy().stock_max_positions);
 
   const staleHoldings = input.holdings.filter(h => h.bar_quality !== 'READY');
   if (staleHoldings.length > 0) {
@@ -677,10 +687,12 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
   }
 
   // -------------------------------- P1: 个股 -8% 硬止损 / +15% 保本 / 收盘跌破 MA20 无条件离场（ETF 仍为武装后移动止盈）
+  // tracker 生命周期由真实持仓驱动：仍持有则保持 OPEN（即使本轮建议卖出），
+  // 持仓已消失的 OPEN 行才转 CLOSED；持有但旧行为 CLOSED 视为重新建仓。
   const trackerByCode = new Map<string, StopTrackerRow>();
   if (portfolioTableExists(input.portfolioDb, 'position_stop_tracker') && input.portfolioDb) {
     const rows = input.portfolioDb.prepare(
-      "SELECT * FROM position_stop_tracker WHERE account_id = ? AND status = 'OPEN'",
+      'SELECT * FROM position_stop_tracker WHERE account_id = ?',
     ).all(input.accountId) as unknown as StopTrackerRow[];
     for (const r of rows) trackerByCode.set(r.ts_code, r);
   }
@@ -688,22 +700,27 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
   for (const h of input.holdings) {
     const isStock = !isEtfCode(h.ts_code);
     const tracked = trackerByCode.get(h.ts_code);
+    const continuing = tracked?.status === 'OPEN';
     if (!isStock && !tracked) continue;
     const remSellable = Math.floor((workingSellable.get(h.ts_code) ?? 0) / 100) * 100;
     if (remSellable < 100 || !(h.price_milli > 0)) continue;
     if (isStock && !tradabilityOf(h.ts_code, { kind: 'STOCK', board: inferBoard(h.ts_code) }).tradable && remSellable < 100) continue;
 
-    const entryMilli = tracked?.entry_price_milli ?? h.ref_cost_milli ?? h.price_milli;
-    const initialStopMilli = tracked?.initial_stop_milli ?? Math.round(entryMilli * 0.92);
-    let currentStopMilli = tracked?.current_stop_milli ?? initialStopMilli;
-    let ma20Armed = tracked?.trailing_ma20_armed ?? 0;
+    const entryMilli = continuing ? tracked!.entry_price_milli : (h.ref_cost_milli ?? h.price_milli);
+    const initialStopMilli = continuing ? tracked!.initial_stop_milli : Math.round(entryMilli * 0.92);
+    let currentStopMilli = continuing ? tracked!.current_stop_milli : initialStopMilli;
+    let ma20Armed = continuing ? tracked!.trailing_ma20_armed : 0;
 
     // 复权基准换算：tracker 内价格按 entry 基准（entry_adj_factor）存储。除权/拆股后
     // adj_factor 上升而原始价下跌，因此历史价的 asOf 原始口径等价价 =
     // stored × entryAdj / currentAdj（Tushare hfq 因子口径）。绝不对 h.price_milli 缩放。
-    // 旧行 entry_adj_factor 为 NULL 时不缩放，并在本次落库补写当前因子。
-    const currentAdj = lastAdjFactorAt(input.marketDb, h.ts_code, input.asOf);
-    const entryAdj = tracked?.entry_adj_factor ?? null;
+    // 旧 OPEN 行缺 entry 基准时回查 entry_date 的真实因子（股票 adj_factor / ETF fund_adj）；
+    // 仍查不到则不缩放并保持 NULL，绝不写 currentAdj 冒充。
+    const adjTable: AdjTable = isStock ? 'adj_factor' : 'fund_adj';
+    const currentAdj = adjFactorAt(input.marketDb, h.ts_code, input.asOf, adjTable) ?? 1;
+    const entryAdj = continuing
+      ? (tracked!.entry_adj_factor ?? adjFactorAt(input.marketDb, h.ts_code, tracked!.entry_date, adjTable))
+      : currentAdj;
     const basisRatio = entryAdj !== null && entryAdj > 0 ? entryAdj / currentAdj : 1;
     const scaledEntryMilli = Math.round(entryMilli * basisRatio);
     let scaledCurrentStopMilli = Math.round(currentStopMilli * basisRatio);
@@ -724,13 +741,14 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     stopTrackerUpdates.push({
       account_id: input.accountId,
       ts_code: h.ts_code,
-      entry_date: tracked?.entry_date ?? input.asOf,
+      entry_date: continuing ? tracked!.entry_date : input.asOf,
       entry_price_milli: entryMilli,
       initial_stop_milli: initialStopMilli,
       current_stop_milli: currentStopMilli,
       trailing_ma20_armed: ma20Armed,
-      entry_adj_factor: entryAdj ?? currentAdj,
-      status: hardStopHit || trailingExitHit ? 'CLOSED' : 'OPEN',
+      entry_adj_factor: entryAdj,
+      // 只要本轮仍真实持有，即使建议卖出也保持 OPEN；CLOSED 由持仓消失驱动。
+      status: 'OPEN',
       updated_at: input.asOf,
     });
 
@@ -780,6 +798,18 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         risk_impact: ['切断单笔下行尾部亏损，释放可用资金'],
       });
     }
+  }
+
+  // 已从当前持仓消失的 OPEN tracker 才转 CLOSED；卖出建议被忽略时保持 OPEN 与保本线。
+  const heldCodes = new Set(input.holdings.filter(h => h.quantity > 0).map(h => h.ts_code));
+  for (const r of trackerByCode.values()) {
+    if (r.status !== 'OPEN' || heldCodes.has(r.ts_code)) continue;
+    stopTrackerUpdates.push({
+      ...r,
+      entry_adj_factor: r.entry_adj_factor ?? null,
+      status: 'CLOSED',
+      updated_at: input.asOf,
+    });
   }
 
   // -------------------------------- P2: 159558.SZ 状态机减仓 / 磨底降本高抛低吸
@@ -951,12 +981,12 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       runtimeCanOpen
       && router.effective_regime !== 'DEFENSIVE'
       && router.sub_strategies.s_stock_swing === 'ACTIVE'
-      && stockSwingCandidates.length > 0
+      && screenedStockCandidates.length > 0
     ) {
       let openStockCount = input.holdings.filter(
         h => !isEtfCode(h.ts_code) && (workingQty.get(h.ts_code) ?? h.quantity) > 0,
       ).length;
-      for (const cand of stockSwingCandidates) {
+      for (const cand of screenedStockCandidates) {
         if (openStockCount >= policy.stock_max_positions) break;
         if ((workingQty.get(cand.ts_code) ?? 0) > 0) continue;
         if (!(cand.entry_ref_price_milli > 0) || !(cand.hard_stop_price_milli > 0)) continue;
