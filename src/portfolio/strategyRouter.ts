@@ -54,7 +54,10 @@ export interface StrategyRouterResult {
     cumulative_pnl_cents: number;
     cumulative_return_pct: number;
     recovery_needed_pct: number;
+    /** 展示用“当前份额下的等价高水位”。 */
     hwm_nav_cents: number;
+    /** 峰日原始基准（写库值）；绝不把展示等价峰写回旧峰日。 */
+    hwm_original_nav_cents: number;
     hwm_date: string;
     /** 锚点建立时已折入的当日流水日期与金额；同日重跑不会重复扣减。 */
     hwm_flows_applied_through: string | null;
@@ -231,35 +234,63 @@ function readSameDayNetExternalFlowCents(
   }
 }
 
+/**
+ * 读取指定日期的真实可投资资产（现金+证券）市值，用于把迁移前的 TOTAL 旧锚点按
+ * “峰日真实基准”迁移。缺少基线、目标日无有效估值时返回 null（不猜、不用今日比例）。
+ */
+function readInvestableValueAt(
+  portfolioDb: DatabaseSync | null | undefined,
+  marketDb: DatabaseSync | null | undefined,
+  accountId: string,
+  date: string,
+): number | null {
+  if (!portfolioDb) return null;
+  try {
+    const baseline = readBaseline(portfolioDb, accountId);
+    if (!baseline || baseline.as_of > date) return null;
+    const prices = buildLedgerPriceTable(portfolioDb, marketDb ?? null, accountId, baseline.as_of, date);
+    const series = buildNavSeries(portfolioDb, accountId, { from: date, to: date, prices });
+    const point = series.points.find(item => item.date === date);
+    if (!point || point.nav_per_unit === null) return null;
+    return Number.isSafeInteger(point.total_value_cents) && point.total_value_cents > 0
+      ? point.total_value_cents
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 interface HwmEvaluation {
+  /** 报告展示的“当前份额下的等价高水位”。 */
   effectiveHwmCents: number;
+  /** 峰日原始基准（写库值）：绝不把展示等价峰写回旧峰日。 */
+  originalHwmCents: number;
   effectiveHwmDate: string;
-  /** 用于回撤/生命线缓冲的比较 NAV（同日外部流水场景下为扣除新增流水后的 NAV）。 */
+  /** 用于回撤/生命线缓冲的比较 NAV（同日新增流水场景下为扣除新增流水后的 NAV）。 */
   comparisonNavCents: number;
   flowsAppliedThrough: string | null;
   appliedSameDayFlowCents: number;
-  /** 高水位口径：迁移前的旧锚点为 TOTAL，新锚点为 INVESTABLE。 */
+  /** 高水位口径：迁移前无证据的旧锚点为 TOTAL，其余为 INVESTABLE。 */
   hwmScope: 'INVESTABLE' | 'TOTAL';
   unitNavRatio: number | null;
   basis: 'UNIT_NAV' | 'RAW_NAV';
   shouldAdvanceHwm: boolean;
-  /** 非单位新高、但检测到锚点未折入的新流水或口径迁移时，也必须写库。 */
+  /** 非单位新高、但检测到锚点未折入的新流水或真实口径迁移时，也必须写库。 */
   shouldWriteHwm: boolean;
   shouldPersistAnchor: boolean;
 }
 
 /**
- * 高水位判定：有账本基线与估值时按“单位份额折算后的净值比”比较（出入金不改变净值），
- * 否则退化为名义净值比较。单位净值创新高时把锚点推进到当日名义净值——
- * 即使该名义值低于旧高水位（出金后 70 -> 63 的场景）。
+ * 高水位判定：有账本基线与估值时按“单位份额折算后的净值比”比较（出入金不改变净值）。
  *
- * 同日重跑：锚点记录建立时已折入的当日净流水；之后只处理“新增”流水。若检测到新增流水，
- * 即使不是单位新高，也把持久名义峰按 `currentNav / (currentNav - incrementalFlow)` 重基并
- * 写库（否则 D+1 的 buildNavSeries 会把同一笔出金当成 40% 回撤）。
+ * 迁移前的 TOTAL 旧锚点：
+ * - 能从峰日快照/账本重建真实同日可投资资产时，按该真实基准迁移到 INVESTABLE，并只把
+ *   **峰日原始基准**写回旧日期；展示等价峰（currentNav/ratio）绝不写回，避免二次折算。
+ * - 缺证据时保留明确的 TOTAL 口径，按总资产原始峰做名义比较，绝不持久化估计值。
  *
- * 旧锚点口径：迁移前锚点记录的是含理财总资产峰值。若调用方提供总资产（displayNavCents），
- * 按 `可投资/总资产` 比例折到可投资口径并迁移标记；若未提供财富数据，则保留 TOTAL 口径与
- * 原比较，绝不静默改标签。
+ * 同日重跑：锚点记录已折入的当日净流水；检测到新增流水时按
+ * `currentNav / (currentNav - incrementalFlow)` 重基持久名义峰并写库（即使不是单位新高），
+ * 这样 D+1 buildNavSeries 不会把同一笔流水当成假回撤。
  */
 function evaluateHwm(
   input: EvaluateStrategyRouterInput,
@@ -270,8 +301,10 @@ function evaluateHwm(
 
   if (!existing) {
     const sameDayFlow = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
+    const initial = Math.max(input.fallbackBaselineNavCents ?? currentNav, currentNav);
     return {
-      effectiveHwmCents: Math.max(input.fallbackBaselineNavCents ?? currentNav, currentNav),
+      effectiveHwmCents: initial,
+      originalHwmCents: initial,
       effectiveHwmDate: input.asOf,
       comparisonNavCents: currentNav,
       flowsAppliedThrough: input.asOf,
@@ -286,20 +319,79 @@ function evaluateHwm(
   }
 
   const legacyScope = existing.hwm_nav_scope !== 'INVESTABLE';
-  const wealthKnown = input.displayNavCents !== undefined && currentTotal > currentNav && currentTotal > 0;
-  // 只对迁移前的 TOTAL 旧锚点缩放；新锚点已经是可投资口径，绝不能再次按理财比例缩水。
-  const scopeScale = legacyScope && wealthKnown ? currentNav / currentTotal : 1;
-  const baseHwmCents = Math.round(existing.hwm_nav_cents * scopeScale);
-  const shouldMigrateScope = legacyScope && input.displayNavCents !== undefined;
+  const investablePeakCents = legacyScope
+    ? readInvestableValueAt(input.portfolioDb, input.marketDb, input.accountId, existing.hwm_date)
+    : null;
+  const legacyFallback = legacyScope && (investablePeakCents === null || investablePeakCents <= 0);
+  const baseHwmCents = legacyFallback ? existing.hwm_nav_cents : (legacyScope ? investablePeakCents! : existing.hwm_nav_cents);
+  const migrationWrite = legacyScope && !legacyFallback;
 
+  // ---- 无峰日可投资证据：保留 TOTAL 口径，按总资产原始峰比较；只允许同日流水的真实重基。
+  if (legacyFallback) {
+    if (existing.hwm_date === input.asOf) {
+      const sameDayFlowCents = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
+      const appliedAtAnchorCents = existing.hwm_flows_applied_through === input.asOf
+        ? existing.hwm_applied_same_day_flow_cents
+        : 0;
+      const incrementalFlowCents = sameDayFlowCents - appliedAtAnchorCents;
+      const preIncrementalTotalCents = currentTotal - incrementalFlowCents;
+      if (incrementalFlowCents !== 0 && baseHwmCents > 0 && preIncrementalTotalCents > 0) {
+        const rebased = Math.round(baseHwmCents * currentTotal / preIncrementalTotalCents);
+        return {
+          effectiveHwmCents: rebased,
+          originalHwmCents: rebased,
+          effectiveHwmDate: input.asOf,
+          comparisonNavCents: currentTotal,
+          flowsAppliedThrough: input.asOf,
+          appliedSameDayFlowCents: sameDayFlowCents,
+          hwmScope: 'TOTAL',
+          unitNavRatio: null,
+          basis: 'RAW_NAV',
+          shouldAdvanceHwm: false,
+          shouldWriteHwm: true,
+          shouldPersistAnchor: true,
+        };
+      }
+      return {
+        effectiveHwmCents: baseHwmCents,
+        originalHwmCents: baseHwmCents,
+        effectiveHwmDate: existing.hwm_date,
+        comparisonNavCents: preIncrementalTotalCents,
+        flowsAppliedThrough: existing.hwm_flows_applied_through,
+        appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
+        hwmScope: 'TOTAL',
+        unitNavRatio: null,
+        basis: 'RAW_NAV',
+        shouldAdvanceHwm: false,
+        shouldWriteHwm: false,
+        shouldPersistAnchor: true,
+      };
+    }
+    return {
+      effectiveHwmCents: baseHwmCents,
+      originalHwmCents: baseHwmCents,
+      effectiveHwmDate: existing.hwm_date,
+      comparisonNavCents: currentTotal,
+      flowsAppliedThrough: existing.hwm_flows_applied_through,
+      appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
+      hwmScope: 'TOTAL',
+      unitNavRatio: null,
+      basis: 'RAW_NAV',
+      shouldAdvanceHwm: false,
+      shouldWriteHwm: false,
+      shouldPersistAnchor: input.asOf >= existing.hwm_date,
+    };
+  }
+
+  // ---- 可投资口径：新锚点，或已由峰日真实基准迁移的旧锚点。
   const shares = readUnitSharePair(input.portfolioDb, input.marketDb, input.accountId, existing.hwm_date, input.asOf);
   if (shares && baseHwmCents > 0) {
     const ratio = (currentNav / baseHwmCents) * (shares.from_units / shares.to_units);
-    // 单位份额按 1e-6 精度取整；用极小容差避免无流水日因舍入抖动推进锚点。
     if (input.asOf >= existing.hwm_date && ratio > 1 + 1e-6) {
       const sameDayFlow = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
       return {
         effectiveHwmCents: currentNav,
+        originalHwmCents: currentNav,
         effectiveHwmDate: input.asOf,
         comparisonNavCents: currentNav,
         flowsAppliedThrough: input.asOf,
@@ -314,20 +406,20 @@ function evaluateHwm(
     }
     return {
       effectiveHwmCents: Math.round(currentNav / ratio),
+      originalHwmCents: baseHwmCents,
       effectiveHwmDate: existing.hwm_date,
       comparisonNavCents: currentNav,
       flowsAppliedThrough: existing.hwm_flows_applied_through,
       appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
-      hwmScope: shouldMigrateScope ? 'INVESTABLE' : (legacyScope ? 'TOTAL' : 'INVESTABLE'),
+      hwmScope: 'INVESTABLE',
       unitNavRatio: ratio,
       basis: 'UNIT_NAV',
       shouldAdvanceHwm: false,
-      shouldWriteHwm: shouldMigrateScope,
+      shouldWriteHwm: migrationWrite,
       shouldPersistAnchor: input.asOf >= existing.hwm_date,
     };
   }
 
-  // 锚点日 == 目标日（同日建锚或重跑）且无法单位化：只扣当日“新增”流水。
   if (existing.hwm_date === input.asOf) {
     const sameDayFlowCents = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
     const appliedAtAnchorCents = existing.hwm_flows_applied_through === input.asOf
@@ -339,6 +431,7 @@ function evaluateHwm(
     if (preIncrementalNavCents > baseHwmCents) {
       return {
         effectiveHwmCents: currentNav,
+        originalHwmCents: currentNav,
         effectiveHwmDate: input.asOf,
         comparisonNavCents: currentNav,
         flowsAppliedThrough: input.asOf,
@@ -352,12 +445,11 @@ function evaluateHwm(
       };
     }
 
-    // 检测到锚点未折入的当日新流水：重基持久名义峰并按新口径写库（即使不是单位新高）。
-    // 这样 D+1 的 buildNavSeries 从出金后份额重建时，不会把同一笔流水算成假回撤。
     if (incrementalFlowCents !== 0 && baseHwmCents > 0 && preIncrementalNavCents > 0) {
       const rebasedHwmCents = Math.round(baseHwmCents * currentNav / preIncrementalNavCents);
       return {
         effectiveHwmCents: rebasedHwmCents,
+        originalHwmCents: rebasedHwmCents,
         effectiveHwmDate: input.asOf,
         comparisonNavCents: currentNav,
         flowsAppliedThrough: input.asOf,
@@ -373,15 +465,16 @@ function evaluateHwm(
 
     return {
       effectiveHwmCents: baseHwmCents,
+      originalHwmCents: baseHwmCents,
       effectiveHwmDate: existing.hwm_date,
       comparisonNavCents: preIncrementalNavCents,
       flowsAppliedThrough: existing.hwm_flows_applied_through,
       appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
-      hwmScope: shouldMigrateScope ? 'INVESTABLE' : (legacyScope ? 'TOTAL' : 'INVESTABLE'),
+      hwmScope: 'INVESTABLE',
       unitNavRatio: null,
       basis: 'RAW_NAV',
       shouldAdvanceHwm: false,
-      shouldWriteHwm: shouldMigrateScope,
+      shouldWriteHwm: migrationWrite,
       shouldPersistAnchor: true,
     };
   }
@@ -390,6 +483,7 @@ function evaluateHwm(
     const sameDayFlow = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
     return {
       effectiveHwmCents: currentNav,
+      originalHwmCents: currentNav,
       effectiveHwmDate: input.asOf,
       comparisonNavCents: currentNav,
       flowsAppliedThrough: input.asOf,
@@ -404,15 +498,16 @@ function evaluateHwm(
   }
   return {
     effectiveHwmCents: baseHwmCents,
+    originalHwmCents: baseHwmCents,
     effectiveHwmDate: existing.hwm_date,
     comparisonNavCents: currentNav,
     flowsAppliedThrough: existing.hwm_flows_applied_through,
     appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
-    hwmScope: shouldMigrateScope ? 'INVESTABLE' : (legacyScope ? 'TOTAL' : 'INVESTABLE'),
+    hwmScope: 'INVESTABLE',
     unitNavRatio: null,
     basis: 'RAW_NAV',
     shouldAdvanceHwm: false,
-    shouldWriteHwm: shouldMigrateScope,
+    shouldWriteHwm: migrationWrite,
     shouldPersistAnchor: input.asOf >= existing.hwm_date,
   };
 }
@@ -556,6 +651,7 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
       cumulative_return_pct: cumulativeReturnPct,
       recovery_needed_pct: recoveryNeededPct,
       hwm_nav_cents: effectiveHwmCents,
+      hwm_original_nav_cents: hwm.originalHwmCents,
       hwm_date: effectiveHwmDate,
       hwm_flows_applied_through: hwm.flowsAppliedThrough,
       hwm_applied_same_day_flow_cents: hwm.appliedSameDayFlowCents,
@@ -635,7 +731,7 @@ export function persistRiskAnchor(
     `).run(
       router.account_id,
       router.anchor_snapshot.initial_principal_cents,
-      router.anchor_snapshot.hwm_nav_cents,
+      router.anchor_snapshot.hwm_original_nav_cents,
       router.anchor_snapshot.hwm_date,
       router.anchor_snapshot.hwm_flows_applied_through,
       router.anchor_snapshot.hwm_applied_same_day_flow_cents,

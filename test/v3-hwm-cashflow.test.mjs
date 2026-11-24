@@ -53,7 +53,7 @@ let seq = 0;
  * 行情只需 `daily(ts_code, trade_date, close)`：buildLedgerPriceTable 会读取它。
  * 不给市价变动时，NAV 变化只来自现金流 —— 正是单位净值法的判定场景。
  */
-function setupAccount({ name, startDay, positions, cashCents, prices }) {
+function setupAccount({ name, startDay, positions, cashCents, prices, wealthCents = 0 }) {
   seq += 1;
   const marketPath = join(dir, `${name}-${seq}-market.sqlite`);
   const marketDb = new DatabaseSync(marketPath);
@@ -74,10 +74,10 @@ function setupAccount({ name, startDay, positions, cashCents, prices }) {
     is_current: false,
     positions,
     totals: {
-      total_assets_cents: securities + cashCents,
+      total_assets_cents: securities + cashCents + wealthCents,
       securities_mv_cents: securities,
       cash_cents: cashCents,
-      wealth_cents: 0,
+      wealth_cents: wealthCents,
       unrealized_pnl_cents: 0,
     },
   });
@@ -376,8 +376,8 @@ test('P1-2 同日重跑不重复扣流水：100→110→入金100 首次存 210�
     db.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
     db.prepare(`
       INSERT INTO account_risk_anchor
-        (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, circuit_breaker_status, locked_until_trade_date, updated_at)
-      VALUES (?,?,?,?, 'NORMAL', NULL, ?)
+        (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, hwm_nav_scope, circuit_breaker_status, locked_until_trade_date, updated_at)
+      VALUES (?,?,?,?, 'INVESTABLE', 'NORMAL', NULL, ?)
     `).run('real-main', 100_000, 100_000, DAY.d0, DAY.d0);
     insertCashEvent(db, { id: 'in-100k', type: 'CASH_DEPOSIT', day: DAY.d1, cents: 100_000 });
 
@@ -500,18 +500,74 @@ test('P1-2 跨日延迟流水：D 日重基后 D+1 buildNavSeries 不得把同�
   }
 });
 
-test('P1-2 旧含理财锚点：有总资产数据时按可投资比例迁移，无财富数据时保留 TOTAL 口径', () => {
-  // 有总资产数据：旧峰值 100（含 10 理财）折到可投资 90，避免 90/100=10% 的假回撤。
-  const migratedDb = bareDb();
+test('P1-2 旧 TOTAL 锚迁移：按峰日真实可投资资产迁移，不用今日比例缩放', () => {
+  // 峰日总资产 100 = 可投资 80 + 理财 20；无流水，理财仍 20，可投资跌到 68（总 88）。
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'legacy-evidence',
+    startDay: DAY.d0,
+    positions: [position('600000.SH', 800, 1000)],
+    cashCents: 0,
+    wealthCents: 20_000,
+    prices: { '600000.SH': { [DAY.d0]: 1.0, [DAY.d1]: 0.85 } },
+  });
   try {
-    migratedDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
-    migratedDb.prepare(`
+    portfolioDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
+    portfolioDb.prepare(`
+      INSERT INTO account_risk_anchor
+        (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, hwm_nav_scope, circuit_breaker_status, locked_until_trade_date, updated_at)
+      VALUES (?,?,?,?, 'TOTAL', 'NORMAL', NULL, ?)
+    `).run('real-main', 100_000, 100_000, DAY.d0, DAY.d0);
+
+    const out = evaluateStrategyRouter({
+      portfolioDb,
+      marketDb,
+      accountId: 'real-main',
+      asOf: DAY.d1,
+      currentNavCents: 68_000,
+      displayNavCents: 88_000,
+      marketRegime: regime,
+    });
+    // 峰日真实可投资 = 80,000；真实 DD = (80-68)/80 = 15%，不是按今日 68/88 缩放的 12%。
+    assert.equal(out.anchor_snapshot.hwm_nav_scope, 'INVESTABLE');
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1500);
+    assert.equal(out.anchor_snapshot.hwm_original_nav_cents, 80_000, '持久值必须是峰日真实基准');
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 80_000, '无流水时展示等价峰=峰日基准');
+    assert.equal(out.should_write_hwm, true);
+    assert.equal(persistRiskAnchor(portfolioDb, out), true);
+    const row = readRiskAnchor(portfolioDb, 'real-main');
+    assert.equal(row.hwm_nav_cents, 80_000, '绝不写入今日比例缩放估计值');
+    assert.equal(row.hwm_nav_scope, 'INVESTABLE');
+
+    // 连续第二次评估：已迁移，不得再次缩放。
+    const again = evaluateStrategyRouter({
+      portfolioDb,
+      marketDb,
+      accountId: 'real-main',
+      asOf: DAY.d1,
+      currentNavCents: 68_000,
+      displayNavCents: 88_000,
+      marketRegime: regime,
+    });
+    assert.equal(again.anchor_snapshot.hwm_drawdown_bps, 1500);
+    assert.equal(again.anchor_snapshot.hwm_original_nav_cents, 80_000);
+    assert.equal(again.should_write_hwm, false);
+  } finally {
+    marketDb.close();
+    portfolioDb.close();
+  }
+});
+
+test('P1-2 旧 TOTAL 锚无峰日证据：保留 TOTAL 口径按总资产比较，不持久化估计值', () => {
+  const db = bareDb();
+  try {
+    db.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
+    db.prepare(`
       INSERT INTO account_risk_anchor
         (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, hwm_nav_scope, circuit_breaker_status, locked_until_trade_date, updated_at)
       VALUES (?,?,?,?, 'TOTAL', 'NORMAL', NULL, ?)
     `).run('real-main', 100_000, 100_000, DAY.d0, DAY.d0);
     const out = evaluateStrategyRouter({
-      portfolioDb: migratedDb,
+      portfolioDb: db,
       marketDb: null,
       accountId: 'real-main',
       asOf: DAY.d0,
@@ -519,40 +575,55 @@ test('P1-2 旧含理财锚点：有总资产数据时按可投资比例迁移，
       displayNavCents: 100_000,
       marketRegime: regime,
     });
-    assert.equal(out.anchor_snapshot.hwm_nav_cents, 90_000, '旧总峰必须折到可投资口径');
-    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0);
-    assert.equal(out.anchor_snapshot.hwm_nav_scope, 'INVESTABLE');
-    assert.equal(out.should_write_hwm, true);
-    assert.equal(persistRiskAnchor(migratedDb, out), true);
-    const row = readRiskAnchor(migratedDb, 'real-main');
-    assert.equal(row.hwm_nav_cents, 90_000);
-    assert.equal(row.hwm_nav_scope, 'INVESTABLE');
+    assert.equal(out.anchor_snapshot.hwm_nav_scope, 'TOTAL', '缺证据时明确保留 TOTAL 口径');
+    assert.equal(out.anchor_snapshot.hwm_original_nav_cents, 100_000);
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0, '按总资产（100,000 vs 100,000）比较');
+    assert.equal(out.should_write_hwm, false, '缺证据时绝不持久化估计值');
   } finally {
-    migratedDb.close();
+    db.close();
   }
+});
 
-  // 无财富数据：不静默改口径，保留 TOTAL 与原比较，等下一次显式迁移。
-  const legacyDb = bareDb();
+test('P1-2 旧 TOTAL 锚 + 跨日流水连续评估：不把展示等价峰写回旧日期（无二次折算）', () => {
+  // 旧峰 100；D1 跌到 90 后入金 90 → 180，份额翻倍，单位净值仍 0.9（真实 DD 10%）。
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'legacy-double-run',
+    startDay: DAY.d0,
+    positions: [position('600000.SH', 1000, 1000)],
+    cashCents: 0,
+    prices: { '600000.SH': { [DAY.d0]: 1.0, [DAY.d1]: 0.9 } },
+  });
   try {
-    legacyDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
-    legacyDb.prepare(`
+    portfolioDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
+    portfolioDb.prepare(`
       INSERT INTO account_risk_anchor
         (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, hwm_nav_scope, circuit_breaker_status, locked_until_trade_date, updated_at)
       VALUES (?,?,?,?, 'TOTAL', 'NORMAL', NULL, ?)
     `).run('real-main', 100_000, 100_000, DAY.d0, DAY.d0);
-    const out = evaluateStrategyRouter({
-      portfolioDb: legacyDb,
-      marketDb: null,
-      accountId: 'real-main',
-      asOf: DAY.d0,
-      currentNavCents: 90_000,
-      marketRegime: regime,
+    recordCash(portfolioDb, { id: 'legacy-dep-90', type: 'CASH_DEPOSIT', day: DAY.d1, cents: 90_000 });
+
+    const first = evaluateStrategyRouter({
+      portfolioDb, marketDb, accountId: 'real-main', asOf: DAY.d1,
+      currentNavCents: 180_000, displayNavCents: 180_000, marketRegime: regime,
     });
-    assert.equal(out.anchor_snapshot.hwm_nav_scope, 'TOTAL', '无财富数据时不得静默改标签');
-    assert.equal(out.anchor_snapshot.hwm_nav_cents, 100_000);
-    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1000);
-    assert.equal(out.should_write_hwm, false, '口径未确认时不得改写锚点');
+    assert.equal(first.anchor_snapshot.hwm_drawdown_bps, 1000);
+    assert.equal(first.anchor_snapshot.hwm_nav_cents, 200_000, '展示等价峰 = 180/0.9');
+    assert.equal(first.anchor_snapshot.hwm_original_nav_cents, 100_000, '写库值必须是峰日原始基准 100');
+    assert.equal(persistRiskAnchor(portfolioDb, first), true);
+    const row = readRiskAnchor(portfolioDb, 'real-main');
+    assert.equal(row.hwm_nav_cents, 100_000, '绝不把 200,000 写回旧峰日');
+    assert.equal(row.hwm_date, DAY.d0);
+    assert.equal(row.hwm_nav_scope, 'INVESTABLE');
+
+    const second = evaluateStrategyRouter({
+      portfolioDb, marketDb, accountId: 'real-main', asOf: DAY.d1,
+      currentNavCents: 180_000, displayNavCents: 180_000, marketRegime: regime,
+    });
+    assert.equal(second.anchor_snapshot.hwm_drawdown_bps, 1000, '第二次评估不得出现 55% 假回撤');
+    assert.notEqual(second.circuit_breaker_status, 'L2_LOCKED');
+    assert.equal(second.should_write_hwm, false);
   } finally {
-    legacyDb.close();
+    marketDb.close();
+    portfolioDb.close();
   }
 });

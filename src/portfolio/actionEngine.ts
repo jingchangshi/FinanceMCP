@@ -1082,7 +1082,9 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       const fundingShortfallCents = Math.max(0, intendedBuyNetCents - availableCashForBuysCents);
 
       // ---- 最小足额可卖国债手数：净额（扣卖费）覆盖实际净缺口，SELL 单独成 funding action。
-      if (fundingShortfallCents >= 500_000 && reservoirQty > 0 && reservoirPriceMilli > 0 && intendedBuyNetCents > 0) {
+      // 只要存在正缺口就计算最小可售手数；5,000 元门槛只约束**实际卖出毛额**，
+      // 不得因为缺口较小而放弃整笔买入。
+      if (fundingShortfallCents > 0 && reservoirQty > 0 && reservoirPriceMilli > 0 && intendedBuyNetCents > 0) {
         const defensiveExcessCents = defensiveAssetsNow === null
           ? 0
           : Math.max(0, defensiveAssetsNow - targetDefensiveCents);
