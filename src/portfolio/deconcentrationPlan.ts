@@ -20,6 +20,8 @@ export interface DeconcentrationPlanRow {
   initial_shares: number;
   target_keep_bps: number;
   anchor_price_milli: number;
+  /** 原始锚定价对应的价格基准交易日（YYYYMMDD）；NULL 表示历史计划未记录，绝不从 created_at 回填。 */
+  anchor_trade_date: string | null;
   support_floor_milli: number | null;
   last_exec_price_milli: number | null;
   last_exec_date: string | null;
@@ -96,6 +98,10 @@ export interface DeconcentrationEvaluation {
   live_weight_pct: number | null;
   reference_price_milli: number | null;
   reference_price_cny: number | null;
+  /** 计划记录的价格基准交易日（原样返回，供审计；NULL 表示历史计划未记录）。 */
+  anchor_trade_date: string | null;
+  /** 锚定价无法按复权因子换算时的本地化披露（保留原始价，不阻断报告）；否则为 null。 */
+  anchor_basis_note_zh: string | null;
   rebound_trigger_milli: number | null;
   rebound_trigger_cny: number | null;
   support_floor_milli: number | null;
@@ -143,6 +149,8 @@ export interface InitDeconcentrationPlanInput {
   plan_mode?: DeconcentrationPlanMode;
   tactical_slot_bps?: number;
   anchor_price_milli: number;
+  /** 原始锚定价对应的价格基准交易日（YYYYMMDD）。显式给出时与新计划一同落库；缺省保持 NULL。 */
+  anchor_trade_date?: string;
   support_floor_milli?: number | null;
   total_tranches?: number;
   created_at: string;
@@ -177,6 +185,17 @@ export function splitSharesIntoTranches(excessShares: number, totalTranches = 4)
   return out;
 }
 
+/** 严格校验 YYYYMMDD 交易日文本（含真实日历日），用于锚定价的价格基准日。 */
+export function isValidTradeDateYmd(value: string | null | undefined): value is string {
+  if (typeof value !== 'string' || !/^\d{8}$/.test(value)) return false;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(4, 6));
+  const day = Number(value.slice(6, 8));
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  return dt.getUTCFullYear() === year && dt.getUTCMonth() === month - 1 && dt.getUTCDate() === day;
+}
+
 export function ensureDeconcentrationPlan(
   portfolioDb: DatabaseSync,
   input: InitDeconcentrationPlanInput,
@@ -200,6 +219,10 @@ export function ensureDeconcentrationPlan(
   const planMode: DeconcentrationPlanMode = input.plan_mode ?? 'STANDARD';
   const targetKeepBps = input.target_keep_bps ?? (planMode === 'BOTTOM_GRIND_25' ? 2500 : 1800);
   const tacticalSlotBps = input.tactical_slot_bps ?? 1000;
+  if (input.anchor_trade_date !== undefined && !isValidTradeDateYmd(input.anchor_trade_date)) {
+    throw new Error(`anchor_trade_date 需要有效的 YYYYMMDD 交易日（收到 ${input.anchor_trade_date}）`);
+  }
+  const anchorTradeDate = input.anchor_trade_date ?? null;
   const totalTranches = input.total_tranches ?? 4;
   const priceCents = input.anchor_price_milli / 10;
   const targetKeepShares = priceCents > 0
@@ -216,6 +239,7 @@ export function ensureDeconcentrationPlan(
     initial_shares: input.initial_shares,
     target_keep_bps: targetKeepBps,
     anchor_price_milli: input.anchor_price_milli,
+    anchor_trade_date: anchorTradeDate,
     support_floor_milli: input.support_floor_milli ?? null,
     last_exec_price_milli: null,
     last_exec_date: null,
@@ -243,13 +267,13 @@ export function ensureDeconcentrationPlan(
     portfolioDb.prepare(`
       INSERT INTO deconcentration_plan (
         plan_id, account_id, ts_code, initial_shares, target_keep_bps,
-        anchor_price_milli, support_floor_milli, last_exec_price_milli, last_exec_date,
+        anchor_price_milli, anchor_trade_date, support_floor_milli, last_exec_price_milli, last_exec_date,
         plan_mode, tactical_slot_bps, tactical_shares, tactical_entry_price_milli,
         tactical_entry_date, completed_swing_count, status, created_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       plan.plan_id, plan.account_id, plan.ts_code, plan.initial_shares, plan.target_keep_bps,
-      plan.anchor_price_milli, plan.support_floor_milli, plan.last_exec_price_milli, plan.last_exec_date,
+      plan.anchor_price_milli, plan.anchor_trade_date, plan.support_floor_milli, plan.last_exec_price_milli, plan.last_exec_date,
       plan.plan_mode, plan.tactical_slot_bps, plan.tactical_shares, plan.tactical_entry_price_milli,
       plan.tactical_entry_date, plan.completed_swing_count, plan.status, plan.created_at,
     );
@@ -275,6 +299,8 @@ function normalizePlanRow(row: Partial<DeconcentrationPlanRow> & Pick<Deconcentr
     initial_shares: Number(row.initial_shares),
     target_keep_bps: Number(row.target_keep_bps),
     anchor_price_milli: Number(row.anchor_price_milli),
+    // 旧库/旧行没有该列或值为 NULL：保持 NULL，绝不从 created_at 推断。
+    anchor_trade_date: isValidTradeDateYmd(row.anchor_trade_date ?? null) ? row.anchor_trade_date! : null,
     support_floor_milli: row.support_floor_milli ?? null,
     last_exec_price_milli: row.last_exec_price_milli ?? null,
     last_exec_date: row.last_exec_date ?? null,
@@ -303,6 +329,8 @@ export function calibrateDeconcentrationPlan(
     nav_cents?: number;
     support_floor_milli?: number | null;
     anchor_price_milli?: number;
+    /** 原始锚定价对应的价格基准交易日（YYYYMMDD）。修改锚定价时必须显式给出。 */
+    anchor_trade_date?: string;
     reset_triggered?: boolean;
   },
 ): {
@@ -317,6 +345,7 @@ export function calibrateDeconcentrationPlan(
   remaining_excess_shares: number | null;
   support_floor_milli: number | null;
   anchor_price_milli: number;
+  anchor_trade_date: string | null;
   reset_tranche_nos: number[];
   tranches: DeconcentrationTrancheRow[];
 } {
@@ -339,6 +368,12 @@ export function calibrateDeconcentrationPlan(
     if (!Number.isSafeInteger(input.anchor_price_milli) || input.anchor_price_milli <= 0) {
       throw new Error(`--anchor-price-milli 需要正整数厘价（收到 ${input.anchor_price_milli}）`);
     }
+    if (input.anchor_trade_date === undefined) {
+      throw new Error('修改锚定价必须同时给出显式的价格基准交易日 --anchor-trade-date YYYYMMDD；不得用计划创建日冒充');
+    }
+  }
+  if (input.anchor_trade_date !== undefined && !isValidTradeDateYmd(input.anchor_trade_date)) {
+    throw new Error(`--anchor-trade-date 需要有效的 YYYYMMDD 交易日（收到 ${input.anchor_trade_date}）`);
   }
   if (input.target_keep_bps !== undefined) {
     if (!Number.isSafeInteger(input.target_keep_bps) || input.target_keep_bps <= 0 || input.target_keep_bps > 10000) {
@@ -359,6 +394,8 @@ export function calibrateDeconcentrationPlan(
     ? input.support_floor_milli
     : (plan.support_floor_milli ?? null);
   const nextAnchorPrice = input.anchor_price_milli ?? plan.anchor_price_milli;
+  // 未触及锚定价/基准日的校准（如只改目标底仓比例）必须原样保留两者。
+  const nextAnchorTradeDate = input.anchor_trade_date ?? plan.anchor_trade_date;
   const resetTrancheNos: number[] = [];
   let computedTargetKeepShares: number | null = null;
   let computedRemainingExcess: number | null = null;
@@ -430,12 +467,13 @@ export function calibrateDeconcentrationPlan(
 
     portfolioDb.prepare(`
       UPDATE deconcentration_plan
-      SET support_floor_milli = ?, anchor_price_milli = ?, plan_mode = ?,
+      SET support_floor_milli = ?, anchor_price_milli = ?, anchor_trade_date = ?, plan_mode = ?,
           target_keep_bps = ?, tactical_slot_bps = ?, initial_shares = ?, status = ?
       WHERE plan_id = ?
     `).run(
       nextSupportFloor,
       nextAnchorPrice,
+      nextAnchorTradeDate,
       nextPlanMode,
       nextTargetKeepBps,
       nextTacticalSlotBps,
@@ -461,6 +499,7 @@ export function calibrateDeconcentrationPlan(
     remaining_excess_shares: computedRemainingExcess,
     support_floor_milli: nextSupportFloor,
     anchor_price_milli: nextAnchorPrice,
+    anchor_trade_date: nextAnchorTradeDate,
     reset_tranche_nos: resetTrancheNos,
     tranches,
   };
@@ -512,7 +551,10 @@ function createAdjPriceConverter(
   marketDb: DatabaseSync | null | undefined,
   tsCode: string,
   asOf: string,
-): ((priceMilli: number, fromDate: string | null | undefined) => number) | null {
+): {
+  factorAt: (date: string) => number | null;
+  adjustPrice: (priceMilli: number, fromDate: string | null | undefined) => number;
+} | null {
   if (!marketDb || !portfolioTableExists(marketDb, 'fund_adj')) return null;
   const db = marketDb;
   const factors = new Map<string, number | null>();
@@ -526,13 +568,52 @@ function createAdjPriceConverter(
     factors.set(date, value);
     return value;
   };
-  return (priceMilli, fromDate) => {
+  const adjustPrice = (priceMilli: number, fromDate: string | null | undefined): number => {
     if (!fromDate || !Number.isFinite(priceMilli) || priceMilli <= 0) return priceMilli;
     const from = factorAt(fromDate);
     const to = factorAt(asOf);
     if (from === null || to === null || from === to) return priceMilli;
     return Math.round(priceMilli * (from / to));
   };
+  return { factorAt, adjustPrice };
+}
+
+/**
+ * 锚定价基准换算（仅在无 later last-exec 价格时使用）：
+ * 对数据库中的**原始**锚定价做一次性只读换算 `round(raw × adj(基准日) / adj(asOf))`，
+ * 绝不把换算结果写回数据库（避免跨日重复复权）。基准日或因子缺失时保留原始价，
+ * 返回本地化披露文本，报告继续输出（不阻断）。
+ */
+function convertAnchorPriceToAsOf(input: {
+  anchorPriceMilli: number;
+  basisDate: string | null;
+  asOf: string;
+  factorAt: ((date: string) => number | null) | null;
+}): { priceMilli: number; noteZh: string | null } {
+  const raw = input.anchorPriceMilli;
+  const rawCny = (raw / 1000).toFixed(3);
+  if (!input.basisDate) {
+    return {
+      priceMilli: raw,
+      noteZh: `锚定价未记录价格基准日，按原始价 ${rawCny} 元计算反弹线，未做除权换算。`,
+    };
+  }
+  if (input.basisDate > input.asOf) {
+    return {
+      priceMilli: raw,
+      noteZh: `锚定价基准日 ${input.basisDate} 晚于评估日 ${input.asOf}，按原始价 ${rawCny} 元计算反弹线。`,
+    };
+  }
+  const from = input.factorAt ? input.factorAt(input.basisDate) : null;
+  const to = input.factorAt ? input.factorAt(input.asOf) : null;
+  if (from === null || to === null) {
+    return {
+      priceMilli: raw,
+      noteZh: `锚定价基准日 ${input.basisDate} 或评估日缺少可用复权因子，按原始价 ${rawCny} 元计算反弹线，未做除权换算。`,
+    };
+  }
+  if (from === to) return { priceMilli: raw, noteZh: null };
+  return { priceMilli: Math.round(raw * (from / to)), noteZh: null };
 }
 
 function rollingMeanAt(series: number[], endIdx: number, window: number): number | null {
@@ -827,6 +908,8 @@ function uninitializedEvaluation(
     live_weight_pct: null,
     reference_price_milli: currentCloseMilli,
     reference_price_cny: currentCloseMilli !== null ? currentCloseMilli / 1000 : null,
+    anchor_trade_date: null,
+    anchor_basis_note_zh: null,
     rebound_trigger_milli: currentCloseMilli !== null ? Math.round(currentCloseMilli * 1.08) : null,
     rebound_trigger_cny: currentCloseMilli !== null ? Math.round(currentCloseMilli * 1.08) / 1000 : null,
     support_floor_milli: null,
@@ -889,7 +972,8 @@ export function evaluateDeconcentrationPlan(input: {
   const plan = normalizePlanRow(rawPlan);
   const planMode = plan.plan_mode;
   // 决策/输出统一使用 asOf 复权基准；数据库仍保存事件日原始价（raw），避免跨日重复复权。
-  const adjustPrice = createAdjPriceConverter(input.marketDb, tsCode, input.asOf)
+  const adjConverter = createAdjPriceConverter(input.marketDb, tsCode, input.asOf);
+  const adjustPrice = adjConverter?.adjustPrice
     ?? ((priceMilli: number, _fromDate?: string | null): number => priceMilli);
 
   const rawTranches = input.portfolioDb.prepare(
@@ -1079,7 +1163,18 @@ export function evaluateDeconcentrationPlan(input: {
   }
 
   const refDate = lastExecDate ?? plan.created_at;
-  const refPriceMilli = lastExecPriceMilli ?? plan.anchor_price_milli;
+  // 锚定价仅在无 later last-exec 价格时参与参考价：从数据库原始价一次性换算到 asOf 基准，
+  // 结果只用于本次评估、绝不写回；基准日或因子缺失时保留原始价并在报告中本地化披露。
+  const anchorConversion = lastExecPriceMilli === null
+    ? convertAnchorPriceToAsOf({
+      anchorPriceMilli: plan.anchor_price_milli,
+      basisDate: plan.anchor_trade_date,
+      asOf: input.asOf,
+      factorAt: adjConverter?.factorAt ?? null,
+    })
+    : null;
+  const anchorBasisNoteZh = anchorConversion?.noteZh ?? null;
+  const refPriceMilli = lastExecPriceMilli ?? anchorConversion?.priceMilli ?? plan.anchor_price_milli;
   const reboundTriggerMilli = Math.round(refPriceMilli * 1.08);
   const supportFloorMilli = plan.support_floor_milli ?? null;
   const qfq = loadEtfQfqCloses(input.marketDb, tsCode, input.asOf, 180);
@@ -1273,6 +1368,8 @@ export function evaluateDeconcentrationPlan(input: {
           ? `${tsCode} 四批换马已执行 ${execCount}/${tranches.length} 批（磨底观察中）；下一观察条件：反弹至 ${(reboundTriggerMilli / 1000).toFixed(3)} 元、跌破箱体防守位 ${(downsideProtectMilli / 1000).toFixed(3)} 元或月度窗口 ${fmtYmdZh(schedule.nextMonthlyTriggerDate)}。`
           : `${tsCode} 四批换马已执行 ${execCount}/${tranches.length} 批；下一观察条件：月度窗口 ${schedule.nextMonthlyTriggerDate ?? '待日历顺延'} 或反弹至 ${(reboundTriggerMilli / 1000).toFixed(3)} 元。`;
   }
+  // 锚定价基准/复权因子缺失时把本地化披露附在状态摘要末尾；不改变任何建议或阻断报告。
+  if (anchorBasisNoteZh) statusSummaryZh = `${statusSummaryZh} ${anchorBasisNoteZh}`;
 
   return {
     schema: 'portfolio-deconcentration-plan/1.0',
@@ -1305,6 +1402,8 @@ export function evaluateDeconcentrationPlan(input: {
     live_weight_pct: liveWeightPct,
     reference_price_milli: refPriceMilli,
     reference_price_cny: refPriceMilli / 1000,
+    anchor_trade_date: plan.anchor_trade_date,
+    anchor_basis_note_zh: anchorBasisNoteZh,
     rebound_trigger_milli: reboundTriggerMilli,
     rebound_trigger_cny: reboundTriggerMilli / 1000,
     support_floor_milli: supportFloorMilli,

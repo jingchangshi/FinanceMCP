@@ -124,6 +124,20 @@ function scenarioTool(args: Record<string, any>): ToolResult {
     const checkedEvidence = evidence ? { ...evidence,
       source: verification?.verified && evidence.source === 'RESEARCH_VERIFIED' ? 'RESEARCH_VERIFIED' as const : 'UNVERIFIED' as const,
     } : null;
+    // 账户门控与 decision.ts 同源：原始未上报交易风险不能由本层自行解释成固定前置条件。
+    // 只在有效处置阻塞执行时加入前置原因；声明缺失/滞后被降级时保留原始披露。
+    const declaration = accountGate.declaration;
+    const accountBlockDetails: string[] = [];
+    if (!accountGate.ok) {
+      const codes = accountGate.reasons.map(reason => reason.code).join(', ');
+      accountBlockDetails.push(`Account ledger verification or state basis is insufficient${codes ? ` (${codes})` : ''}`);
+    }
+    if (declaration.blocks_execution && declaration.reason) {
+      accountBlockDetails.push(`Completeness disposition blocks execution (${declaration.risk_basis ?? 'unknown'}): ${declaration.reason.detail}`);
+    }
+    const accountPreconditions = accountBlockDetails.length > 0
+      ? [{ code: 'account_not_current' as const, detail: accountBlockDetails.join('; ') }]
+      : [];
     const result = buildScenario({
       snapshot: summary,
       as_of_trade_date: tradeDate,
@@ -131,7 +145,7 @@ function scenarioTool(args: Record<string, any>): ToolResult {
       action,
       evidence: checkedEvidence,
       resolved: bundle.resolved,
-      preconditions: [...bundle.preconditions, ...(!accountGate.ok || accountGate.unreported_trade_risk ? [{ code: 'account_not_current' as const, detail: 'Account ledger completeness or verification is insufficient' }] : [])],
+      preconditions: [...bundle.preconditions, ...accountPreconditions],
       fee_context: loadFeeContext(db, accountId, tradeDate),
       share_data_available: false,
     });
@@ -147,7 +161,7 @@ function scenarioTool(args: Record<string, any>): ToolResult {
         suspended: q.suspended, adj_factor: q.adj_factor, suspension_known: q.suspension_known,
       })),
       account: { snapshot_id: snapshot.snapshot_id, is_current: snapshot.is_current, as_of: snapshot.as_of },
-      warnings: [...new Set([...(result.warnings ?? []), ...bundle.warnings])],
+      warnings: [...new Set([...(result.warnings ?? []), ...bundle.warnings, ...declaration.warnings.map(w => w.code)])],
       execution_price_is_reference: true,
       execution_price_note: '行情收盘价只是参考价，不是下一交易日的保证成交价；实际成交价由市场决定。',
       caller_prices_ignored: mode === 'server'

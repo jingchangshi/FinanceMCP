@@ -114,9 +114,10 @@ ${RISK_POLICY_USAGE}
   portfolio-evidence-history --id ID [--db PATH]       查看某条证据的状态变更历史
   portfolio-deconcentration-calibrate --account ID [--ts-code CODE] --confirm [--db PATH]
         [--mode STANDARD|BOTTOM_GRIND_25] [--target-keep-bps 2500] [--tactical-slot-bps 1000]
-        [--support-floor-milli 厘] [--anchor-price-milli 厘] [--trade-date YYYYMMDD] [--market-db PATH]
-        [--reset-triggered]
-                                                       校准减仓/磨底降本状态机模式、目标底仓比例、防守位与剩余拆分份数
+        [--support-floor-milli 厘] [--anchor-price-milli 厘 --anchor-trade-date YYYYMMDD]
+        [--trade-date YYYYMMDD] [--market-db PATH] [--reset-triggered]
+                                                       校准减仓/磨底降本状态机模式、目标底仓比例、防守位与剩余拆分份数；
+                                                       修改锚定价必须同时给出价格基准交易日
 
   收盘日报与研究候选（D1/C2/C6）：
   portfolio-daily-report --account ID [--date YYYYMMDD] [--snapshot ID] [--max-actions 0..3]
@@ -824,6 +825,10 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       const rawFloor = intArg(h.arg('support-floor-milli'), '--support-floor-milli');
       const supportFloorMilli = rawFloor === undefined ? undefined : rawFloor === 0 ? null : rawFloor;
       const anchorPriceMilli = intArg(h.arg('anchor-price-milli'), '--anchor-price-milli');
+      const anchorTradeDate = h.arg('anchor-trade-date')?.trim();
+      if (anchorPriceMilli !== undefined && !anchorTradeDate) {
+        throw new Error('修改锚定价必须同时给出价格基准交易日 --anchor-trade-date YYYYMMDD');
+      }
       const tsCode = h.arg('ts-code') ?? '159558.SZ';
       const db = openPortfolioDb(h.arg('db'));
       try {
@@ -883,6 +888,7 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
           nav_cents: navCents,
           support_floor_milli: supportFloorMilli,
           anchor_price_milli: anchorPriceMilli,
+          anchor_trade_date: anchorTradeDate,
           reset_triggered: h.flag('reset-triggered'),
         });
         h.print({ ...result, nav_cents: navCents, current_shares: currentShares, current_price_milli: currentPriceMilli, db: portfolioDbPath() });
@@ -974,8 +980,21 @@ export function runScenario(db: DatabaseSync, action: string, h: PortfolioCliHel
   if (!Number.isFinite(fees.slippage_rate_per_side) || fees.slippage_rate_per_side < 0) throw new Error('--slippage 需要非负数');
   if (!Number.isFinite(stress.shock_pct) || stress.shock_pct > 0) throw new Error('--stress 需要非正数（如 -0.10）');
 
-  return {
-    ...buildScenario({
+  // 账户门控与 decision.ts 同源：原始未上报交易风险不能由本层自行解释成固定前置条件。
+  // 只在有效处置阻塞执行时加入前置原因；声明缺失/滞后被降级时保留原始披露。
+  const declaration = accountGate.declaration;
+  const accountBlockDetails: string[] = [];
+  if (!accountGate.ok) {
+    const codes = accountGate.reasons.map(reason => reason.code).join(', ');
+    accountBlockDetails.push(`Account ledger verification or state basis is insufficient${codes ? ` (${codes})` : ''}`);
+  }
+  if (declaration.blocks_execution && declaration.reason) {
+    accountBlockDetails.push(`Completeness disposition blocks execution (${declaration.risk_basis ?? 'unknown'}): ${declaration.reason.detail}`);
+  }
+  const accountPreconditions = accountBlockDetails.length > 0
+    ? [{ code: 'account_not_current' as const, detail: accountBlockDetails.join('; ') }]
+    : [];
+  const scenario = buildScenario({
       snapshot: summary,
       as_of_trade_date: tradeDate,
       quotes: bundle.quotes,
@@ -984,10 +1003,13 @@ export function runScenario(db: DatabaseSync, action: string, h: PortfolioCliHel
         && verifyTrustedRotation(db, { evidence_id: evidence.evidence_id, claim: evidence.basis, buyCode: scenarioAction.buy_code,
           sellCode: scenarioAction.sell_code, asOf: tradeDate }, trustedEvidencePolicy()).verified ? 'RESEARCH_VERIFIED' : 'UNVERIFIED' } : null,
       resolved: bundle.resolved,
-      preconditions: [...bundle.preconditions, ...(!accountGate.ok || accountGate.unreported_trade_risk ? [{ code: 'account_not_current' as const, detail: 'Account ledger completeness or verification is insufficient' }] : [])],
+      preconditions: [...bundle.preconditions, ...accountPreconditions],
       ...(!h.arg('commission') && !h.arg('slippage') ? { fee_context: loadFeeContext(db, accountId, tradeDate) } : {}),
       rules: { fees, stress },
-    }),
+    });
+  return {
+    ...scenario,
+    warnings: [...new Set([...scenario.warnings, ...declaration.warnings.map(w => w.code)])],
     quote_mode: bundle.mode,
   };
 }

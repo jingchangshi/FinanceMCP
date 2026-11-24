@@ -429,6 +429,7 @@ export type DecisionReasonCode =
   | 'account_completeness_undeclared'
   | 'account_reconciliation_mismatch'
   | 'unreported_trade_risk'
+  | 'unreported_trade_lag_warning'
   | 'as_of_not_trading_day'
   | 'risk_budget_exceeded'
   | 'stock_not_cached'
@@ -650,12 +651,123 @@ export interface DecisionResult {
 
 // ---------------------------------------------------------------- 账户状态门控
 
+// 完整性声明的原始风险来源：显式承认 / 从未声明 / 声明已滞后于决策日。
+export type DeclarationRiskBasis = 'explicit' | 'undeclared' | 'expired';
+
 /**
- * 账户可执行与否的统一门控（R2 A1.5 / A1 跨日重建）。
+ * 完整性声明的**有效处置**（decision / dailyReport / scenario 包装层共用同一口径）。
  *
- * 可执行路径有两条，满足其一即可（两者都保留原有的安全条件）：
+ * - `unreported_trade_risk` 是原始披露，永不因执行降级而改写；
+ * - `blocks_execution` 才是执行门控：用户**显式**声明存在未上报交易风险时始终阻塞；
+ *   声明缺失或滞后时，仅在账户可执行依据不成立时阻塞——可执行依据 =
+ *   真实账户已验证 + 已存储的当日当前快照或账本基线重放成功 + 无对账/账本冲突。
  *
- * 1. **同日确认快照**：`is_current === true` 且快照日期 == 决策日（0 天容忍）；
+ * 快照不一致、账本冲突、坏行情、未交收现金/T+1、重放失败都各自保留原阻塞原因，
+ * 不会被这里的降级豁免。
+ */
+export interface EffectiveDeclarationDisposition {
+  /** 原始风险披露（声明缺失/滞后/显式承认时均为 true）。 */
+  unreported_trade_risk: boolean;
+  /** 原始风险来源；无风险时为 null。 */
+  risk_basis: DeclarationRiskBasis | null;
+  /** 有效执行门控：true 时任何交易腿（含 HOLD 附带的减仓对照腿）都不得 executable。 */
+  blocks_execution: boolean;
+  /** 可执行依据：同日已存当前快照 / 账本重建 / 不成立。 */
+  execution_basis: 'same_day_snapshot' | 'ledger_reconstruction' | 'none';
+  /** 阻塞时并入 reasons 的原因；不阻塞时为 null。 */
+  reason: Reason | null;
+  /** 原始风险与降级披露（绝不静默丢弃）；阻塞时也保留原始风险披露。 */
+  warnings: Reason[];
+  note: string;
+}
+
+export interface DeclarationFacts {
+  as_of: string;
+  completeness: AccountCompleteness | null;
+  /** 与 evaluateAccountStatus 的保守推导一致：缺失/滞后/显式承认都为 true。 */
+  unreported_trade_risk: boolean;
+  /** 账本门控已确认 REAL_ACCOUNT_VERIFIED。 */
+  account_verified: boolean;
+  /** 传入快照就是账户库中已存储的当前快照（同日路径）。 */
+  same_day_snapshot_stored: boolean;
+  /** 已存储基线 + 重放覆盖决策日 + 无未来事件（重建路径）。 */
+  reconstruction_stored: boolean;
+  /** 账本重放成功且无未解决导入冲突。 */
+  replay_ok: boolean;
+}
+
+/**
+ * 把「原始未上报交易风险」与「是否阻塞执行」拆开：
+ * 声明缺失/滞后只在可执行依据成立时降为警告；显式承认风险永远阻塞。
+ */
+export function effectiveDeclarationDisposition(facts: DeclarationFacts): EffectiveDeclarationDisposition {
+  const raw = facts.unreported_trade_risk;
+  const riskBasis: DeclarationRiskBasis | null = !raw
+    ? null
+    : facts.completeness === null
+      ? 'undeclared'
+      : facts.completeness.unreported_trade_risk === true
+        ? 'explicit'
+        : 'expired';
+  const basis: EffectiveDeclarationDisposition['execution_basis'] =
+    facts.account_verified && facts.replay_ok && facts.same_day_snapshot_stored
+      ? 'same_day_snapshot'
+      : facts.account_verified && facts.replay_ok && facts.reconstruction_stored
+        ? 'ledger_reconstruction'
+        : 'none';
+  const blocks = raw && (riskBasis === 'explicit' || basis === 'none');
+  const reason: Reason | null = blocks
+    ? {
+        code: 'unreported_trade_risk',
+        detail: riskBasis === 'explicit'
+          ? '用户显式声明账户存在未上报交易风险：可执行数量依赖当前现金与份额，未上报成交可能已使其失效，因此只给示意。'
+          : '完整性声明缺失或未覆盖决策日，且账户可执行依据（真实账户 + 已存储快照/基线 + 成功重放）不成立：只给示意。',
+      }
+    : null;
+  const warnings: Reason[] = [];
+  if (raw) {
+    warnings.push({
+      code: 'unreported_trade_risk',
+      detail: '原始披露：账户存在未上报交易风险（声明缺失、声明滞后或用户显式承认），不能声称与券商实时一致。',
+    });
+  }
+  if (!blocks && riskBasis === 'undeclared') {
+    warnings.push({
+      code: 'account_completeness_undeclared',
+      detail: '没有完整性声明（reported_events_through 缺失）；已按可执行依据（真实账户 + 已存储快照/基线 + 成功重放）降为提醒。',
+    });
+  }
+  if (!blocks && (riskBasis === 'undeclared' || riskBasis === 'expired')) {
+    const through = facts.completeness?.reported_events_through ?? null;
+    warnings.push({
+      code: 'unreported_trade_lag_warning',
+      detail: through
+        ? `账本事件记录截止 ${through}，若期间有手工成交请补录后再核对委托数量。`
+        : '尚未声明账本完整性（reported_events_through 缺失），按可能存在未上报成交披露；请核对并补录后再依赖委托份数。',
+    });
+  }
+  return {
+    unreported_trade_risk: raw,
+    risk_basis: riskBasis,
+    blocks_execution: blocks,
+    execution_basis: basis,
+    reason,
+    warnings,
+    note: blocks
+      ? '完整性状态阻塞执行：显式风险声明始终阻塞；声明缺失/滞后仅在账户可执行依据不成立时阻塞。'
+      : raw
+        ? '完整性状态不阻塞执行：原始风险仍保留披露，可执行依据成立（真实账户 + 已存储快照/基线 + 成功重放）。'
+        : '完整性声明覆盖决策日且用户声明无未上报交易风险。',
+  };
+}
+
+/**
+ * 账户可执行状态的统一门控（R2 A1.5 / A1 跨日重建）。
+ *
+ * 可执行依据有两条，满足其一即可（两者都保留原有的安全条件）：
+ *
+ * 1. **同日确认快照**：传入快照就是账户库中已存储的当前快照（`is_current === true`）
+ *    且快照日期 == 决策日（0 天容忍）；
  * 2. **账本重建**（R2 A1）：以 `account_baseline + account_event` 重建决策日的状态，
  *    不要求用户每天刷新快照。必须同时满足：
  *    (a) 账户有 `account_baseline`；
@@ -663,9 +775,11 @@ export interface DecisionResult {
  *    (c) 决策日 >= baseline.as_of；
  *    (d) 账本里没有晚于决策日的事件（否则重建的"当日"状态会被未来事件污染）；
  *    (e) 决策日没有未交收卖出（现金口径无歧义）；
- *    (f) 完整性已披露（`account_completeness` 存在且 `as_of` 覆盖决策日）。
- *    通过时 `state_basis = 'ledger_reconstruction'`，并始终披露
- *    `unreported_trade_risk`（默认 true）。
+ *    (f) 账本重放成功且无未解决导入冲突。
+ *
+ * 完整性声明（`account_completeness`）不在这里硬阻塞：缺失/滞后由
+ * `effectiveDeclarationDisposition` 统一处置——可执行依据成立时降为警告，
+ * 用户显式声明 `unreported_trade_risk=true` 时仍阻塞执行。原始风险始终披露。
  *
  * 无论走哪条路径：
  * - 快照比决策日旧 → 只发 `account_snapshot_stale` **警告**（不硬阻塞），
@@ -705,8 +819,18 @@ export interface AccountStatusEvaluation {
   last_user_reconciled_at: string | null;
   /** 完整性声明本身的 as_of（缺失时为 null）。 */
   completeness_as_of: string | null;
-  /** 是否存在未上报交易风险（声明缺失时默认 true）。 */
+  /** 是否存在未上报交易风险（原始披露：声明缺失时默认 true）。 */
   unreported_trade_risk: boolean;
+  /** 真实性门控是否已确认（与 gate 区分：缺少基线时 gate 会降为 PENDING）。 */
+  account_verified: boolean;
+  /** 传入快照即账户库中已存储的当前快照（同日可执行路径）。 */
+  same_day_snapshot_stored: boolean;
+  /** 已存储基线 + 重放覆盖决策日 + 无未来事件（账本重建路径）。 */
+  reconstruction_stored: boolean;
+  /** 账本重放成功且无未解决导入冲突。 */
+  replay_ok: boolean;
+  /** 完整性声明的有效处置：原始风险披露与执行阻塞位分离。 */
+  declaration: EffectiveDeclarationDisposition;
   /**
    * 账本重放给出的可卖数量（R2 A4）。没有账本时为空对象，
    * 由调用方退回"只校验总持仓"的旧行为。
@@ -747,11 +871,16 @@ export function evaluateAccountStatus(
   let unreportedRisk = true;
   const sellable: AccountStatusEvaluation['sellable'] = {};
   const sameDay = /^\d{8}$/.test(snapshotYmd) && snapshotYmd === asOf;
+  let accountVerified = false;
+  let sameDaySnapshotStored = false;
+  let reconstructionStored = false;
+  let replayOk = false;
 
   if (!portfolioDb) {
     reasons.push({ code: 'account_gate_unavailable', detail: '未提供只读账户库，无法复核真实账户确认状态与研究证据' });
   } else {
     const evaluated = realAccountGate(portfolioDb, accountId);
+    accountVerified = evaluated.verified;
     gate = evaluated.verified ? 'VERIFIED' : 'PENDING';
     confirmedAt = evaluated.confirmed_at;
     completeness = readAccountCompleteness(portfolioDb, accountId) ?? null;
@@ -793,6 +922,9 @@ export function evaluateAccountStatus(
           code: 'account_snapshot_mismatch',
           detail: `传入快照 ${snapshot.snapshot_id} 不是账户库当前快照 ${storedCurrent.snapshot_id}，不能作为可执行依据`,
         });
+      } else if (snapshot.is_current === true) {
+        // 传入快照就是账户库中已存储的当前快照：同日可执行依据成立。
+        sameDaySnapshotStored = true;
       }
     } else if (storedCurrent && snapshotYmd > storedCurrent.as_of.replace(/-/g, '')) {
       // 快照比账户库当前快照还新：数据自相矛盾，不能只靠账本重建绕过。
@@ -813,8 +945,13 @@ export function evaluateAccountStatus(
         baselineAsOf = baseline.as_of;
         try {
           const replay = replayAccount(portfolioDb, accountId, { asOf, calendar: options.calendar });
+          replayOk = true;
           const validation = validateLedger(portfolioDb, accountId);
-          if (!validation.ok || validation.conflicts_recorded > 0) reasons.push({ code: 'account_reconstruction_unavailable', detail: 'Ledger has invariant violations or unresolved import conflicts; reconcile before execution' });
+          if (!validation.ok || validation.conflicts_recorded > 0) {
+            // 账本自相矛盾/存在未解决导入冲突：重放不可作为可执行依据。
+            replayOk = false;
+            reasons.push({ code: 'account_reconstruction_unavailable', detail: 'Ledger has invariant violations or unresolved import conflicts; reconcile before execution' });
+          }
           pendingSettlement = replay.cash.unsettled_cents;
           // A4：账本给出的可卖数量（T+1 排除决策日当日买入）。键统一归一化，
           // 避免事件里的代码写法与决策输入写法不同导致静默跳过校验。
@@ -851,15 +988,8 @@ export function evaluateAccountStatus(
               detail: `账户 ${accountId} 在 ${asOf} 仍有未交收卖出 ${(pendingSettlement / 100).toFixed(2)} 元，可用现金口径有歧义`,
             });
           }
-          // (f) 完整性披露：必须存在声明（用户至少要说明"核对到哪个时点"）。
-          //     声明是否覆盖决策日不再硬阻塞：未覆盖时按 unreported_trade_risk=true
-          //     处理，跨日估值仍可进行，只是不给可执行腿。
-          if (!completeness) {
-            reasons.push({
-              code: 'account_completeness_undeclared',
-              detail: `账户 ${accountId} 没有完整性声明（用户尚未确认已录入到哪个时点）`,
-            });
-          }
+          // (f) 完整性声明不再在这里硬阻塞：缺失/滞后由 effectiveDeclarationDisposition
+          //     统一处置——可执行依据成立时降为警告，否则由 disposition 的阻塞原因补入。
           // A2：同日确认快照存在时，必须与账本重放对账一致。
           if (sameDay) {
             reconciliation = reconcileAccountVsLedger(portfolioDb, accountId, snapshot);
@@ -872,6 +1002,8 @@ export function evaluateAccountStatus(
               });
             }
           }
+          // 账本重建路径的成立条件：决策日不早于基线、无未来事件、重放/校验成功。
+          reconstructionStored = reconstructionAsOf === asOf && !futureEvents && replayOk;
         } catch (error) {
           reasons.push({ code: 'account_gate_unavailable', detail: `账本重放失败：${(error as Error).message}` });
         }
@@ -894,12 +1026,30 @@ export function evaluateAccountStatus(
     });
   }
 
+  // 完整性声明的有效处置：原始风险披露与执行阻塞位分离（decision/report/scenario 同源）。
+  const declaration = effectiveDeclarationDisposition({
+    as_of: asOf,
+    completeness,
+    unreported_trade_risk: unreportedRisk,
+    account_verified: accountVerified,
+    same_day_snapshot_stored: sameDaySnapshotStored,
+    reconstruction_stored: reconstructionStored,
+    replay_ok: replayOk,
+  });
+  if (declaration.blocks_execution && declaration.risk_basis !== 'explicit') {
+    reasons.push({
+      code: 'account_completeness_undeclared',
+      detail: declaration.risk_basis === 'expired'
+        ? `账户 ${accountId} 的完整性声明未覆盖决策日 ${asOf}（已录入至 ${completeness?.reported_events_through ?? '未声明'}），且可执行依据不成立`
+        : `账户 ${accountId} 没有完整性声明（用户尚未确认已录入到哪个时点），且可执行依据不成立`,
+    });
+  }
+
   const hardCodes = new Set(reasons.map(r => r.code));
   const sameDayPath = sameDay && snapshot.is_current === true
     && !hardCodes.has('account_not_current') && !hardCodes.has('account_snapshot_mismatch');
   const reconstructionPath = reconstructionAsOf === asOf && !futureEvents && gate === 'VERIFIED'
-    && baselineAsOf !== null && !hardCodes.has('account_completeness_undeclared')
-    && !hardCodes.has('account_gate_unavailable');
+    && baselineAsOf !== null && !hardCodes.has('account_gate_unavailable');
   const stateBasis: AccountStatusEvaluation['state_basis'] = reasons.length > 0
     ? 'none'
     : sameDayPath ? 'same_day_snapshot'
@@ -924,12 +1074,22 @@ export function evaluateAccountStatus(
     last_user_reconciled_at: completeness?.last_user_reconciled_at ?? null,
     completeness_as_of: completeness?.as_of ?? null,
     unreported_trade_risk: unreportedRisk,
+    account_verified: accountVerified,
+    same_day_snapshot_stored: sameDaySnapshotStored,
+    reconstruction_stored: reconstructionStored,
+    replay_ok: replayOk,
+    declaration,
     sellable,
     warnings,
     note: stateBasis === 'ledger_reconstruction'
-      ? '可执行依据：账本按决策日重建（基线 + 事件）+ REAL_ACCOUNT_VERIFIED + 无未来事件 + 无未交收卖出 + 完整性已披露。'
-        + (unreportedRisk ? '仍存在未上报交易风险：不能声称与券商实时一致。' : '用户已声明无未上报交易。')
-      : '可执行要求：当日确认快照或账本重建 + REAL_ACCOUNT_VERIFIED + 无未交收卖出 + 完整性已披露。',
+      ? '可执行依据：账本按决策日重建（基线 + 事件）+ REAL_ACCOUNT_VERIFIED + 无未来事件 + 无未交收卖出 + 完整性声明已核实或已按有效处置降为提醒。'
+        + (declaration.blocks_execution
+          ? '完整性状态仍阻塞执行。'
+          : declaration.unreported_trade_risk ? '仍存在未上报交易风险（原始披露）：不能声称与券商实时一致。' : '用户已声明无未上报交易。')
+      : stateBasis === 'same_day_snapshot'
+        ? '可执行依据：账户库中已存储的当日当前快照 + REAL_ACCOUNT_VERIFIED + 无未交收卖出 + 完整性声明已核实或已按有效处置降为提醒。'
+          + (declaration.blocks_execution ? '完整性状态仍阻塞执行。' : declaration.unreported_trade_risk ? '仍存在未上报交易风险（原始披露）。' : '')
+        : '可执行要求：当日确认快照或账本重建 + REAL_ACCOUNT_VERIFIED + 无未交收卖出 + 完整性声明已核实或可执行依据成立。',
   };
 }
 
@@ -1208,6 +1368,7 @@ export function buildDecision(input: DecisionInput): DecisionResult {
     calendar: settlementCalendarOf(db),
   });
   const accountCurrent = accountStatus.is_current;
+  const declaration = accountStatus.declaration;
   const tradeRequested = input.action.type === 'SELL_AND_BUY' || input.action.type === 'REDUCE_EQUITY';
   if (tradeRequested) {
     for (const r of accountStatus.reasons) {
@@ -1217,18 +1378,14 @@ export function buildDecision(input: DecisionInput): DecisionResult {
   // 快照陈旧等只作为警告传给调用方，不阻塞账本重建的可执行路径。
   // warnings 输出约定是"无空格的原因码"，细节在 account_status 里完整保留。
   for (const w of accountStatus.warnings) warnings.push(w.code);
-  // 未上报交易风险：必须随结果一起披露，且不得声称与券商实时一致。
-  // 交易类表达额外降级为软性原因：可执行腿是对"当前现金/份额"的承诺，而未上报的
-  // 成交可能已经改变它们。研究/示意仍可计算，但 executable 必须为 false。
-  if (accountStatus.unreported_trade_risk) {
-    warnings.push('unreported_trade_risk');
-    if (tradeRequested) {
-      reasons.push({
-        code: 'unreported_trade_risk',
-        detail: '账户存在未上报交易的风险（完整性声明未覆盖决策日或声明为存在风险）：'
-          + '可执行数量依赖当前现金与份额，未上报成交可能已使其失效，因此只给示意。',
-      });
-    }
+  // 原始未上报交易风险与降级披露一律保留；是否阻塞执行由共享有效处置决定。
+  for (const w of declaration.warnings) {
+    if (!warnings.includes(w.code)) warnings.push(w.code);
+  }
+  // 有效处置阻塞时，交易类表达降级为软性原因：可执行腿是对"当前现金/份额"的承诺，
+  // 而未上报的成交可能已经改变它们。研究/示意仍可计算，但 executable 必须为 false。
+  if (declaration.blocks_execution && declaration.reason && tradeRequested) {
+    if (!reasons.some(x => x.code === declaration.reason!.code)) reasons.push(declaration.reason);
   }
 
   const before = buildState(input, quotes);
@@ -1253,18 +1410,25 @@ export function buildDecision(input: DecisionInput): DecisionResult {
   options.push(hold);
 
   const reduceSpec = reduceLegOf(input);
-  // 未上报交易风险必须进入**选项级**原因，否则选项自己算出的状态仍会是 ACTIONABLE
-  // （顶层 reasons 只影响主请求状态，不影响单个选项的 executable）。
-  const accountIssuesForOptions: Reason[] = accountStatus.reasons.slice();
-  if (tradeRequested && accountStatus.unreported_trade_risk) {
-    accountIssuesForOptions.push({
-      code: 'unreported_trade_risk',
-      detail: '账户存在未上报交易的风险：可执行数量依赖当前现金与份额，未上报成交可能已使其失效，因此只给示意。',
-    });
+  // 账户/完整性原因必须进入**实际带交易腿的选项**，否则选项自己算出的状态仍会是
+  // ACTIONABLE（顶层 reasons 只影响主请求状态，不影响单个选项的 executable）。
+  // 注意：HOLD 请求附带的 reduce 对照腿同样是交易腿，不能只看顶层 tradeRequested。
+  const accountIssuesForTrade: Reason[] = accountStatus.reasons.slice();
+  if (declaration.blocks_execution && declaration.reason
+      && !accountIssuesForTrade.some(x => x.code === declaration.reason!.code)) {
+    accountIssuesForTrade.push(declaration.reason);
   }
-  options.push(optionReduce(before, reduceSpec, quotes, resolveFor, asOf, stressRules, fees, lots, stockRules, accountIssuesForOptions, tradingDayOk, accountStatus, feeFor));
+  const reduceHasTradeIntent = reduceSpec !== null;
+  const rotateHasTradeIntent = input.action.type === 'SELL_AND_BUY';
+  options.push(optionReduce(
+    before, reduceSpec, quotes, resolveFor, asOf, stressRules, fees, lots, stockRules,
+    reduceHasTradeIntent ? accountIssuesForTrade : [], tradingDayOk, accountStatus, feeFor,
+  ));
 
-  const rotate = optionRotate(input, before, quotes, resolveFor, asOf, stressRules, fees, lots, stockRules, accountIssuesForOptions, tradingDayOk, evidence, accountStatus, feeFor);
+  const rotate = optionRotate(
+    input, before, quotes, resolveFor, asOf, stressRules, fees, lots, stockRules,
+    rotateHasTradeIntent ? accountIssuesForTrade : [], tradingDayOk, evidence, accountStatus, feeFor,
+  );
   options.push(rotate);
 
   options.push(optionNoAction(before, input.action.type === 'NO_ACTION' ? (input.action.reason ?? '调用方选择不操作') : '保留现金与现有持仓，不产生交易', stressRules, fees));
@@ -1626,7 +1790,8 @@ function decisionTracksOf(
   // 快照过期）按既有语义不阻塞可执行，门控也不得阻塞，保持与 executable 同口径。
   const accountCodes = [
     ...accountStatus.reasons.map(r => r.code),
-    ...(accountStatus.unreported_trade_risk ? ['unreported_trade_risk'] : []),
+    // 只有有效处置阻塞时才进入风险轨；原始风险披露不改变门控结论。
+    ...(accountStatus.declaration.blocks_execution ? ['unreported_trade_risk'] : []),
   ];
   const optionHard = codes.filter(code => HARD_GATE_REASON_CODES.has(code) || ACCOUNT_GATE_REASON_CODES.has(code));
   const blocked = [...new Set([
@@ -2028,6 +2193,14 @@ function decisionId(
       pending_settlement_cents: accountStatus.pending_settlement_cents,
       state_basis: accountStatus.state_basis,
       unreported_trade_risk: accountStatus.unreported_trade_risk,
+      // 有效处置：显式声明风险与同日推断滞后都是 raw=true，但执行含义不同，
+      // 必须进入哈希，避免同一 decision_id 对应两种执行门控。
+      declaration: {
+        unreported_trade_risk: accountStatus.declaration.unreported_trade_risk,
+        risk_basis: accountStatus.declaration.risk_basis,
+        blocks_execution: accountStatus.declaration.blocks_execution,
+        execution_basis: accountStatus.declaration.execution_basis,
+      },
       completeness_as_of: accountStatus.completeness_as_of,
       reconciliation_ok: accountStatus.reconciliation ? accountStatus.reconciliation.ok : null,
     },

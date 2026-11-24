@@ -324,14 +324,71 @@ test('日报门控：已确认账户+当前快照但从未声明完整性只进 
     assert.equal(report.gate.satisfied, true, `缺少完整性声明不得阻断可执行：${JSON.stringify(report.gate)}`);
     assert.ok(report.gate.warnings.some(w => w.code === 'account_completeness_undeclared'), '缺少声明应进入 warnings');
     assert.ok(report.gate.warnings.some(w => w.code === 'unreported_trade_lag_warning'), '未报成交风险提示必须保留');
+    // 原始风险与执行阻塞位分离：日报与 decision.ts 使用同一有效处置。
+    assert.equal(report.gate.unreported_trade_risk, true);
+    assert.equal(report.gate.declaration.unreported_trade_risk, true);
+    assert.equal(report.gate.declaration.risk_basis, 'undeclared');
+    assert.equal(report.gate.declaration.blocks_execution, false);
+    assert.equal(report.gate.declaration.execution_basis, 'ledger_reconstruction');
     assert.equal(report.status, 'ACTIONABLE');
     assert.ok(
       report.first_section.actions.some(action => action.legs.some(leg => leg.executable === true)),
       '至少一条执行腿必须可执行',
     );
+    // 风险轨不得因原始风险披露而列入 blocked_by。
+    for (const option of report.decision_comparison.options) {
+      assert.equal(option.risk_track.blocked_by.includes('unreported_trade_risk'), false,
+        `${option.action} 风险轨不得因原始风险阻塞：${JSON.stringify(option.risk_track.blocked_by)}`);
+    }
     const anchor = pDb.prepare('SELECT hwm_nav_cents FROM account_risk_anchor WHERE account_id = ?').get(acc);
     assert.ok(anchor, 'V3 高水位锚点必须持久化');
     assert.ok(anchor.hwm_nav_cents > 0);
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('日报门控：完整性声明滞后到基线日（asOf 前一交易日）只作 warnings，执行腿保持可执行', () => {
+  const mDb = seedMarket('declared-lag');
+  const pDb = openPortfolioDb(join(dir, 'declared-lag-portfolio.sqlite'), { marketPath: join(dir, 'declared-lag-market.sqlite') });
+  const acc = 'real-declared-lag';
+  try {
+    const pos = [{ ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 20_000, ref_price_milli: 900, ref_cost_milli: 900, market_value_cents: 1_800_000 }];
+    importSnapshot(pDb, snapshotData({ id: 'snap-declared-lag-d0', asOf: D0, positions: pos, cashCents: 8_200_000 }));
+    initBaseline(pDb, acc, { asOf: D0, snapshotId: 'snap-declared-lag-d0' });
+    markSnapshotCurrent(pDb, 'snap-declared-lag-d0', { confirmedBy: 'test' });
+    confirmRealAccount(pDb, acc, { confirm: true, note: 'test' });
+    // 同日推断滞后：声明存在且用户声明无未上报风险，但只覆盖到 D0，目标日 D1 未被核对。
+    setAccountCompleteness(pDb, acc, {
+      as_of: D0, reported_events_through: D0, unreported_trade_risk: false,
+    }, { confirm: true, recordedBy: 'test' });
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${acc}`, '10000000');
+
+    const report = buildDailyReport({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: acc,
+      snapshotId: 'snap-declared-lag-d0',
+      asOfTradeDate: D1,
+    });
+    assert.equal(report.gate.satisfied, true, `声明滞后不得硬阻塞：${JSON.stringify(report.gate)}`);
+    assert.equal(report.gate.unreported_trade_risk, true, '原始披露保留');
+    assert.equal(report.gate.declaration.risk_basis, 'expired');
+    assert.equal(report.gate.declaration.blocks_execution, false);
+    assert.equal(report.gate.declaration.execution_basis, 'ledger_reconstruction');
+    assert.ok(report.gate.warnings.some(w => w.code === 'unreported_trade_lag_warning'));
+    assert.equal(report.gate.warnings.some(w => w.code === 'account_completeness_undeclared'), false,
+      '已有声明时不得冒充“未声明”');
+    assert.equal(report.gate.reasons.some(r => r.code === 'unreported_trade_risk'), false,
+      JSON.stringify(report.gate.reasons));
+    assert.equal(report.status, 'ACTIONABLE');
+    assert.ok(report.first_section.actions.some(action => action.legs.some(leg => leg.executable === true)),
+      '可执行依据成立时执行腿必须可执行');
+    for (const option of report.decision_comparison.options) {
+      assert.equal(option.risk_track.blocked_by.includes('unreported_trade_risk'), false,
+        `${option.action} 风险轨不得因声明滞后阻塞：${JSON.stringify(option.risk_track.blocked_by)}`);
+    }
   } finally {
     pDb.close();
     mDb.close();
