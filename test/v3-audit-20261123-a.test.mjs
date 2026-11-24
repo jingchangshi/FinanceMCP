@@ -21,8 +21,8 @@ const { weekdays } = await import('./ashare-fixture.mjs');
 
 const ACC = 'audit-a';
 
-function seedDaily(db, tsCode, days, closes, adjFactors = null) {
-  upsertRows(db, 'daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
+function seedDaily(db, tsCode, days, closes, adjFactors = null, priceTable = 'daily') {
+  upsertRows(db, priceTable, ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
     days.map((trade_date, i) => {
       const close = closes[i];
       const prev = i > 0 ? closes[i - 1] : close;
@@ -123,11 +123,11 @@ test('P0-1 re-buy after CLOSED must not resurrect a ghost high stop', () => {
     assert.deepEqual(sellsFor(first, '600036.SH'), [], '重新买入价 30.00 不得被旧的 50.00 幽灵止损触发');
     let row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
     assert.equal(row.status, 'OPEN');
+    assert.equal(row.entry_adj_factor, null, '无真实 as-of 因子时不得写入 1 冒充');
     assert.equal(row.entry_price_milli, 30000);
     assert.equal(row.initial_stop_milli, 27600);
     assert.equal(row.current_stop_milli, 27600, 'CLOSED 行必须整体重置，而不是 MAX 保留 50000');
     assert.equal(row.trailing_ma20_armed, 0);
-    assert.equal(row.entry_adj_factor, 1);
 
     const second = runEngine({ pDb, mDb, asOf: next, holdings: [holding('600036.SH', 30500, 30000)] });
     assert.deepEqual(sellsFor(second, '600036.SH'), [], '次日 30.50 仍远高于新止损 27.60');
@@ -302,6 +302,64 @@ test('P0-1 ETF legacy tracker uses fund_adj, never the stock adj_factor table', 
   }
 });
 
+test('P0-1 new tracker without a real as-of factor keeps NULL and does not scale', () => {
+  const { mDb, pDb } = openDbPair('no-factor-new');
+  try {
+    const days = weekdays('20260901', 12);
+    const asOf = days[10];
+    seedDaily(mDb, '600036.SH', days, days.map(() => 10.0)); // 无 adj_factor 行
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 10000, 10000)] });
+    assert.deepEqual(sellsFor(out, '600036.SH'), []);
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.entry_adj_factor, null, '无真实因子时不得写入 1');
+    assert.equal(row.entry_price_milli, 10000);
+    assert.equal(row.current_stop_milli, 9200, '无因子时按原始价建仓，止损 8%');
+    assert.equal(row.status, 'OPEN');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-1 new tracker records a real as-of factor instead of defaulting to 1', () => {
+  const { mDb, pDb } = openDbPair('real-factor-new');
+  try {
+    const days = weekdays('20260901', 12);
+    const asOf = days[10];
+    seedDaily(mDb, '600036.SH', days, days.map(() => 10.0), days.map(() => 2));
+    runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 10000, 10000)] });
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.entry_adj_factor, 2, '必须记录真实的 as-of 因子 2');
+    assert.equal(row.current_stop_milli, 9200);
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-1 missing current factor skips scaling even with a stored entry factor', () => {
+  const { mDb, pDb } = openDbPair('no-current-factor');
+  try {
+    const days = weekdays('20260901', 12);
+    const asOf = days[10];
+    seedDaily(mDb, '600036.SH', days, days.map(() => 9.9)); // 无 adj_factor 行
+    setTracker(pDb, {
+      ts_code: '600036.SH', entry_price_milli: 10000, initial_stop_milli: 9200,
+      current_stop_milli: 10000, trailing_ma20_armed: 1, entry_adj_factor: 1,
+      status: 'OPEN', entry_date: days[0],
+    });
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 9900, 10000)] });
+    assert.equal(sellsFor(out, '600036.SH').length, 1, '缺少 current 因子时按 entry 基准原始价比较');
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.entry_adj_factor, 1, '已记录的真实 entry 因子保持不变');
+    assert.equal(row.current_stop_milli, 10000);
+    assert.equal(row.status, 'OPEN');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
 test('P0-1 an ordinary open position still exits on the MA20 trail', () => {
   const { mDb, pDb } = openDbPair('trail');
   try {
@@ -377,12 +435,44 @@ test('P0-2 stock above MA20 holds without arming', () => {
   }
 });
 
+test('P0-2 ETF MA20 uses fund_adj/fund_daily: a dividend must not create a false breakdown', () => {
+  const { mDb, pDb } = openDbPair('etf-ma20-div');
+  try {
+    const days = weekdays('20260901', 25);
+    const asOf = days.at(-1);
+    const divIdx = 20;
+    // 除息前 1.00；除息后 0.97，末日 0.975（真实 fund_daily 行情）。
+    const closes = days.map((_, i) => (i < divIdx ? 1.0 : i === days.length - 1 ? 0.975 : 0.97));
+    seedDaily(mDb, '159558.SZ', days, closes, null, 'fund_daily');
+    // 对照陷阱：若误用股票 daily 或 adj_factor，未复权 MA20 会把 0.975 判为跌破。
+    seedDaily(mDb, '159558.SZ', days, days.map(() => 1.0));
+    upsertRows(mDb, 'adj_factor', ['ts_code', 'trade_date', 'adj_factor'],
+      days.map(trade_date => ({ ts_code: '159558.SZ', trade_date, adj_factor: 1 })));
+    // 分红复权：除息日起 fund_adj = 前收/除息价 = 1/0.97。
+    upsertRows(mDb, 'fund_adj', ['ts_code', 'trade_date', 'adj_factor'],
+      days.map((trade_date, i) => ({ ts_code: '159558.SZ', trade_date, adj_factor: i < divIdx ? 1 : 1 / 0.97 })));
+    setTracker(pDb, {
+      ts_code: '159558.SZ', entry_price_milli: 1000, initial_stop_milli: 920,
+      current_stop_milli: 1000, trailing_ma20_armed: 1, entry_adj_factor: 1,
+      status: 'OPEN', entry_date: days[0],
+    });
+
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('159558.SZ', 975, 1000, '半导体设备ETF')] });
+    assert.deepEqual(sellsFor(out, '159558.SZ'), [], 'ETF 分红后原始价 0.975 不得被未复权 MA20 假跌破');
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '159558.SZ');
+    assert.equal(row.status, 'OPEN');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
 test('P0-2 ETF tracker rows keep the armed-only MA20 semantics', () => {
   const { mDb, pDb } = openDbPair('ma20-etf');
   try {
     const days = weekdays('20260901', 25);
     const asOf = days.at(-1);
-    seedDaily(mDb, '159558.SZ', days, days.map(() => 0.85));
+    seedDaily(mDb, '159558.SZ', days, days.map(() => 0.85), null, 'fund_daily');
     setTracker(pDb, {
       ts_code: '159558.SZ', entry_price_milli: 850, initial_stop_milli: 782,
       current_stop_milli: 782, trailing_ma20_armed: 0, entry_adj_factor: 1,

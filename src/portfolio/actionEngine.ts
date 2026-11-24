@@ -238,6 +238,7 @@ export function sizeStockSwingOrder(input: StockSwingOrderInput): StockSwingOrde
 }
 
 type AdjTable = 'adj_factor' | 'fund_adj';
+type PriceTable = 'daily' | 'fund_daily';
 
 /** 读取 asOf 当日或之前最后一个复权因子（carry-forward）；缺失/不可用时返回 null。 */
 function adjFactorAt(
@@ -254,32 +255,26 @@ function adjFactorAt(
   return Number.isFinite(factor) && factor > 0 ? factor : null;
 }
 
-/** 股票复权因子（缺失按 1 处理）；ETF 走 fund_adj，见 adjFactorAt。 */
-function lastAdjFactorAt(
+/** 前复权 MA20：股票用 daily/adj_factor，ETF 用 fund_daily/fund_adj。 */
+function computeMa20Milli(
   marketDb: DatabaseSync | null | undefined,
   tsCode: string,
   asOf: string,
-): number {
-  return adjFactorAt(marketDb, tsCode, asOf, 'adj_factor') ?? 1;
-}
-
-function stockMa20Milli(
-  marketDb: DatabaseSync | null | undefined,
-  tsCode: string,
-  asOf: string,
+  priceTable: PriceTable,
+  adjTable: AdjTable,
 ): number | null {
-  if (!marketDb || !portfolioTableExists(marketDb, 'daily')) return null;
+  if (!marketDb || !portfolioTableExists(marketDb, priceTable)) return null;
   const bars = (marketDb.prepare(
-    'SELECT trade_date, close FROM daily WHERE ts_code = ? AND trade_date <= ? AND close > 0 ORDER BY trade_date DESC LIMIT 25',
+    `SELECT trade_date, close FROM ${priceTable} WHERE ts_code = ? AND trade_date <= ? AND close > 0 ORDER BY trade_date DESC LIMIT 25`,
   ).all(tsCode, asOf) as { trade_date: string; close: number }[]).reverse();
   if (bars.length < 20) return null;
   const adjMap = new Map<string, number>();
-  let carry = lastAdjFactorAt(marketDb, tsCode, bars[0].trade_date);
-  if (portfolioTableExists(marketDb, 'adj_factor')) {
-    // carry 已从窗口首日或之前的真实因子起步，避免把窗口前的除权基准当作 1
-    // 而扭曲前复权均线。
+  // carry 从窗口首日或之前的真实因子起步（缺失按 1），避免把窗口前的除权基准
+  // 当作 1 而扭曲前复权均线。
+  let carry = adjFactorAt(marketDb, tsCode, bars[0].trade_date, adjTable) ?? 1;
+  if (portfolioTableExists(marketDb, adjTable)) {
     const adjRows = marketDb.prepare(
-      'SELECT trade_date, adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date BETWEEN ? AND ? ORDER BY trade_date ASC',
+      `SELECT trade_date, adj_factor FROM ${adjTable} WHERE ts_code = ? AND trade_date BETWEEN ? AND ? ORDER BY trade_date ASC`,
     ).all(tsCode, bars[0].trade_date, asOf) as { trade_date: string; adj_factor: number }[];
     for (const row of adjRows) if (Number(row.adj_factor) > 0) adjMap.set(String(row.trade_date), Number(row.adj_factor));
   }
@@ -730,13 +725,16 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     // adj_factor 上升而原始价下跌，因此历史价的 asOf 原始口径等价价 =
     // stored × entryAdj / currentAdj（Tushare hfq 因子口径）。绝不对 h.price_milli 缩放。
     // 旧 OPEN 行缺 entry 基准时回查 entry_date 的真实因子（股票 adj_factor / ETF fund_adj）；
-    // 仍查不到则不缩放并保持 NULL，绝不写 currentAdj 冒充。
+    // 查不到则保持 NULL。只有 entry 与 as-of 两个真实因子齐备时才缩放；缺失任一侧
+    // 一律跳过比值（不缩放、不写 1 冒充）。
     const adjTable: AdjTable = isStock ? 'adj_factor' : 'fund_adj';
-    const currentAdj = adjFactorAt(input.marketDb, h.ts_code, input.asOf, adjTable) ?? 1;
+    const currentAdj = adjFactorAt(input.marketDb, h.ts_code, input.asOf, adjTable);
     const entryAdj = continuing
       ? (tracked!.entry_adj_factor ?? adjFactorAt(input.marketDb, h.ts_code, tracked!.entry_date, adjTable))
       : currentAdj;
-    const basisRatio = entryAdj !== null && entryAdj > 0 ? entryAdj / currentAdj : 1;
+    const basisRatio = entryAdj !== null && currentAdj !== null && entryAdj > 0 && currentAdj > 0
+      ? entryAdj / currentAdj
+      : 1;
     const scaledEntryMilli = Math.round(entryMilli * basisRatio);
     let scaledCurrentStopMilli = Math.round(currentStopMilli * basisRatio);
 
@@ -746,7 +744,11 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       scaledCurrentStopMilli = Math.round(currentStopMilli * basisRatio);
     }
 
-    const ma20Milli = stockMa20Milli(input.marketDb, h.ts_code, input.asOf);
+    const ma20Milli = computeMa20Milli(
+      input.marketDb, h.ts_code, input.asOf,
+      isStock ? 'daily' : 'fund_daily',
+      isStock ? 'adj_factor' : 'fund_adj',
+    );
     const hardStopHit = h.price_milli <= scaledCurrentStopMilli;
     // EXP-V3-02（research/ashare/experiments/exp_v3_02_stock_swing_rqalpha.py）：
     // 个股在硬止损之后，收盘价 < MA20 即无条件离场，不依赖 +15% 武装；ETF tracker
