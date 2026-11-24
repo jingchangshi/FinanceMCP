@@ -4,6 +4,7 @@ import {
   type MarketRegimeResult,
   type MarketRegimeTier,
 } from '../ashare/marketRegime.js';
+import { readSnapshot } from './account.js';
 import { portfolioTableExists } from './db.js';
 import { buildNavSeries, readBaseline } from './ledger.js';
 import { buildLedgerPriceTable } from './riskPolicy.js';
@@ -236,7 +237,13 @@ function readSameDayNetExternalFlowCents(
 
 /**
  * 读取指定日期的真实可投资资产（现金+证券）市值，用于把迁移前的 TOTAL 旧锚点按
- * “峰日真实基准”迁移。缺少基线、目标日无有效估值时返回 null（不猜、不用今日比例）。
+ * “峰日真实基准”迁移。
+ *
+ * 只有**精确证据**才允许迁移：
+ * - 峰日估值点 `confidence === 'exact'`（每个持仓当日都有真实价格）；或
+ * - 峰日正好是账本基线快照日（用户导入的同日账户快照，可独立核实）。
+ * `carried_forward`（沿用前日价）/`cost_fallback`（成本估价）/`no_price` 一律视为估计：
+ * 返回 null，让调用方复用 TOTAL fallback，不改峰、不持久化估计值。
  */
 function readInvestableValueAt(
   portfolioDb: DatabaseSync | null | undefined,
@@ -248,10 +255,20 @@ function readInvestableValueAt(
   try {
     const baseline = readBaseline(portfolioDb, accountId);
     if (!baseline || baseline.as_of > date) return null;
+    // 峰日就是基线快照日：基线快照的现金+证券是用户导入的同日真实账户状态。
+    if (baseline.as_of === date && baseline.snapshot_id) {
+      const snapshot = readSnapshot(portfolioDb, baseline.snapshot_id);
+      if (snapshot) {
+        const investable = snapshot.totals.securities_mv_cents + snapshot.totals.cash_cents;
+        if (Number.isSafeInteger(investable) && investable > 0) return investable;
+      }
+    }
     const prices = buildLedgerPriceTable(portfolioDb, marketDb ?? null, accountId, baseline.as_of, date);
     const series = buildNavSeries(portfolioDb, accountId, { from: date, to: date, prices });
     const point = series.points.find(item => item.date === date);
     if (!point || point.nav_per_unit === null) return null;
+    // carried_forward / cost_fallback 也是非空 NAV，但它们是估计值，不能永久标成峰值。
+    if (point.confidence !== 'exact') return null;
     return Number.isSafeInteger(point.total_value_cents) && point.total_value_cents > 0
       ? point.total_value_cents
       : null;
