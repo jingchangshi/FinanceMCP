@@ -105,11 +105,15 @@ function memberView(row: StockRow, verdicts: Map<string, SignalVerdict>, extra: 
   };
 }
 
-function marketJudgement(regime: Regime | undefined, breadth: ReturnType<typeof marketBreadth>, pctMa20: number, pctMa60: number, indices: ReturnType<typeof indexPerformance>) {
+function marketJudgement(regime: Regime | undefined, breadth: ReturnType<typeof marketBreadth>, pctMa20: number | null, pctMa60: number | null, indices: ReturnType<typeof indexPerformance>) {
   const points: string[] = [];
   if (regime) points.push(`市场趋势状态（沪深300）：${REGIME_LABELS[regime]}；仅按沪深300收盘相对 MA60 与 MA20 相对五个交易日前的斜率判定，上升需收盘高于 MA60 且 MA20 上行，下降需收盘低于 MA60 且 MA20 不上行，其余为震荡。`);
   points.push(`全市场当日有日线记录的 ${breadth.stocks} 只股票中，上涨 ${breadth.up} 家 / 下跌 ${breadth.down} 家（上涨占比 ${(breadth.up_ratio * 100).toFixed(1)}%），涨停 ${breadth.limit_up}、跌停 ${breadth.limit_down}；停牌或当日无行情股票不在此分母内。`);
-  points.push(`扫描股票中站上 MA20 的占比 ${(pctMa20 * 100).toFixed(1)}%，站上 MA60 占比 ${(pctMa60 * 100).toFixed(1)}%；这是技术广度，分母与全市场上涨占比不同。`);
+  if (pctMa20 !== null && pctMa60 !== null) {
+    points.push(`扫描股票中站上 MA20 的占比 ${(pctMa20 * 100).toFixed(1)}%，站上 MA60 占比 ${(pctMa60 * 100).toFixed(1)}%；这是技术广度，分母与全市场上涨占比不同。`);
+  } else {
+    points.push('扫描股票缺少有效的 MA20/MA60 序列，站上均线占比不可用（未知，不按 0% 处理）。');
+  }
   if (breadth.amount_ma20_yi) {
     const ratio = breadth.amount_yi / breadth.amount_ma20_yi;
     points.push(`全市场当日成交额 ${breadth.amount_yi.toFixed(0)} 亿，相对前 20 个交易日（不含当日）日成交额均值为 ${(ratio * 100).toFixed(0)}%（${ratio > 1.1 ? '高于均值' : ratio < 0.9 ? '低于均值' : '接近均值'}）。`);
@@ -124,8 +128,9 @@ function marketJudgement(regime: Regime | undefined, breadth: ReturnType<typeof 
     points.push(`近 20 日中证1000 相对沪深300 ${diff >= 0 ? '强' : '弱'} ${Math.abs(diff).toFixed(1)} 个百分点（指数相对收益，不参与上述市场宽度或成交额判定）。`);
   }
   let tone: 'risk_on' | 'neutral' | 'risk_off' = 'neutral';
-  if (breadth.up_ratio >= 0.6 && pctMa20 >= 0.5) tone = 'risk_on';
-  else if (breadth.up_ratio <= 0.35 && pctMa20 <= 0.4) tone = 'risk_off';
+  // Unknown breadth never implies risk_off: only known values can set the tone.
+  if (pctMa20 !== null && breadth.up_ratio >= 0.6 && pctMa20 >= 0.5) tone = 'risk_on';
+  else if (pctMa20 !== null && breadth.up_ratio <= 0.35 && pctMa20 <= 0.4) tone = 'risk_off';
   points.push(`市场情绪 tone=${tone}：risk_on 要求全市场上涨占比 ≥60% 且扫描股票站上 MA20 占比 ≥50%；risk_off 要求分别 ≤35% 与 ≤40%；其他情况为 neutral。`);
   return { tone, points };
 }
@@ -265,7 +270,11 @@ export function generateReport(db: DatabaseSync, date: string, mode: RunMode = '
       indices,
       breadth_scope: 'up/down/flat、涨跌停和成交额覆盖当日 daily 表中有市场行记录的全市场股票；MA20/MA60 技术广度来自 scanMarket 扫描股票。没有当日市场行的停牌或缺行情股票不在日线宽度分母中。',
       volume_scope: '全市场成交额由当日有行情记录的股票 daily.amount 求和；20日基准为前20个交易日（不含当日）的日成交额均值，环比为前一交易日基准。',
-      breadth: { ...breadth, pct_above_ma20: r2(scan.pct_above_ma20 * 100, 1), pct_above_ma60: r2(scan.pct_above_ma60 * 100, 1) },
+      breadth: {
+        ...breadth,
+        pct_above_ma20: scan.pct_above_ma20 === null ? null : r2(scan.pct_above_ma20 * 100, 1),
+        pct_above_ma60: scan.pct_above_ma60 === null ? null : r2(scan.pct_above_ma60 * 100, 1),
+      },
       suspended_or_missing: scan.suspended_or_missing,
     },
     sectors: {

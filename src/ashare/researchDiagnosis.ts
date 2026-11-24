@@ -162,10 +162,11 @@ function share(values: number[]): number | null {
 function diagnoseMarketState(scan: MarketScan, cohortCount: number, required: number): DiagnosisClaim[] {
   const claims: DiagnosisClaim[] = [];
   const breadth = scan.pct_above_ma20;
+  const pctText = (v: number | null) => (v === null ? '不可用（无有效均线）' : `${pct(v)}%`);
   claims.push({
     tier: 'OBSERVED_FACT',
     dimension: 'market_state',
-    statement: `截至 ${scan.trade_date}，可交易股票中 ${pct(breadth)}% 站在 MA20 上方，${pct(scan.pct_above_ma60)}% 站在 MA60 上方。`,
+    statement: `截至 ${scan.trade_date}，可交易股票中 ${pctText(breadth)} 站在 MA20 上方，${pctText(scan.pct_above_ma60)} 站在 MA60 上方。`,
     evidence: { pct_above_ma20: breadth, pct_above_ma60: scan.pct_above_ma60, stocks_scanned: scan.rows.length },
   });
   const sectorStrength = scan.sectors.map(s => s.strength).filter(finite);

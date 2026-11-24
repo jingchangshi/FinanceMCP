@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { checkQuality, previousTradeDay, type QualityStatus } from './ingest.js';
+import { checkQuality, previousTradeDay, PRICE_DEFECT_SQL, type QualityStatus } from './ingest.js';
 import { resolveDataProviderMode } from './providers/types.js';
 
 /**
@@ -90,6 +90,21 @@ function countOn(db: DatabaseSync, table: string, date: string): number {
 
 /** Floor for a same-day page relative to the previous trading day / the daily universe. */
 const COVERAGE_FLOOR = 0.97;
+
+/**
+ * Up to this many symbols with unusable price fields are treated as isolated defects: they are
+ * excluded by symbol and disclosed, not a reason to refuse the day. More than this (or ~0.1% of
+ * a 5,500-name market) is a market-level data failure and blocks the snapshot.
+ */
+const ISOLATED_PRICE_DEFECT_LIMIT = 5;
+
+function priceDefectSymbolsOn(db: DatabaseSync, date: string): string[] {
+  if (!tableExists(db, 'daily')) return [];
+  try {
+    return (db.prepare(`SELECT ts_code FROM daily WHERE trade_date = ? AND ${PRICE_DEFECT_SQL} ORDER BY ts_code`)
+      .all(date) as { ts_code: string }[]).map(r => r.ts_code);
+  } catch { return []; }
+}
 
 /**
  * Rows of `dataset` on `date` that actually carry a usable value for the daily bars that exist
@@ -219,29 +234,22 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
   const quality_ready = quality.status === 'READY';
   const financials_synced_today = financialsSyncedToday(db, asOf);
 
-  // The pool is ranked from these four datasets, and they are keyed per stock:
-  // if one of them covers fewer names than `daily`, the ranking inputs are
-  // partial even though the day exists. `listed` is deliberately NOT the
-  // yardstick — on real production data it is 5577 while `daily` is 5571
-  // (halts, new listings), so gating on it would refuse every real day.
+  // Auxiliary datasets (daily_basic / adj_factor / stk_limit) cover fewer names than `daily`.
+  // That degrades ranking inputs, but the price bars themselves are intact: DISCLOSE it instead
+  // of refusing the day. `listed` is deliberately NOT the yardstick — on real production data it
+  // is 5577 while `daily` is 5571 (halts, new listings), so gating on it would refuse every day.
   const counts = {
     daily, daily_basic: quality.counts.daily_basic ?? 0,
     adj_factor: quality.counts.adj_factor ?? 0, stk_limit: quality.counts.stk_limit ?? 0,
   };
-  const short = Object.entries(counts).filter(([k, n]) => k !== 'daily' && n < daily).map(([k, n]) => `${k}=${n}`);
-  if (short.length) {
-    return {
-      status: 'NOT_READY',
-      checks: { bars_present, quality_ready, financials_synced_today },
-      reason: `bar datasets incomplete for ${asOf} (daily=${daily}): ${short.join(', ')}`,
-    };
-  }
+  const auxiliaryGaps = Object.entries(counts)
+    .filter(([k, n]) => k !== 'daily' && n < daily)
+    .map(([k, n]) => `${k}=${n} < daily=${daily}（辅助数据不足，按数据质量警告披露，不阻断日报）`);
 
   // Free mode writes daily_basic/adj_factor rows 1:1 with daily — the historical backfill path
   // writes every valuation field as NULL — so a row-count check passes on an empty sheet.
-  // Measure usable values and DISCLOSE the gap: a missing valuation column degrades the ranking,
-  // but blocking the whole day's report for it is unnecessary defense (MASTER_PLAN_V3). DEGRADED
-  // still publishes and carries this reason in `data_state.readiness`.
+  // Measure usable values and DISCLOSE the gap (same rationale as above). DEGRADED still
+  // publishes and carries this reason in `data_state.readiness`.
   const freeCoverageIssues: string[] = [];
   if (resolveDataProviderMode() === 'free') {
     const floor = Math.ceil(daily * COVERAGE_FLOOR);
@@ -255,15 +263,18 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
     }
   }
 
-  // Missing bar evidence is not a degradation to disclose: a short page, an invalid close or a
-  // NULL OHLC means the day's prices cannot be trusted. `checkQuality` already calls these
-  // NOT_READY in its own cache status; readiness must not downgrade that to DEGRADED.
+  // Price-field defects: an isolated bad close/NULL OHLC is excluded by symbol (scanMarket keeps
+  // it out of breadth and suppresses its signals) and disclosed; only a market-level share of
+  // broken bars means the day's prices cannot be trusted. A short same-day page is likewise a
+  // market-level gap. `checkQuality` already marks these NOT_READY in its own cache status.
+  const badPriceSymbols = priceDefectSymbolsOn(db, asOf);
   const hardDefects: string[] = [];
   if ((quality.counts.prev_daily ?? 0) > 0 && quality.coverage.daily_vs_prev < COVERAGE_FLOOR) {
     hardDefects.push(`daily=${daily} 低于前一交易日 ${quality.counts.prev_daily} 的 97%`);
   }
-  if ((quality.anomalies.bad_close ?? 0) > 0) hardDefects.push(`bad_close=${quality.anomalies.bad_close}`);
-  if ((quality.anomalies.null_ohlc ?? 0) > 0) hardDefects.push(`null_ohlc=${quality.anomalies.null_ohlc}`);
+  if (badPriceSymbols.length > ISOLATED_PRICE_DEFECT_LIMIT) {
+    hardDefects.push(`价格字段非法 ${badPriceSymbols.length} 只（> ${ISOLATED_PRICE_DEFECT_LIMIT}），属大面积坏条`);
+  }
   if (hardDefects.length) {
     return {
       status: 'NOT_READY',
@@ -272,7 +283,13 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
     };
   }
 
-  const disclosed: string[] = [...freeCoverageIssues];
+  const disclosed: string[] = [...auxiliaryGaps, ...freeCoverageIssues];
+  if (badPriceSymbols.length > 0) {
+    const sample = badPriceSymbols.slice(0, 10).join(',');
+    disclosed.push(
+      `价格字段非法 ${badPriceSymbols.length} 只（${sample}${badPriceSymbols.length > 10 ? ',…' : ''}）：已按 symbol 剔除出市场宽度并抑制其技术信号，不阻断日报`,
+    );
+  }
   if (quality.status !== 'READY') {
     disclosed.push(`market quality ${quality.status}: ${quality.reasons.slice(0, 3).join('; ') || 'see checkQuality'}`);
   }

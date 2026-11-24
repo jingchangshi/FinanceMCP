@@ -389,6 +389,15 @@ export type InvalidBarKinds = Record<InvalidBarKind, number>;
 /** Union of {@link INVALID_BAR_KINDS}; the one definition used by every quality check. */
 export const INVALID_BAR_SQL = `(${Object.values(INVALID_BAR_KINDS).map(expr => `(${expr})`).join(' OR ')})`;
 
+/**
+ * The subset of {@link INVALID_BAR_KINDS} that makes the *price fields* unusable on their own
+ * (bad close, NULL OHLC, nonpositive/high<low). A missing amount is deliberately absent: the
+ * price bars are still readable, so only amount-consuming logic should react. Consumers use this
+ * to exclude a symbol from breadth / signal generation instead of blocking the whole day.
+ */
+export const PRICE_DEFECT_KINDS = ['null_open', 'null_high', 'null_low', 'null_close', 'nonpositive', 'high_low'] as const;
+export const PRICE_DEFECT_SQL = `(${PRICE_DEFECT_KINDS.map(k => `(${INVALID_BAR_KINDS[k]})`).join(' OR ')})`;
+
 export type QualityStatus = 'READY' | 'DEGRADED' | 'NOT_READY';
 export interface QualityReport {
   trade_date: string;

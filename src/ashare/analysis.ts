@@ -2,8 +2,9 @@ import type { DatabaseSync } from 'node:sqlite';
 import { forEachStockBars } from './bars.js';
 import { computeIndicators, type Bars, type IndicatorSet } from './indicators.js';
 import { detectSignals, technicalState, TechnicalState } from './signals.js';
-import { recentTradeDays, addDays } from './ingest.js';
+import { recentTradeDays, addDays, PRICE_DEFECT_SQL } from './ingest.js';
 import { Fundamentals, fundamentalRisk, fundamentalsAsOf } from './fundamentals.js';
+import type { FinancialSelectionOrder } from './data.js';
 
 export const LEGACY_SCORE_VERSION = 'score-1.0.0';
 export const RESEARCH_SCORE_VERSION = 'score-2.0.0';
@@ -111,8 +112,9 @@ export interface MarketScan {
   rows: StockRow[];
   suspended_or_missing: number;
   signal_counts: Record<string, number>;
-  pct_above_ma20: number;
-  pct_above_ma60: number;
+  /** null when no scanned stock has a valid MA20 / MA60: unknown, not "0% above". */
+  pct_above_ma20: number | null;
+  pct_above_ma60: number | null;
   sectors: SectorRow[];
 }
 
@@ -153,6 +155,12 @@ const isSt = (name: string) => /ST|退/.test(name ?? '');
 export interface MarketScanHooks {
   onStock?: (code: string, bars: Bars, x: IndicatorSet, i: number, row: StockRow) => void;
   score_version?: ScoreVersion;
+  /**
+   * Which record the point-in-time fundamentals map selects. Default `period-first`
+   * (`end_date DESC, ann_date DESC`, the public data-tool contract); the stock-swing
+   * strategy opts into `announcement-first` to match the TactiCore experiment.
+   */
+  fundamentals_order?: FinancialSelectionOrder;
 }
 
 export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHooks = {}): MarketScan {
@@ -162,7 +170,11 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
   const basic = new Map((db.prepare('SELECT ts_code, name, industry, list_date FROM stock_basic').all() as any[]).map(r => [r.ts_code, r]));
   const dailyBasic = new Map((db.prepare('SELECT * FROM daily_basic WHERE trade_date = ?').all(date) as any[]).map(r => [r.ts_code, r]));
   const pctToday = new Map((db.prepare('SELECT ts_code, pct_chg FROM daily WHERE trade_date = ?').all(date) as any[]).map(r => [r.ts_code, r.pct_chg]));
-  const fundamentals = fundamentalsAsOf(db, date);
+  // Symbols whose as-of bar has unusable price fields (bad close / NULL OHLC / nonpositive).
+  // They stay in the scan for disclosure, but must not generate signals or enter breadth.
+  const priceDefect = new Set((db.prepare(`SELECT ts_code FROM daily WHERE trade_date = ? AND ${PRICE_DEFECT_SQL}`).all(date) as any[])
+    .map(r => r.ts_code as string));
+  const fundamentals = fundamentalsAsOf(db, date, hooks.fundamentals_order);
   const minListDate = addDays(date, -SCORE_RULES.min_listed_days);
 
   const rows: StockRow[] = [];
@@ -177,7 +189,10 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
     const state = technicalState(bars, x, i);
     // Signals on a series that mixes adjusted and raw prices would look precise but be wrong.
     const adjIncomplete = (bars.adjMissing ?? 0) > 0;
-    const signals = adjIncomplete ? [] : detectSignals(bars, x, i);
+    // A bar with unusable price fields cannot support a signal either; suppress only this
+    // symbol's signals (and breadth membership), never the whole day's scan.
+    const defectivePrice = priceDefect.has(code);
+    const signals = adjIncomplete || defectivePrice ? [] : detectSignals(bars, x, i);
     signals.forEach(s => { signalCounts[s] = (signalCounts[s] ?? 0) + 1; });
     const f = fundamentals.get(code);
     const industry = info.industry || '未知';
@@ -207,6 +222,7 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
       eligible: true,
     };
     if (adjIncomplete) row.risk_flags.push(`复权因子缺失 ${bars.adjMissing} 天，技术指标不可靠，未生成信号`);
+    if (defectivePrice) row.risk_flags.push('当日行情价格字段非法（OHLC），技术信号已抑制且不计入市场宽度');
     if (state.rsi14 > 80) row.risk_flags.push(`RSI14 过热 (${state.rsi14.toFixed(0)})`);
     if (state.atr_pct > 0.07) row.risk_flags.push(`波动率高 (ATR/价格 ${(state.atr_pct * 100).toFixed(1)}%)`);
     const reason =
@@ -226,10 +242,11 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
   const sectors = sectorRank(rows, version);
   scoreRows(rows, sectors, version);
   // Breadth is a market-wide statement, not a candidate count: a stock without 60 valid bars
-  // has no MA60 to be above or below, and .BJ names are outside the V3 A-share universe.
-  // Counting them inflated the denominator and understated breadth. Candidate scans, ranking
-  // and eligibility below are unchanged — only these two ratios use the narrower universe.
-  const breadthUniverse = rows.filter(r => !r.ts_code.endsWith('.BJ'));
+  // has no MA60 to be above or below, .BJ names are outside the V3 A-share universe, and a
+  // symbol whose as-of price fields are illegal has no meaningful MA. Counting them inflated
+  // the denominator and understated breadth. Candidate scans, ranking and eligibility are
+  // unchanged — only these two ratios use the narrower universe.
+  const breadthUniverse = rows.filter(r => !r.ts_code.endsWith('.BJ') && !priceDefect.has(r.ts_code));
   const ma20Valid = breadthUniverse.filter(r => Number.isFinite(r.ma20));
   const ma60Valid = breadthUniverse.filter(r => Number.isFinite(r.ma60));
   return {
@@ -237,8 +254,9 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
     rows,
     suspended_or_missing: missing,
     signal_counts: signalCounts,
-    pct_above_ma20: ma20Valid.length ? ma20Valid.filter(r => r.state.above_ma20).length / ma20Valid.length : 0,
-    pct_above_ma60: ma60Valid.length ? ma60Valid.filter(r => r.state.above_ma60).length / ma60Valid.length : 0,
+    // No valid MA anywhere means "unknown", not "0% above": a 0 would read as maximally weak.
+    pct_above_ma20: ma20Valid.length ? ma20Valid.filter(r => r.state.above_ma20).length / ma20Valid.length : null,
+    pct_above_ma60: ma60Valid.length ? ma60Valid.filter(r => r.state.above_ma60).length / ma60Valid.length : null,
     sectors,
   };
 }
