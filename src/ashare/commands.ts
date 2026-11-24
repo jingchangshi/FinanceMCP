@@ -157,7 +157,11 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
     case 'acceptance': {
       const days = Number(h.arg('days') || 3);
       const end = h.arg('end') ? h.ymd(h.arg('end'), '--end') : latestTradeDay(db, shanghaiToday())!;
-      h.print(acceptance(db, end, days, { allowDegraded: h.flag('allow-degraded') }));
+      h.print(acceptance(db, end, days, {
+        strictReady: h.flag('strict-ready'),
+        // Compatibility alias only: the default already allows DEGRADED.
+        allowDegraded: h.flag('allow-degraded') || undefined,
+      }));
       return true;
     }
     case 'audit': {

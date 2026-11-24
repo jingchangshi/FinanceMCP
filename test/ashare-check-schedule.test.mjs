@@ -103,3 +103,15 @@ test('an unavailable monthly journal leaves the daily evidence intact', t => {
   assert.equal(result.status, 1);
   assert.match(result.stdout, /journal=available journal_monthly=unavailable run_1930=yes outcome_1930=success deadline_2115=met run_2215=unknown outcome_2215=unknown/);
 });
+
+test('journal evidence stays scheduler-only and never stands in for report or Feishu success', t => {
+  // An on-time window is observed, but this evidence source cannot claim a report,
+  // a publication, a timer origin or a passed schedule; those stay separate.
+  const result = run(t, start('19:30:00') + finish('19:45:00'), {
+    monthlyJournal: monthlyStart('22:15:00') + monthlyFinish('22:20:00'),
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /deadline_2115=met/);
+  assert.match(result.stdout, /trigger_source=unknown schedule=UNKNOWN/);
+  assert.doesNotMatch(result.stdout, /report_id|feishu|publish/i);
+});

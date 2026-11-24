@@ -139,29 +139,35 @@ systemctl --user start finance-ashare-daily.service（20261017 周六）→ {"tr
 
 ### 8.1 判定规则（`acceptance`，`src/ashare/acceptance.ts`）
 
-每个交易日五项全部满足才为 `PASS`：
+2026-11-24 起按统一入口重定义：19:30 一次触发、21:15 数据就绪截止；21:15 后继续重试属于晚恢复。旧的“当日两次 live 报告 + 两次 `REFRESH_OK` + 股票池连续性门槛”语义作废（§9.4、§10.3 中相关描述为历史记录）。
+
+评估日 `D` 通过需以下五项同时成立：
 
 | 条件 | 含义 |
 |---|---|
-| `scheduled_runs` | 当日（北京时间）至少 2 份 `run_mode=live` 报告；这本身不能证明生成时间属于两个窗口，也不能证明由 timer 触发 |
-| `data_rechecked` | `sync_history` 中当日 `daily` 至少有 2 次 `refresh_status=REFRESH_OK` 的请求（第二次运行确实复查当日行情）；失败或不完整的请求不计入 |
-| `final_status` | 最后一份 live 报告为 **READY**。DEGRADED（非核心缺口：涨跌停价覆盖率或非核心指数缺失）默认**不通过**；仅在 `--allow-degraded` 时记为 `PASS_DEGRADED`，不会显示为 PASS。NOT_READY 一律不通过 |
-| `mcp_consistent` | MCP 工具对该日返回的报告 ID 等于最后一份 live 报告 |
-| `watchlist_continuous` | 股票池 `previous_date` 为前一交易日，且数量 = 前一日数量 + 新增 − 移出 |
+| `live_report` | 存在 `D` 的 `run_mode=live` 报告，生成时间在同一北京自然日 15:00 收盘后、且不晚于评估时刻。取其中最新一份作为**证据报告**；`replay` 与次日（或更晚）补跑不计入 |
+| `data_rechecked` | `sync_history` 中 `dataset=daily`、`key=D`、`refresh_status=REFRESH_OK` 的请求至少一次，且该请求在同一北京自然日收盘后、不晚于证据报告的生成时间。`REFRESH_INCOMPLETE` / `REFRESH_FAILED` 不计；一次免费的完整拉取即可，后续重试成功也可满足 |
+| `final_status` | 证据报告为 **READY**。DEGRADED（非核心缺口：涨跌停价覆盖率或非核心指数缺失）默认记 `PASS_DEGRADED`，`--strict-ready` 时失败；NOT_READY 一律失败 |
+| `mcp_consistent` | MCP 工具对该日返回的报告 ID 等于评估时刻前最新的 live 目标日报告（可能是一份更晚的同日恢复或次日补跑；它能被 MCP 提供，但不因此成为证据报告） |
+| `on_time` | 同日收盘后、21:15 前至少有一份状态非 NOT_READY 的 live 报告。只有 21:15 后才就绪的算 `late_recovery`，不是按时 SLA，也不证明 timer 触发 |
 
-当天 21:15 前未满足的条件显示为 `PENDING`。
+- 评估按当前时刻（或测试注入的 `now`）过滤：评估时刻之后生成/同步的记录不参与判断；整体 `passed` 要求最近 N 个交易日全部 PASS/PASS_DEGRADED。
+- `replay` 报告和次日（或更晚）补跑生成的报告不作为该日证据；若目标日只有这类报告，`live_report` 与 `on_time` 失败，并以 `late_recovery` 与“完全没有运行证据”区分。
+- 21:15 前没有可接受报告、之后才就绪的同日恢复或次日补跑记为 `late_recovery`：不是按时 SLA，也不证明 timer 触发。若当日已有 21:15 前可接受的报告，之后的补跑只作为 MCP 提供的更新，不改变该日结论。
+- 当日 21:15 前未满足的检查显示为 `PENDING`；21:15 起为 `FAIL`。
+- 以下仅作诊断或独立证据，**不是**报告成功门槛：19:30 journal 的 origin/outcome、重试次数与耗时、股票池连续性/尝试次数、22:15 可选月末研究任务（内部按真实月末 gate 且可 `--force`）、飞书发布 E2E。定时器与发布脚本未改动。
+- `--allow-degraded` 保留为兼容别名（默认已允许 DEGRADED）；`--strict-ready` 优先。
 
-**两类证据分开核验**：`acceptance` 只证明*流水线执行*（数据库里的 live 报告与有效 Tushare 请求），不能证明这些运行由 systemd timer 触发
+**三类证据分开核验**：`acceptance` 只证明*流水线执行*（数据库里的 live 报告与有效行情请求），不能证明这些运行由 systemd timer 触发
 （手动 `systemctl start` 或 `docker exec … daily` 也会留下同样的记录）。*调度证据*由 `deploy/ashare/check-schedule.sh <YYYYMMDD>` 从
-systemd 用户 journal 读取：报告工作日北京时间 19:30:00–19:35:59 内是否观察到 `finance-ashare-daily.service`（统一入口）的 `Starting`，以及 22:15:00–22:20:59 内是否观察到 `finance-ashare-research-monthly.service` 的 `Starting`，并按日志顺序将结束记录关联到启动。`deadline_2115` 说明统一入口的结束时间在 21:15 数据就绪截止之前还是之后（`met` / `exceeded`；无结束记录时 `unknown`）。`outcome` 为 `success`、`failed`、`unknown` 或 `ambiguous`；窗口无启动、日志不完整或结束记录无法关联时不能声称成功。窗口外运行的结束记录不计入窗口内运行。`run=no` 只表示查询结果中未观察到启动，不能证明日志完整。journal 查询失败时各状态为 `unknown`。
+systemd 用户 journal 读取：报告工作日北京时间 19:30:00–19:35:59 内是否观察到 `finance-ashare-daily.service`（统一入口）的 `Starting`，以及 22:15:00–22:20:59 内是否观察到 `finance-ashare-research-monthly.service` 的 `Starting`，并按日志顺序将结束记录关联到启动。`deadline_2115` 说明统一入口的结束时间在 21:15 数据就绪截止之前还是之后（`met` / `exceeded`；无结束记录时 `unknown`）。`outcome` 为 `success`、`failed`、`unknown` 或 `ambiguous`；窗口无启动、日志不完整或结束记录无法关联时不能声称成功。窗口外运行的结束记录不计入窗口内运行。`run=no` 只表示查询结果中未观察到启动，不能证明日志完整。journal 查询失败时各状态为 `unknown`。*发布证据*（飞书文档与通知的 E2E）是独立的第三类证据，不进入上述两类判定。
 
-窗口内手动启动与 timer 启动在这些服务日志中无法区分；timer 的 `LastTriggerUSec` 也不能证明某次服务启动的来源。脚本因此始终输出 `trigger_source=unknown schedule=UNKNOWN` 并以 1 退出，不会声称调度通过；timer 状态查询失败另标为 `timer_status=unavailable`。即使各窗口均观察到成功，也仍需独立的、能关联具体调用和 timer 的证据才能判定自动调度通过。流水线和调度证据均满足要求，当日才算 PASS；整体 `passed` 要求最近 N 个交易日全部 PASS（或允许时 PASS_DEGRADED）。
+窗口内手动启动与 timer 启动在这些服务日志中无法区分；timer 的 `LastTriggerUSec` 也不能证明某次服务启动的来源。脚本因此始终输出 `trigger_source=unknown schedule=UNKNOWN` 并以 1 退出，不会声称调度通过；timer 状态查询失败另标为 `timer_status=unavailable`。即使各窗口均观察到成功，也仍需独立的、能关联具体调用和 timer 的证据才能判定自动调度通过。流水线、调度、发布三类证据均满足要求，当日才算完整验收；`acceptance` 的 `passed` 只覆盖流水线部分。
 
 2026-10-17 的历史查询曾观察到窗口外 00:35 和 07:45 的启动；旧脚本输出的 `schedule=FAIL` 不应被视为当前脚本的结论。
-修复前的版本把 DEGRADED 计为通过、只要求一份非 NOT_READY 报告，且无法证明第二次运行重新拉取了数据。
 
 部署后基线（2026-10-17 周六）：`acceptance --days 3` → `passed: false`；20261014/15 无 live 报告，20261016 仅一次补发、
-无两次当日拉取记录（`scheduled_runs`、`data_rechecked` 未满足）。这是预期结果。
+无当日收盘后的有效复查记录（`live_report`、`data_rechecked` 未满足）。这是预期结果。
 
 ### 8.2 2026-10-19 / 10-20 / 10-21 记录（只在日期真实发生并产生证据后填写）
 
@@ -169,7 +175,7 @@ systemd 用户 journal 读取：报告工作日北京时间 19:30:00–19:35:59 
 |---|---|---|---|
 | 18:40 / 21:10 计划运行是否触发 | PENDING | PENDING | PENDING |
 | 每次 Tushare 同步是否成功 | PENDING | PENDING | PENDING |
-| 是否真正复查当日行情（`daily_fetches` ≥ 2） | PENDING | PENDING | PENDING |
+| 是否真正复查当日行情（`daily_fetches` 至少一次 `REFRESH_OK` 且不晚于证据报告） | PENDING | PENDING | PENDING |
 | 最终报告状态 / 生成时间 | PENDING | PENDING | PENDING |
 | 股票池数量及增减是否连续 | PENDING | PENDING | PENDING |
 | MCP 返回报告 ID 与数据库一致 | PENDING | PENDING | PENDING |
@@ -191,7 +197,7 @@ docker inspect -f '{{.State.StartedAt}} restarts={{.RestartCount}} health={{.Sta
 df -h ~ ; ls -la ~/.local/share/finance-mcp-ashare/reports/<YYYYMMDD>/
 ```
 
-10-21 21:20 之后执行 `docker exec finance-mcp-ashare node build/ashare/cli.js acceptance --days 3`；`passed: true` 只满足流水线部分，还须独立证明每天两次 timer 触发及成功，才可把
+10-21 21:20 之后执行 `docker exec finance-mcp-ashare node build/ashare/cli.js acceptance --days 3`；`passed: true` 只满足流水线部分，还须独立证明每个交易日 19:30 的 timer 触发（`check-schedule.sh` 的 journal 证据）与飞书发布 E2E 成功，才可把
 “连续 3 个真实交易日”改为 ✅。任何一天 FAIL：记录 `failed` 列表与日志，不得用手动补跑替代（手动 `report` 为 `run_mode=manual`，不计入）。
 
 ### 8.3 ChatGPT 侧（用户账号操作，PENDING）
@@ -201,7 +207,7 @@ df -h ~ ; ls -la ~/.local/share/finance-mcp-ashare/reports/<YYYYMMDD>/
    记录回复中的报告 ID，应与 §8.2 第 2 步 `final.report_id` 一致；截图保存。
 3. 将已有 A 股日报定时任务改为调用 `ashare_daily_report`（不带 date 即为当日），时间设在北京时间 **21:30 之后**；
    次日查看任务输出中的报告 ID 与生成时间，同样与数据库比对。
-4. 在 21:10 之前调用会得到 `PENDING`/旧的 18:40 版本或 `NOT_READY`，属预期行为，不算失败。
+4. 在 21:15 之前调用会得到 `PENDING`/较早的 19:30 版本或 `NOT_READY`，属预期行为，不算失败。
 
 ### 8.4 调度核验范围（2026-10-18）
 
@@ -290,7 +296,7 @@ node deploy/ashare/mcp-e2e.mjs https://share.shijingchang.cn/ashare/mcp 20261016
 
 1. `latestReportMeta`：按交易日 → 正式/手动优先于重放 → 生成时间排序；`report` 表新增 `run_mode`（启动时从 JSON 回填：live 1、replay 74）；
    NOT_READY 报告引用的“最近可用报告”限制在 as-of 之前。测试覆盖“较晚生成的旧日期重放不成为最新”。
-2. 验收 READY / DEGRADED：见 §8.1；单测覆盖 READY 通过、DEGRADED 默认不通过/`--allow-degraded` 记 PASS_DEGRADED、单次运行、缺少复查、
+2. 验收 READY / DEGRADED（历史记录：该轮规则已被 2026-11-24 的 §8.1 新语义取代）：见 §8.1；单测覆盖 READY 通过、DEGRADED 默认不通过/`--allow-degraded` 记 PASS_DEGRADED、单次运行、缺少复查、
    较晚重放不影响 MCP 一致性、当日 21:15 前 PENDING。
 3. 复权因子缺失：`bars.ts` 统计 `adjMissing`；有缺失的股票不合格（“复权因子缺失，价格序列不连续”）、不输出信号、风险提示注明；
    信号证据计算跳过这类股票；`ashare_stock_analysis` 给出警告且不列信号。当前正式缓存中缺失为 0 行（已查询）。
@@ -384,7 +390,7 @@ node deploy/ashare/mcp-e2e.mjs https://share.shijingchang.cn/ashare/mcp 20261016
 
 ### 10.3 P1：连续三日验收证据
 
-- `acceptance` 保留，`data_rechecked` 只统计 `REFRESH_OK` 的请求（单测：两次均 INCOMPLETE 时不通过）；DEGRADED 规则不变
+- 历史记录（2026-11-24 已被 §8.1 新语义取代）：`acceptance` 保留，`data_rechecked` 只统计 `REFRESH_OK` 的请求（单测：两次均 INCOMPLETE 时不通过）；当时的 DEGRADED 规则为
   （仅 `--allow-degraded` 时 `PASS_DEGRADED`）。流水线证据与调度证据的区分与 `check-schedule.sh` 见 §8.1、§8.2。
 - 2026-10-19 / 20 / 21 仍为 **PENDING**，未填写任何未来结果。
 
