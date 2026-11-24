@@ -463,13 +463,37 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestCreateUnconfirmed(unittest.TestCase):
+    def test_timeout_on_create_is_left_for_manual_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xml_path = render_sample_xml(root)
+
+            class TimeoutRunner:
+                def __init__(self):
+                    self.calls = []
+
+                def __call__(self, argv, cwd):
+                    self.calls.append(list(argv))
+                    raise LarkError("lark-cli timed out after 180s", retryable=True)
+
+            runner = TimeoutRunner()
+            with self.assertRaises(LarkError):
+                publish(root, xml_path, "20261106", TITLE, SOURCE_COUNT, CONFIG, runner=runner)
+            self.assertEqual(len(runner.calls), 1, "publish must not blindly re-create after an uncertain timeout")
+            self.assertEqual(load_ledger(root / "data/feishu/account_publish_ledger.jsonl"), [])
+            incidents = (root / "data/feishu/account_publish_incidents.jsonl").read_text(encoding="utf-8")
+            self.assertIn("create_unconfirmed", incidents)
+            self.assertIn("verify in feishu", incidents.lower())
+
+
 class TestLarkRetry(unittest.TestCase):
     """Bounded exponential backoff: transient failures retry, 4xx rejects do not."""
 
     def _completed(self, returncode=0, stdout="", stderr=""):
         return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
-    def _run_with(self, responses, env=None):
+    def _run_with(self, responses, env=None, argv=None):
         """Runs lark-cli with `responses` (exceptions or CompletedProcess)."""
         settings = {"ASHARE_FEISHU_RETRY_ATTEMPTS": "3", "ASHARE_FEISHU_RETRY_BASE_SECONDS": "0.01"}
         if env:
@@ -480,7 +504,7 @@ class TestLarkRetry(unittest.TestCase):
             result = None
             error = None
             try:
-                result = run_lark(["lark-cli", "docs", "+fetch"], Path("."))
+                result = run_lark(argv or ["lark-cli", "docs", "+fetch"], Path("."))
             except Exception as exc:  # noqa: BLE001
                 error = exc
             return result, error, run, sleep
@@ -522,6 +546,25 @@ class TestLarkRetry(unittest.TestCase):
         )
         ok = self._completed(0, stdout='{"ok": true, "data": {}}')
         result, error, run, _ = self._run_with([limited, ok])
+        self.assertIsNone(error)
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(run.call_count, 2)
+
+    def test_non_idempotent_create_is_not_retried(self):
+        timeouts = [subprocess.TimeoutExpired("lark-cli", 180) for _ in range(3)]
+        argv = ["lark-cli", "docs", "+create", "--doc-format", "xml", "--content", "@./r.xml", "--format", "json"]
+        result, error, run, sleep = self._run_with(timeouts, argv=argv)
+        self.assertIsNone(result)
+        self.assertIsInstance(error, LarkError)
+        self.assertEqual(error.retryable, True)
+        self.assertEqual(run.call_count, 1, "create outcome is unknown; retrying can orphan a second document")
+        self.assertEqual(sleep.call_count, 0)
+
+    def test_keyed_notification_is_retried(self):
+        fail = self._completed(1, stderr='{"ok": false, "error": {"type": "server_error", "code": 503, "message": "service unavailable"}}')
+        ok = self._completed(0, stdout='{"ok": true, "data": {"message_id": "om_1"}}')
+        argv = ["lark-cli", "im", "+messages-send", "--idempotency-key", "k-1", "--markdown", "x", "--format", "json"]
+        result, error, run, _ = self._run_with([fail, ok], argv=argv)
         self.assertIsNone(error)
         self.assertEqual(result["ok"], True)
         self.assertEqual(run.call_count, 2)

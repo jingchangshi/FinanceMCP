@@ -913,23 +913,60 @@ function brokerNoteFields(note: unknown): { broker: string | null; source_id: st
  * `broker:<account>:<broker>:<raw>` 导入的行不能被新 id 再导入一次。
  */
 function sameBrokerFact(event: NormalizedEvent, row: any): boolean {
+  // Only broker statements with a broker source id participate in content
+  // dedupe. A hand-entered record without broker/source_id must never be
+  // silently merged with an independent trade that happens to share the same
+  // day/quantity/cash tuple.
+  if (event.source !== 'broker_statement' || row.source !== 'broker_statement') return false;
+  const incoming = brokerNoteFields(event.note);
+  const existing = brokerNoteFields(row.note);
+  if (!incoming.source_id || !existing.source_id) return false;
+  if (incoming.source_id !== existing.source_id) return false;
   if (String(row.account_id) !== event.account_id) return false;
   if (String(row.occurred_on) !== event.occurred_on) return false;
   if ((row.ts_code ?? null) !== (event.ts_code ?? null)) return false;
   if (String(row.event_type) !== event.event_type) return false;
   if ((row.quantity ?? null) !== (event.quantity ?? null)) return false;
   if ((row.cash_delta_cents ?? 0) !== (event.cash_delta_cents ?? 0)) return false;
+  // Correlate the full economics, not just cash: the same cash delta can come
+  // from a different gross/fee/tax split.
+  if ((row.gross_cents ?? null) !== (event.gross_cents ?? null)) return false;
+  if ((row.fee_cents ?? 0) !== (event.fee_cents ?? 0)) return false;
+  if ((row.tax_cents ?? 0) !== (event.tax_cents ?? 0)) return false;
   if (event.event_type === 'REVERSE') {
     // Compare the raw broker target id, not the full event id: the same
     // reversal may reference a v1 id on the old row and a v2 id on the re-import.
     const rawTarget = (value: unknown): string => String(value ?? '').split(':').pop() ?? '';
     if (rawTarget(row.reverses_event_id) !== rawTarget(event.reverses_event_id)) return false;
   }
-  const incoming = brokerNoteFields(event.note);
-  const existing = brokerNoteFields(row.note);
   if (incoming.broker && existing.broker && incoming.broker !== existing.broker) return false;
-  if (incoming.source_id && existing.source_id && incoming.source_id !== existing.source_id) return false;
   return true;
+}
+
+/**
+ * Resolve a REVERSE row's raw broker target inside the current transaction.
+ *
+ * A broker reversal names only the original statement's 流水号, not its date,
+ * type or event id. `account + broker source id` must therefore identify
+ * exactly one event; duplicates (a source id reused across days/brokers) are
+ * rejected with a row-level error instead of guessing the first match. The
+ * query runs inside the write transaction, so a buy recorded earlier in the
+ * same CSV is visible and a later reversal row can find it.
+ */
+function resolveReverseTargetBySource(
+  db: DatabaseSync, accountId: string, targetId: string,
+): { eventId?: string; error?: string } {
+  const parts = targetId.split(':');
+  const rawTarget = parts[0] === 'broker' && parts.length > 3 ? parts.slice(3).join(':') : '';
+  if (!rawTarget) return { error: `撤销目标 ${targetId} 不是可解析的券商流水号` };
+  const rows = db.prepare(
+    'SELECT event_id, occurred_on, note FROM account_event WHERE account_id = ? AND event_type != ?',
+  ).all(accountId, 'REVERSE') as any[];
+  const matches = rows.filter(row => brokerNoteFields(row.note).source_id === rawTarget);
+  if (matches.length === 1) return { eventId: String(matches[0].event_id) };
+  if (matches.length === 0) return { error: `撤销目标流水号 ${rawTarget} 在账户内没有对应事件` };
+  const detail = matches.map(row => `${row.event_id}@${row.occurred_on}`).join(', ');
+  return { error: `撤销目标流水号 ${rawTarget} 对应多笔事件（${detail}），无法唯一确定` };
 }
 
 /**
@@ -980,18 +1017,28 @@ export function importEvents(
       if (dedupeByContent) {
         if (event.event_type === 'REVERSE' && event.reverses_event_id
           && !db.prepare('SELECT 1 FROM account_event WHERE event_id = ?').get(event.reverses_event_id)) {
-          // The v2 id scheme must still be able to reverse a row that was
-          // imported under the v1 scheme (raw id lives in the broker CSV note).
-          // v1 target: broker:<account>:<broker|unspecified>:<raw>
-          const targetParts = event.reverses_event_id.split(':');
-          const rawTarget = targetParts[0] === 'broker' && targetParts.length > 3
-            ? targetParts.slice(3).join(':')
-            : '';
-          const targetRow = rawTarget
-            ? existingRows.find(row => row.event_type !== 'REVERSE'
-              && brokerNoteFields(row.note).source_id === rawTarget)
-            : undefined;
-          if (targetRow) event.reverses_event_id = String(targetRow.event_id);
+          // v1 target ids (`broker:<account>:<broker>:<raw>`) cannot contain the
+          // original date/type, so resolve by the raw broker source id inside
+          // this transaction. Duplicate candidates are a row-level rejection,
+          // never a first-match guess.
+          const resolved = resolveReverseTargetBySource(db, id, event.reverses_event_id);
+          if (!resolved.eventId) {
+            const reason = `reverse_target_unresolved: ${resolved.error}`;
+            const incomingHash = eventContentHash(event);
+            results.push({
+              status: 'CONFLICT', event_id: event.event_id,
+              reason, existing_hash: '', incoming_hash: incomingHash,
+            });
+            counts.conflict += 1;
+            if (!continueOnConflict) {
+              aborted = true;
+              abortReason = `事件 ${event.event_id} 冲突（${reason}），整批回滚`;
+              break;
+            }
+            recordConflict(db, event.event_id, id, '', incomingHash, reason);
+            continue;
+          }
+          event.reverses_event_id = resolved.eventId;
         }
         const match = existingRows.find(row => row.event_id !== event.event_id && sameBrokerFact(event, row));
         if (match) {

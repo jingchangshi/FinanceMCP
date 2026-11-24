@@ -28,10 +28,22 @@ fi
 REVIEW_OUT="$LOG_DIR/forward-review-$STAMP.json"
 REVIEW_ERR="$LOG_DIR/forward-review-$STAMP.log"
 record_code=0
-if docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record --require-current-snapshots >"$OUT" 2>"$ERR"; then
+# The unified pipeline pins the target trade date; the standalone account timer
+# keeps the CLI's default (latest closed day) when no date is supplied.
+if [ -n "${ASHARE_EXPECTED_TRADE_DATE:-}" ]; then
+  set +e
+  docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record --require-current-snapshots --date "$ASHARE_EXPECTED_TRADE_DATE" >"$OUT" 2>"$ERR"
+  record_code=$?
+  set -e
+else
+  set +e
+  docker exec "$CONTAINER" node build/ashare/cli.js investment-research-record --require-current-snapshots >"$OUT" 2>"$ERR"
+  record_code=$?
+  set -e
+fi
+if [ "$record_code" -eq 0 ]; then
   printf 'finance-ashare account-daily ok (private log: %s)\n' "$OUT"
 else
-  record_code=$?
   printf 'finance-ashare account-daily FAILED (exit %s); see private log %s\n' "$record_code" "$ERR" >&2
 fi
 review_code=0

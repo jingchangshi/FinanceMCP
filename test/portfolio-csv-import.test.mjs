@@ -138,3 +138,82 @@ test('E6 a v2-id original can be reversed by a statement that names the raw brok
     assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event').get().n, 2);
   } finally { db.close(); }
 });
+
+test('E7 a buy and its reversal in the same CSV resolve within the transaction', () => {
+  const db = fixture();
+  try {
+    const header = '流水号,成交日期,业务名称,证券代码,成交数量,成交价格,成交金额,佣金,印花税,资金发生额,撤销流水号';
+    const csv = `${header}\n` +
+      'fill-1,2026-10-19,买入,159999,100,1.250,125.00,0.01,0,-125.01,\n' +
+      'rev-1,2026-10-20,撤销,,,,,,,,fill-1\n';
+    const events = parseTradeCsv(csv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 2, JSON.stringify(result));
+    assert.equal(result.counts.conflict, 0);
+    const original = db.prepare("SELECT event_id, reversed_by FROM account_event WHERE event_type = 'TRADE_BUY'").get();
+    assert.ok(original.reversed_by, 'reverse row must find the buy recorded earlier in the same batch');
+  } finally { db.close(); }
+});
+
+test('E8 an ambiguous reversal target is rejected row-level, never first-match guessed', () => {
+  const db = fixture();
+  try {
+    const note = JSON.stringify({ format: 'broker_csv/1', broker: null, source_id: 'dup-1' });
+    for (const [id, date] of [['dup-a', '20261019'], ['dup-b', '20261020']]) {
+      recordEvent(db, {
+        event_id: id, account_id: 'synthetic', event_type: 'TRADE_BUY', occurred_on: date,
+        ts_code: '159999.SZ', quantity: 100, price_milli: 1250,
+        fee_cents: 1, tax_cents: 0, source: 'broker_statement', note,
+      });
+    }
+    const reverseCsv = '流水号,成交日期,业务名称,撤销流水号\nrev-x,2026-10-21,撤销,dup-1\n';
+    const events = parseTradeCsv(reverseCsv, { accountId: 'synthetic' }).events;
+    const aborted = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(aborted.aborted, true);
+    assert.match(aborted.abort_reason ?? '', /对应多笔事件/);
+    assert.equal(aborted.counts.recorded, 0);
+    assert.equal(aborted.results[0].status, 'CONFLICT');
+    assert.match(aborted.results[0].reason, /reverse_target_unresolved/);
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM account_event WHERE event_type = 'REVERSE'").get().n, 0);
+    assert.ok(db.prepare('SELECT COUNT(*) n FROM account_event_conflict').get().n >= 1, 'row error is left on record');
+
+    // continue-on-conflict rejects only the bad row.
+    const continued = importEvents(db, 'synthetic', events, { dedupeByContent: true, continueOnConflict: true });
+    assert.equal(continued.counts.conflict, 1);
+    assert.equal(continued.counts.recorded, 0);
+  } finally { db.close(); }
+});
+
+test('E9 a manual record without broker/source id is never silently merged with a CSV trade', () => {
+  const db = fixture();
+  try {
+    recordEvent(db, {
+      event_id: 'manual-1', account_id: 'synthetic', event_type: 'TRADE_BUY', occurred_on: '20261019',
+      ts_code: '159999.SZ', quantity: 100, price_milli: 1250,
+      fee_cents: 6, tax_cents: 0, source: 'synthetic', note: '',
+    });
+    const csv = `${EASTMONEY_HEADER}\n2026-10-19,证券买入,159999,100,1.250,125.00,-125.06,0.01,0.02,0,0.03,fill-9\n`;
+    const events = parseTradeCsv(csv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(result.counts.recorded, 1, 'manual record must not be treated as the same broker fill');
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM account_event').get().n, 2);
+  } finally { db.close(); }
+});
+
+test('E10 equal cash but a different gross/fee/tax split is not deduplicated', () => {
+  const db = fixture();
+  try {
+    recordEvent(db, {
+      event_id: 'broker:synthetic:unspecified:f1', account_id: 'synthetic', event_type: 'TRADE_BUY',
+      occurred_on: '20261019', ts_code: '159999.SZ', quantity: 100, price_milli: 1250,
+      fee_cents: 6, tax_cents: 0, source: 'broker_statement',
+      note: JSON.stringify({ format: 'broker_csv/1', broker: null, source_id: 'f1' }),
+    });
+    // Same cash (-12506) but fee 5 / tax 1 instead of fee 6 / tax 0.
+    const csv = `${EASTMONEY_HEADER}\n2026-10-19,证券买入,159999,100,1.250,125.00,-125.06,0.01,0.01,0.01,0.03,f1\n`;
+    const events = parseTradeCsv(csv, { accountId: 'synthetic' }).events;
+    const result = importEvents(db, 'synthetic', events, { dedupeByContent: true });
+    assert.equal(result.counts.duplicate, 0, 'a different economic split is not the same fact');
+    assert.equal(result.counts.recorded, 1);
+  } finally { db.close(); }
+});
