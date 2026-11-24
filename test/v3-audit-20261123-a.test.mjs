@@ -21,8 +21,8 @@ const { weekdays } = await import('./ashare-fixture.mjs');
 
 const ACC = 'audit-a';
 
-function seedDaily(db, tsCode, days, closes, adjFactors = null) {
-  upsertRows(db, 'daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
+function seedDaily(db, tsCode, days, closes, adjFactors = null, priceTable = 'daily') {
+  upsertRows(db, priceTable, ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'],
     days.map((trade_date, i) => {
       const close = closes[i];
       const prev = i > 0 ? closes[i - 1] : close;
@@ -377,12 +377,44 @@ test('P0-2 stock above MA20 holds without arming', () => {
   }
 });
 
+test('P0-2 ETF MA20 uses fund_adj/fund_daily: a dividend must not create a false breakdown', () => {
+  const { mDb, pDb } = openDbPair('etf-ma20-div');
+  try {
+    const days = weekdays('20260901', 25);
+    const asOf = days.at(-1);
+    const divIdx = 20;
+    // 除息前 1.00；除息后 0.97，末日 0.975（真实 fund_daily 行情）。
+    const closes = days.map((_, i) => (i < divIdx ? 1.0 : i === days.length - 1 ? 0.975 : 0.97));
+    seedDaily(mDb, '159558.SZ', days, closes, null, 'fund_daily');
+    // 对照陷阱：若误用股票 daily 或 adj_factor，未复权 MA20 会把 0.975 判为跌破。
+    seedDaily(mDb, '159558.SZ', days, days.map(() => 1.0));
+    upsertRows(mDb, 'adj_factor', ['ts_code', 'trade_date', 'adj_factor'],
+      days.map(trade_date => ({ ts_code: '159558.SZ', trade_date, adj_factor: 1 })));
+    // 分红复权：除息日起 fund_adj = 前收/除息价 = 1/0.97。
+    upsertRows(mDb, 'fund_adj', ['ts_code', 'trade_date', 'adj_factor'],
+      days.map((trade_date, i) => ({ ts_code: '159558.SZ', trade_date, adj_factor: i < divIdx ? 1 : 1 / 0.97 })));
+    setTracker(pDb, {
+      ts_code: '159558.SZ', entry_price_milli: 1000, initial_stop_milli: 920,
+      current_stop_milli: 1000, trailing_ma20_armed: 1, entry_adj_factor: 1,
+      status: 'OPEN', entry_date: days[0],
+    });
+
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('159558.SZ', 975, 1000, '半导体设备ETF')] });
+    assert.deepEqual(sellsFor(out, '159558.SZ'), [], 'ETF 分红后原始价 0.975 不得被未复权 MA20 假跌破');
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '159558.SZ');
+    assert.equal(row.status, 'OPEN');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
 test('P0-2 ETF tracker rows keep the armed-only MA20 semantics', () => {
   const { mDb, pDb } = openDbPair('ma20-etf');
   try {
     const days = weekdays('20260901', 25);
     const asOf = days.at(-1);
-    seedDaily(mDb, '159558.SZ', days, days.map(() => 0.85));
+    seedDaily(mDb, '159558.SZ', days, days.map(() => 0.85), null, 'fund_daily');
     setTracker(pDb, {
       ts_code: '159558.SZ', entry_price_milli: 850, initial_stop_milli: 782,
       current_stop_milli: 782, trailing_ma20_armed: 0, entry_adj_factor: 1,
