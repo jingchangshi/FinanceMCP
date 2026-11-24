@@ -278,3 +278,40 @@ test('日报输出：wealth 不计入单位化 NAV，入金 90% 不会触发假 
     mDb.close();
   }
 });
+
+test('日报门控：已确认账户+当前快照但从未声明完整性只进 warnings，不阻断可执行腿与 V3 持久化', () => {
+  const mDb = seedMarket('undeclared');
+  const pDb = openPortfolioDb(join(dir, 'undeclared-portfolio.sqlite'), { marketPath: join(dir, 'undeclared-market.sqlite') });
+  const acc = 'real-undeclared';
+  try {
+    const pos = [{ ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 20_000, ref_price_milli: 900, ref_cost_milli: 900, market_value_cents: 1_800_000 }];
+    importSnapshot(pDb, snapshotData({ id: 'snap-undeclared-d0', asOf: D0, positions: pos, cashCents: 8_200_000 }));
+    initBaseline(pDb, acc, { asOf: D0, snapshotId: 'snap-undeclared-d0' });
+    markSnapshotCurrent(pDb, 'snap-undeclared-d0', { confirmedBy: 'test' });
+    confirmRealAccount(pDb, acc, { confirm: true, note: 'test' });
+    // 刻意不调用 setAccountCompleteness：从未声明 reported_events_through。
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${acc}`, '10000000');
+
+    const report = buildDailyReport({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: acc,
+      snapshotId: 'snap-undeclared-d0',
+      asOfTradeDate: D1,
+    });
+    assert.equal(report.gate.satisfied, true, `缺少完整性声明不得阻断可执行：${JSON.stringify(report.gate)}`);
+    assert.ok(report.gate.warnings.some(w => w.code === 'account_completeness_undeclared'), '缺少声明应进入 warnings');
+    assert.ok(report.gate.warnings.some(w => w.code === 'unreported_trade_lag_warning'), '未报成交风险提示必须保留');
+    assert.equal(report.status, 'ACTIONABLE');
+    assert.ok(
+      report.first_section.actions.some(action => action.legs.some(leg => leg.executable === true)),
+      '至少一条执行腿必须可执行',
+    );
+    const anchor = pDb.prepare('SELECT hwm_nav_cents FROM account_risk_anchor WHERE account_id = ?').get(acc);
+    assert.ok(anchor, 'V3 高水位锚点必须持久化');
+    assert.ok(anchor.hwm_nav_cents > 0);
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});

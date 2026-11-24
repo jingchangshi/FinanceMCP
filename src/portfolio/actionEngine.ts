@@ -873,7 +873,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
               rank: actions.length + 1,
               title: `执行 159558.SZ 震荡磨底战术回补：买入 ${buyShares} 份`,
               reasons: [
-                `25%底仓降本四门槛全部满足：60日均线10日斜率 ${guards?.ma60_slope10_pct?.toFixed(2) ?? '0.00'}%（未下行）、折价目标 ${(guards?.reload_target_cny ?? 0).toFixed(3)} 元达成、近3日出现极值超卖且当日右侧阳线站稳5日线。`,
+                `25%底仓降本回补条件满足：60日均线10日斜率 ${guards?.ma60_slope10_pct?.toFixed(2) ?? '0.00'}%（未下行）、折价目标 ${(guards?.reload_target_cny ?? 0).toFixed(3)} 元达成、近3日出现极值超卖，且当日收阳、收盘 >= MA5×0.995（3 日冷却与 <30% 仓位上限为系统附加护栏，非 EXP-V3-04 签发条件）。`,
                 `按单个 +${(deconcentration.tactical_slot_bps / 100).toFixed(0)}% 战术降本槽买入 ${buyShares} 份（买后封顶总仓位约 ${deconcentration.max_grind_weight_pct.toFixed(0)}%），不设窄幅噪点止损，统一由账户级熔断线兜底并在反弹 +7.5% 或牛市均线破位兑现降本。`,
               ],
               counter_evidence: ['若次日行业突发黑天鹅大幅低开，短期账面波动可能放大，但仓位已严控在单槽上限内并受账户高水位熔断保护。'],
@@ -946,10 +946,17 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     const reservoirCode = policy.defensive_bond_reservoir_etf;
     const reservoirRow = (input.candidates?.candidates ?? []).find(row => row.ts_code === reservoirCode);
     const reservoirHolding = input.holdings.find(h => h.ts_code === reservoirCode);
-    const quotePriceMilli = reservoirRow && (reservoirRow.data.latest_close_milli ?? 0) > 0
+    // 蓄水池只认当日新鲜报价：当日的 latest_close_milli 且 bar 日期 == asOf。
+    // 旧报价不用于买入；卖出若只有旧报价则退回持仓参考价并明确告警，绝不臆造当日价。
+    const freshQuoteMilli = reservoirRow
+      && reservoirRow.data.latest_bar_date === input.asOf
+      && (reservoirRow.data.latest_close_milli ?? 0) > 0
       ? reservoirRow.data.latest_close_milli!
       : 0;
-    const reservoirPriceMilli = quotePriceMilli > 0 ? quotePriceMilli : (reservoirHolding?.price_milli ?? 0);
+    const reservoirPriceMilli = freshQuoteMilli > 0 ? freshQuoteMilli : (reservoirHolding?.price_milli ?? 0);
+    const reservoirQuoteDate = freshQuoteMilli > 0
+      ? reservoirRow!.data.latest_bar_date
+      : (reservoirHolding?.latest_bar_date ?? null);
     let reservoirQty = workingQty.get(reservoirCode) ?? 0;
     let reservoirHeldCents: number | null = reservoirQty > 0
       ? (reservoirPriceMilli > 0 ? roundCent(reservoirQty * (reservoirPriceMilli / 10)) : null)
@@ -1053,6 +1060,9 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       const fundingShortfallCents = Math.max(0, etfBudgetCents - cashAvailableCents);
 
       if (fundingShortfallCents >= 500_000 && reservoirQty > 0 && reservoirPriceMilli > 0) {
+        if (freshQuoteMilli <= 0) {
+          blockers.push(`${reservoirCode} 当日无新鲜行情，融资卖出腿按持仓参考价计价（未使用或臆造当日价）。`);
+        }
         const sellableQty = Math.floor((workingSellable.get(reservoirCode) ?? 0) / 100) * 100;
         const maxSharesByValue = Math.floor((fundingShortfallCents / (reservoirPriceMilli / 10)) / 100) * 100;
         const sellShares = Math.min(sellableQty, maxSharesByValue, reservoirQty);
@@ -1080,7 +1090,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
               gross_cents: grossCents,
               fees_cents: fees.total_cents,
               net_cents: netCents,
-              quote_trade_date: reservoirRow?.data.latest_bar_date ?? reservoirHolding?.latest_bar_date ?? null,
+              quote_trade_date: reservoirQuoteDate,
               executable: true,
               reason: 'P3_DEFENSIVE_RESERVOIR_FUNDING',
             });
@@ -1196,12 +1206,12 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       if (reservoirHeldCents === null) {
         blockers.push(`${reservoirCode} 国债 ETF 防御蓄水池持仓缺少可用报价，无法计算防御桶余额，本次跳过且不臆造价格。`);
       } else if (reservoirBudgetCents >= 500_000) {
-        if (!reservoirRow || quotePriceMilli <= 0 || reservoirRow.data.buy_blocked) {
-          blockers.push(`${reservoirCode} 国债 ETF 防御蓄水池缺少当日可交易报价或已被禁买，本次跳过且不臆造价格。`);
+        if (!reservoirRow || freshQuoteMilli <= 0 || !reservoirRow.included || reservoirRow.data.buy_blocked) {
+          blockers.push(`${reservoirCode} 国债 ETF 防御蓄水池缺少当日新鲜报价或未通过现有可买入过滤（included/buy_blocked），本次跳过且不臆造价格。`);
         } else {
           const rules = feeFor(reservoirCode, 'ETF');
           const sized = sizeEtfBuy({
-            priceMilli: quotePriceMilli,
+            priceMilli: freshQuoteMilli,
             budgetCents: reservoirBudgetCents,
             availableCashCents: workingCashCents - cashBufferCents,
             rules,
@@ -1222,11 +1232,11 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
               quantity: sized.shares,
               lot_size: 100,
               lots: sized.shares / 100,
-              price_milli: quotePriceMilli,
+              price_milli: freshQuoteMilli,
               gross_cents: sized.gross_cents,
               fees_cents: sized.fees_cents,
               net_cents: sized.net_cents,
-              quote_trade_date: reservoirRow.data.latest_bar_date,
+              quote_trade_date: reservoirQuoteDate,
               executable: true,
               reason: 'P3_DEFENSIVE_BOND_RESERVOIR',
             });

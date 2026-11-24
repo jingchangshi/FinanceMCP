@@ -854,14 +854,17 @@ function renderSectionB(r: DailyReportResult): string {
   } else {
     items.push('【可考虑的交易决策】本期没有足够证据支持新的交易，建议暂不操作。（没有经过检验的优势证据支持新的买卖）');
   }
-  const unreported = !r.gate.satisfied && (
-    r.gate.unreported_trade_risk
-    || r.data_quality.tiers.account_trade_completeness.status !== 'CONFIRMED_THROUGH_TARGET_DATE'
-  );
-  if (unreported) {
-    items.push('【需要核实的事实】账本事件只记录到 '
-      + `${ymd(r.gate.reported_events_through)}，其后的券商成交尚未录入；`
-      + '补齐并完成核对前，本报告不提供可直接使用的买卖数量。');
+  const completenessUnconfirmed = r.gate.unreported_trade_risk
+    || r.data_quality.tiers.account_trade_completeness.status !== 'CONFIRMED_THROUGH_TARGET_DATE';
+  if (completenessUnconfirmed && r.gate.satisfied) {
+    // 缺少完整性声明/对账滞后只作风险提示，不再声称“不提供可直接使用的买卖数量”。
+    items.push('【需要核实的事实】' + (r.gate.reported_events_through
+      ? `账本事件声明至 ${ymd(r.gate.reported_events_through)}；若其后存在未录入成交，请先补录并核对现金与可用份额。`
+      : '尚未声明账本完整性；若存在未录入的券商成交，请先补录并核对现金与可用份额。'));
+  } else if (!r.gate.satisfied && completenessUnconfirmed) {
+    items.push('【需要核实的事实】' + (r.gate.reported_events_through
+      ? `账本事件只记录到 ${ymd(r.gate.reported_events_through)}，其后的券商成交尚未录入；补齐并完成核对前，本报告不提供可直接使用的买卖数量。`
+      : '尚未声明账本完整性；补齐完整性声明与对账前，本报告不提供可直接使用的买卖数量。'));
   } else if (c?.reconciliation_reminder.needs_reminder && c.reconciliation_reminder.message_zh) {
     items.push(`【需要核实的事实】${zh(c.reconciliation_reminder.message_zh)}`);
   }
@@ -1267,10 +1270,14 @@ function renderSectionH(r: DailyReportResult): string {
     items.push(`下一交易日收盘后核对：${trigger}——若成立，重估持有依据。`);
   }
   if (r.gate.unreported_trade_risk) {
-    if (r.gate.satisfied && r.gate.reported_events_through) {
-      items.push(`若 ${ymd(r.gate.reported_events_through)} 之后存在手工成交，请补录账本事件以保持现金与可用份额同步。`);
+    if (r.gate.satisfied) {
+      items.push(r.gate.reported_events_through
+        ? `若 ${ymd(r.gate.reported_events_through)} 之后存在手工成交，请补录账本事件以保持现金与可用份额同步。`
+        : '尚未声明账本完整性；若存在未录入的券商成交，请先补录并核对现金与可用份额。');
     } else {
-      items.push(`补录 ${ymd(r.gate.reported_events_through)} 之后的券商成交并完成现金/持仓核对——在未录入成交风险解除前，不提供可直接使用的买卖数量。`);
+      items.push(r.gate.reported_events_through
+        ? `补录 ${ymd(r.gate.reported_events_through)} 之后的券商成交并完成现金/持仓核对——在未录入成交风险解除前，不提供可直接使用的买卖数量。`
+        : '补录缺失的券商成交并完成现金/持仓核对——在未录入成交风险解除前，不提供可直接使用的买卖数量。');
     }
   } else if (!r.plan_tracking.available) {
     items.push('历史预案跟踪数据补齐后，回看观察触发条件是否被触发（当前无法核对）。');

@@ -1043,8 +1043,10 @@ function buildQualityTiers(
       status: accountEvaluation?.ok && !accountEvaluation.unreported_trade_risk ? 'CONFIRMED_THROUGH_TARGET_DATE' : 'UNCONFIRMED_RISK',
       detail: accountEvaluation?.ok && !accountEvaluation.unreported_trade_risk
         ? '完整性声明覆盖目标交易日且账本门控通过'
-        : gateReasons.length === 0 && accountEvaluation?.reported_events_through
-          ? `账本事件声明至 ${accountEvaluation.reported_events_through}（存在滞后提醒，不阻断既定规则执行）`
+        : gateReasons.length === 0
+          ? accountEvaluation?.reported_events_through
+            ? `账本事件声明至 ${accountEvaluation.reported_events_through}（存在滞后提醒，不阻断既定规则执行）`
+            : '未声明账本完整性；按可能存在未上报成交披露，已降为提醒，不阻断既定规则执行'
           : `账户完整性或账本门控未满足：${gateReasons.map(reason => reason.code).join('、') || '未知'}`,
     },
     research_evidence: {
@@ -1833,9 +1835,13 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       asOf,
     );
     for (const w of accountEvaluation.warnings ?? []) gateWarnings.push({ code: w.code, detail: w.detail });
+    // 反防御护栏（SERVER_EXECUTION_WORK_ORDER §一.2）：已确认真实账户 + 当前快照时，
+    // “从未声明完整性”与“已声明的对账滞后/未交收”只进 warnings，不得清零可执行腿，
+    // 也不得阻断 HWM/tracker 持久化。
+    // 例外：用户已显式声明 unreported_trade_risk=true（承认可能有未报成交）时仍按真实风险硬门控；
+    // 账户未验证、快照失效或账本重建失败同样按硬门控阻塞。
     const explicitCompletenessRisk = accountEvaluation.completeness?.unreported_trade_risk === true;
-    const hasPriorCompleteness = Boolean(accountEvaluation.reported_events_through) && !explicitCompletenessRisk;
-    const lagBypassEligible = hasPriorCompleteness && snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED';
+    const lagBypassEligible = snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED' && !explicitCompletenessRisk;
     const lagCodes = new Set(['account_completeness_undeclared', 'unreported_trade_risk', 'account_settlement_pending']);
     for (const reason of accountEvaluation.reasons) {
       if (lagBypassEligible && lagCodes.has(reason.code)) {
@@ -1844,13 +1850,14 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         gateReasons.push({ code: reason.code, detail: reason.detail });
       }
     }
-    // 铁律 2（反防御性护栏）：已有前置账本完整性声明的已确认真实账户，不因对账滞后清零可执行动作，
-    // 仅在 warnings 中保留漏记交易提醒；只有从未声明完整性（reported_events_through===null）或账户未确认时才阻塞可执行。
+    // 保留实际未报成交风险提示；已确认真实账户 + 当前快照时降为警告（不阻断执行与 V3 持久化）。
     if (accountEvaluation.unreported_trade_risk) {
       if (lagBypassEligible) {
         gateWarnings.push({
           code: 'unreported_trade_lag_warning',
-          detail: `账本事件记录截止 ${accountEvaluation.reported_events_through}，若期间有手工成交请补录后再核对委托数量。`,
+          detail: accountEvaluation.reported_events_through
+            ? `账本事件记录截止 ${accountEvaluation.reported_events_through}，若期间有手工成交请补录后再核对委托数量。`
+            : '尚未声明账本完整性（reported_events_through 缺失），按可能存在未上报成交披露；请核对并补录后再依赖委托份数。',
         });
       } else {
         gateReasons.push({

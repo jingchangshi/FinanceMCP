@@ -258,7 +258,7 @@ test('P0-3: 国债蓄水池缺少行情时不买、不臆造价格，并留下�
     assert.ok(action, '缺蓄水池行情不应影响风格桶买单');
     assert.equal(buyLegs(action).some(leg => leg.ts_code === '511010.SH'), false);
     assert.ok(
-      out.blockers.some(line => line.includes('511010.SH') && line.includes('缺少当日可交易报价')),
+      out.blockers.some(line => line.includes('511010.SH') && line.includes('缺少当日新鲜报价')),
       '缺行情必须给出阻断说明',
     );
   } finally {
@@ -363,6 +363,73 @@ test('P0-3: DEF→OFF 时卖出超额 511010 作为权益融资腿，并保留�
     const growthLegs = buyLegs(action).filter(leg => ['159205.SZ', '159337.SZ', '589850.SH'].includes(leg.ts_code));
     assert.ok(growthLegs.length > 0, '融资后应能买入成长桶');
     assert.equal(buyLegs(action).some(leg => leg.ts_code === '511010.SH'), false, '防御目标仍充足时不应再买国债 ETF');
+  } finally {
+    db.close();
+  }
+});
+
+test('P0-3: 蓄水池买入只认当日新鲜报价且必须 included/未禁买', () => {
+  const staleReservoir = candidateRow({ code: '511010.SH', name: '国债ETF', closeMilli: 50_000, category: 'bond' });
+  staleReservoir.data.latest_bar_date = '20261119'; // 旧报价：不得用于买入
+  const excludedReservoir = candidateRow({ code: '511010.SH', name: '国债ETF', closeMilli: 100_000, category: 'bond' });
+  excludedReservoir.included = false;
+
+  for (const [label, row] of [['stale', staleReservoir], ['not-included', excludedReservoir]]) {
+    const db = freshDb();
+    try {
+      const cashCents = 9_900_000;
+      const out = run(db, {
+        marketRegime: regime('OFFENSIVE', 'GROWTH_LEADING'),
+        cashCents,
+        totalAssetsCents: 10_000_000,
+        candidateRows: [ROWS.growth1, ROWS.growth2, ROWS.growth3, ROWS.value, row],
+      });
+      const action = rebalance(out);
+      assert.ok(action, `${label}: 风格桶仍应生成`);
+      assert.equal(buyLegs(action).some(leg => leg.ts_code === '511010.SH'), false, `${label}: 蓄水池不得买入`);
+      assert.ok(
+        out.blockers.some(line => line.includes('511010.SH') && line.includes('缺少当日新鲜报价')),
+        `${label}: 必须留下新鲜报价/过滤阻断说明`,
+      );
+    } finally {
+      db.close();
+    }
+  }
+});
+
+test('P0-3: 蓄水池卖出只有旧报价时改用持仓参考价并明确告警，不臆造当日价', () => {
+  const db = freshDb();
+  try {
+    const staleReservoir = candidateRow({ code: '511010.SH', name: '国债ETF', closeMilli: 50_000, category: 'bond' });
+    staleReservoir.data.latest_bar_date = '20261119'; // 旧报价 50 元，与持仓 100 元不同
+    const holdings = [
+      {
+        ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 15_000, sellable_quantity: 15_000,
+        weight: 0.15, market_value_cents: 1_500_000, price_milli: 1000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 1000,
+      },
+      {
+        ts_code: '511010.SH', name: '国债ETF', quantity: 850, sellable_quantity: 850,
+        weight: 0.85, market_value_cents: 8_500_000, price_milli: 100_000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 100_000,
+      },
+    ];
+    const out = run(db, {
+      marketRegime: regime('OFFENSIVE', 'GROWTH_LEADING'),
+      cashCents: 0,
+      totalAssetsCents: 10_000_000,
+      holdings,
+      candidateRows: [ROWS.growth1, ROWS.growth2, ROWS.growth3, ROWS.value, staleReservoir],
+    });
+    const action = rebalance(out);
+    assert.ok(action);
+    const funding = sellLegs(action).find(leg => leg.ts_code === '511010.SH');
+    assert.ok(funding, '仍应生成融资卖出腿');
+    assert.equal(funding.price_milli, 100_000, '旧报价 50 元不得用于卖出，应使用持仓参考价 100 元');
+    assert.ok(
+      out.blockers.some(line => line.includes('511010.SH') && line.includes('按持仓参考价计价')),
+      '旧报价卖出必须明确告警',
+    );
   } finally {
     db.close();
   }
