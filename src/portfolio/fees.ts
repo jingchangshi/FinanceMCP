@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { EASTMONEY_SUPER_ETF_CODES } from '../ashare/etfDeclarations.js';
+import { inPortfolioTransaction } from './db.js';
 import { DEFAULT_FEE_RULES, DEFAULT_STOCK_RULES, FEE_RULE_VERSION, type FeeRules } from './rules.js';
 
 export type FeeEvidence = 'CONFIRMED' | 'PUBLIC_REFERENCE' | 'ASSUMED' | 'UNKNOWN';
@@ -103,14 +104,17 @@ export function saveFeeProfile(db: DatabaseSync, accountId: string, profile: Fee
   validateFeeProfile(profile);
   if (profile.account_id && profile.account_id !== accountId) throw new Error('Fee profile account mismatch');
   const scoped = { ...profile, account_id: accountId };
-  const profiles = loadFeeContext(db, accountId, profile.effective_from).profiles;
-  const existing = profiles.find(p => p.id === scoped.id);
-  if (existing) {
-    if (JSON.stringify(existing) !== JSON.stringify(scoped)) throw new Error('Fee profile id already exists; append a new version');
-    return { created: false, profile: existing };
-  }
-  db.prepare('INSERT INTO account_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(keyFor(accountId), JSON.stringify([...profiles, scoped]));
-  return { created: true, profile: scoped };
+  // Read-modify-write must be atomic: two concurrent appends would otherwise drop one profile.
+  return inPortfolioTransaction(db, () => {
+    const profiles = loadFeeContext(db, accountId, profile.effective_from).profiles;
+    const existing = profiles.find(p => p.id === scoped.id);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(scoped)) throw new Error('Fee profile id already exists; append a new version');
+      return { created: false, profile: existing };
+    }
+    db.prepare('INSERT INTO account_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(keyFor(accountId), JSON.stringify([...profiles, scoped]));
+    return { created: true, profile: scoped };
+  });
 }
 
 /** Code > account/broker category > category default > conservative estimate. */
