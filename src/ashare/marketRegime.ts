@@ -70,7 +70,13 @@ export interface MarketRegimeResult {
 }
 
 export interface EvaluateMarketRegimeOptions {
-  /** 可选：历史回溯确认窗口长度（默认 5 个交易日）。 */
+  /**
+   * 可选：历史回溯确认窗口长度（默认 20 个交易日）。
+   *
+   * 窗口起点决定状态机的初始 confirmed（窗口首日直接取 raw），并把窗口内的
+   * crash 保护带进最终结论。5 日窗口会让 6 天前的暴跌保护与当时的档位一起被
+   * 遗忘；20 日窗口覆盖一个自然月，与 V3「低频」调仓节奏一致。
+   */
   hysteresisLookbackDays?: number;
   /** 可选（测试注入）：按交易日覆盖全市场站上 MA60 比例（0~1），避免在小样本单测里扫描全市场。 */
   pctAboveMa60ByDate?: Record<string, number>;
@@ -348,7 +354,7 @@ export function evaluateMarketRegime(
     };
   }
 
-  const lookback = Math.max(2, opts.hysteresisLookbackDays ?? 5);
+  const lookback = Math.max(2, opts.hysteresisLookbackDays ?? 20);
   let dates = tableExists(db, 'trade_cal') ? recentTradeDays(db, asOf, lookback) : [];
   if (!dates.length) {
     dates = (db.prepare(

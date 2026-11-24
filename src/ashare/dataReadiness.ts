@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { checkQuality, previousTradeDay, type QualityStatus } from './ingest.js';
+import { resolveDataProviderMode } from './providers/types.js';
 
 /**
  * Data readiness and the data fingerprint that goes INTO the snapshot hash
@@ -84,6 +85,30 @@ function countOn(db: DatabaseSync, table: string, date: string): number {
   if (!tableExists(db, table)) return 0;
   try {
     return Number((db.prepare(`SELECT COUNT(*) c FROM ${table} WHERE trade_date = ?`).get(date) as { c: number }).c);
+  } catch { return 0; }
+}
+
+/** Floor for a same-day page relative to the previous trading day / the daily universe. */
+const COVERAGE_FLOOR = 0.97;
+
+/**
+ * Rows of `dataset` on `date` that actually carry a usable value for the daily bars that exist
+ * that day. Free mode backfills `daily_basic`/`adj_factor` one row per stock with NULL values,
+ * so the row count alone is always "complete" while the ranking inputs are empty. A row with
+ * NULL pe/pb/circ_mv, or a non-positive factor, is a row that cannot be used.
+ */
+function usableCoverageOn(db: DatabaseSync, dataset: 'daily_basic' | 'adj_factor', date: string): number {
+  if (!tableExists(db, 'daily') || !tableExists(db, dataset)) return 0;
+  const alias = dataset === 'daily_basic' ? 'b' : 'a';
+  const usable = dataset === 'daily_basic'
+    ? `(${alias}.pe_ttm IS NOT NULL OR ${alias}.pb IS NOT NULL OR ${alias}.circ_mv IS NOT NULL)`
+    : `(${alias}.adj_factor IS NOT NULL AND ${alias}.adj_factor > 0)`;
+  try {
+    return Number((db.prepare(`
+      SELECT COUNT(*) c
+      FROM daily d
+      JOIN ${dataset} ${alias} ON ${alias}.trade_date = d.trade_date AND ${alias}.ts_code = d.ts_code
+      WHERE d.trade_date = ? AND ${usable}`).get(date) as { c: number }).c);
   } catch { return 0; }
 }
 
@@ -212,7 +237,42 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
     };
   }
 
-  const disclosed: string[] = [];
+  // Free mode writes daily_basic/adj_factor rows 1:1 with daily — the historical backfill path
+  // writes every valuation field as NULL — so a row-count check passes on an empty sheet.
+  // Measure usable values and DISCLOSE the gap: a missing valuation column degrades the ranking,
+  // but blocking the whole day's report for it is unnecessary defense (MASTER_PLAN_V3). DEGRADED
+  // still publishes and carries this reason in `data_state.readiness`.
+  const freeCoverageIssues: string[] = [];
+  if (resolveDataProviderMode() === 'free') {
+    const floor = Math.ceil(daily * COVERAGE_FLOOR);
+    const usableBasic = usableCoverageOn(db, 'daily_basic', asOf);
+    const usableAdj = usableCoverageOn(db, 'adj_factor', asOf);
+    if (usableBasic < floor) {
+      freeCoverageIssues.push(`free 模式 daily_basic 有效值 ${usableBasic} < ${floor}（估值字段缺失，按数据质量警告披露，不阻断日报）`);
+    }
+    if (usableAdj < floor) {
+      freeCoverageIssues.push(`free 模式 adj_factor 正值 ${usableAdj} < ${floor}（复权因子缺失，按数据质量警告披露，不阻断日报）`);
+    }
+  }
+
+  // Missing bar evidence is not a degradation to disclose: a short page, an invalid close or a
+  // NULL OHLC means the day's prices cannot be trusted. `checkQuality` already calls these
+  // NOT_READY in its own cache status; readiness must not downgrade that to DEGRADED.
+  const hardDefects: string[] = [];
+  if ((quality.counts.prev_daily ?? 0) > 0 && quality.coverage.daily_vs_prev < COVERAGE_FLOOR) {
+    hardDefects.push(`daily=${daily} 低于前一交易日 ${quality.counts.prev_daily} 的 97%`);
+  }
+  if ((quality.anomalies.bad_close ?? 0) > 0) hardDefects.push(`bad_close=${quality.anomalies.bad_close}`);
+  if ((quality.anomalies.null_ohlc ?? 0) > 0) hardDefects.push(`null_ohlc=${quality.anomalies.null_ohlc}`);
+  if (hardDefects.length) {
+    return {
+      status: 'NOT_READY',
+      checks: { bars_present, quality_ready, financials_synced_today },
+      reason: `行情数据硬缺陷 for ${asOf}: ${hardDefects.join(', ')}`,
+    };
+  }
+
+  const disclosed: string[] = [...freeCoverageIssues];
   if (quality.status !== 'READY') {
     disclosed.push(`market quality ${quality.status}: ${quality.reasons.slice(0, 3).join('; ') || 'see checkQuality'}`);
   }

@@ -926,7 +926,7 @@ export function collectEtfPenetrationInputs(db: DatabaseSync, opts: CollectOptio
   if (hasTable(db, 'fina_indicator') && conCodes.length) {
     for (const row of db.prepare(`
       SELECT * FROM (
-        SELECT f.*, ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY end_date DESC, ann_date DESC) rn
+        SELECT f.*, ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY ann_date DESC, end_date DESC) rn
         FROM fina_indicator f
         WHERE ann_date <= ? AND end_date >= ? AND ann_date >= end_date AND ts_code IN ${inCon}
       ) WHERE rn = 1`).all(asOf, addDays(asOf, -550), ...conCodes) as any[]) {

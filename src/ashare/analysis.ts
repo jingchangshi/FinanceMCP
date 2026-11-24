@@ -225,14 +225,20 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
 
   const sectors = sectorRank(rows, version);
   scoreRows(rows, sectors, version);
-  const total = rows.length || 1;
+  // Breadth is a market-wide statement, not a candidate count: a stock without 60 valid bars
+  // has no MA60 to be above or below, and .BJ names are outside the V3 A-share universe.
+  // Counting them inflated the denominator and understated breadth. Candidate scans, ranking
+  // and eligibility below are unchanged — only these two ratios use the narrower universe.
+  const breadthUniverse = rows.filter(r => !r.ts_code.endsWith('.BJ'));
+  const ma20Valid = breadthUniverse.filter(r => Number.isFinite(r.ma20));
+  const ma60Valid = breadthUniverse.filter(r => Number.isFinite(r.ma60));
   return {
     trade_date: date,
     rows,
     suspended_or_missing: missing,
     signal_counts: signalCounts,
-    pct_above_ma20: rows.filter(r => r.state.above_ma20).length / total,
-    pct_above_ma60: rows.filter(r => r.state.above_ma60).length / total,
+    pct_above_ma20: ma20Valid.length ? ma20Valid.filter(r => r.state.above_ma20).length / ma20Valid.length : 0,
+    pct_above_ma60: ma60Valid.length ? ma60Valid.filter(r => r.state.above_ma60).length / ma60Valid.length : 0,
     sectors,
   };
 }
