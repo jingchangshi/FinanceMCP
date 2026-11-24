@@ -638,13 +638,16 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     // adj_factor 上升而原始价下跌，因此历史价的 asOf 原始口径等价价 =
     // stored × entryAdj / currentAdj（Tushare hfq 因子口径）。绝不对 h.price_milli 缩放。
     // 旧 OPEN 行缺 entry 基准时回查 entry_date 的真实因子（股票 adj_factor / ETF fund_adj）；
-    // 仍查不到则不缩放并保持 NULL，绝不写 currentAdj 冒充。
+    // 查不到则保持 NULL。只有 entry 与 as-of 两个真实因子齐备时才缩放；缺失任一侧
+    // 一律跳过比值（不缩放、不写 1 冒充）。
     const adjTable: AdjTable = isStock ? 'adj_factor' : 'fund_adj';
-    const currentAdj = adjFactorAt(input.marketDb, h.ts_code, input.asOf, adjTable) ?? 1;
+    const currentAdj = adjFactorAt(input.marketDb, h.ts_code, input.asOf, adjTable);
     const entryAdj = continuing
       ? (tracked!.entry_adj_factor ?? adjFactorAt(input.marketDb, h.ts_code, tracked!.entry_date, adjTable))
       : currentAdj;
-    const basisRatio = entryAdj !== null && entryAdj > 0 ? entryAdj / currentAdj : 1;
+    const basisRatio = entryAdj !== null && currentAdj !== null && entryAdj > 0 && currentAdj > 0
+      ? entryAdj / currentAdj
+      : 1;
     const scaledEntryMilli = Math.round(entryMilli * basisRatio);
     let scaledCurrentStopMilli = Math.round(currentStopMilli * basisRatio);
 

@@ -123,11 +123,11 @@ test('P0-1 re-buy after CLOSED must not resurrect a ghost high stop', () => {
     assert.deepEqual(sellsFor(first, '600036.SH'), [], '重新买入价 30.00 不得被旧的 50.00 幽灵止损触发');
     let row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
     assert.equal(row.status, 'OPEN');
+    assert.equal(row.entry_adj_factor, null, '无真实 as-of 因子时不得写入 1 冒充');
     assert.equal(row.entry_price_milli, 30000);
     assert.equal(row.initial_stop_milli, 27600);
     assert.equal(row.current_stop_milli, 27600, 'CLOSED 行必须整体重置，而不是 MAX 保留 50000');
     assert.equal(row.trailing_ma20_armed, 0);
-    assert.equal(row.entry_adj_factor, 1);
 
     const second = runEngine({ pDb, mDb, asOf: next, holdings: [holding('600036.SH', 30500, 30000)] });
     assert.deepEqual(sellsFor(second, '600036.SH'), [], '次日 30.50 仍远高于新止损 27.60');
@@ -296,6 +296,64 @@ test('P0-1 ETF legacy tracker uses fund_adj, never the stock adj_factor table', 
     const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '159558.SZ');
     assert.equal(row.entry_adj_factor, 1, 'ETF entry 因子取自 fund_adj 的 entry_date 值');
     assert.equal(row.current_stop_milli, 1000);
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-1 new tracker without a real as-of factor keeps NULL and does not scale', () => {
+  const { mDb, pDb } = openDbPair('no-factor-new');
+  try {
+    const days = weekdays('20260901', 12);
+    const asOf = days[10];
+    seedDaily(mDb, '600036.SH', days, days.map(() => 10.0)); // 无 adj_factor 行
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 10000, 10000)] });
+    assert.deepEqual(sellsFor(out, '600036.SH'), []);
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.entry_adj_factor, null, '无真实因子时不得写入 1');
+    assert.equal(row.entry_price_milli, 10000);
+    assert.equal(row.current_stop_milli, 9200, '无因子时按原始价建仓，止损 8%');
+    assert.equal(row.status, 'OPEN');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-1 new tracker records a real as-of factor instead of defaulting to 1', () => {
+  const { mDb, pDb } = openDbPair('real-factor-new');
+  try {
+    const days = weekdays('20260901', 12);
+    const asOf = days[10];
+    seedDaily(mDb, '600036.SH', days, days.map(() => 10.0), days.map(() => 2));
+    runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 10000, 10000)] });
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.entry_adj_factor, 2, '必须记录真实的 as-of 因子 2');
+    assert.equal(row.current_stop_milli, 9200);
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('P0-1 missing current factor skips scaling even with a stored entry factor', () => {
+  const { mDb, pDb } = openDbPair('no-current-factor');
+  try {
+    const days = weekdays('20260901', 12);
+    const asOf = days[10];
+    seedDaily(mDb, '600036.SH', days, days.map(() => 9.9)); // 无 adj_factor 行
+    setTracker(pDb, {
+      ts_code: '600036.SH', entry_price_milli: 10000, initial_stop_milli: 9200,
+      current_stop_milli: 10000, trailing_ma20_armed: 1, entry_adj_factor: 1,
+      status: 'OPEN', entry_date: days[0],
+    });
+    const out = runEngine({ pDb, mDb, asOf, holdings: [holding('600036.SH', 9900, 10000)] });
+    assert.equal(sellsFor(out, '600036.SH').length, 1, '缺少 current 因子时按 entry 基准原始价比较');
+    const row = pDb.prepare('SELECT * FROM position_stop_tracker WHERE account_id = ? AND ts_code = ?').get(ACC, '600036.SH');
+    assert.equal(row.entry_adj_factor, 1, '已记录的真实 entry 因子保持不变');
+    assert.equal(row.current_stop_milli, 10000);
+    assert.equal(row.status, 'OPEN');
   } finally {
     pDb.close();
     mDb.close();
