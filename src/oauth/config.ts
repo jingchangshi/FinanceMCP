@@ -33,11 +33,18 @@ export interface OAuthConfig {
   scope: string;
   writeScope: string;
   /**
-   * 为真时，追加工具必须持有 writeScope（或 portfolio:admin）。默认关闭：
-   * 在此之前签发的令牌只有 portfolio:read，直接强制会让既有的 ChatGPT 写回立刻失败，
-   * 所以要等连接器用新 scope 重新授权后再打开。
+   * 为真时，追加工具必须持有 writeScope（或 portfolio:admin）。
+   * **默认开启（fail closed）**：只读令牌无法追加研究记录。过渡期若某个旧连接器
+   * 尚未重新授权，运维必须显式设置 `ASHARE_OAUTH_REQUIRE_WRITE_SCOPE=0` 才允许
+   * 兼容行为——默认再也不能静默放宽写权限。
    */
   requireWriteScope: boolean;
+  /** DCR 允许的回调主机白名单（精确主机或 `*.example.com` 通配）。 */
+  dcrRedirectHosts: string[];
+  /** DCR 客户端数量上限（单用户私服的保守上限）。 */
+  maxClients: number;
+  /** 同一来源在 15 分钟窗口内允许的登录失败次数。 */
+  maxLoginFailures: number;
 }
 
 function required(name: string): string {
@@ -52,6 +59,43 @@ function positiveInt(name: string, fallback: number): number {
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} 必须是正整数（秒）`);
   return value;
+}
+
+function positiveCount(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} 必须是正整数`);
+  return value;
+}
+
+/**
+ * DCR 回调主机白名单。
+ *
+ * 默认只覆盖本机回环与已知连接器（ChatGPT / Gemini）实际使用的回调主机；
+ * 这既保住现有验收测试和真实连接器，又阻止任意 HTTPS 主机通过 DCR 注册一个
+ * 钓鱼回调地址。运维可以用 `ASHARE_OAUTH_DCR_REDIRECT_HOSTS`（逗号分隔，
+ * 支持 `*.example.com`）显式增删。
+ */
+const DEFAULT_DCR_REDIRECT_HOSTS = [
+  'localhost',
+  '127.0.0.1',
+  '[::1]',
+  'chatgpt.com',
+  'chat.openai.com',
+  'gemini.google.com',
+  'oauth-redirect.googleusercontent.com',
+];
+
+function dcrRedirectHosts(): string[] {
+  const raw = (process.env.ASHARE_OAUTH_DCR_REDIRECT_HOSTS ?? '').trim();
+  const hosts = (raw ? raw.split(',') : DEFAULT_DCR_REDIRECT_HOSTS)
+    .map(host => host.trim().toLowerCase())
+    .filter(Boolean);
+  if (hosts.length === 0) {
+    throw new Error('ASHARE_OAUTH_DCR_REDIRECT_HOSTS 不能为空：请列出允许的 DCR 回调主机');
+  }
+  return hosts;
 }
 
 function normalizedUrl(raw: string, name: string): string {
@@ -96,6 +140,10 @@ export function oauthConfig(): OAuthConfig | null {
     refreshTokenLifetime: positiveInt('ASHARE_OAUTH_REFRESH_TOKEN_TTL', 30 * 24 * 3600),
     scope: OAUTH_SCOPE,
     writeScope: OAUTH_WRITE_SCOPE,
-    requireWriteScope: (process.env.ASHARE_OAUTH_REQUIRE_WRITE_SCOPE ?? '').trim() === '1',
+    // Fail closed by default; `=0` is the explicit, documented compatibility switch.
+    requireWriteScope: (process.env.ASHARE_OAUTH_REQUIRE_WRITE_SCOPE ?? '').trim() !== '0',
+    dcrRedirectHosts: dcrRedirectHosts(),
+    maxClients: positiveCount('ASHARE_OAUTH_MAX_CLIENTS', 50),
+    maxLoginFailures: positiveCount('ASHARE_OAUTH_MAX_LOGIN_FAILURES', 10),
   };
 }

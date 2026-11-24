@@ -460,8 +460,8 @@ test('S8 无效、过期、错误 audience、只写的令牌都被拒绝', async
   } finally { await server.stop(); }
 });
 
-test('S9 未开启强制时保持兼容：只读令牌仍能到达追加工具（过渡期，待用户重新授权后再开启）', async () => {
-  const server = await startServer({});
+test('S9 显式关闭强制时保持兼容：只读令牌仍能到达追加工具（兼容开关，非默认）', async () => {
+  const server = await startServer({ ASHARE_OAUTH_REQUIRE_WRITE_SCOPE: '0' });
   try {
     const client = await registerClient(server);
     const token = await grantedToken(server, client, 'portfolio:read');

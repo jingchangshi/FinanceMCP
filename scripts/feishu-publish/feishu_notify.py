@@ -24,6 +24,7 @@ from feishu_publish import (  # noqa: E402
     DEFAULT_CONFIG_NAME,
     INCIDENT_NAME,
     LEDGER_DIR,
+    is_non_retryable_client_error,
     ledger_entry_for_date,
     load_json,
     load_ledger,
@@ -103,11 +104,20 @@ def _format_action_line(action: dict[str, Any]) -> str:
     return f"- **{prefix}{humanize_text(title)}**"
 
 
+def _format_hm(value: Any) -> str:
+    """Render a 4-digit HHMM deadline (or an already formatted HH:MM) as HH:MM."""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) == 4:
+        return f"{digits[:2]}:{digits[2:]}"
+    return str(value or "").strip()
+
+
 def build_notification_markdown(
     bundle: dict[str, Any],
     publish_entry: dict[str, Any],
     *,
     data_delayed: bool = False,
+    deadline_hm: str = "2115",
 ) -> tuple[str, str]:
     """Build concise Feishu IM Markdown summary + deterministic fingerprint."""
     payload = bundle.get("payload") if isinstance(bundle.get("payload"), dict) else bundle
@@ -160,9 +170,15 @@ def build_notification_markdown(
 
     lines: list[str] = [f"**A 股攻防实战日报｜{iso_date} 收盘**"]
     if data_delayed:
+        # The readiness deadline is configurable on the host
+        # (ASHARE_READINESS_DEADLINE_HM); hardcoding 21:15 made the banner lie
+        # whenever the operator changed it. Empty value falls back to the
+        # historical text instead of printing "至 ：".
+        deadline_txt = _format_hm(deadline_hm)
+        deadline_clause = f"截至 {deadline_txt} " if deadline_txt else ""
         lines.append("")
         lines.append(
-            "⚠️ **数据延迟提示**：截至 21:15 上游部分收盘数据未完全就绪，以下基于最新可用缓存生成，明早开盘前请复核。"
+            f"⚠️ **数据延迟提示**：{deadline_clause}上游部分收盘数据未完全就绪，以下基于最新可用缓存生成，明早开盘前请复核。"
         )
 
     lines.append("")
@@ -275,6 +291,7 @@ def notify(
     config: dict[str, Any],
     *,
     data_delayed: bool = False,
+    deadline_hm: str = "2115",
     force: bool = False,
     dry_run: bool = False,
     runner: Callable[[list[str], Path], dict[str, Any]] = run_lark,
@@ -291,7 +308,7 @@ def notify(
     identity = str(config.get("identity", "bot"))
     targets = resolve_notify_targets(config)
     markdown_text, notify_sha256 = build_notification_markdown(
-        bundle, publish_entry, data_delayed=data_delayed
+        bundle, publish_entry, data_delayed=data_delayed, deadline_hm=deadline_hm
     )
     ledger_path = root / LEDGER_DIR / NOTIFY_LEDGER_NAME
     existing = ledger_entry_for_date(load_ledger(ledger_path), trade_date)
@@ -318,7 +335,7 @@ def notify(
 
     idempotency_key = f"ashare-{trade_date}-{notify_sha256[:16]}"
     errors: list[str] = []
-    for flag_name, target_id in targets:
+    for index, (flag_name, target_id) in enumerate(targets):
         try:
             res = runner(
                 [
@@ -356,10 +373,25 @@ def notify(
             return entry
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{flag_name}({target_id}): {exc}")
+            has_next_target = index + 1 < len(targets)
+            if has_next_target and is_non_retryable_client_error(exc):
+                # Explicit 4xx/permission rejection: this recipient can never
+                # receive the message, so trying the group is safe.
+                print(
+                    f"feishu_notify warning: {flag_name} {target_id} rejected ({exc}); "
+                    f"falling back to {targets[index + 1][0]}",
+                    file=sys.stderr,
+                )
+                continue
+            # Timeout/network/5xx after bounded retries: the private message may
+            # already have been delivered. Sending the group copy would duplicate
+            # delivery, so stop and record the incident instead.
             print(
-                f"feishu_notify warning: failed for {flag_name} {target_id}: {exc}",
+                f"feishu_notify warning: failed for {flag_name} {target_id}: {exc}; "
+                "not falling back (ambiguous delivery)",
                 file=sys.stderr,
             )
+            break
 
     incident_path = root / LEDGER_DIR / INCIDENT_NAME
     write_incident(
@@ -386,6 +418,11 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--trade-date", default="")
     parser.add_argument("--data-delayed", action="store_true")
+    parser.add_argument(
+        "--deadline-hm",
+        default=os.environ.get("ASHARE_READINESS_DEADLINE_HM", "2115"),
+        help="HHMM readiness deadline rendered in the delayed-data banner.",
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -410,6 +447,7 @@ def main() -> None:
         pub_entry,
         config,
         data_delayed=args.data_delayed,
+        deadline_hm=args.deadline_hm,
         force=args.force,
         dry_run=args.dry_run,
     )

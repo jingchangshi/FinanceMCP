@@ -6,6 +6,7 @@ calls are made.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ sys.path.insert(0, str(HERE.parent))
 
 from feishu_render import render_xml  # noqa: E402
 from feishu_publish import (  # noqa: E402
+    LarkError,
     dry_run,
     load_ledger,
     publish,
@@ -146,8 +148,12 @@ class TestPublisher(unittest.TestCase):
                 self.root, self.xml_path, "20261106", TITLE, SOURCE_COUNT, CONFIG,
                 runner=runner,
             )
-        # Ledger untouched; incident recorded; no receipt for the failed day.
-        self.assertEqual(self._ledger(), [])
+        # The created document is not silently orphaned: a pending ledger row
+        # carries its id, and the incident records the verification failure.
+        ledger = self._ledger()
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["status"], "pending")
+        self.assertEqual(ledger[0]["document_id"], runner.document_id)
         incidents = (self.root / "data/feishu/account_publish_incidents.jsonl").read_text(
             encoding="utf-8"
         )
@@ -175,7 +181,10 @@ class TestPublisher(unittest.TestCase):
                 self.root, self.xml_path, "20261106", TITLE, SOURCE_COUNT, CONFIG,
                 runner=runner,
             )
-        self.assertEqual(self._ledger(), [])
+        # Not a verified receipt, but the orphan document is discoverable.
+        ledger = self._ledger()
+        self.assertEqual([(e["status"], e["document_id"]) for e in ledger],
+                         [("pending", runner.document_id)])
 
     def test_hyperlink_count_mismatch_fails_closed(self):
         # Caught either by local pre-publish validation (ValueError, before any
@@ -452,3 +461,67 @@ class TestPublisher(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLarkRetry(unittest.TestCase):
+    """Bounded exponential backoff: transient failures retry, 4xx rejects do not."""
+
+    def _completed(self, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+    def _run_with(self, responses, env=None):
+        """Runs lark-cli with `responses` (exceptions or CompletedProcess)."""
+        settings = {"ASHARE_FEISHU_RETRY_ATTEMPTS": "3", "ASHARE_FEISHU_RETRY_BASE_SECONDS": "0.01"}
+        if env:
+            settings.update(env)
+        with patch.dict(os.environ, settings), \
+             patch("feishu_publish.subprocess.run", side_effect=responses) as run, \
+             patch("feishu_publish.time.sleep") as sleep:
+            result = None
+            error = None
+            try:
+                result = run_lark(["lark-cli", "docs", "+fetch"], Path("."))
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+            return result, error, run, sleep
+
+    def test_retries_5xx_envelope_three_times_then_succeeds(self):
+        fail = self._completed(
+            1, stderr='{"ok": false, "error": {"type": "internal_error", "code": 500, "message": "internal server error"}}'
+        )
+        ok = self._completed(0, stdout='{"ok": true, "data": {"document": {}}}')
+        result, error, run, sleep = self._run_with([fail, fail, ok])
+        self.assertIsNone(error)
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_count, 2, "two backoff sleeps between three attempts")
+
+    def test_permission_4xx_is_not_retried(self):
+        denied = self._completed(
+            1, stderr='{"ok": false, "error": {"type": "permission", "code": 4030004, "message": "forbidden"}}'
+        )
+        result, error, run, sleep = self._run_with([denied])
+        self.assertIsNone(result)
+        self.assertIsInstance(error, LarkError)
+        self.assertEqual(error.retryable, False)
+        self.assertEqual(run.call_count, 1, "an explicit 4xx must fail immediately")
+        self.assertEqual(sleep.call_count, 0)
+
+    def test_timeout_is_retried_and_then_raises(self):
+        timeouts = [subprocess.TimeoutExpired("lark-cli", 180) for _ in range(3)]
+        result, error, run, sleep = self._run_with(timeouts)
+        self.assertIsNone(result)
+        self.assertIsInstance(error, LarkError)
+        self.assertEqual(error.retryable, True)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_count, 2, "sleeps only between attempts, not after the last")
+
+    def test_429_is_retried(self):
+        limited = self._completed(
+            1, stderr='{"ok": false, "error": {"type": "rate_limit", "code": 429, "message": "too many requests"}}'
+        )
+        ok = self._completed(0, stdout='{"ok": true, "data": {}}')
+        result, error, run, _ = self._run_with([limited, ok])
+        self.assertIsNone(error)
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(run.call_count, 2)

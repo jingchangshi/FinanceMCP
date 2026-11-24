@@ -7,9 +7,13 @@ set -eu
 if ! docker info >/dev/null 2>&1 && [ -z "${ASHARE_SG_REEXEC:-}" ] && getent group docker | cut -d: -f4 | tr "," "\n" | grep -qx "$(id -un)"; then
   ASHARE_SG_REEXEC=1 exec sg docker -c "ASHARE_SG_REEXEC=1 $0 $*"
 fi
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+. "$HERE/ops-lock.sh"
 DATA_DIR="${ASHARE_HOST_DATA_DIR:-$HOME/.local/share/finance-mcp-ashare}"
 LOG_DIR="$DATA_DIR/logs"
 mkdir -p "$LOG_DIR"
+# Serialize against unified/hotspot/account/upgrade; a busy lock exits 73 fast.
+acquire_ashare_ops_lock || exit $?
 STAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
 OUT="$LOG_DIR/daily-$STAMP.json"
 ERR="$LOG_DIR/daily-$STAMP.log"

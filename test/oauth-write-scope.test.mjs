@@ -108,11 +108,20 @@ test('W3 强制开启时，只读令牌仍可调用其他私有工具，写 scop
   } finally { await s.stop(); }
 });
 
-test('W4 未开启强制时行为与以前一致：只读令牌不被写 scope 门拦截（过渡期兼容既有 ChatGPT 连接器）', async () => {
-  const s = await start({});
+test('W4 显式关闭强制时行为与以前一致：只读令牌不被写 scope 门拦截（兼容开关，非默认）', async () => {
+  const s = await start({ ASHARE_OAUTH_REQUIRE_WRITE_SCOPE: '0' });
   try {
     const res = await s.call(s.mint('portfolio:read'), APPEND, {});
     assert.notEqual(res.status, 403, res.text);
+  } finally { await s.stop(); }
+});
+
+test('W4b 未设置环境变量时默认强制写 scope：只读令牌不能追加（fail closed）', async () => {
+  const s = await start({});
+  try {
+    const res = await s.call(s.mint('portfolio:read'), APPEND, {});
+    assert.equal(res.status, 403, res.text);
+    assert.match(res.headers.get('www-authenticate') ?? '', /insufficient_scope/);
   } finally { await s.stop(); }
 });
 

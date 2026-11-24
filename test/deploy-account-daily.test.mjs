@@ -51,10 +51,15 @@ test('scheduled record failure still runs forward review and reports record fail
   assert.equal(calls.length, 2);
   assert.match(calls[0], /investment-research-record --require-current-snapshots/);
   assert.match(calls[1], /portfolio-journal-review --record --confirm/);
+  // Structured handoff: unified must use this exact path and exit code, never
+  // a newest-file guess that could pick up a previous day.
+  assert.match(result.stdout, /^ACCOUNT_OUT=.*account-daily-.*\.json$/m);
+  assert.match(result.stdout, /^RC=1$/m);
 });
 
 test('review failure is reported after successful record', () => {
   const { result, calls } = run(0, 9);
   assert.equal(result.status, 77);
   assert.equal(calls.length, 2);
+  assert.match(result.stdout, /^RC=0$/m);
 });

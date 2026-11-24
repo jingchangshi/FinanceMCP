@@ -209,6 +209,10 @@ export class OAuthStore {
     }));
   }
 
+  countClients(): number {
+    return Number((this.db.prepare('SELECT COUNT(*) n FROM oauth_client').get() as any)?.n ?? 0);
+  }
+
   /** 将已通过前缀匹配验证的精确回调地址固化进客户端记录，保证后续 token 换取通过精确校验。 */
   rememberRedirectUri(clientId: string, redirectUri: string): void {
     const existing = this.getClient(clientId);

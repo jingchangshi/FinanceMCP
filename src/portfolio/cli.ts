@@ -698,7 +698,8 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       if (!existsSync(file)) throw new Error(`事件文件不存在：${file}`);
       let parsed: unknown;
       const text = readFileSync(file, 'utf8');
-      if (h.arg('format') === 'csv' || /\.csv$/i.test(file)) {
+      const fromCsv = h.arg('format') === 'csv' || /\.csv$/i.test(file);
+      if (fromCsv) {
         parsed = parseTradeCsv(text, { accountId, brokerId: h.arg('broker') }).events;
       } else {
         try { parsed = JSON.parse(text); }
@@ -718,6 +719,10 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
             continueOnConflict: h.flag('continue-on-conflict'),
             mode: h.flag('dry-run') ? 'dry_run' : 'live',
             calendar: market ? settlementCalendarFromDb(market) : undefined,
+            // CSV: v1->v2 id migration compatibility. JSON event imports keep
+            // strict event_id semantics; only broker statements need content
+            // dedupe for rows imported before the id scheme changed.
+            dedupeByContent: fromCsv,
           });
         } finally { market?.close(); }
         h.print({
@@ -726,7 +731,7 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
           db: portfolioDbPath(),
           note: result.aborted
             ? '冲突导致整批回滚：账本事件零部分写入；冲突本身已单独留痕。'
-            : '重复导入同 id 同内容为 DUPLICATE（不新增行）；同 id 不同内容只写冲突表，不覆盖原记录。',
+            : '重复导入同 id 同内容为 DUPLICATE（不新增行）；券商 CSV 还会按成交事实与历史行去重（含 v1 id / 带不带 --broker）；同 id 不同内容只写冲突表，不覆盖原记录。',
         });
       } finally {
         db.close();

@@ -885,16 +885,71 @@ export interface ImportResult {
   dry_run: boolean;
 }
 
+/** 券商 CSV note 里的兼容字段；历史 v1 行与新 v2 行都写这两个键。 */
+function brokerNoteFields(note: unknown): { broker: string | null; source_id: string | null } {
+  try {
+    const parsed = JSON.parse(String(note ?? ''));
+    if (parsed && typeof parsed === 'object') {
+      return {
+        broker: typeof parsed.broker === 'string' && parsed.broker ? parsed.broker : null,
+        source_id: typeof parsed.source_id === 'string' && parsed.source_id ? parsed.source_id : null,
+      };
+    }
+  } catch { /* 非 broker_csv note */ }
+  return { broker: null, source_id: null };
+}
+
+/**
+ * 兼容去重：判断一条新的券商事件是否与账本里已有行是同一笔成交。
+ *
+ * 字段口径按审计要求：(account, broker 如存在, occurred_on, ts_code, event_type,
+ * quantity, cash_delta)。两点补充：
+ * - 双方都有券商源 ID 时必须相等，否则同一天同价同量的两笔真实分笔成交会被
+ *   误判为重复；
+ * - broker 只在一侧存在时不构成差异：`--broker` 只是导入标注，同一份对账单
+ *   带与不带 `--broker` 必须得到同一笔事实。
+ *
+ * 这是 v1→v2 event_id 迁移的兼容路径：历史上按
+ * `broker:<account>:<broker>:<raw>` 导入的行不能被新 id 再导入一次。
+ */
+function sameBrokerFact(event: NormalizedEvent, row: any): boolean {
+  if (String(row.account_id) !== event.account_id) return false;
+  if (String(row.occurred_on) !== event.occurred_on) return false;
+  if ((row.ts_code ?? null) !== (event.ts_code ?? null)) return false;
+  if (String(row.event_type) !== event.event_type) return false;
+  if ((row.quantity ?? null) !== (event.quantity ?? null)) return false;
+  if ((row.cash_delta_cents ?? 0) !== (event.cash_delta_cents ?? 0)) return false;
+  if (event.event_type === 'REVERSE') {
+    // Compare the raw broker target id, not the full event id: the same
+    // reversal may reference a v1 id on the old row and a v2 id on the re-import.
+    const rawTarget = (value: unknown): string => String(value ?? '').split(':').pop() ?? '';
+    if (rawTarget(row.reverses_event_id) !== rawTarget(event.reverses_event_id)) return false;
+  }
+  const incoming = brokerNoteFields(event.note);
+  const existing = brokerNoteFields(row.note);
+  if (incoming.broker && existing.broker && incoming.broker !== existing.broker) return false;
+  if (incoming.source_id && existing.source_id && incoming.source_id !== existing.source_id) return false;
+  return true;
+}
+
 /**
  * 批量导入。默认任何一条冲突都整体回滚（不产生半批写入）；
  * `continueOnConflict` 才逐条继续，但冲突仍只落冲突表、不覆盖原事件。
+ *
+ * `dedupeByContent` 只供券商 CSV 导入使用：在按 event_id 判重之前，先按
+ * `sameBrokerFact` 识别“同一笔成交、不同 id 方案”的旧行（v1 id、带/不带
+ * `--broker`），返回 DUPLICATE 而不是新增一行。
  */
 export function importEvents(
   db: DatabaseSync, accountId: string, inputs: LedgerEventInput[],
-  options: { continueOnConflict?: boolean; mode?: RecordMode; calendar?: SettlementCalendar } = {},
+  options: {
+    continueOnConflict?: boolean; mode?: RecordMode; calendar?: SettlementCalendar;
+    dedupeByContent?: boolean;
+  } = {},
 ): ImportResult {
   const id = requireText(accountId, 'account_id');
   const continueOnConflict = options.continueOnConflict === true;
+  const dedupeByContent = options.dedupeByContent === true;
   const dryRun = (options.mode ?? 'live') === 'dry_run';
   const normalized: NormalizedEvent[] = [];
   for (const [index, input] of inputs.entries()) {
@@ -913,9 +968,41 @@ export function importEvents(
   let aborted = false;
   let abortReason: string | null = null;
 
+  // Read once, before the write transaction: the compatibility lookup must see
+  // every pre-existing row (v1 ids, imports with/without --broker).
+  const existingRows: any[] = dedupeByContent
+    ? db.prepare('SELECT * FROM account_event WHERE account_id = ?').all(id) as any[]
+    : [];
+
   db.exec('BEGIN IMMEDIATE');
   try {
     for (const event of normalized) {
+      if (dedupeByContent) {
+        if (event.event_type === 'REVERSE' && event.reverses_event_id
+          && !db.prepare('SELECT 1 FROM account_event WHERE event_id = ?').get(event.reverses_event_id)) {
+          // The v2 id scheme must still be able to reverse a row that was
+          // imported under the v1 scheme (raw id lives in the broker CSV note).
+          // v1 target: broker:<account>:<broker|unspecified>:<raw>
+          const targetParts = event.reverses_event_id.split(':');
+          const rawTarget = targetParts[0] === 'broker' && targetParts.length > 3
+            ? targetParts.slice(3).join(':')
+            : '';
+          const targetRow = rawTarget
+            ? existingRows.find(row => row.event_type !== 'REVERSE'
+              && brokerNoteFields(row.note).source_id === rawTarget)
+            : undefined;
+          if (targetRow) event.reverses_event_id = String(targetRow.event_id);
+        }
+        const match = existingRows.find(row => row.event_id !== event.event_id && sameBrokerFact(event, row));
+        if (match) {
+          results.push({
+            status: 'DUPLICATE', event_id: event.event_id,
+            event_type: event.event_type, content_hash: eventContentHash(event),
+          });
+          counts.duplicate += 1;
+          continue;
+        }
+      }
       const result = recordOne(db, event);
       results.push(result);
       if (result.status === 'CONFLICT' && !continueOnConflict) {

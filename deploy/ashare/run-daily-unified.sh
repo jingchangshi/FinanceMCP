@@ -24,6 +24,10 @@ DATA_DIR="${ASHARE_HOST_DATA_DIR:-$HOME/.local/share/finance-mcp-ashare}"
 PRIVATE_DIR="${ASHARE_PRIVATE_HOST_DIR:-$HOME/.local/share/ashare-private}"
 LOG_DIR="$DATA_DIR/logs"
 mkdir -p "$LOG_DIR"
+# One shared lock across daily/unified/hotspot/account/upgrade: an operator
+# upgrade must never rebuild the image underneath a running daily sync.
+. "$HERE/ops-lock.sh"
+acquire_ashare_ops_lock || exit $?
 
 CONTAINER="${ASHARE_CONTAINER:-finance-mcp-ashare}"
 ACCOUNT_ID="${ASHARE_ACCOUNT_ID:-real-main}"
@@ -34,6 +38,15 @@ MAX_WAIT_ATTEMPTS="${ASHARE_MAX_WAIT_ATTEMPTS:-30}"
 DELAY_ALERT_ATTEMPT="${ASHARE_DELAY_ALERT_ATTEMPT:-3}"
 FEISHU_CONFIG="${ASHARE_FEISHU_CONFIG:-$REPO_ROOT/scripts/feishu-publish/config.json}"
 PYTHON_BIN="${ASHARE_PYTHON_BIN:-python3}"
+# A fund NAV that has produced no observable row for this many calendar days is
+# treated as stale even when the ETF price bars are current.
+FUND_NAV_MAX_LAG_DAYS="${ASHARE_FUND_NAV_MAX_LAG_DAYS:-10}"
+# Before the A-share close the most recent *closed* trading day is the previous
+# one; this keeps a Persistent=true catch-up after midnight from targeting a day
+# whose close has not happened yet.
+MARKET_CLOSE_HM="${ASHARE_MARKET_CLOSE_HM:-1500}"
+# Guard against a stale trade_cal pointing months into the past.
+EXPECTED_DATE_MAX_BACKFILL_DAYS="${ASHARE_EXPECTED_DATE_MAX_BACKFILL_DAYS:-14}"
 
 DAILY_SCRIPT="${ASHARE_DAILY_SCRIPT:-$HERE/run-daily.sh}"
 HOTSPOT_SCRIPT="${ASHARE_HOTSPOT_SCRIPT:-$HERE/run-hotspot-daily.sh}"
@@ -45,24 +58,108 @@ STAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 
-EXPECTED_DATE=""
+EXPECTED_DATE_ARG=""
 prev_arg=""
 for arg in "$@"; do
   if [ "$prev_arg" = "--date" ]; then
-    EXPECTED_DATE="$arg"
+    EXPECTED_DATE_ARG="$arg"
     break
   fi
   case "$arg" in
     --date=*)
-      EXPECTED_DATE="${arg#--date=}"
+      EXPECTED_DATE_ARG="${arg#--date=}"
       break
       ;;
   esac
   prev_arg="$arg"
 done
-if [ -z "$EXPECTED_DATE" ]; then
-  EXPECTED_DATE="$(TZ=Asia/Shanghai date +%Y%m%d)"
-fi
+
+# Most recent *closed* trading day, used when the caller did not pass --date.
+# This is what makes a Persistent=true Saturday catch-up backfill Friday instead
+# of skipping the whole day as "non-trading".
+resolve_expected_date() {
+  if [ -n "$EXPECTED_DATE_ARG" ]; then
+    printf '%s' "$EXPECTED_DATE_ARG"
+    return 0
+  fi
+  today="${ASHARE_TODAY_OVERRIDE:-$(TZ=Asia/Shanghai date +%Y%m%d)}"
+  now_hm="${ASHARE_NOW_HM_OVERRIDE:-$(TZ=Asia/Shanghai date +%H%M)}"
+  if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DATA_DIR/ashare.sqlite" ]; then
+    if awk -v n="$now_hm" -v c="$MARKET_CLOSE_HM" 'BEGIN { exit ((n + 0) >= (c + 0)) ? 0 : 1 }'; then
+      day="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" \
+        "SELECT MAX(cal_date) FROM trade_cal WHERE is_open = 1 AND cal_date <= '$today';" 2>/dev/null || true)"
+    else
+      day="$(sqlite3 -readonly "$DATA_DIR/ashare.sqlite" \
+        "SELECT MAX(cal_date) FROM trade_cal WHERE is_open = 1 AND cal_date < '$today';" 2>/dev/null || true)"
+    fi
+    case "$day" in
+      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+        limit="$(TZ=Asia/Shanghai date -d "$today - $EXPECTED_DATE_MAX_BACKFILL_DAYS days" +%Y%m%d 2>/dev/null || true)"
+        if [ -n "$limit" ] && [ "$day" \< "$limit" ]; then
+          # Calendar is stale (no recent open day): fall through to the previous
+          # safe behaviour rather than backfilling an arbitrary old month.
+          :
+        else
+          printf '%s' "$day"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  # Documented safe fallback: the host date, exactly as before this change. The
+  # readiness gate below still refuses to publish unless the report date matches.
+  printf '%s' "$today"
+}
+
+EXPECTED_DATE="$(resolve_expected_date)"
+echo "finance-ashare unified expected date: $EXPECTED_DATE${EXPECTED_DATE_ARG:+ (explicit --date)}"
+
+# When no explicit --date was given, pass the resolved closed trading day to the
+# daily CLI; otherwise a weekend catch-up would run "today" and skip the report.
+run_daily() {
+  if [ -n "$EXPECTED_DATE_ARG" ]; then
+    "$DAILY_SCRIPT" "$@"
+  else
+    # Keep any other caller flags; only supply the resolved date.
+    "$DAILY_SCRIPT" --date "$EXPECTED_DATE" "$@"
+  fi
+}
+
+# A fund NAV cutoff (calendar date) for the staleness assertion. If GNU date
+# cannot answer, the stale comparison is skipped; the missing/error checks above
+# still catch a crashed NAV sync.
+FUND_NAV_CUTOFF="$(TZ=Asia/Shanghai date -d "$EXPECTED_DATE - $FUND_NAV_MAX_LAG_DAYS days" +%Y%m%d 2>/dev/null || true)"
+
+# Positive ETF readiness verdict. Every branch except the final "ready" is a
+# reason the Stage-1 gate must NOT accept:
+#   * coverage may be missing entirely after a crashed ETF sync;
+#   * empty `missing` alone is not proof - `no_upstream_bar` and `errors` are
+#     failures too, as is a `ready` set that does not cover `expected`;
+#   * a jq parse failure is reported by the caller as "jq_failed", never 0.
+etf_readiness() {
+  jq -r --arg d "$2" --arg cutoff "$FUND_NAV_CUTOFF" '
+    def items(x): if (x|type) == "array" then x else [] end;
+    def positive_nav_dates: ((.etf.fund_nav.per_date // {}) | to_entries | map(select((.value // 0) > 0) | .key));
+    if (.etf | type) != "object" then "etf_section_missing"
+    elif (.etf.coverage | type) != "object" then "coverage_missing"
+    elif (.etf.coverage[$d] | type) != "object" then "coverage_entry_missing"
+    else .etf.coverage[$d] as $c
+      | items($c.expected) as $expected
+      | items($c.ready) as $ready
+      | if ($expected | length) == 0 then "expected_set_missing"
+        elif (($ready | sort) != ($expected | sort)) then "ready_set_incomplete"
+        elif (items($c.missing) | length) > 0 then "coverage_missing_items"
+        elif (items($c.no_upstream_bar) | length) > 0 then "no_upstream_bar"
+        elif (items($c.errors) | length) > 0 then "coverage_errors"
+        elif (items(.etf.errors) | length) > 0 then "etf_errors"
+        elif (.etf.fund_nav | type) != "object" then "fund_nav_missing"
+        elif (items(.etf.fund_nav.errors) | length) > 0 then "fund_nav_errors"
+        elif (positive_nav_dates | length) == 0 then "fund_nav_no_rows"
+        elif (($cutoff | length) > 0 and ((positive_nav_dates | max) < $cutoff)) then "fund_nav_stale"
+        else "ready"
+        end
+    end' "$1" 2>/dev/null
+}
 
 within_poll_window() {
   now_hm="${ASHARE_NOW_HM_OVERRIDE:-$(TZ=Asia/Shanghai date +%H%M)}"
@@ -73,12 +170,13 @@ within_poll_window() {
 # --- Stage 1: Market + ETF + fund_nav sync with readiness polling ---
 DAILY_JSON=""
 DATA_DELAYED=0
+ETF_STATE="not_checked"
 attempt=1
 while :; do
   attempt_out="$TMP_DIR/daily-$attempt.out"
   attempt_err="$TMP_DIR/daily-$attempt.err"
   set +e
-  "$DAILY_SCRIPT" "$@" >"$attempt_out" 2>"$attempt_err"
+  run_daily "$@" >"$attempt_out" 2>"$attempt_err"
   daily_exit=$?
   set -e
   cat "$attempt_out"
@@ -91,14 +189,27 @@ while :; do
       echo "finance-ashare unified SKIPPED: non-trading day ($skip_date)"
       exit 0
     fi
-    if [ "$daily_exit" -eq 76 ] || [ "$daily_exit" -eq 79 ]; then
-      echo "finance-ashare unified note: closed-loop observe exited $daily_exit; continuing with market report" >&2
-    fi
+    case "$daily_exit" in
+      0) : ;;
+      76|79)
+        echo "finance-ashare unified note: closed-loop observe exited $daily_exit; market report retained, continuing market report" >&2
+        ;;
+      *)
+        echo "finance-ashare unified WARNING: daily exited $daily_exit; its output is not accepted as READY" >&2
+        ;;
+    esac
     REPORT_DATE="$(jq -r '.report.trade_date // empty' "$DAILY_JSON" 2>/dev/null || true)"
     REPORT_STATUS="$(jq -r '.report.status // empty' "$DAILY_JSON" 2>/dev/null || true)"
-    ETF_MISSING="$(jq -r --arg d "$REPORT_DATE" '(if ($d | length) > 0 then (.etf.coverage[$d].missing // []) else [] end) | length' "$DAILY_JSON" 2>/dev/null || echo 0)"
+    etf_rc=0
+    ETF_STATE="$(etf_readiness "$DAILY_JSON" "$REPORT_DATE")" || etf_rc=$?
+    if [ "$etf_rc" -ne 0 ] || [ -z "$ETF_STATE" ]; then
+      ETF_STATE="jq_failed"
+    fi
 
-    if [ "$REPORT_DATE" = "$EXPECTED_DATE" ] && [ "$REPORT_STATUS" = "READY" ] && [ "${ETF_MISSING:-0}" = "0" ]; then
+    daily_accepted=0
+    case "$daily_exit" in 0|76|79) daily_accepted=1 ;; esac
+    if [ "$daily_accepted" = "1" ] && [ "$REPORT_DATE" = "$EXPECTED_DATE" ] \
+      && [ "$REPORT_STATUS" = "READY" ] && [ "$ETF_STATE" = "ready" ]; then
       DATA_DELAYED=0
       echo "finance-ashare unified Stage 1 READY on attempt $attempt (trade_date=$REPORT_DATE)"
       break
@@ -106,7 +217,7 @@ while :; do
   else
     REPORT_DATE=""
     REPORT_STATUS="exit_$daily_exit"
-    ETF_MISSING="?"
+    ETF_STATE="daily_json_missing"
   fi
 
   if [ "$attempt" -lt "$MAX_WAIT_ATTEMPTS" ] && within_poll_window; then
@@ -130,7 +241,7 @@ while :; do
         echo "finance-ashare unified delay alert failed (exit $delay_rc); continuing poll" >&2
       fi
     fi
-    echo "finance-ashare unified waiting for readiness (attempt=$attempt expected=$EXPECTED_DATE report_date=${REPORT_DATE:-none} status=${REPORT_STATUS:-unknown} etf_missing=${ETF_MISSING:-?} now=$now_hm < $DEADLINE_HM); sleeping ${POLL_SECONDS}s..." >&2
+    echo "finance-ashare unified waiting for readiness (attempt=$attempt expected=$EXPECTED_DATE report_date=${REPORT_DATE:-none} status=${REPORT_STATUS:-unknown} etf_state=${ETF_STATE:-?} now=$now_hm < $DEADLINE_HM); sleeping ${POLL_SECONDS}s..." >&2
     sleep "$POLL_SECONDS"
     attempt=$((attempt + 1))
     continue
@@ -140,7 +251,7 @@ while :; do
   if [ -z "$DAILY_JSON" ] || [ ! -f "$DAILY_JSON" ]; then
     echo "finance-ashare unified WARNING: deadline reached without daily JSON (exit=$daily_exit); continuing with fallback account bundle and Feishu delay report" >&2
   else
-    echo "finance-ashare unified WARNING: deadline reached with partial readiness (report_date=${REPORT_DATE:-none} status=${REPORT_STATUS:-unknown} etf_missing=${ETF_MISSING:-?}); continuing with delay alert" >&2
+    echo "finance-ashare unified WARNING: deadline reached with partial readiness (report_date=${REPORT_DATE:-none} status=${REPORT_STATUS:-unknown} etf_state=${ETF_STATE:-?}); continuing with delay alert" >&2
   fi
   break
 done
@@ -169,22 +280,33 @@ set -e
 cat "$acct_out"
 [ -s "$acct_err" ] && cat "$acct_err" >&2
 
-ACCOUNT_LOG_JSON="$(sed -n 's/^finance-ashare account-daily ok (private log: \(.*\))$/\1/p' "$acct_out" | tail -n 1)"
-acct_from_stdout=1
-if [ -z "$ACCOUNT_LOG_JSON" ] || [ ! -f "$ACCOUNT_LOG_JSON" ]; then
-  acct_from_stdout=0
-  ACCOUNT_LOG_JSON="$(ls -t "$PRIVATE_DIR/logs"/account-daily-*.json 2>/dev/null | head -n 1 || true)"
+ACCOUNT_LOG_JSON="$(sed -n 's/^ACCOUNT_OUT=//p' "$acct_out" | tail -n 1)"
+ACCOUNT_RC="$(sed -n 's/^RC=//p' "$acct_out" | tail -n 1)"
+[ -n "$ACCOUNT_RC" ] || ACCOUNT_RC="$account_exit"
+# Any non-zero record/review exit is a failed run: never let its (possibly stale)
+# bundle pass as a normal same-day report. The delayed banner is forced and the
+# bundle is only used when it is explicitly for the expected trade date.
+if [ "$account_exit" -ne 0 ] || [ "$ACCOUNT_RC" != "0" ]; then
+  DATA_DELAYED=1
+  echo "finance-ashare unified note: account-daily exited $account_exit (RC=$ACCOUNT_RC); forcing the delayed-data banner" >&2
 fi
 
 BUNDLE_HOST_PATH=""
-if [ -n "$ACCOUNT_LOG_JSON" ] && [ -f "$ACCOUNT_LOG_JSON" ]; then
+if [ "$ACCOUNT_RC" != "0" ]; then
+  # The research-record command failed; its (possibly partial) output is not a
+  # trustworthy same-day bundle. Use a fresh live bundle instead, with a banner.
+  echo "finance-ashare unified note: account record failed (RC=$ACCOUNT_RC); not trusting its output bundle" >&2
+elif [ -n "$ACCOUNT_LOG_JSON" ] && [ -f "$ACCOUNT_LOG_JSON" ]; then
   acct_as_of="$(jq -r '.as_of_trade_date // empty' "$ACCOUNT_LOG_JSON" 2>/dev/null || true)"
   priv_out="$(jq -r '.private_output // empty' "$ACCOUNT_LOG_JSON" 2>/dev/null || true)"
-  if [ -n "$priv_out" ] && { [ "$acct_as_of" = "$EXPECTED_DATE" ] || { [ "$acct_from_stdout" = "1" ] && [ -z "$acct_as_of" ]; }; }; then
+  if [ -n "$priv_out" ] && [ "$acct_as_of" = "$EXPECTED_DATE" ]; then
     case "$priv_out" in
       /private/*) BUNDLE_HOST_PATH="$PRIVATE_DIR/${priv_out#/private/}" ;;
       *) BUNDLE_HOST_PATH="$priv_out" ;;
     esac
+  else
+    echo "finance-ashare unified note: account bundle is not for $EXPECTED_DATE (as_of=${acct_as_of:-none}); not publishing it as normal" >&2
+    DATA_DELAYED=1
   fi
 fi
 
@@ -207,9 +329,9 @@ if [ -n "$BUNDLE_HOST_PATH" ] && [ -f "$BUNDLE_HOST_PATH" ]; then
     FEISHU_ERR="$LOG_DIR/feishu-$STAMP.log"
     set +e
     if [ "$DATA_DELAYED" = "1" ]; then
-      "$PYTHON_BIN" "$PUBLISH_SCRIPT" --root "$REPO_ROOT" --bundle "$BUNDLE_HOST_PATH" --config "$FEISHU_CONFIG" --data-delayed >"$FEISHU_OUT" 2>"$FEISHU_ERR"
+      "$PYTHON_BIN" "$PUBLISH_SCRIPT" --root "$REPO_ROOT" --bundle "$BUNDLE_HOST_PATH" --config "$FEISHU_CONFIG" --data-delayed --deadline-hm "$DEADLINE_HM" >"$FEISHU_OUT" 2>"$FEISHU_ERR"
     else
-      "$PYTHON_BIN" "$PUBLISH_SCRIPT" --root "$REPO_ROOT" --bundle "$BUNDLE_HOST_PATH" --config "$FEISHU_CONFIG" >"$FEISHU_OUT" 2>"$FEISHU_ERR"
+      "$PYTHON_BIN" "$PUBLISH_SCRIPT" --root "$REPO_ROOT" --bundle "$BUNDLE_HOST_PATH" --config "$FEISHU_CONFIG" --deadline-hm "$DEADLINE_HM" >"$FEISHU_OUT" 2>"$FEISHU_ERR"
     fi
     feishu_exit=$?
     set -e

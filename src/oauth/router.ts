@@ -98,6 +98,24 @@ function firstStr(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+/** DCR 回调主机白名单匹配：精确主机，或显式的 `*.example.com` 后缀通配。 */
+function redirectHostAllowed(hostname: string, allowlist: readonly string[]): boolean {
+  const host = hostname.toLowerCase();
+  return allowlist.some(pattern => {
+    const normalized = pattern.toLowerCase();
+    if (normalized === host) return true;
+    return normalized.startsWith('*.') && host.endsWith(normalized.slice(1));
+  });
+}
+
+function displayHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return '（无法解析的回调地址）';
+  }
+}
+
 export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
   const store = new OAuthStore(config.dbPath);
   const model = createModel(store, config);
@@ -116,6 +134,33 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
   const limitAuthorize = rateLimiter(20);
   const limitToken = rateLimiter(60);
   const limitRegister = rateLimiter(20);
+
+  // 登录失败限流：按来源 IP 在 15 分钟窗口内计数，成功登录即清零。
+  // 与通用 rateLimiter 分开，因为只有*失败*的密码尝试才计入。
+  const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
+  const loginFailures = new Map<string, { start: number; count: number }>();
+  const loginKey = (req: Request): string => req.ip || req.socket.remoteAddress || 'unknown';
+  const loginBlocked = (key: string): boolean => {
+    const entry = loginFailures.get(key);
+    if (!entry) return false;
+    if (Date.now() - entry.start >= LOGIN_FAILURE_WINDOW_MS) {
+      loginFailures.delete(key);
+      return false;
+    }
+    return entry.count >= config.maxLoginFailures;
+  };
+  const noteLoginFailure = (key: string): void => {
+    const now = Date.now();
+    const entry = loginFailures.get(key);
+    if (!entry || now - entry.start >= LOGIN_FAILURE_WINDOW_MS) {
+      loginFailures.set(key, { start: now, count: 1 });
+      if (loginFailures.size > 10_000) {
+        for (const [k, v] of loginFailures) if (now - v.start >= LOGIN_FAILURE_WINDOW_MS) loginFailures.delete(k);
+      }
+      return;
+    }
+    entry.count += 1;
+  };
 
   // ---------------------------------------------------------------- 元数据
 
@@ -190,6 +235,15 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
         res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uri 不是合法 URL' });
         return;
       }
+      if (!redirectHostAllowed(parsed.hostname, config.dcrRedirectHosts)) {
+        // 未限制主机的 DCR 允许任何人注册一个指向自己站点的回调地址，再把
+        // 授权页伪装成“登录你的账户”——这是典型的 OAuth 钓鱼路径。
+        res.status(400).json({
+          error: 'invalid_redirect_uri',
+          error_description: `redirect_uri 主机 ${parsed.hostname} 不在 DCR 允许列表；如需新增请配置 ASHARE_OAUTH_DCR_REDIRECT_HOSTS`,
+        });
+        return;
+      }
       if (uri.endsWith('/*')) {
         if (parsed.protocol !== 'https:' || parsed.search || parsed.hash) {
           res.status(400).json({ error: 'invalid_redirect_uri', error_description: '通配 redirect_uri 必须是无查询无 fragment 的 https URL' });
@@ -206,6 +260,14 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
         res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uri 不能带 fragment' });
         return;
       }
+    }
+
+    if (store.countClients() >= config.maxClients) {
+      res.status(403).json({
+        error: 'registration_limit_reached',
+        error_description: `DCR 客户端数量已达上限 ${config.maxClients}；请先清理不再使用的客户端`,
+      });
+      return;
     }
 
     const clientSecret = authMethod === 'none' ? null : opaqueToken(32);
@@ -234,6 +296,8 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
 
   interface AuthorizeParams {
     client_id: string;
+    /** DCR 注册时提供的应用名；同意页必须展示，否则用户无法识别请求方。 */
+    client_name: string | null;
     redirect_uri: string;
     response_type: string;
     state?: string;
@@ -282,7 +346,8 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
 
     return {
       params: {
-        client_id: clientId, redirect_uri: redirectUri, response_type: responseType,
+        client_id: clientId, client_name: client.client_name?.trim() || null,
+        redirect_uri: redirectUri, response_type: responseType,
         state, code_challenge: codeChallenge ?? '', code_challenge_method: codeChallenge ? method : '', scope, resource,
       },
     };
@@ -315,9 +380,20 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
   button { margin-top: 16px; width: 100%; padding: 11px; font-size: 1rem; border-radius: 8px; border: 0; background: #2563eb; color: #fff; cursor: pointer; }
   .err { color: #b91c1c; margin: 0 0 12px; }
   code { background: #8881; padding: 1px 5px; border-radius: 4px; }
+  .client { background: #8881; border-radius: 8px; padding: 10px 14px; margin: 12px 0 14px; font-size: .92rem; }
+  .client p { margin: 4px 0; }
+  .client .host { font-size: 1.02rem; }
+  .warn { color: #b45309; font-weight: 600; }
 </style></head>
 <body><div class="card">
   <h1>授权访问 A股投资账户</h1>
+  <div class="client">
+    <p>请求授权的应用：<strong>${escapeHtml(params.client_name ?? '未命名客户端（请核对客户端 ID）')}</strong></p>
+    <p class="host">授权码将发送到：<strong>${escapeHtml(displayHost(params.redirect_uri))}</strong></p>
+    <p class="warn">只有在你确认上述主机属于你信任的应用时才继续；任何其他主机都可能是钓鱼。</p>
+    <p>回调地址：<code>${escapeHtml(params.redirect_uri)}</code></p>
+    <p>客户端 ID：<code>${escapeHtml(params.client_id)}</code></p>
+  </div>
   <p class="muted">${(params.scope ?? config.scope).split(' ').includes(config.writeScope)
     ? '一个客户端正在请求读取你的账户数据，并<strong>追加研究记录</strong>。'
     : '一个客户端正在请求<strong>只读</strong>访问你的账户数据。'}</p>
@@ -352,11 +428,18 @@ export function createOAuthRuntime(config: OAuthConfig): OAuthRuntime {
       return;
     }
     const params = parsed.params;
+    const failureKey = loginKey(req);
+    if (loginBlocked(failureKey)) {
+      renderLogin(res, params, 429, '登录失败次数过多，请 15 分钟后再试');
+      return;
+    }
     const password = str(req.body?.password) ?? '';
     if (!passwordMatches(config.loginPassword, password)) {
+      noteLoginFailure(failureKey);
       renderLogin(res, params, 401, '密码不正确');
       return;
     }
+    loginFailures.delete(failureKey);
     store.rememberRedirectUri(params.client_id, params.redirect_uri);
 
     const oauthRequest = new OAuth2Server.Request({
