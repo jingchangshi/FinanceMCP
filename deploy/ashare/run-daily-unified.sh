@@ -38,9 +38,6 @@ MAX_WAIT_ATTEMPTS="${ASHARE_MAX_WAIT_ATTEMPTS:-30}"
 DELAY_ALERT_ATTEMPT="${ASHARE_DELAY_ALERT_ATTEMPT:-3}"
 FEISHU_CONFIG="${ASHARE_FEISHU_CONFIG:-$REPO_ROOT/scripts/feishu-publish/config.json}"
 PYTHON_BIN="${ASHARE_PYTHON_BIN:-python3}"
-# A fund NAV that has produced no observable row for this many calendar days is
-# treated as stale even when the ETF price bars are current.
-FUND_NAV_MAX_LAG_DAYS="${ASHARE_FUND_NAV_MAX_LAG_DAYS:-10}"
 # Before the A-share close the most recent *closed* trading day is the previous
 # one; this keeps a Persistent=true catch-up after midnight from targeting a day
 # whose close has not happened yet.
@@ -125,37 +122,38 @@ run_daily() {
   fi
 }
 
-# A fund NAV cutoff (calendar date) for the staleness assertion. If GNU date
-# cannot answer, the stale comparison is skipped; the missing/error checks above
-# still catch a crashed NAV sync.
-FUND_NAV_CUTOFF="$(TZ=Asia/Shanghai date -d "$EXPECTED_DATE - $FUND_NAV_MAX_LAG_DAYS days" +%Y%m%d 2>/dev/null || true)"
-
-# Positive ETF readiness verdict. Every branch except the final "ready" is a
-# reason the Stage-1 gate must NOT accept:
-#   * coverage may be missing entirely after a crashed ETF sync;
-#   * empty `missing` alone is not proof - `no_upstream_bar` and `errors` are
-#     failures too, as is a `ready` set that does not cover `expected`;
+# Positive ETF readiness verdict.
+#   * coverage must exist: a crashed sync leaves it missing/empty, never READY;
+#   * `no_upstream_bar` is a *confirmed* suspension/no-listing, so it counts as
+#     verified alongside `ready` and is disclosed as a warning, not a blocker;
+#   * only ETF errors concerning the report date or a held code block; historical
+#     backfill and dynamic-candidate request errors do not hold the pipeline;
+#   * fund_nav is not a pipeline gate: per-code NAV lag/premium is disclosed and
+#     the QDII buy gate lives in the decision layer.
 #   * a jq parse failure is reported by the caller as "jq_failed", never 0.
 etf_readiness() {
-  jq -r --arg d "$2" --arg cutoff "$FUND_NAV_CUTOFF" '
+  jq -r --arg d "$2" '
     def items(x): if (x|type) == "array" then x else [] end;
-    def positive_nav_dates: ((.etf.fund_nav.per_date // {}) | to_entries | map(select((.value // 0) > 0) | .key));
+    def relevant_errors($date; $codes):
+      [ items(.etf.errors)[] as $e
+        | select(($e | type) == "string")
+        | select(($e | startswith("fund_nav")) | not)
+        | select(($e | startswith("fund_daily_history")) | not)
+        | select(($e | contains($date)) or ([$codes[] as $c | select($e | contains($c))] | length > 0))
+        | $e ];
     if (.etf | type) != "object" then "etf_section_missing"
     elif (.etf.coverage | type) != "object" then "coverage_missing"
     elif (.etf.coverage[$d] | type) != "object" then "coverage_entry_missing"
     else .etf.coverage[$d] as $c
       | items($c.expected) as $expected
       | items($c.ready) as $ready
+      | items($c.no_upstream_bar) as $confirmed
       | if ($expected | length) == 0 then "expected_set_missing"
-        elif (($ready | sort) != ($expected | sort)) then "ready_set_incomplete"
+        elif ((($ready + $confirmed) | sort) != ($expected | sort)) then "verified_set_incomplete"
         elif (items($c.missing) | length) > 0 then "coverage_missing_items"
-        elif (items($c.no_upstream_bar) | length) > 0 then "no_upstream_bar"
         elif (items($c.errors) | length) > 0 then "coverage_errors"
-        elif (items(.etf.errors) | length) > 0 then "etf_errors"
-        elif (.etf.fund_nav | type) != "object" then "fund_nav_missing"
-        elif (items(.etf.fund_nav.errors) | length) > 0 then "fund_nav_errors"
-        elif (positive_nav_dates | length) == 0 then "fund_nav_no_rows"
-        elif (($cutoff | length) > 0 and ((positive_nav_dates | max) < $cutoff)) then "fund_nav_stale"
+        elif (relevant_errors($d; $expected) | length) > 0 then "etf_errors"
+        elif ($confirmed | length) > 0 then "ready_with_suspended"
         else "ready"
         end
     end' "$1" 2>/dev/null
@@ -208,10 +206,19 @@ while :; do
 
     daily_accepted=0
     case "$daily_exit" in 0|76|79) daily_accepted=1 ;; esac
+    etf_ok=0
+    case "$ETF_STATE" in ready|ready_with_suspended) etf_ok=1 ;; esac
     if [ "$daily_accepted" = "1" ] && [ "$REPORT_DATE" = "$EXPECTED_DATE" ] \
-      && [ "$REPORT_STATUS" = "READY" ] && [ "$ETF_STATE" = "ready" ]; then
+      && [ "$REPORT_STATUS" = "READY" ] && [ "$etf_ok" = "1" ]; then
+      if [ "$ETF_STATE" = "ready_with_suspended" ]; then
+        echo "finance-ashare unified WARNING: confirmed no upstream bar (suspended/not listed): $(jq -r --arg d "$REPORT_DATE" '.etf.coverage[$d].no_upstream_bar | join(",")' "$DAILY_JSON" 2>/dev/null || echo "?") - treated as verified" >&2
+      fi
+      nav_errs="$(jq -r '.etf.fund_nav.errors // [] | length' "$DAILY_JSON" 2>/dev/null || echo 0)"
+      if [ "${nav_errs:-0}" != "0" ]; then
+        echo "finance-ashare unified note: fund_nav reported ${nav_errs} error(s); NAV lag is disclosed per code and does not block Stage 1" >&2
+      fi
       DATA_DELAYED=0
-      echo "finance-ashare unified Stage 1 READY on attempt $attempt (trade_date=$REPORT_DATE)"
+      echo "finance-ashare unified Stage 1 READY on attempt $attempt (trade_date=$REPORT_DATE etf_state=$ETF_STATE)"
       break
     fi
   else
@@ -274,7 +281,7 @@ acct_out="$TMP_DIR/account.out"
 acct_err="$TMP_DIR/account.err"
 account_exit=0
 set +e
-"$ACCOUNT_SCRIPT" >"$acct_out" 2>"$acct_err"
+ASHARE_EXPECTED_TRADE_DATE="$EXPECTED_DATE" "$ACCOUNT_SCRIPT" >"$acct_out" 2>"$acct_err"
 account_exit=$?
 set -e
 cat "$acct_out"
@@ -291,6 +298,11 @@ if [ "$account_exit" -ne 0 ] || [ "$ACCOUNT_RC" != "0" ]; then
   echo "finance-ashare unified note: account-daily exited $account_exit (RC=$ACCOUNT_RC); forcing the delayed-data banner" >&2
 fi
 
+# The bundle file's own date, not the record receipt's echo of it.
+bundle_as_of() {
+  jq -r '.as_of_trade_date // .payload.as_of_trade_date // empty' "$1" 2>/dev/null || true
+}
+
 BUNDLE_HOST_PATH=""
 if [ "$ACCOUNT_RC" != "0" ]; then
   # The research-record command failed; its (possibly partial) output is not a
@@ -304,6 +316,12 @@ elif [ -n "$ACCOUNT_LOG_JSON" ] && [ -f "$ACCOUNT_LOG_JSON" ]; then
       /private/*) BUNDLE_HOST_PATH="$PRIVATE_DIR/${priv_out#/private/}" ;;
       *) BUNDLE_HOST_PATH="$priv_out" ;;
     esac
+    bundle_date="$(bundle_as_of "$BUNDLE_HOST_PATH")"
+    if [ "$bundle_date" != "$EXPECTED_DATE" ]; then
+      echo "finance-ashare unified WARNING: account bundle as_of=${bundle_date:-none} != $EXPECTED_DATE; not publishing it as today" >&2
+      DATA_DELAYED=1
+      BUNDLE_HOST_PATH=""
+    fi
   else
     echo "finance-ashare unified note: account bundle is not for $EXPECTED_DATE (as_of=${acct_as_of:-none}); not publishing it as normal" >&2
     DATA_DELAYED=1
@@ -314,8 +332,14 @@ if [ -z "$BUNDLE_HOST_PATH" ] || [ ! -f "$BUNDLE_HOST_PATH" ]; then
   DATA_DELAYED=1
   mkdir -p "$PRIVATE_DIR/logs"
   live_bundle="$PRIVATE_DIR/logs/live-bundle-$STAMP.json"
-  if docker exec "$CONTAINER" node build/ashare/cli.js investment-research-bundle --account "$ACCOUNT_ID" >"$live_bundle" 2>"$PRIVATE_DIR/logs/live-bundle-$STAMP.err"; then
-    BUNDLE_HOST_PATH="$live_bundle"
+  if docker exec "$CONTAINER" node build/ashare/cli.js investment-research-bundle --account "$ACCOUNT_ID" --date "$EXPECTED_DATE" >"$live_bundle" 2>"$PRIVATE_DIR/logs/live-bundle-$STAMP.err"; then
+    bundle_date="$(bundle_as_of "$live_bundle")"
+    if [ "$bundle_date" = "$EXPECTED_DATE" ]; then
+      BUNDLE_HOST_PATH="$live_bundle"
+    else
+      echo "finance-ashare unified WARNING: fallback bundle as_of=${bundle_date:-none} != $EXPECTED_DATE; refusing to publish another day as today" >&2
+      BUNDLE_HOST_PATH=""
+    fi
   else
     BUNDLE_HOST_PATH=""
   fi

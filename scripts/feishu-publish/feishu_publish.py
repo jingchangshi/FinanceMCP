@@ -224,6 +224,29 @@ def _retry_base_seconds() -> float:
         return 0.5
 
 
+def _lark_call_is_retryable(argv: list[str]) -> bool:
+    """Only reads, idempotent overwrites and keyed sends may be retried.
+
+    ``docs +create`` is deliberately excluded: after a timeout or 5xx the
+    document may already exist, and retrying could create a second orphan.
+    """
+    if len(argv) < 3:
+        return False
+    domain, verb = argv[1], argv[2]
+    if domain == "docs" and verb == "+fetch":
+        return True
+    if domain == "docs" and verb == "+update":
+        try:
+            return argv[argv.index("--command") + 1] == "overwrite"
+        except (ValueError, IndexError):
+            return False
+    if domain == "drive" and verb == "+update-title":
+        return True
+    if domain == "im" and verb == "+messages-send":
+        return "--idempotency-key" in argv
+    return False
+
+
 def _run_lark_once(cmd: list[str], cwd: Path) -> dict[str, Any]:
     completed = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True, timeout=180
@@ -288,7 +311,7 @@ def run_lark(argv: list[str], cwd: Path) -> dict[str, Any]:
     first attempt so the caller can fall back without duplicating a delivery.
     """
     cmd = [resolve_lark_bin(), *argv[1:]] if argv and argv[0] == "lark-cli" else list(argv)
-    attempts = _retry_attempts()
+    attempts = _retry_attempts() if _lark_call_is_retryable(argv) else 1
     last_error: LarkError | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -405,6 +428,33 @@ def write_incident(path: Path, incident: dict[str, Any]) -> None:
         handle.write(json.dumps(incident, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _record_create_unconfirmed(
+    root: Path, trade_date: str, report_hash: str, exc: BaseException
+) -> None:
+    """Record an unknown-outcome Docx create for manual verification.
+
+    Only an explicit client rejection is a known failure; a timeout/5xx means
+    the document may exist, so the operator must check Feishu before retrying.
+    """
+    if is_non_retryable_client_error(exc):
+        return
+    write_incident(
+        root / LEDGER_DIR / INCIDENT_NAME,
+        {
+            "status": "create_unconfirmed",
+            "trade_date": trade_date,
+            "report_sha256": report_hash,
+            "renderer_version": RENDERER_VERSION,
+            "error": str(exc),
+            "note": (
+                "document creation outcome is unknown; a retry may create a "
+                "second document. Verify in Feishu before re-running."
+            ),
+            "at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 def verify_readback(remote_content: Any, title: str, source_count: int) -> list[str]:
@@ -528,16 +578,21 @@ def publish(
                 and ("permission" in msg or "parent location" in msg)
             )
             if not can_fallback:
+                _record_create_unconfirmed(root, trade_date, report_hash, exc)
                 raise
             parent_fallback = "bot_root_permission_denied"
-            result = runner(
-                [
-                    "lark-cli", "docs", "+create", "--as", identity,
-                    "--doc-format", "xml", "--content", f"@./{relative_xml}",
-                    "--format", "json",
-                ],
-                root,
-            )
+            try:
+                result = runner(
+                    [
+                        "lark-cli", "docs", "+create", "--as", identity,
+                        "--doc-format", "xml", "--content", f"@./{relative_xml}",
+                        "--format", "json",
+                    ],
+                    root,
+                )
+            except RuntimeError as retry_exc:
+                _record_create_unconfirmed(root, trade_date, report_hash, retry_exc)
+                raise
         document = (result.get("data") or {}).get("document") or {}
         document_id = document.get("document_id")
         document_url = document.get("url")
