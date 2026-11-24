@@ -46,6 +46,29 @@ if [ "$record_code" -eq 0 ]; then
 else
   printf 'finance-ashare account-daily FAILED (exit %s); see private log %s\n' "$record_code" "$ERR" >&2
 fi
+# Stage 3b: pre-generate the compact chat brief (read-only report build). The private
+# MCP tool reads this cache; without it the tool returns not_ready quickly instead of
+# recomputing a multi-minute report inside a chat request. A failure here never blocks
+# the Feishu report or the forward review.
+BRIEF_LOG="$LOG_DIR/daily-brief-$STAMP.log"
+if [ "$record_code" -eq 0 ]; then
+  brief_date="${ASHARE_EXPECTED_TRADE_DATE:-}"
+  if [ -z "$brief_date" ] && [ -s "$OUT" ]; then
+    brief_date="$(jq -r '.as_of_trade_date // empty' "$OUT" 2>/dev/null || true)"
+  fi
+  if [ -n "$brief_date" ]; then
+    brief_code=0
+    docker exec "$CONTAINER" timeout -s KILL 600 node build/ashare/cli.js portfolio-daily-report \
+      --account "${ASHARE_ACCOUNT_ID:-real-main}" --date "$brief_date" --format brief \
+      --output "/private/daily-briefs/$brief_date.json" \
+      >"$LOG_DIR/daily-brief-$STAMP.out" 2>"$BRIEF_LOG" || brief_code=$?
+    if [ "$brief_code" -eq 0 ]; then
+      printf 'finance-ashare daily brief ok (date %s, private /private/daily-briefs/%s.json)\n' "$brief_date" "$brief_date"
+    else
+      printf 'finance-ashare daily brief FAILED (exit %s); see %s\n' "$brief_code" "$BRIEF_LOG" >&2
+    fi
+  fi
+fi
 review_code=0
 if docker exec "$CONTAINER" node build/ashare/cli.js portfolio-journal-review --record --confirm >"$REVIEW_OUT" 2>"$REVIEW_ERR"; then
   printf 'finance-ashare forward-review ok (private log: %s)\n' "$REVIEW_OUT"

@@ -32,6 +32,7 @@ const FROZEN_REQUIRED = {
   ashare_portfolio_scenario: ['action'],
   ashare_portfolio_decision: ['action'],
   ashare_portfolio_daily_report: [],
+  ashare_portfolio_daily_brief: [],
   ashare_etf_candidates: [],
   ashare_portfolio_benchmarks: [],
   ashare_chatgpt_research_record_append: ['report_id', 'as_of_trade_date', 'independent_judgement', 'final_conclusion'],

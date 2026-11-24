@@ -21,6 +21,7 @@ const ACCOUNT_TOOLS = [
   'ashare_portfolio_decision',
   // V1.0 C2/C6/D1：研究候选、固定基准与收盘日报（仍为账户侧只读工具）。
   'ashare_portfolio_daily_report',
+  'ashare_portfolio_daily_brief',
   'ashare_etf_candidates',
   'ashare_portfolio_benchmarks',
   'ashare_investment_research_bundle',
