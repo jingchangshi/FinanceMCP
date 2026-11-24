@@ -394,10 +394,10 @@ test('10.1-4 ETF 行情不完整 → PARTIAL + WAIT + 研究窗口不新鲜', ()
   assert.notEqual(report.status, 'ACTIONABLE');
 });
 
-test('10.1-5 账户身份已确认但成交完整性未声明 → UNCONFIRMED_RISK + 门控阻塞', () => {
+test('10.1-5 账户身份已确认但成交完整性未声明 → UNCONFIRMED_RISK 披露，仅 warnings 不阻断', () => {
   seedMarket('m1-identity-incomplete');
   // confirmed=true（身份已确认）、completeness=false（未声明完整性）：
-  // 档位分层必须区分二者——身份确认不等于成交完整。
+  // 档位分层必须区分二者——身份确认不等于成交完整；但缺少声明只进 warnings。
   seedAccount('m1-identity-incomplete', { confirmed: true, completeness: false });
   const report = build('m1-identity-incomplete', {
     scenario: { sellCode: '159558.SZ', sellQuantity: 1000, buyCode: '510300.SH', buyQuantity: 100 },
@@ -405,12 +405,13 @@ test('10.1-5 账户身份已确认但成交完整性未声明 → UNCONFIRMED_RI
   assert.equal(report.data_quality.tiers.account_identity.status, 'REAL_ACCOUNT_VERIFIED');
   assert.equal(report.data_quality.tiers.account_identity.verified, true);
   assert.equal(report.data_quality.tiers.account_trade_completeness.status, 'UNCONFIRMED_RISK');
-  assert.equal(report.gate.satisfied, false);
-  assert.ok(report.gate.reasons.some(r => r.code === 'account_completeness_undeclared'),
-    JSON.stringify(report.gate.reasons));
+  assert.equal(report.gate.satisfied, true, JSON.stringify(report.gate.reasons));
+  assert.ok(report.gate.warnings.some(w => w.code === 'account_completeness_undeclared'),
+    JSON.stringify(report.gate.warnings));
+  assert.ok(report.gate.warnings.some(w => w.code === 'unreported_trade_lag_warning'),
+    JSON.stringify(report.gate.warnings));
   assert.ok(report.gate.unreported_trade_risk === true);
-  for (const option of report.decision_comparison.options) assert.equal(option.executable, false);
-  assert.notEqual(report.status, 'ACTIONABLE');
+  assert.notEqual(report.status, 'DATA_INSUFFICIENT');
 });
 
 test('10.1-6 现金、持仓及可卖数量不一致 → 对账差异三字段 + 决策降级', () => {

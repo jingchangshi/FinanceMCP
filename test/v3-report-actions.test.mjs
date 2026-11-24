@@ -77,9 +77,11 @@ function seedMarket(name) {
     { ts_code: '601001.SH', symbol: '601001', name: '优质回踩A', industry: '强行业', scale: 1 },
     { ts_code: '601007.SH', symbol: '601007', name: '优质回踩B', industry: '强行业', scale: 1.2 },
   ];
+  const stopStock = { ts_code: '600519.SH', symbol: '600519', name: '止损测试股', industry: '弱行业' };
   upsertRows(db, 'stock_basic', ['ts_code', 'symbol', 'name', 'industry', 'list_date', 'list_status'], [
     ...background.map(s => ({ ts_code: s.ts_code, symbol: s.symbol, name: s.name, industry: s.industry, list_date: '20180101', list_status: 'L' })),
     ...probes.map(s => ({ ts_code: s.ts_code, symbol: s.symbol, name: s.name, industry: s.industry, list_date: '20180101', list_status: 'L' })),
+    { ...stopStock, list_date: '20180101', list_status: 'L' },
   ]);
 
   const dailyRows = [];
@@ -128,6 +130,20 @@ function seedMarket(name) {
       or_yoy: 18, netprofit_yoy: 22, dt_netprofit_yoy: 20, grossprofit_margin: 34,
     });
   }
+  // 600519.SH：D0 10.00，D1 9.00 → 触发 P1 -8% 硬止损，用于验证执行清单不被一页摘要截断。
+  for (const day of DAYS) {
+    const close = day === D1 ? 9.0 : 10.0;
+    const preClose = 10.0;
+    dailyRows.push({ ts_code: stopStock.ts_code, trade_date: day, open: close, high: close * 1.01, low: close * 0.99, close, pre_close: preClose, pct_chg: ((close / preClose) - 1) * 100, vol: 1e5, amount: 2e5 });
+    adjRows.push({ ts_code: stopStock.ts_code, trade_date: day, adj_factor: 1 });
+    limitRows.push({ ts_code: stopStock.ts_code, trade_date: day, up_limit: 11, down_limit: 9 });
+    basicRows.push({ ts_code: stopStock.ts_code, trade_date: day, turnover_rate: 1.5, pe_ttm: 20, pb: 2, circ_mv: 1e6, total_mv: 1.2e6 });
+  }
+  // 个股持仓取价需要 suspend_d 当日同步证明；无停牌记录时也要有 status=ok 的同步行。
+  upsertRows(db, 'sync_log', ['dataset', 'key', 'rows', 'status', 'message', 'synced_at'], [
+    { dataset: 'suspend_d', key: D0, rows: 0, status: 'ok', message: null, synced_at: `${D0.slice(0, 4)}-${D0.slice(4, 6)}-${D0.slice(6, 8)}T15:00:00+08:00` },
+    { dataset: 'suspend_d', key: D1, rows: 0, status: 'ok', message: null, synced_at: `${D1.slice(0, 4)}-${D1.slice(4, 6)}-${D1.slice(6, 8)}T15:00:00+08:00` },
+  ]);
   upsertRows(db, 'daily', ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'pct_chg', 'vol', 'amount'], dailyRows);
   upsertRows(db, 'adj_factor', ['ts_code', 'trade_date', 'adj_factor'], adjRows);
   upsertRows(db, 'stk_limit', ['ts_code', 'trade_date', 'up_limit', 'down_limit'], limitRows);
@@ -199,8 +215,11 @@ test('日报输出：2 个个股买单 + 成长/价值/国债蓄水池腿不被 
   const pDb = openPortfolioDb(join(dir, 'cap-portfolio.sqlite'), { marketPath: join(dir, 'cap-market.sqlite') });
   const acc = 'real-report';
   try {
-    const pos = [{ ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 20_000, ref_price_milli: 900, ref_cost_milli: 900, market_value_cents: 1_800_000 }];
-    importSnapshot(pDb, snapshotData({ id: 'snap-cap-d0', asOf: D0, positions: pos, cashCents: 8_200_000 }));
+    const pos = [
+      { ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 20_000, ref_price_milli: 900, ref_cost_milli: 900, market_value_cents: 1_800_000 },
+      { ts_code: '600519.SH', name: '止损测试股', quantity: 100, ref_price_milli: 10_000, ref_cost_milli: 10_000, market_value_cents: 100_000 },
+    ];
+    importSnapshot(pDb, snapshotData({ id: 'snap-cap-d0', asOf: D0, positions: pos, cashCents: 8_100_000 }));
     initBaseline(pDb, acc, { asOf: D0, snapshotId: 'snap-cap-d0' });
     markSnapshotCurrent(pDb, 'snap-cap-d0', { confirmedBy: 'test' });
     confirmRealAccount(pDb, acc, { confirm: true, note: 'test' });
@@ -216,19 +235,20 @@ test('日报输出：2 个个股买单 + 成长/价值/国债蓄水池腿不被 
       snapshotId: 'snap-cap-d0',
       asOfTradeDate: D1,
     });
-    const actions = report.first_section.actions;
-    assert.ok(actions.length <= 3, `动作数不得超过 3，实际 ${actions.length}`);
-    const legs = actions.flatMap(action => action.legs);
-    const codes = new Set(legs.map(leg => leg.ts_code));
-    assert.ok(codes.has('601001.SH'), '应有第一只个股买单');
-    assert.ok(codes.has('601007.SH'), '应有第二只个股买单');
-    assert.ok(codes.has('159205.SZ'), '成长桶腿不得被动作上限截断');
-    assert.ok(codes.has('159337.SZ'), '成长桶第二腿不得被截断');
-    assert.ok(codes.has('589850.SH'), '成长桶第三腿不得被截断');
-    assert.ok(codes.has('159330.SZ'), '价值桶腿不得被截断');
-    assert.ok(codes.has('511010.SH'), '国债蓄水池腿不得被截断');
-    assert.equal(codes.has('159290.SZ'), false, '成长桶只取 EXP-01 前 3 只');
-    assert.equal(actions.filter(action => action.code === 'P3-SUPER-ETF-REBALANCE').length, 1, '成长/价值/蓄水池必须合并为一个 action');
+    assert.equal(report.first_section.actions.length, 3, '一页摘要仍只列最多 3 个动作');
+    assert.ok(report.execution_plan.count >= 4, `执行清单必须保留全部动作，实际 ${report.execution_plan.count}`);
+    const summaryCodes = new Set(report.first_section.actions.flatMap(action => action.legs).map(leg => leg.ts_code));
+    const execCodes = new Set(report.execution_plan.actions.flatMap(action => action.legs).map(leg => leg.ts_code));
+    assert.ok(summaryCodes.has('600519.SH'), 'P1 止损应进入一页摘要');
+    assert.ok(summaryCodes.has('601001.SH'), '应有第一只个股买单');
+    assert.ok(summaryCodes.has('601007.SH'), '应有第二只个股买单');
+    assert.ok(execCodes.has('159205.SZ'), '成长桶腿不得被执行清单截断');
+    assert.ok(execCodes.has('159337.SZ'), '成长桶第二腿不得被截断');
+    assert.ok(execCodes.has('589850.SH'), '成长桶第三腿不得被截断');
+    assert.ok(execCodes.has('159330.SZ'), '价值桶腿不得被截断');
+    assert.ok(execCodes.has('511010.SH'), '国债蓄水池腿不得被截断');
+    assert.equal(execCodes.has('159290.SZ'), false, '成长桶只取 EXP-01 前 3 只');
+    assert.equal(report.execution_plan.actions.filter(action => action.code === 'P3-SUPER-ETF-REBALANCE').length, 1, '成长/价值/蓄水池必须合并为一个 action');
   } finally {
     pDb.close();
     mDb.close();
@@ -273,6 +293,44 @@ test('日报输出：wealth 不计入单位化 NAV，入金 90% 不会触发假 
     assert.equal(day1.v3_cockpit.router.hwm_drawdown_pct, 10, '真实回撤应保持在 10%');
     assert.notEqual(day1.v3_cockpit.router.circuit_breaker_status, 'L2_LOCKED', '入金不得触发假 L2');
     assert.equal(day1.v3_cockpit.router.hwm_nav_cents, 19_000_000, '单位化等效高水位 = 17,100,000 / 0.9');
+    assert.equal(day1.v3_cockpit.principal.current_nav_cents, 18_100_000, '本金盈亏展示必须使用含理财总资产');
+  } finally {
+    pDb.close();
+    mDb.close();
+  }
+});
+
+test('日报门控：已确认账户+当前快照但从未声明完整性只进 warnings，不阻断可执行腿与 V3 持久化', () => {
+  const mDb = seedMarket('undeclared');
+  const pDb = openPortfolioDb(join(dir, 'undeclared-portfolio.sqlite'), { marketPath: join(dir, 'undeclared-market.sqlite') });
+  const acc = 'real-undeclared';
+  try {
+    const pos = [{ ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 20_000, ref_price_milli: 900, ref_cost_milli: 900, market_value_cents: 1_800_000 }];
+    importSnapshot(pDb, snapshotData({ id: 'snap-undeclared-d0', asOf: D0, positions: pos, cashCents: 8_200_000 }));
+    initBaseline(pDb, acc, { asOf: D0, snapshotId: 'snap-undeclared-d0' });
+    markSnapshotCurrent(pDb, 'snap-undeclared-d0', { confirmedBy: 'test' });
+    confirmRealAccount(pDb, acc, { confirm: true, note: 'test' });
+    // 刻意不调用 setAccountCompleteness：从未声明 reported_events_through。
+    pDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run(`initial_principal_cents:${acc}`, '10000000');
+
+    const report = buildDailyReport({
+      portfolioDb: pDb,
+      marketDb: mDb,
+      accountId: acc,
+      snapshotId: 'snap-undeclared-d0',
+      asOfTradeDate: D1,
+    });
+    assert.equal(report.gate.satisfied, true, `缺少完整性声明不得阻断可执行：${JSON.stringify(report.gate)}`);
+    assert.ok(report.gate.warnings.some(w => w.code === 'account_completeness_undeclared'), '缺少声明应进入 warnings');
+    assert.ok(report.gate.warnings.some(w => w.code === 'unreported_trade_lag_warning'), '未报成交风险提示必须保留');
+    assert.equal(report.status, 'ACTIONABLE');
+    assert.ok(
+      report.first_section.actions.some(action => action.legs.some(leg => leg.executable === true)),
+      '至少一条执行腿必须可执行',
+    );
+    const anchor = pDb.prepare('SELECT hwm_nav_cents FROM account_risk_anchor WHERE account_id = ?').get(acc);
+    assert.ok(anchor, 'V3 高水位锚点必须持久化');
+    assert.ok(anchor.hwm_nav_cents > 0);
   } finally {
     pDb.close();
     mDb.close();

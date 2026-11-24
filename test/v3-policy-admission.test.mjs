@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 const dir = mkdtempSync(join(tmpdir(), 'ashare-v3-policy-'));
@@ -24,7 +25,7 @@ const {
 const { openPortfolioDb } = await import('../build/portfolio/db.js');
 const { runActionEngine } = await import('../build/portfolio/actionEngine.js');
 
-const ASOF = '20261120';
+const ASOF = '20261231'; // 未来交易日：保证测试中“现在”记录的事件早于目标日北京时间收盘
 const ACCOUNT = 'real-main';
 
 const regime = {
@@ -197,7 +198,7 @@ test('P1-3: 准入账本按实际 accountId/asOf 评估 GRANT/SUSPEND/RESUME/REV
     const granted = load();
     assert.equal(granted.runtime_admission.store_available, true);
     assert.equal(granted.runtime_admission.latest_action, 'GRANT');
-    assert.equal(granted.runtime_admission.evaluated_as_of, '2026-11-20T23:59:59.999Z');
+    assert.equal(granted.runtime_admission.evaluated_as_of, '2026-12-31T07:00:00.000Z');
     assert.equal(granted.runtime_can_open, true);
 
     recordAction(path, 'SUSPEND');
@@ -218,6 +219,45 @@ test('P1-3: 准入账本按实际 accountId/asOf 评估 GRANT/SUSPEND/RESUME/REV
     assert.equal(load({ accountId: 'other-account' }).runtime_can_open, true);
     // 未提供实际账户/日期 → 跳过准入评估，不使用环境变量或墙钟。
     assert.equal(loadApprovedV3Policy().runtime_can_open, true);
+  } finally {
+    delete process.env.ASHARE_V3_ADMISSION_DB;
+  }
+});
+
+test('P1-3: 准入按北京时间收盘评估，只取评估时刻前已记录的事件', () => {
+  const path = privateAdmissionPath('time-travel');
+  const store = new StrategyAdmissionStore(path, { create: true });
+  store.close();
+  const raw = new DatabaseSync(path);
+  const release = V3_OFFENSIVE_POLICY_RELEASE_V3_2_0;
+  const scope = scopeOf(release);
+  const insert = raw.prepare(`
+    INSERT INTO admission_events
+      (action, strategy_id, version, release_hash, account, market, environment,
+       valid_from, valid_until, recorded_at, uid, operator, reason)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  const add = (action, recordedAt) => insert.run(
+    action, release.strategy.id, release.strategy.version, V3_POLICY_EXPECTED_HASH,
+    scope.account, scope.market, scope.environment,
+    '2020-01-01T00:00:00.000Z', '2100-01-01T00:00:00.000Z',
+    recordedAt, process.getuid?.() ?? 0, 'test', 'test fixture',
+  );
+  add('GRANT', '2026-01-01T00:00:00.000Z');
+  add('SUSPEND', '2026-06-01T00:00:00.000Z');
+  add('RESUME', '2026-12-15T00:00:00.000Z'); // 晚于 2026-11-20 收盘
+  raw.close();
+
+  process.env.ASHARE_V3_ADMISSION_DB = path;
+  try {
+    const before = load({ asOf: '20261120' });
+    assert.equal(before.runtime_admission.evaluated_as_of, '2026-11-20T07:00:00.000Z', '应以北京时间 15:00 收盘评估');
+    assert.equal(before.runtime_admission.latest_action, 'SUSPEND', '未来的 RESUME 不得解除昨日回放');
+    assert.equal(before.runtime_can_open, false);
+
+    const after = load({ asOf: '20261231' });
+    assert.equal(after.runtime_admission.latest_action, 'RESUME');
+    assert.equal(after.runtime_can_open, true);
   } finally {
     delete process.env.ASHARE_V3_ADMISSION_DB;
   }

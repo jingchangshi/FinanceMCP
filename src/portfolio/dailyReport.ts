@@ -554,12 +554,18 @@ export interface DailyReportResult {
   status: DailyReportStatus;
   actionable: boolean;
   /** 报告第一节，永远是这一项。 */
+  /** 第一节（一页摘要）：最多 maxActions 个动作。 */
   first_section: {
     heading: '下一交易日最值得做的 0-3 个动作及理由';
     count: number;
     actions: ActionPlan[];
     no_action_reason: string | null;
     observation_triggers: string[];
+  };
+  /** 完整执行清单：不按一页摘要上限截断，执行腿必须在任何动作数下保留。 */
+  execution_plan: {
+    count: number;
+    actions: ActionPlan[];
   };
   as_of_trade_date: string;
   expected_next_trade_date: string | null;
@@ -1043,8 +1049,10 @@ function buildQualityTiers(
       status: accountEvaluation?.ok && !accountEvaluation.unreported_trade_risk ? 'CONFIRMED_THROUGH_TARGET_DATE' : 'UNCONFIRMED_RISK',
       detail: accountEvaluation?.ok && !accountEvaluation.unreported_trade_risk
         ? '完整性声明覆盖目标交易日且账本门控通过'
-        : gateReasons.length === 0 && accountEvaluation?.reported_events_through
-          ? `账本事件声明至 ${accountEvaluation.reported_events_through}（存在滞后提醒，不阻断既定规则执行）`
+        : gateReasons.length === 0
+          ? accountEvaluation?.reported_events_through
+            ? `账本事件声明至 ${accountEvaluation.reported_events_through}（存在滞后提醒，不阻断既定规则执行）`
+            : '未声明账本完整性；按可能存在未上报成交披露，已降为提醒，不阻断既定规则执行'
           : `账户完整性或账本门控未满足：${gateReasons.map(reason => reason.code).join('、') || '未知'}`,
     },
     research_evidence: {
@@ -1833,9 +1841,13 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       asOf,
     );
     for (const w of accountEvaluation.warnings ?? []) gateWarnings.push({ code: w.code, detail: w.detail });
+    // 反防御护栏（SERVER_EXECUTION_WORK_ORDER §一.2）：已确认真实账户 + 当前快照时，
+    // “从未声明完整性”与“已声明的对账滞后/未交收”只进 warnings，不得清零可执行腿，
+    // 也不得阻断 HWM/tracker 持久化。
+    // 例外：用户已显式声明 unreported_trade_risk=true（承认可能有未报成交）时仍按真实风险硬门控；
+    // 账户未验证、快照失效或账本重建失败同样按硬门控阻塞。
     const explicitCompletenessRisk = accountEvaluation.completeness?.unreported_trade_risk === true;
-    const hasPriorCompleteness = Boolean(accountEvaluation.reported_events_through) && !explicitCompletenessRisk;
-    const lagBypassEligible = hasPriorCompleteness && snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED';
+    const lagBypassEligible = snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED' && !explicitCompletenessRisk;
     const lagCodes = new Set(['account_completeness_undeclared', 'unreported_trade_risk', 'account_settlement_pending']);
     for (const reason of accountEvaluation.reasons) {
       if (lagBypassEligible && lagCodes.has(reason.code)) {
@@ -1844,13 +1856,14 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         gateReasons.push({ code: reason.code, detail: reason.detail });
       }
     }
-    // 铁律 2（反防御性护栏）：已有前置账本完整性声明的已确认真实账户，不因对账滞后清零可执行动作，
-    // 仅在 warnings 中保留漏记交易提醒；只有从未声明完整性（reported_events_through===null）或账户未确认时才阻塞可执行。
+    // 保留实际未报成交风险提示；已确认真实账户 + 当前快照时降为警告（不阻断执行与 V3 持久化）。
     if (accountEvaluation.unreported_trade_risk) {
       if (lagBypassEligible) {
         gateWarnings.push({
           code: 'unreported_trade_lag_warning',
-          detail: `账本事件记录截止 ${accountEvaluation.reported_events_through}，若期间有手工成交请补录后再核对委托数量。`,
+          detail: accountEvaluation.reported_events_through
+            ? `账本事件记录截止 ${accountEvaluation.reported_events_through}，若期间有手工成交请补录后再核对委托数量。`
+            : '尚未声明账本完整性（reported_events_through 缺失），按可能存在未上报成交披露；请核对并补录后再依赖委托份数。',
         });
       } else {
         gateReasons.push({
@@ -1936,17 +1949,18 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
 
   const ctx: ActionContext = { summary, asOf, gateSatisfied, fees, lots, candidates: screening, engineOut };
   const built = maxActions === 0 ? { actions: [] as ActionPlan[], blockers: [] as string[] } : buildActions(ctx);
-  const actions = built.actions.slice(0, maxActions);
+  // 执行清单保留全部动作；只有一页摘要（first_section）按 maxActions 截断。
+  const allActions = built.actions;
 
   // ---- 状态：只有账户门控满足且有动作时才可能 ACTIONABLE；否则最多 ILLUSTRATIVE。
   const insufficient = summary.status === 'DATA_INSUFFICIENT';
-  const anyExecutableLeg = actions.some(action => action.legs.some(leg => leg.executable === true));
+  const anyExecutableLeg = allActions.some(action => action.legs.some(leg => leg.executable === true));
   const quotesReady = summary.data_quality?.quotes?.ready ?? [];
   const quotesNotReady = [...new Set([...(summary.data_quality?.quotes?.stale ?? []), ...(summary.data_quality?.quotes?.not_ready ?? []), ...(summary.data_quality?.quotes?.missing ?? [])])];
   const quotesComplete = quotesNotReady.length === 0 && quotesReady.length > 0;
   let status: DailyReportStatus;
   if (insufficient) status = 'DATA_INSUFFICIENT';
-  else if (actions.length === 0) status = quotesComplete ? 'NO_ACTION' : 'DATA_INSUFFICIENT';
+  else if (allActions.length === 0) status = quotesComplete ? 'NO_ACTION' : 'DATA_INSUFFICIENT';
   else status = gateSatisfied && anyExecutableLeg ? 'ACTIONABLE' : 'ILLUSTRATIVE';
 
   if (engineOut && maxActions > 0 && gateSatisfied && quotesComplete) {
@@ -1954,10 +1968,10 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
   }
 
   // 动作序号按最终顺序重排，保证 rank 连续（1..n）。
-  actions.forEach((action, index) => { action.rank = index + 1; });
+  allActions.forEach((action, index) => { action.rank = index + 1; });
 
   // 任何非 ACTIONABLE 状态下，所有腿都必须是 executable:false。
-  const normalizedActions: ActionPlan[] = actions.map(action => {
+  const executionActions: ActionPlan[] = allActions.map(action => {
     const legs = action.legs.map(leg => (status === 'ACTIONABLE' ? leg : { ...leg, executable: false, reason: leg.reason ?? 'report_status_not_actionable' }));
     return {
       ...action,
@@ -1967,6 +1981,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         : { executable: false, legs: legs.map(leg => ({ ...leg, executable: false })) },
     };
   });
+  const normalizedActions = executionActions.slice(0, maxActions);
 
   // ---- 观察触发条件：NO_ACTION 时由“阻塞原因”与持仓质量共同给出，并补充 V3 核心触发线。
   const v3Triggers: string[] = [];
@@ -2309,7 +2324,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         super_etf_candidates: engineOut.super_etf_candidates,
         cross_border_monitor: engineOut.cross_border_monitor,
         stock_swing_candidates: engineOut.stock_swing_candidates,
-        actions_summary: normalizedActions.map((act, idx) => ({
+        actions_summary: executionActions.map((act, idx) => ({
           priority: act.priority ?? engineOut.actions[idx]?.priority ?? 'P3',
           code: act.code,
           kind: act.kind,
@@ -2358,6 +2373,10 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
             })()
           : null,
       observation_triggers: observationTriggers,
+    },
+    execution_plan: {
+      count: executionActions.length,
+      actions: executionActions,
     },
     as_of_trade_date: asOf,
     expected_next_trade_date: nextTradeDay(marketDb, asOf),

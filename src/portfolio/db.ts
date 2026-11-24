@@ -163,6 +163,8 @@ CREATE TABLE IF NOT EXISTS account_risk_anchor (
   initial_principal_cents INTEGER NOT NULL,
   hwm_nav_cents INTEGER NOT NULL,
   hwm_date TEXT NOT NULL,
+  hwm_flows_applied_through TEXT,
+  hwm_applied_same_day_flow_cents INTEGER NOT NULL DEFAULT 0,
   circuit_breaker_status TEXT NOT NULL DEFAULT 'NORMAL',
   locked_until_trade_date TEXT,
   updated_at TEXT NOT NULL
@@ -240,6 +242,17 @@ export function ensurePortfolioLedgerSchema(db: DatabaseSync): void {
 
 export function ensurePortfolioV3Schema(db: DatabaseSync): void {
   db.exec(PORTFOLIO_V3_SCHEMA);
+  const anchorCols = new Set(
+    (db.prepare('PRAGMA table_info(account_risk_anchor)').all() as Array<{ name?: string }>)
+      .map(c => c.name)
+      .filter((n): n is string => Boolean(n)),
+  );
+  if (!anchorCols.has('hwm_flows_applied_through')) {
+    db.exec('ALTER TABLE account_risk_anchor ADD COLUMN hwm_flows_applied_through TEXT;');
+  }
+  if (!anchorCols.has('hwm_applied_same_day_flow_cents')) {
+    db.exec('ALTER TABLE account_risk_anchor ADD COLUMN hwm_applied_same_day_flow_cents INTEGER NOT NULL DEFAULT 0;');
+  }
   const cols = new Set(
     (db.prepare('PRAGMA table_info(deconcentration_plan)').all() as Array<{ name?: string }>)
       .map(c => c.name)
