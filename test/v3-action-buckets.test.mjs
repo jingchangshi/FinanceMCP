@@ -588,3 +588,54 @@ test('P0-3 仅个股可买时融资按股票实际净额，且 SELL 在 BUY 之�
     db.close();
   }
 });
+
+test('P0-3 融资门槛：缺口<5,000 但一手国债卖额>=5,000 时仍应融资', () => {
+  const stockCandidate = {
+    ts_code: '601001.SH', name: '测试回踩', trade_date: ASOF,
+    entry_ref_price_milli: 10_000, hard_stop_price_milli: 9_200,
+    entry_ref_price_cny: 10, max_chase_price_cny: 10.2, hard_stop_price_cny: 9.2,
+    stop_loss_pct: -8, setup_label_zh: '缩量回踩 20 日均线', reasons_zh: ['测试候选'],
+  };
+  const db = freshDb();
+  try {
+    const holdings = [
+      {
+        ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 37_500, sellable_quantity: 37_500,
+        weight: 0.375, market_value_cents: 3_750_000, price_milli: 1000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 1000,
+      },
+      {
+        ts_code: '511010.SH', name: '国债ETF', quantity: 505, sellable_quantity: 505,
+        weight: 0.505, market_value_cents: 5_050_000, price_milli: 100_000,
+        latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 100_000,
+      },
+    ];
+    const cashCents = 1_200_000;
+    const out = run(db, {
+      marketRegime: regime('OFFENSIVE', 'GROWTH_LEADING'),
+      cashCents,
+      totalAssetsCents: 10_000_000,
+      holdings,
+      candidateRows: [ROWS.value, ROWS.reservoir],
+      stockCandidates: [stockCandidate],
+    });
+    const stockAction = out.actions.find(action => action.code === 'P3-STOCK-SWING-BUY-601001.SH');
+    assert.ok(stockAction, '应形成个股买入腿');
+    const stockLeg = stockAction.legs[0];
+    const availableCash = cashCents - 10_000;
+    const shortfall = stockLeg.net_cents - availableCash;
+    assert.ok(shortfall > 0 && shortfall < 500_000, `测试前提：缺口应小于 5,000 元，实际 ${shortfall}`);
+    const fundingAction = out.actions.find(action => action.code === 'P3-BOND-RESERVOIR-FUNDING');
+    assert.ok(fundingAction, '缺口较小时仍应按一手实际卖额判断是否融资');
+    const sell = sellLegs(fundingAction)[0];
+    assert.ok(sell.gross_cents >= 500_000, '5,000 元门槛只约束实际卖出毛额');
+    assert.ok(sell.quantity === 100, `最小足额手数应为 100 份，实际 ${sell.quantity}`);
+    assert.ok(
+      out.actions.indexOf(fundingAction) < out.actions.indexOf(stockAction),
+      '融资 SELL 必须排在股票 BUY 之前',
+    );
+    assert.ok(stockLeg.net_cents > availableCash, '股票买入应使用融资后的现金，而不是被现金上限缩量');
+  } finally {
+    db.close();
+  }
+});
