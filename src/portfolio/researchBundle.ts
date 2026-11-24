@@ -389,9 +389,26 @@ export function buildInvestmentResearchBundle(input: ResearchBundleInput): any {
     }));
     // A missing current market report must not be replaced by prior-day judgement inside the composed report.
     if (portfolio && !coreReady) {
+      // 最终状态是 DATA_INSUFFICIENT：执行清单必须与 first_section 同源，保留数量但全部不可执行。
+      const blockedActions = (portfolio.execution_plan?.actions ?? []).map((action: any) => {
+        const legs = (action.legs ?? []).map((leg: any) => ({
+          ...leg,
+          executable: false,
+          reason: leg.reason ?? 'report_status_not_actionable',
+        }));
+        return {
+          ...action,
+          legs,
+          illustrative: { executable: false, legs: legs.map((leg: any) => ({ ...leg, executable: false })) },
+        };
+      });
       portfolio = { ...portfolio, status: 'DATA_INSUFFICIENT', actionable: false,
         market_judgement: { available: false, as_of_trade_date: asOf, reason: 'target_market_data_unavailable' },
         first_section: { ...portfolio.first_section, count: 0, actions: [], no_action_reason: 'DATA_INSUFFICIENT: target market data unavailable' },
+        execution_plan: {
+          count: portfolio.execution_plan?.count ?? blockedActions.length,
+          actions: blockedActions,
+        },
       };
     }
     screening = portfolio?.candidate_vs_cash?.screening ?? safe('etf_candidates', () => screenEtfCandidates(market, {

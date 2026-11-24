@@ -1042,116 +1042,205 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     const defensiveAssetsCents = (): number | null =>
       reservoirHeldCents === null ? null : workingCashCents + reservoirHeldCents;
 
-    // 底盘/蓄水池的合并买入腿与融资腿在个股之前登记，便于先形成真实买入意图、
-    // 再按净缺口卖出超额 511010；没有任何买入腿时不得空卖。
+    const defensiveAssetsNow = defensiveAssetsCents();
+    const cashRoomNowCents = defensiveAssetsNow === null
+      ? Math.max(0, workingCashCents)
+      : Math.max(0, defensiveAssetsNow - targetDefensiveCents);
+    const baseEtfGapCents = Math.max(0, targetBaseEtfCents - baseEtfHeldCents);
+    const bucketSpecs = superEtfBucketSpecs(router.effective_regime, regime.style);
+
     const etfLegs: ActionEngineLeg[] = [];
     const etfReasons: string[] = [
       `当前处于${regime.regime_label_zh}且${regime.style_label_zh}，按 V3-01 目标持仓差额配置底盘超级 ETF 与防御蓄水池，不按新增现金均分、不单押一只。`,
     ];
     let etfFeesEstimated = false;
     let stockBuysAdded = 0;
-    let financingSaleApplied = false;
+    let fundingActionIndex = -1;
 
-    const defensiveAssetsNow = defensiveAssetsCents();
-    const cashRoomNowCents = defensiveAssetsNow === null
-      ? Math.max(0, workingCashCents)
-      : Math.max(0, defensiveAssetsNow - targetDefensiveCents);
-    const baseEtfGapCents = Math.max(0, targetBaseEtfCents - baseEtfHeldCents);
-    const bucketSpecsForIntent = superEtfBucketSpecs(router.effective_regime, regime.style);
-    const etfHasPotentialBuy = superEligible.some(row =>
-      bucketSpecsForIntent.some(spec => spec.codes.includes(row.ts_code)));
+    interface PendingBucketBuy { spec: SuperEtfBucketSpec; row: EtfCandidateRow; targetBuyCents: number }
+    const pendingBuys: PendingBucketBuy[] = [];
+    const bucketSkipped = new Map<string, string[]>();
+    let totalTargetBuyCents = 0;
 
-    // 个股先锋意图：按目标缺口/防御余量定量，不占用融资前现金（用于计算融资缺口）。
-    let stockIntentNetCents = 0;
-    if (
-      runtimeCanOpen
-      && router.effective_regime !== 'DEFENSIVE'
-      && router.sub_strategies.s_stock_swing === 'ACTIVE'
-      && stockSwingCandidates.length > 0
-    ) {
-      let intentOpenCount = input.holdings.filter(
-        h => !isEtfCode(h.ts_code) && (workingQty.get(h.ts_code) ?? h.quantity) > 0,
-      ).length;
-      let intentGapCents = pioneerGapRemainingCents;
-      for (const cand of stockSwingCandidates) {
-        if (intentOpenCount >= policy.stock_max_positions) break;
-        if ((workingQty.get(cand.ts_code) ?? 0) > 0) continue;
-        if (!(cand.entry_ref_price_milli > 0) || !(cand.hard_stop_price_milli > 0)) continue;
-        const deployBudgetCents = Math.min(intentGapCents, cashRoomNowCents);
-        if (deployBudgetCents < minStockOrderCents) break;
-        const rules = feeFor(cand.ts_code, 'STOCK');
-        const sized = sizeStockSwingOrder({
-          navCents: investableAssetsCents,
-          entryPriceMilli: cand.entry_ref_price_milli,
-          hardStopPriceMilli: cand.hard_stop_price_milli,
-          availableCashCents: deployBudgetCents,
-          commissionRate: rules.commission_rate,
-          commissionMinCents: rules.commission_min_cents,
-          transferFeeRate: rules.transfer_fee_rate,
-          maxRiskBps: policy.stock_risk_budget_bps,
-          maxWeightBps: policy.stock_max_single_weight_bps,
-          minOrderCents: minStockOrderCents,
-        });
-        if (sized.shares < 100 || sized.skipped_reason !== null) continue;
-        stockIntentNetCents += sized.net_cents;
-        intentGapCents -= sized.gross_cents;
-        intentOpenCount += 1;
-      }
-    }
-
-    const etfIntentCents = etfHasPotentialBuy && baseEtfGapCents >= 100_000
-      ? Math.min(baseEtfGapCents, Math.max(0, cashRoomNowCents - stockIntentNetCents))
-      : 0;
-    const intendedBuyNetCents = stockIntentNetCents + etfIntentCents;
-    const availableCashForBuysCents = Math.max(0, workingCashCents - cashBufferCents);
-    const fundingShortfallCents = Math.max(0, intendedBuyNetCents - availableCashForBuysCents);
-
-    // 只按净缺口卖出可卖的超额 511010（含个股先锋 + ETF 桶 + 蓄水池的买入意图）。
-    if (fundingShortfallCents >= 500_000 && reservoirQty > 0 && reservoirPriceMilli > 0) {
-      const defensiveExcessCents = defensiveAssetsNow === null
-        ? 0
-        : Math.max(0, defensiveAssetsNow - targetDefensiveCents);
-      const sellValueCents = Math.min(fundingShortfallCents, reservoirHeldCents ?? 0, defensiveExcessCents);
-      const sellableQty = Math.floor((workingSellable.get(reservoirCode) ?? 0) / 100) * 100;
-      const maxSharesByValue = Math.floor((sellValueCents / (reservoirPriceMilli / 10)) / 100) * 100;
-      const sellShares = Math.min(sellableQty, maxSharesByValue, reservoirQty);
-      if (sellShares >= 100) {
-        const priceCents = reservoirPriceMilli / 10;
-        const grossCents = roundCent(sellShares * priceCents);
-        if (grossCents >= 500_000) {
-          if (freshQuoteMilli <= 0) {
-            blockers.push(`${reservoirCode} 当日无新鲜行情，融资卖出腿按持仓参考价计价（未使用或臆造当日价）。`);
+    if (runtimeCanOpen) {
+      // ---- 先形成桶的目标差额买入计划（目标持仓 - 现有持仓，桶内等权）。
+      for (const spec of bucketSpecs) {
+        const bucketTargetCents = Math.floor(targetBaseEtfCents * spec.share_bps / 10000);
+        const bucketHeldCents = spec.codes.reduce((sum, code) => sum + heldValueCents(code), 0);
+        const bucketGapCents = Math.max(0, bucketTargetCents - bucketHeldCents);
+        const members = spec.codes
+          .map(code => superByCode.get(code))
+          .filter((row): row is EtfCandidateRow => Boolean(row));
+        if (members.length === 0) {
+          blockers.push(`${spec.label_zh}桶无合格超级 ETF 成员（未入选或禁买），本次跳过，预算份额不集中到单一 ETF。`);
+          continue;
+        }
+        const perMemberTargetCents = bucketTargetCents / members.length;
+        const raw: Array<{ row: EtfCandidateRow; buyCents: number }> = [];
+        for (const row of members) {
+          const held = heldValueCents(row.ts_code);
+          let buyCents = Math.max(0, perMemberTargetCents - held);
+          if (row.category === 'industry_theme') {
+            // 行业主题买后权重上限 20%（占账户总资产）。
+            buyCents = Math.min(buyCents, Math.max(0, 0.20 * input.totalAssetsCents - held));
           }
-          const rules = feeFor(reservoirCode, 'ETF');
-          const fees = calculateFees(grossCents, 'sell', rules);
-          const netCents = grossCents - fees.total_cents;
-          workingQty.set(reservoirCode, reservoirQty - sellShares);
-          workingSellable.set(reservoirCode, Math.max(0, (workingSellable.get(reservoirCode) ?? 0) - sellShares));
-          workingCashCents += netCents;
-          reservoirQty -= sellShares;
-          reservoirHeldCents = roundCent(reservoirQty * priceCents);
-          etfFeesEstimated = etfFeesEstimated || Boolean(rules.fee_model?.estimated);
-          financingSaleApplied = true;
-          etfLegs.push({
-            side: 'SELL',
-            ts_code: reservoirCode,
-            name: reservoirHolding?.name ?? reservoirRow?.name ?? null,
-            quantity: sellShares,
-            lot_size: 100,
-            lots: sellShares / 100,
-            price_milli: reservoirPriceMilli,
-            gross_cents: grossCents,
-            fees_cents: fees.total_cents,
-            net_cents: netCents,
-            quote_trade_date: reservoirQuoteDate,
-            executable: true,
-            reason: 'P3_DEFENSIVE_RESERVOIR_FUNDING',
+          if (buyCents > 0) raw.push({ row, buyCents });
+        }
+        const rawSum = raw.reduce((sum, item) => sum + item.buyCents, 0);
+        if (rawSum <= 0) continue;
+        const gapScale = Math.min(1, bucketGapCents / rawSum);
+        for (const item of raw) {
+          const targetBuyCents = Math.floor(item.buyCents * gapScale);
+          if (targetBuyCents <= 0) continue;
+          pendingBuys.push({ spec, row: item.row, targetBuyCents });
+          totalTargetBuyCents += targetBuyCents;
+        }
+      }
+
+      // ---- 实际整手 ETF 买入意图（含费用），用于融资缺口。
+      const bucketIntentScale = totalTargetBuyCents > 0
+        ? Math.min(1, baseEtfGapCents / totalTargetBuyCents)
+        : 0;
+      let etfIntentNetCents = 0;
+      for (const pending of pendingBuys) {
+        const budgetCents = Math.floor(pending.targetBuyCents * bucketIntentScale);
+        const priceMilli = pending.row.data.latest_close_milli ?? 0;
+        if (!(priceMilli > 0) || budgetCents < 100_000) continue;
+        const rules = feeFor(pending.row.ts_code, 'ETF');
+        const sized = sizeEtfBuy({
+          priceMilli,
+          budgetCents,
+          availableCashCents: budgetCents * 2,
+          rules,
+          minGrossCents: 100_000,
+        });
+        if (sized) etfIntentNetCents += sized.net_cents;
+      }
+
+      // ---- 个股先锋意图（实际整手 + 费用），同样计入融资缺口。
+      let stockIntentNetCents = 0;
+      if (
+        router.effective_regime !== 'DEFENSIVE'
+        && router.sub_strategies.s_stock_swing === 'ACTIVE'
+        && stockSwingCandidates.length > 0
+      ) {
+        let intentOpenCount = input.holdings.filter(
+          h => !isEtfCode(h.ts_code) && (workingQty.get(h.ts_code) ?? h.quantity) > 0,
+        ).length;
+        let intentGapCents = pioneerGapRemainingCents;
+        for (const cand of stockSwingCandidates) {
+          if (intentOpenCount >= policy.stock_max_positions) break;
+          if ((workingQty.get(cand.ts_code) ?? 0) > 0) continue;
+          if (!(cand.entry_ref_price_milli > 0) || !(cand.hard_stop_price_milli > 0)) continue;
+          const deployBudgetCents = Math.min(intentGapCents, cashRoomNowCents);
+          if (deployBudgetCents < minStockOrderCents) break;
+          const rules = feeFor(cand.ts_code, 'STOCK');
+          const sized = sizeStockSwingOrder({
+            navCents: investableAssetsCents,
+            entryPriceMilli: cand.entry_ref_price_milli,
+            hardStopPriceMilli: cand.hard_stop_price_milli,
+            availableCashCents: deployBudgetCents,
+            commissionRate: rules.commission_rate,
+            commissionMinCents: rules.commission_min_cents,
+            transferFeeRate: rules.transfer_fee_rate,
+            maxRiskBps: policy.stock_risk_budget_bps,
+            maxWeightBps: policy.stock_max_single_weight_bps,
+            minOrderCents: minStockOrderCents,
           });
-          etfReasons.push('防守转进攻：卖出超出新防御目标的国债 ETF，为已形成的股票/ETF 买入腿提供资金。');
+          if (sized.shares < 100 || sized.skipped_reason !== null) continue;
+          stockIntentNetCents += sized.net_cents;
+          intentGapCents -= sized.gross_cents;
+          intentOpenCount += 1;
+        }
+      }
+
+      const intendedBuyNetCents = stockIntentNetCents + etfIntentNetCents;
+      const availableCashForBuysCents = Math.max(0, workingCashCents - cashBufferCents);
+      const fundingShortfallCents = Math.max(0, intendedBuyNetCents - availableCashForBuysCents);
+
+      // ---- 最小足额可卖国债手数：净额（扣卖费）覆盖实际净缺口，SELL 单独成 funding action。
+      if (fundingShortfallCents >= 500_000 && reservoirQty > 0 && reservoirPriceMilli > 0 && intendedBuyNetCents > 0) {
+        const defensiveExcessCents = defensiveAssetsNow === null
+          ? 0
+          : Math.max(0, defensiveAssetsNow - targetDefensiveCents);
+        const sellMaxGrossCents = Math.min(reservoirHeldCents ?? 0, defensiveExcessCents);
+        const priceCents = reservoirPriceMilli / 10;
+        const sellableQty = Math.floor((workingSellable.get(reservoirCode) ?? 0) / 100) * 100;
+        const maxShares = Math.min(
+          sellableQty,
+          Math.floor((sellMaxGrossCents / priceCents) / 100) * 100,
+          reservoirQty,
+        );
+        if (maxShares >= 100) {
+          const rules = feeFor(reservoirCode, 'ETF');
+          let chosen: { shares: number; gross: number; fees: number; net: number } | null = null;
+          // 从缺口估算起算，按整手向上补齐到“净额覆盖缺口”的最小手数。
+          const estimateShares = Math.ceil(fundingShortfallCents / (priceCents * 100)) * 100;
+          for (let shares = Math.max(100, Math.min(maxShares, estimateShares)); shares <= maxShares; shares += 100) {
+            const gross = roundCent(shares * priceCents);
+            const fees = calculateFees(gross, 'sell', rules).total_cents;
+            if (gross - fees >= fundingShortfallCents) {
+              chosen = { shares, gross, fees, net: gross - fees };
+              break;
+            }
+          }
+          if (!chosen) {
+            const gross = roundCent(maxShares * priceCents);
+            const fees = calculateFees(gross, 'sell', rules).total_cents;
+            chosen = { shares: maxShares, gross, fees, net: gross - fees };
+            blockers.push('防御蓄水池可卖超额不足以覆盖全部买入净缺口，本次按上限卖出，买入随剩余现金缩量。');
+          }
+          if (chosen.gross >= 500_000) {
+            if (freshQuoteMilli <= 0) {
+              blockers.push(`${reservoirCode} 当日无新鲜行情，融资卖出腿按持仓参考价计价（未使用或臆造当日价）。`);
+            }
+            workingQty.set(reservoirCode, reservoirQty - chosen.shares);
+            workingSellable.set(reservoirCode, Math.max(0, (workingSellable.get(reservoirCode) ?? 0) - chosen.shares));
+            workingCashCents += chosen.net;
+            reservoirQty -= chosen.shares;
+            reservoirHeldCents = roundCent(reservoirQty * priceCents);
+            etfFeesEstimated = etfFeesEstimated || Boolean(rules.fee_model?.estimated);
+            fundingActionIndex = actions.length;
+            actions.push({
+              priority: 'P3',
+              code: 'P3-BOND-RESERVOIR-FUNDING',
+              kind: 'ROTATE',
+              rank: actions.length + 1,
+              title: '卖出超额国债 ETF 为 P3 买入融资',
+              reasons: [
+                '防守转进攻：卖出超出新防御目标的国债 ETF，为已形成的个股/ETF 买入腿提供资金；该卖出腿先于所有依赖的买入腿执行。',
+                '只按实际整手买入净缺口卖出最小足额手数，未把整块底盘缺口一次性变现。',
+              ],
+              counter_evidence: ['若次日权益低开，融资买入的部分承担短期波动；剩余国债 ETF 仍覆盖防御目标。'],
+              legs: [{
+                side: 'SELL',
+                ts_code: reservoirCode,
+                name: reservoirHolding?.name ?? reservoirRow?.name ?? null,
+                quantity: chosen.shares,
+                lot_size: 100,
+                lots: chosen.shares / 100,
+                price_milli: reservoirPriceMilli,
+                gross_cents: chosen.gross,
+                fees_cents: chosen.fees,
+                net_cents: chosen.net,
+                quote_trade_date: reservoirQuoteDate,
+                executable: true,
+                reason: 'P3_DEFENSIVE_RESERVOIR_FUNDING',
+              }],
+              fees_cents: chosen.fees,
+              fees_estimated: Boolean(rules.fee_model?.estimated),
+              triggers: [`先卖出 ${chosen.shares} 份 ${reservoirCode}（参考价 ${(reservoirPriceMilli / 1000).toFixed(3)} 元），再执行后续买入腿`],
+              invalidation_conditions: ['国债 ETF 当日无可用报价时不下单'],
+              risk_impact: ['只变现防御目标以上的超额国债，防御底线不变'],
+            });
+          } else {
+            blockers.push('国债 ETF 融资卖出低于最低毛额门槛（最低佣金摊薄不经济），本次不融资，买入按现有现金缩量。');
+          }
         }
       }
     }
 
+    // ---- 个股先于底盘 ETF 执行（融资卖出已在前一步登记，SEO order: funding action → stock buys → ETF rebalance）。
     if (
       runtimeCanOpen
       && router.effective_regime !== 'DEFENSIVE'
@@ -1232,54 +1321,14 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     }
 
     if (runtimeCanOpen) {
-      // ---- 底盘 ETF 与蓄水池：按目标持仓差额买入（融资腿已在上方按净缺口形成）。
-      let defensiveAfterStocks = defensiveAssetsCents();
-      let cashRoomCents = defensiveAfterStocks === null
+      // ---- 底盘 ETF 执行：按目标差额计划、以融资后的实际现金定量。
+      const defensiveAfterStocks = defensiveAssetsCents();
+      const cashRoomCents = defensiveAfterStocks === null
         ? Math.max(0, workingCashCents)
         : Math.max(0, defensiveAfterStocks - targetDefensiveCents);
-      let etfBudgetCents = Math.max(0, Math.min(baseEtfGapCents, cashRoomCents));
-
-      // ---- 风格桶：按“桶内等权目标 - 现有持仓”差额买入；成长桶只取 EXP-01 前 3 只。
-      const bucketSpecs = superEtfBucketSpecs(router.effective_regime, regime.style);
-      interface PendingBucketBuy { spec: SuperEtfBucketSpec; row: EtfCandidateRow; targetBuyCents: number }
-      const pendingBuys: PendingBucketBuy[] = [];
-      const bucketSkipped = new Map<string, string[]>();
-      let totalTargetBuyCents = 0;
-      for (const spec of bucketSpecs) {
-        const bucketTargetCents = Math.floor(targetBaseEtfCents * spec.share_bps / 10000);
-        const bucketHeldCents = spec.codes.reduce((sum, code) => sum + heldValueCents(code), 0);
-        const bucketGapCents = Math.max(0, bucketTargetCents - bucketHeldCents);
-        const members = spec.codes
-          .map(code => superByCode.get(code))
-          .filter((row): row is EtfCandidateRow => Boolean(row));
-        if (members.length === 0) {
-          blockers.push(`${spec.label_zh}桶无合格超级 ETF 成员（未入选或禁买），本次跳过，预算份额不集中到单一 ETF。`);
-          continue;
-        }
-        const perMemberTargetCents = bucketTargetCents / members.length;
-        const raw: Array<{ row: EtfCandidateRow; buyCents: number }> = [];
-        for (const row of members) {
-          const held = heldValueCents(row.ts_code);
-          let buyCents = Math.max(0, perMemberTargetCents - held);
-          if (row.category === 'industry_theme') {
-            // 行业主题买后权重上限 20%（占账户总资产）。
-            buyCents = Math.min(buyCents, Math.max(0, 0.20 * input.totalAssetsCents - held));
-          }
-          if (buyCents > 0) raw.push({ row, buyCents });
-        }
-        const rawSum = raw.reduce((sum, item) => sum + item.buyCents, 0);
-        if (rawSum <= 0) continue;
-        const gapScale = Math.min(1, bucketGapCents / rawSum);
-        for (const item of raw) {
-          const targetBuyCents = Math.floor(item.buyCents * gapScale);
-          if (targetBuyCents <= 0) continue;
-          pendingBuys.push({ spec, row: item.row, targetBuyCents });
-          totalTargetBuyCents += targetBuyCents;
-        }
-      }
-
+      const etfBudgetCents = Math.max(0, Math.min(baseEtfGapCents, cashRoomCents));
       const budgetScale = totalTargetBuyCents > 0
-        ? Math.min(1, Math.max(0, Math.min(baseEtfGapCents, etfBudgetCents)) / totalTargetBuyCents)
+        ? Math.min(1, etfBudgetCents / totalTargetBuyCents)
         : 0;
       if (pendingBuys.length > 0 && budgetScale <= 0) {
         blockers.push('底盘 ETF 目标差额已满足或现金不足，本次不新增 ETF 仓位。');
@@ -1375,6 +1424,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
               executable: true,
               reason: 'P3_DEFENSIVE_BOND_RESERVOIR',
             });
+            etfReasons.push('防御桶中尚未配置到国债 ETF 的闲置资金转入蓄水池，保留日常现金缓冲。');
           }
         }
       } else if (reservoirTargetCents > 0) {
@@ -1384,23 +1434,20 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         }
       }
 
-      // 无买入腿不得空卖：融资卖出只有在股票先锋或 ETF/蓄水池形成买入腿时才保留。
-      if (financingSaleApplied && stockBuysAdded === 0 && !etfLegs.some(leg => leg.side === 'BUY')) {
-        for (let i = etfLegs.length - 1; i >= 0; i -= 1) {
-          if (etfLegs[i].side === 'SELL') etfLegs.splice(i, 1);
-        }
+      // 无买入腿不得空卖：撤销独立 funding action。
+      if (fundingActionIndex >= 0 && stockBuysAdded === 0 && !etfLegs.some(leg => leg.side === 'BUY')) {
+        actions.splice(fundingActionIndex, 1);
         blockers.push('本次未形成任何可执行的买入腿，已取消国债 ETF 融资卖出。');
       }
 
       if (etfLegs.length > 0) {
         const buyLegs = etfLegs.filter(leg => leg.side === 'BUY');
-        const sellLegs = etfLegs.filter(leg => leg.side === 'SELL');
         actions.push({
           priority: 'P3',
           code: 'P3-SUPER-ETF-REBALANCE',
           kind: 'ROTATE',
           rank: actions.length + 1,
-          title: `底盘超级 ETF 与防御蓄水池再平衡：${buyLegs.length} 笔买入${sellLegs.length > 0 ? ` / ${sellLegs.length} 笔卖出` : ''}`,
+          title: `底盘超级 ETF 与防御蓄水池再平衡：${buyLegs.length} 笔买入`,
           reasons: etfReasons.slice(0, 2),
           counter_evidence: ['若市场次日跌破风格锚，需随环境切档缩减仓位；按目标差额买入不保证短期相对收益。'],
           legs: etfLegs,
@@ -1412,6 +1459,9 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         });
       }
     }
+
+    // rank 连续：融资 action 可能被撤销（splice）。
+    actions.forEach((action, index) => { action.rank = index + 1; });
   }
 
   return {

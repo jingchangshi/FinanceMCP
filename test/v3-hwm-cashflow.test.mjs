@@ -452,7 +452,107 @@ test('P1-2 旧库迁移：account_risk_anchor 自动补齐当日流水列', () =
     );
     assert.ok(cols.has('hwm_flows_applied_through'), '迁移必须补齐 hwm_flows_applied_through');
     assert.ok(cols.has('hwm_applied_same_day_flow_cents'), '迁移必须补齐 hwm_applied_same_day_flow_cents');
+    assert.ok(cols.has('hwm_nav_scope'), '迁移必须补齐 hwm_nav_scope');
   } finally {
     db.close();
+  }
+});
+
+test('P1-2 跨日延迟流水：D 日重基后 D+1 buildNavSeries 不得把同一笔出金算成假 L2', () => {
+  const { portfolioDb, marketDb } = setupAccount({
+    name: 'delayed-flow',
+    startDay: DAY.d0,
+    positions: [position('600000.SH', 600, 1000)],
+    cashCents: 40_000,
+    prices: { '600000.SH': { [DAY.d0]: 1.0, [DAY.d1]: 1.0, [DAY.d2]: 1.0 } },
+  });
+  try {
+    // D1 先建峰（尚无流水）。
+    const atAnchor = evaluate(portfolioDb, marketDb, { asOf: DAY.d1, nav: 100_000 });
+    assert.equal(persistRiskAnchor(portfolioDb, atAnchor), true);
+    assert.equal(readRiskAnchor(portfolioDb, 'real-main').hwm_nav_cents, 100_000);
+
+    // 稍后补记 D1 出金 40,000：无价格变化，净值 100,000 -> 60,000。
+    recordCash(portfolioDb, { id: 'delayed-wd', type: 'CASH_WITHDRAW', day: DAY.d1, cents: -40_000 });
+
+    const d1Rerun = evaluate(portfolioDb, marketDb, { asOf: DAY.d1, nav: 60_000 });
+    assert.equal(d1Rerun.anchor_snapshot.hwm_drawdown_bps, 0, 'D 日重跑不得出现假回撤');
+    assert.equal(d1Rerun.should_advance_hwm, false);
+    assert.equal(d1Rerun.should_write_hwm, true, '新增同日流水必须重基写库');
+    assert.equal(d1Rerun.anchor_snapshot.hwm_nav_cents, 60_000, '持久名义峰按 current/(current-incremental) 重基');
+    assert.equal(persistRiskAnchor(portfolioDb, d1Rerun), true);
+    const rebased = readRiskAnchor(portfolioDb, 'real-main');
+    assert.equal(rebased.hwm_nav_cents, 60_000);
+    assert.equal(rebased.hwm_flows_applied_through, DAY.d1);
+    assert.equal(rebased.hwm_applied_same_day_flow_cents, -40_000);
+    assert.equal(rebased.hwm_nav_scope, 'INVESTABLE');
+
+    const d1Again = evaluate(portfolioDb, marketDb, { asOf: DAY.d1, nav: 60_000 });
+    assert.equal(d1Again.anchor_snapshot.hwm_drawdown_bps, 0);
+
+    const d2 = evaluate(portfolioDb, marketDb, { asOf: DAY.d2, nav: 60_000 });
+    assert.equal(d2.anchor_snapshot.hwm_nav_basis, 'UNIT_NAV');
+    assert.equal(d2.anchor_snapshot.hwm_drawdown_bps, 0, 'D+1 按出金后份额重建也不得出现假 L2');
+    assert.equal(d2.circuit_breaker_status, 'NORMAL');
+  } finally {
+    marketDb.close();
+    portfolioDb.close();
+  }
+});
+
+test('P1-2 旧含理财锚点：有总资产数据时按可投资比例迁移，无财富数据时保留 TOTAL 口径', () => {
+  // 有总资产数据：旧峰值 100（含 10 理财）折到可投资 90，避免 90/100=10% 的假回撤。
+  const migratedDb = bareDb();
+  try {
+    migratedDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
+    migratedDb.prepare(`
+      INSERT INTO account_risk_anchor
+        (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, hwm_nav_scope, circuit_breaker_status, locked_until_trade_date, updated_at)
+      VALUES (?,?,?,?, 'TOTAL', 'NORMAL', NULL, ?)
+    `).run('real-main', 100_000, 100_000, DAY.d0, DAY.d0);
+    const out = evaluateStrategyRouter({
+      portfolioDb: migratedDb,
+      marketDb: null,
+      accountId: 'real-main',
+      asOf: DAY.d0,
+      currentNavCents: 90_000,
+      displayNavCents: 100_000,
+      marketRegime: regime,
+    });
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 90_000, '旧总峰必须折到可投资口径');
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 0);
+    assert.equal(out.anchor_snapshot.hwm_nav_scope, 'INVESTABLE');
+    assert.equal(out.should_write_hwm, true);
+    assert.equal(persistRiskAnchor(migratedDb, out), true);
+    const row = readRiskAnchor(migratedDb, 'real-main');
+    assert.equal(row.hwm_nav_cents, 90_000);
+    assert.equal(row.hwm_nav_scope, 'INVESTABLE');
+  } finally {
+    migratedDb.close();
+  }
+
+  // 无财富数据：不静默改口径，保留 TOTAL 与原比较，等下一次显式迁移。
+  const legacyDb = bareDb();
+  try {
+    legacyDb.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
+    legacyDb.prepare(`
+      INSERT INTO account_risk_anchor
+        (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, hwm_nav_scope, circuit_breaker_status, locked_until_trade_date, updated_at)
+      VALUES (?,?,?,?, 'TOTAL', 'NORMAL', NULL, ?)
+    `).run('real-main', 100_000, 100_000, DAY.d0, DAY.d0);
+    const out = evaluateStrategyRouter({
+      portfolioDb: legacyDb,
+      marketDb: null,
+      accountId: 'real-main',
+      asOf: DAY.d0,
+      currentNavCents: 90_000,
+      marketRegime: regime,
+    });
+    assert.equal(out.anchor_snapshot.hwm_nav_scope, 'TOTAL', '无财富数据时不得静默改标签');
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 100_000);
+    assert.equal(out.anchor_snapshot.hwm_drawdown_bps, 1000);
+    assert.equal(out.should_write_hwm, false, '口径未确认时不得改写锚点');
+  } finally {
+    legacyDb.close();
   }
 });
