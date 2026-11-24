@@ -80,9 +80,6 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
         const account = resolveAccountId(db, args.account_id);
         const session = resolveResearchDate(market, ymd(args.as_of_trade_date, 'as_of_trade_date'));
         const asOf = session.as_of_trade_date ?? null;
-        const latestCached = latestDailyBriefDate();
-        const latestReportRow = db.prepare('SELECT MAX(trade_date) AS d FROM report').get() as { d?: string } | undefined;
-        const latestReport = latestReportRow?.d ? String(latestReportRow.d) : null;
         if (asOf) {
           const path = dailyBriefPath(asOf);
           const brief = readDailyBrief(path);
@@ -90,6 +87,15 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
             return json({ ...brief, brief_source: 'cached', cache_path: path, account_id: account.account_id });
           }
         }
+        // 缓存未命中时才查询最新日期；report 表在市场库，不在账户库。任何查询失败都必须
+        // 退化为 not_ready，不能把聊天请求变成异常。
+        let latestCached: string | null = null;
+        let latestReport: string | null = null;
+        try { latestCached = latestDailyBriefDate(); } catch { /* ignore */ }
+        try {
+          const latestReportRow = market?.prepare('SELECT MAX(trade_date) AS d FROM report').get() as { d?: string } | undefined;
+          latestReport = latestReportRow?.d ? String(latestReportRow.d) : null;
+        } catch { /* ignore */ }
         return json({
           schema: DAILY_BRIEF_SCHEMA,
           brief_source: 'not_ready',
