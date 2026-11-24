@@ -4,6 +4,7 @@ import { ashareDbPath, getAshareDb } from '../ashare/db.js';
 import { resolveAccountId, resolveAccountSnapshot } from './accounts.js';
 import { openPortfolioDb, portfolioDbPath, portfolioEnabled } from './db.js';
 import { buildDailyReport } from './dailyReport.js';
+import { DAILY_BRIEF_SCHEMA, dailyBriefPath, latestDailyBriefDate, readDailyBrief } from './dailyBrief.js';
 import { buildBenchmarkComparison } from './benchmarks.js';
 import { screenEtfCandidates } from '../ashare/etfUniverse.js';
 import { resolveResearchDate } from '../ashare/researchDate.js';
@@ -71,6 +72,38 @@ function latestTradeDayOf(market: DatabaseSync | null): string | undefined {
 
 export function runPortfolioResearchTool(name: string, args: Record<string, any>): ToolResult {
   switch (name) {
+    case 'ashare_portfolio_daily_brief': {
+      // 快路径：只读每日流水线预生成的 compact brief；绝不在此重算全市场。
+      const db = readDb();
+      const market = readOnlyMarket();
+      try {
+        const account = resolveAccountId(db, args.account_id);
+        const session = resolveResearchDate(market, ymd(args.as_of_trade_date, 'as_of_trade_date'));
+        const asOf = session.as_of_trade_date ?? null;
+        const latestCached = latestDailyBriefDate();
+        const latestReportRow = db.prepare('SELECT MAX(trade_date) AS d FROM report').get() as { d?: string } | undefined;
+        const latestReport = latestReportRow?.d ? String(latestReportRow.d) : null;
+        if (asOf) {
+          const path = dailyBriefPath(asOf);
+          const brief = readDailyBrief(path);
+          if (brief && brief.as_of_trade_date === asOf) {
+            return json({ ...brief, brief_source: 'cached', cache_path: path, account_id: account.account_id });
+          }
+        }
+        return json({
+          schema: DAILY_BRIEF_SCHEMA,
+          brief_source: 'not_ready',
+          status: 'DATA_INSUFFICIENT',
+          actionable: false,
+          as_of_trade_date: asOf,
+          reason: 'daily_brief_not_ready',
+          session,
+          latest_cached_date: latestCached,
+          latest_report_date: latestReport,
+          message_zh: `${asOf ?? '目标日'} 的简报尚未生成；每日流水线通常在 19:45 后生成。最新缓存：${latestCached ?? '无'}；最新市场报告：${latestReport ?? '无'}。请在该时间后重试；本工具不会重算全市场，因此不会等待或超时。`,
+        });
+      } finally { db.close(); }
+    }
     case 'ashare_investment_research_bundle': {
       const db = readDb();
       try {
@@ -266,6 +299,7 @@ export function runPortfolioResearchTool(name: string, args: Record<string, any>
 
 /** 供 dispatch.ts 判断一个私有工具是否由本模块实现。 */
 export const RESEARCH_PRIVATE_TOOLS = new Set([
+  'ashare_portfolio_daily_brief',
   'ashare_investment_research_bundle',
   'ashare_portfolio_daily_report',
   'ashare_etf_candidates',

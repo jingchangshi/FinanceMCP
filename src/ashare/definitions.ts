@@ -336,6 +336,20 @@ export const portfolioToolDefinitions: { name: string; description: string; inpu
     securitySchemes: PRIVATE_READ_SCHEMES,
   },
   {
+    name: 'ashare_portfolio_daily_brief',
+    description: `快速只读的每日行动简报（缓存版，推荐给定时任务/聊天）：只读取每日流水线在收盘后预生成的 compact brief，毫秒级返回，不重算全市场、不返回数十 MB 研究 bundle。包含首屏 0–3 个动作、完整执行清单、V3 cockpit、市场判断、持仓与数据质量。若目标日简报尚未生成，快速返回 DATA_INSUFFICIENT（含 latest_cached_date / latest_report_date），不会等待或触发 DEADLINE_EXCEEDED。每日流水线通常在交易日 19:45 后生成简报；请在该时间之后运行定时任务。${PORTFOLIO_NOTE} 只在 /private/mcp 提供。`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
+        as_of_trade_date: { type: 'string', description: '目标交易日 YYYYMMDD；缺省为最近交易日' },
+      },
+      required: [],
+    },
+    annotations: READ_ONLY,
+    securitySchemes: PRIVATE_READ_SCHEMES,
+  },
+  {
     name: 'ashare_etf_candidates',
     description: `适格 ETF 动态研究候选（C2，只读本地 fund_* 缓存）：按宽基/行业主题/债券/黄金/跨境分类，给出数据覆盖、规模（份额×价格，万份/元口径）、流动性（20 日成交额中位数）、跟踪质量与风险特征，并逐项给出纳入或剔除原因。数据缺失时显式 DEGRADED（列出缺哪张表/哪个日期），绝不静默丢弃；溢折价在缓存缺少 NAV/IOPV 时标 unavailable，不估算。五只真实持仓永远包含且不被流动性/规模过滤（held:true）。这是研究候选筛选，不是买入信号，评分是启发式排序。${PORTFOLIO_NOTE} 只在 /private/mcp 提供。`,
     inputSchema: {

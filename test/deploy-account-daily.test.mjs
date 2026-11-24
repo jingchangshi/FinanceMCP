@@ -37,7 +37,7 @@ test('target-date readiness rejects stale, missing and unready upstream snapshot
 function run(recordCode, reviewCode, extraEnv = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'account-daily-test-'));
   const calls = join(dir, 'calls');
-  writeFileSync(join(dir, 'docker'), `#!/bin/sh\nif [ "$1" = info ]; then exit 0; fi\nprintf '%s\\n' "$*" >> "$CALLS"\ncase "$*" in\n  *investment-research-record*) exit ${recordCode} ;;\n  *portfolio-journal-review*) exit ${reviewCode} ;;\nesac\nexit 99\n`);
+  writeFileSync(join(dir, 'docker'), `#!/bin/sh\nif [ "$1" = info ]; then exit 0; fi\nprintf '%s\\n' "$*" >> "$CALLS"\ncase "$*" in\n  *investment-research-record*) [ -n "\${RECORD_JSON:-}" ] && printf '%s\\n' "$RECORD_JSON"; exit ${recordCode} ;;\n  *portfolio-daily-report*) exit \${BRIEF_CODE:-0} ;;\n  *portfolio-journal-review*) exit ${reviewCode} ;;\nesac\nexit 99\n`);
   chmodSync(join(dir, 'docker'), 0o755);
   const result = spawnSync('/bin/sh', [join(process.cwd(), 'deploy/ashare/run-account-daily.sh')], {
     encoding: 'utf8', env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, CALLS: calls, ASHARE_PRIVATE_HOST_DIR: dir, ASHARE_SG_REEXEC: '1', ...extraEnv },
@@ -64,8 +64,20 @@ test('review failure is reported after successful record', () => {
   assert.match(result.stdout, /^RC=0$/m);
 });
 
-test('an explicit expected trade date is passed to investment-research-record', () => {
+test('an explicit expected trade date is passed to investment-research-record and daily brief', () => {
   const { result, calls } = run(0, 0, { ASHARE_EXPECTED_TRADE_DATE: '20261113' });
   assert.equal(result.status, 0);
   assert.match(calls[0], /investment-research-record --require-current-snapshots --date 20261113/);
+  assert.equal(calls.length, 3);
+  assert.match(calls[1], /portfolio-daily-report --account real-main --date 20261113 --format brief --output \/private\/daily-briefs\/20261113\.json/);
+  assert.match(calls[2], /portfolio-journal-review --record --confirm/);
+  assert.match(result.stdout, /daily brief ok \(date 20261113/);
+});
+
+test('a failed daily brief is disclosed but does not fail account-daily or the review', () => {
+  const { result, calls } = run(0, 0, { ASHARE_EXPECTED_TRADE_DATE: '20261113', BRIEF_CODE: '1' });
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 3);
+  assert.match(result.stderr, /daily brief FAILED \(exit 1\)/);
+  assert.match(result.stdout, /^RC=0$/m);
 });

@@ -21,6 +21,7 @@ import { defaultTradeDate, runResearchSummaryCommand } from './researchCli.js';
 import { listConfiguredAccounts, resolveAccountId, resolveAccountSnapshot, resolveAccountState } from './accounts.js';
 import { evaluateAccountStatus } from './decision.js';
 import { buildDailyReport } from './dailyReport.js';
+import { buildDailyBrief, DAILY_BRIEF_SCHEMA, writeDailyBrief } from './dailyBrief.js';
 import { renderDailyReport } from './reportRenderer.js';
 import { screenEtfCandidates } from '../ashare/etfUniverse.js';
 import { buildLayeredScreen } from '../ashare/layeredScreen.js';
@@ -120,7 +121,7 @@ ${RISK_POLICY_USAGE}
                                                        修改锚定价必须同时给出价格基准交易日
 
   收盘日报与研究候选（D1/C2/C6）：
-  portfolio-daily-report --account ID [--date YYYYMMDD] [--snapshot ID] [--max-actions 0..3]
+  portfolio-daily-report --account ID [--date YYYYMMDD] [--snapshot ID] [--max-actions 0..3] [--format json|user|technical|both|brief] [--output PATH]
         [--market-db PATH] [--db PATH] [--format json|user|technical|both]
                                                       缺省 json=原始日报 JSON（向后兼容）；user/technical=双层
                                                       渲染正文；both={user,technical} JSON 信封
@@ -570,8 +571,8 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       // 现有调用方与回放脚本不受影响）；user/technical 输出对应层的 markdown 正文；
       // both 输出 {user, technical} 的 JSON 信封。渲染只消费 buildDailyReport 的同一份结果。
       const format = h.arg('format') ?? 'json';
-      if (format !== 'json' && format !== 'user' && format !== 'technical' && format !== 'both') {
-        throw new Error('--format 需要 user|technical|both|json 之一');
+      if (format !== 'json' && format !== 'user' && format !== 'technical' && format !== 'both' && format !== 'brief') {
+        throw new Error('--format 需要 user|technical|both|brief|json 之一');
       }
       const dbPath = h.arg('db') ?? portfolioDbPath();
       if (!existsSync(dbPath)) throw new Error(`账户数据库不存在（${dbPath}），请先运行 finance-ashare portfolio-import`);
@@ -593,6 +594,20 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
         });
         if (format === 'json') {
           h.print(report);
+        } else if (format === 'brief') {
+          // 每日流水线用 --output 预生成缓存；私有 MCP 只读该缓存，避免聊天请求重算全市场。
+          const brief = buildDailyBrief(report);
+          const output = h.arg('output');
+          if (output) {
+            writeDailyBrief(output, brief);
+            h.print({
+              ok: true, schema: DAILY_BRIEF_SCHEMA, output,
+              as_of_trade_date: brief.as_of_trade_date, report_id: brief.report_id,
+              status: brief.status, actionable: brief.actionable,
+            });
+          } else {
+            h.print(brief);
+          }
         } else {
           const rendered = renderDailyReport(report);
           if (format === 'user') process.stdout.write(rendered.user + '\n');
