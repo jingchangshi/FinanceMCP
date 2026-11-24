@@ -11,9 +11,10 @@ FinanceMCP 内的轻量 A 股日频数据与分析模块，为 ChatGPT 网页版
 ## 架构
 
 ```
-systemd user timer (18:40 / 21:10 Asia/Shanghai, 工作日)
-  └─ deploy/ashare/run-daily.sh
-       └─ docker exec finance-mcp-ashare node build/ashare/cli.js daily
+systemd user timer (19:30 Asia/Shanghai, 工作日；数据就绪轮询截止 21:15)
+  └─ deploy/ashare/run-daily-unified.sh（串行调用行情、热点、账户研究与飞书发布）
+       └─ deploy/ashare/run-daily.sh
+            └─ docker exec finance-mcp-ashare node build/ashare/cli.js daily
             ├─ sync: trade_cal → stock_basic → 按交易日批量 daily / daily_basic / adj_factor / stk_limit
             │        → index_daily 增量 → fina_indicator_vip（按报告期批量）
             ├─ quality check → READY / DEGRADED / NOT_READY

@@ -16,7 +16,7 @@ import { ashareDbPath } from './db.js';
 import { runRealCadence } from './cadenceProducers.js';
 import type { ResearchCadence } from './researchCadence.js';
 
-export const CADENCE_USAGE = 'research-cadence <weekly|monthly> --as-of <YYYYMMDD|latest> --account-id <ID> [--dry-run]';
+export const CADENCE_USAGE = 'research-cadence <weekly|monthly> --as-of <YYYYMMDD|latest> --account-id <ID> [--dry-run] [--force]';
 
 /** Latest trade date in the market cache, read-only. Null when there is no cache or no data. */
 function latestCachedDate(path: string): string | null {
@@ -49,8 +49,13 @@ export async function runCadenceCommand(
   // Weekly output must land on the mounted data volume: the producer's own default is a
   // relative path, which inside a container is a directory that disappears with it.
   const dataDir = env.ASHARE_DATA_DIR;
+  // The monthly unit fires daily and the producer skips unless the as-of is the
+  // month's last trading day. A manual review of an earlier date is still legitimate,
+  // so the gate has an explicit override; it is never a default.
+  const force = args.includes('--force') || env.ASHARE_CADENCE_FORCE === '1';
   const result = await runRealCadence(cadence as ResearchCadence, {
     asOf, accountId, env, dryRun: args.includes('--dry-run'),
+    ...(cadence === 'monthly' && !force ? { monthEndOnly: true } : {}),
     ...(cadence === 'weekly' && dataDir ? { outputDir: join(dataDir, 'research-cadence', 'diagnosis') } : {}),
   });
   const { report, ...rest } = result;

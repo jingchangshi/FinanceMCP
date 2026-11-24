@@ -271,6 +271,50 @@ test('the monthly review needs the account ledger and an account id', async (t) 
     'the refusal must come from the up-front guard, before any ledger work');
 });
 
+test('monthEndOnly skips a monthly review before the month\'s last trading day', async (t) => {
+  // The monthly timer now fires daily, so the producer has to refuse an early
+  // as-of itself. AS_OF is 2024-02-26; adding the 27th-29th to the calendar makes
+  // the 29th the month's last session, and the 26th provably not it.
+  const live = marketFixture(t);
+  const db = new DatabaseSync(live);
+  const cal = db.prepare('INSERT OR REPLACE INTO trade_cal (cal_date,is_open) VALUES (?,1)');
+  for (const day of ['20240227', '20240228', '20240229']) cal.run(day);
+  db.close();
+  const portfolio = portfolioFixture(t, live);
+
+  const early = await runRealCadence('monthly', {
+    asOf: AS_OF, env: ON, accountId: 'real-main', portfolioDbPath: portfolio, marketDbPath: live, monthEndOnly: true,
+  });
+  assert.equal(early.produced, false);
+  assert.equal(early.skip_reason, 'not_month_end');
+  assert.match(early.detail ?? '', /20240229/, 'the skip must name the month\'s last trading day');
+  assert.equal(early.written_to, null, 'an early monthly run must write nothing');
+
+  // The same gate must let the last trading day through, or it would suppress the
+  // report entirely instead of scheduling it.
+  const last = await runRealCadence('monthly', {
+    asOf: '20240229', env: ON, accountId: 'real-main', portfolioDbPath: portfolio, marketDbPath: live,
+    monthEndOnly: true, dryRun: true,
+  });
+  assert.equal(last.skip_reason, null, `unexpected skip: ${last.skip_reason} ${last.detail ?? ''}`);
+  assert.equal(last.report.as_of_trade_date, '20240229');
+});
+
+test('monthEndOnly refuses a month end the calendar cannot prove', async (t) => {
+  // The seeded calendar stops at AS_OF (2024-02-26) while February 2024 has 29
+  // days: no later open day exists, but the calendar does not cover the tail
+  // either. Treating that as "last trading day" would publish an early review.
+  const live = marketFixture(t);
+  const portfolio = portfolioFixture(t, live);
+  const result = await runRealCadence('monthly', {
+    asOf: AS_OF, env: ON, accountId: 'real-main', portfolioDbPath: portfolio, marketDbPath: live, monthEndOnly: true,
+  });
+  assert.equal(result.produced, false);
+  assert.equal(result.skip_reason, 'month_end_unverified');
+  assert.match(result.detail ?? '', /--force/);
+  assert.equal(result.written_to, null);
+});
+
 test('a monthly review that finds no ledger creates none', async (t) => {
   // The ledger is opened only when it already exists, and read-only when it
   // does. Both halves matter: `openPortfolioDb` with `writable: true` creates

@@ -2,6 +2,13 @@ import { createHash } from 'node:crypto';
 
 /** Offline feedback envelope; no account data or persistence. */
 const ID = /^[A-Za-z][A-Za-z0-9_.-]{0,63}(?![\s\S])/;
+// Identifiers are free-form today but will eventually be auto-generated. A
+// conservative screen keeps identifiers that look like broker keys out of the
+// contract before generation exists: a delimited six-digit A-share/ETF code
+// (600000, 159558) or a twelve-plus-digit account number. Dates (8 digits) and
+// version-like tokens still pass; the check is about digit runs, not digits.
+const STOCK_CODE_LIKE = /(?:^|[^0-9])[0-9]{6}(?:[^0-9]|$)/;
+const ACCOUNT_LIKE = /[0-9]{12,}/;
 const SHA = /^[0-9a-f]{64}(?![\s\S])/;
 const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -18,7 +25,9 @@ function object(value: unknown, keys: string[]): Record<string, any> {
   if (actual.length !== keys.length || actual.some(key => !keys.includes(key))) throw new Error('invalid feedback object');
   return value as Record<string, any>;
 }
-function id(value: unknown): boolean { return typeof value === 'string' && ID.test(value); }
+function id(value: unknown): boolean {
+  return typeof value === 'string' && ID.test(value) && !STOCK_CODE_LIKE.test(value) && !ACCOUNT_LIKE.test(value);
+}
 function timestamp(value: unknown): value is string {
   if (typeof value !== 'string' || !TIME.test(value) || value.startsWith('0000')) return false;
   const date = new Date(value);

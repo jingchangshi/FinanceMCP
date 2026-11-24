@@ -1,6 +1,6 @@
 # StrategyRelease 离线契约 v1
 
-这是研究发布的离线交换格式，不连接数据导出、候选 runner、调度或生产。研究状态是发布方声明，不证明研究结论；`production_admission` 必须显式为 `NOT_APPROVED`，无批准、启用或执行接口。未来 FinanceMCP 生产准入需要独立决策和独立实现，不能由研究发布、校验通过或接口连通推导。
+这是研究发布的离线交换格式，不连接数据导出、候选 runner、调度或生产执行。研究状态是发布方声明，不证明研究结论。`production_admission` 只允许两个值：`NOT_APPROVED`（未获账户批准，仅可用于研究或影子）和 `APPROVED_FOR_ACCOUNT`（账户所有者明确批准该 release 用于其本机账户；现行 V3 策略发布使用该值，见 AShareInvestor 仓库 `docs/v3-offensive-system/MASTER_PLAN_V3.md` 与本仓库 `src/portfolio/v3Policy.ts`）。该字段是发布方声明，不是加密授权或下单许可：执行前仍须由本地准入库（`strategy-admission`）校验 release 哈希、实现哈希、账户/市场/环境作用域和有效期；字段值本身不会启用任何执行接口。
 
 必填且拒绝未知字段：`schema_version`、`research_status`、`production_admission`、`strategy`（`id`、`version`）、`inputs`（`source`、`snapshot`、含首尾的 `start_date` / `end_date`、非空 `assets`）、非空文本数组 `rules`、非空字符串映射 `parameters`、非空 `evidence`（每项 `reference` 和小写 SHA-256）及 `content_hash`。参数键限定 ASCII 字母开头、其余字母数字或下划线；参数值为字符串以避免跨语言数值规范化歧义。日期格式为有效的 `YYYY-MM-DD`；资产不得重复。研究状态仅允许 `DRAFT`、`RESEARCH_PUBLISHED`、`FROZEN`、`PROSPECTIVE_SHADOW_ACTIVE`、`REJECTED`，并非自动状态转换。
 

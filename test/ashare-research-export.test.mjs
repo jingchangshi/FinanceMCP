@@ -310,6 +310,19 @@ test('RE-16 the export refuses to write its snapshot into the live database path
   } finally { fix.db.close(); fix.dir.cleanup(); }
 });
 
+test('RE-18 CSV escaping quotes carriage returns, not only commas, quotes and newlines', () => {
+  const fix = buildDb('csv-cr', {});
+  const out = tempDir('out-csv-cr');
+  try {
+    fix.db.prepare("UPDATE stock_basic SET name = ? WHERE ts_code = '600000.SH'").run('测试\r名称');
+    runResearchExport(fix.db, { asOfTradeDate: fix.asOfDay, outputDir: out.dir, datasets: ['stock_basic'], now: new Date('2026-01-10T00:00:00Z') });
+    const csv = readFileSync(join(out.dir, 'stock_basic.csv'), 'utf8');
+    // A bare CR inside an unquoted field ends the record for many CSV readers;
+    // the field must be quoted and the byte preserved.
+    assert.ok(csv.includes('"测试\r名称"'), 'CR must trigger quoting and survive verbatim');
+  } finally { out.cleanup(); fix.db.close(); fix.dir.cleanup(); }
+});
+
 /** Many audit runs sharing a handful of `end_date` values, inserted in shuffled order.
  *
  *  This is the shape that actually breaks: `data_audit` is a rowid table whose only index is
