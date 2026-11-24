@@ -2,7 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { forEachStockBars } from './bars.js';
 import { computeIndicators, type Bars, type IndicatorSet } from './indicators.js';
 import { detectSignals, technicalState, TechnicalState } from './signals.js';
-import { recentTradeDays, addDays, PRICE_DEFECT_SQL } from './ingest.js';
+import { recentTradeDays, addDays, priceDefectSymbols } from './ingest.js';
 import { Fundamentals, fundamentalRisk, fundamentalsAsOf } from './fundamentals.js';
 import type { FinancialSelectionOrder } from './data.js';
 
@@ -172,8 +172,7 @@ export function scanMarket(db: DatabaseSync, date: string, hooks: MarketScanHook
   const pctToday = new Map((db.prepare('SELECT ts_code, pct_chg FROM daily WHERE trade_date = ?').all(date) as any[]).map(r => [r.ts_code, r.pct_chg]));
   // Symbols whose as-of bar has unusable price fields (bad close / NULL OHLC / nonpositive).
   // They stay in the scan for disclosure, but must not generate signals or enter breadth.
-  const priceDefect = new Set((db.prepare(`SELECT ts_code FROM daily WHERE trade_date = ? AND ${PRICE_DEFECT_SQL}`).all(date) as any[])
-    .map(r => r.ts_code as string));
+  const priceDefect = new Set(priceDefectSymbols(db, date));
   const fundamentals = fundamentalsAsOf(db, date, hooks.fundamentals_order);
   const minListDate = addDays(date, -SCORE_RULES.min_listed_days);
 

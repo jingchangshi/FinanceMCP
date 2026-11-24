@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { checkQuality, previousTradeDay, PRICE_DEFECT_SQL, type QualityStatus } from './ingest.js';
+import {
+  checkQuality, previousTradeDay, ISOLATED_BAR_DEFECT_LIMIT, priceDefectSymbols, type QualityStatus,
+} from './ingest.js';
 import { resolveDataProviderMode } from './providers/types.js';
 
 /**
@@ -90,21 +92,6 @@ function countOn(db: DatabaseSync, table: string, date: string): number {
 
 /** Floor for a same-day page relative to the previous trading day / the daily universe. */
 const COVERAGE_FLOOR = 0.97;
-
-/**
- * Up to this many symbols with unusable price fields are treated as isolated defects: they are
- * excluded by symbol and disclosed, not a reason to refuse the day. More than this (or ~0.1% of
- * a 5,500-name market) is a market-level data failure and blocks the snapshot.
- */
-const ISOLATED_PRICE_DEFECT_LIMIT = 5;
-
-function priceDefectSymbolsOn(db: DatabaseSync, date: string): string[] {
-  if (!tableExists(db, 'daily')) return [];
-  try {
-    return (db.prepare(`SELECT ts_code FROM daily WHERE trade_date = ? AND ${PRICE_DEFECT_SQL} ORDER BY ts_code`)
-      .all(date) as { ts_code: string }[]).map(r => r.ts_code);
-  } catch { return []; }
-}
 
 /**
  * Rows of `dataset` on `date` that actually carry a usable value for the daily bars that exist
@@ -263,17 +250,17 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
     }
   }
 
-  // Price-field defects: an isolated bad close/NULL OHLC is excluded by symbol (scanMarket keeps
-  // it out of breadth and suppresses its signals) and disclosed; only a market-level share of
-  // broken bars means the day's prices cannot be trusted. A short same-day page is likewise a
-  // market-level gap. `checkQuality` already marks these NOT_READY in its own cache status.
-  const badPriceSymbols = priceDefectSymbolsOn(db, asOf);
+  // Price-field defects follow the same local/market policy as checkQuality: an isolated bad
+  // close/NULL OHLC is excluded by symbol (scanMarket keeps it out of breadth and suppresses its
+  // signals) and disclosed; only a market-level share of broken bars blocks the day. A short
+  // same-day page is likewise a market-level gap.
+  const invalidBars = Number(quality.anomalies.invalid_bar ?? 0);
   const hardDefects: string[] = [];
   if ((quality.counts.prev_daily ?? 0) > 0 && quality.coverage.daily_vs_prev < COVERAGE_FLOOR) {
     hardDefects.push(`daily=${daily} 低于前一交易日 ${quality.counts.prev_daily} 的 97%`);
   }
-  if (badPriceSymbols.length > ISOLATED_PRICE_DEFECT_LIMIT) {
-    hardDefects.push(`价格字段非法 ${badPriceSymbols.length} 只（> ${ISOLATED_PRICE_DEFECT_LIMIT}），属大面积坏条`);
+  if (invalidBars > ISOLATED_BAR_DEFECT_LIMIT) {
+    hardDefects.push(`行情记录非法 ${invalidBars} 条（> ${ISOLATED_BAR_DEFECT_LIMIT}），属市场级坏条，阻止发布`);
   }
   if (hardDefects.length) {
     return {
@@ -284,11 +271,12 @@ export function checkDataReadiness(db: DatabaseSync, asOf: string): ReadinessRes
   }
 
   const disclosed: string[] = [...auxiliaryGaps, ...freeCoverageIssues];
-  if (badPriceSymbols.length > 0) {
-    const sample = badPriceSymbols.slice(0, 10).join(',');
-    disclosed.push(
-      `价格字段非法 ${badPriceSymbols.length} 只（${sample}${badPriceSymbols.length > 10 ? ',…' : ''}）：已按 symbol 剔除出市场宽度并抑制其技术信号，不阻断日报`,
-    );
+  if (invalidBars > 0) {
+    const badPrice = priceDefectSymbols(db, asOf);
+    const detail = badPrice.length
+      ? `价格字段非法 ${badPrice.length} 只（${badPrice.slice(0, 10).join(',')}${badPrice.length > 10 ? ',…' : ''}）`
+      : `行情记录非法 ${invalidBars} 条`;
+    disclosed.push(`${detail}：已按 symbol 剔除出市场宽度并抑制其技术信号，不阻断日报`);
   }
   if (quality.status !== 'READY') {
     disclosed.push(`market quality ${quality.status}: ${quality.reasons.slice(0, 3).join('; ') || 'see checkQuality'}`);

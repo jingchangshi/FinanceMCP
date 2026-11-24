@@ -98,9 +98,11 @@ while :; do
     REPORT_STATUS="$(jq -r '.report.status // empty' "$DAILY_JSON" 2>/dev/null || true)"
     ETF_MISSING="$(jq -r --arg d "$REPORT_DATE" '(if ($d | length) > 0 then (.etf.coverage[$d].missing // []) else [] end) | length' "$DAILY_JSON" 2>/dev/null || echo 0)"
 
-    if [ "$REPORT_DATE" = "$EXPECTED_DATE" ] && [ "$REPORT_STATUS" = "READY" ] && [ "${ETF_MISSING:-0}" = "0" ]; then
+    # DEGRADED publishes by contract (isolated bad bars / auxiliary gaps are disclosed in the
+    # report); only a genuine market-level NOT_READY keeps polling.
+    if [ "$REPORT_DATE" = "$EXPECTED_DATE" ] && { [ "$REPORT_STATUS" = "READY" ] || [ "$REPORT_STATUS" = "DEGRADED" ]; } && [ "${ETF_MISSING:-0}" = "0" ]; then
       DATA_DELAYED=0
-      echo "finance-ashare unified Stage 1 READY on attempt $attempt (trade_date=$REPORT_DATE)"
+      echo "finance-ashare unified Stage 1 $REPORT_STATUS on attempt $attempt (trade_date=$REPORT_DATE)"
       break
     fi
   else
