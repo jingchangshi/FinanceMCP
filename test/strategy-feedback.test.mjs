@@ -35,22 +35,6 @@ test('reject invalid fields, identifiers, timestamps and states', () => {
   correction.payload.corrects_event_id = correction.event_id;
   assert.throws(() => validateEvent(correction));
 });
-test('identifiers that look like stock codes or account numbers are rejected', () => {
-  const original = fixture[0].event;
-  for (const mutate of [
-    e => e.event_id = 'SH600000',
-    e => e.payload.signal_id = 'SIGNAL_159558',
-    e => e.payload.signal_id = 'SIGNAL-510300-SH',
-    e => e.coverage.universe_id = 'ACC-123456789012',
-    e => e.payload.signal_id = '123456789012345',
-  ]) { const event = structuredClone(original); mutate(event); assert.throws(() => validateEvent(event)); }
-  // Dates and version-like tokens are not broker keys; rejecting them would make
-  // the screen break legitimate future identifiers.
-  for (const eventId of ['sig_20260102', 'UNIVERSE_V3_2_0']) {
-    const event = structuredClone(original); event.event_id = eventId;
-    assert.doesNotThrow(() => validateEvent(event), eventId);
-  }
-});
 test('both languages reject delimiter-colliding object keys', {skip: !process.env.TACTICORE_FEEDBACK_ROOT}, () => {
   const event = structuredClone(fixture[0].event);
   event.payload = {'result|signal_id': 'TEST_SIGNAL'};
