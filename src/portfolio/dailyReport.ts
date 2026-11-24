@@ -659,6 +659,8 @@ export interface DailyReportResult {
     reported_events_through: string | null;
     last_user_reconciled_at: string | null;
     unreported_trade_risk: boolean;
+    /** 与 decision.ts 同源的完整性声明有效处置（原始风险 vs 执行阻塞位）。 */
+    declaration: AccountStatusEvaluation['declaration'] | null;
     reasons: { code: string; detail: string }[];
     warnings: { code: string; detail: string }[];
     note: string;
@@ -1841,36 +1843,26 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       asOf,
     );
     for (const w of accountEvaluation.warnings ?? []) gateWarnings.push({ code: w.code, detail: w.detail });
+    // 完整性声明使用与 decision.ts 相同的**有效处置**：原始未上报交易风险照常披露；
+    // 只有显式声明存在风险（或可执行依据不成立）时才阻塞。日报不再自行解释原始布尔值。
+    const declaration = accountEvaluation.declaration;
     // 反防御护栏（SERVER_EXECUTION_WORK_ORDER §一.2）：已确认真实账户 + 当前快照时，
-    // “从未声明完整性”与“已声明的对账滞后/未交收”只进 warnings，不得清零可执行腿，
-    // 也不得阻断 HWM/tracker 持久化。
-    // 例外：用户已显式声明 unreported_trade_risk=true（承认可能有未报成交）时仍按真实风险硬门控；
-    // 账户未验证、快照失效或账本重建失败同样按硬门控阻塞。
-    const explicitCompletenessRisk = accountEvaluation.completeness?.unreported_trade_risk === true;
-    const lagBypassEligible = snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED' && !explicitCompletenessRisk;
-    const lagCodes = new Set(['account_completeness_undeclared', 'unreported_trade_risk', 'account_settlement_pending']);
+    // 未交收卖出（decision 层的 T+1 现金歧义）在日报侧仍只作披露，不阻断既定规则执行；
+    // 但降级必须显式写出，不能静默丢弃。完整性声明由上面的共享处置单独决定。
+    const settlementWaiverEligible = snapshotIsCurrent && accountStatus === 'REAL_ACCOUNT_VERIFIED';
     for (const reason of accountEvaluation.reasons) {
-      if (lagBypassEligible && lagCodes.has(reason.code)) {
+      if (settlementWaiverEligible && reason.code === 'account_settlement_pending') {
         gateWarnings.push({ code: reason.code, detail: reason.detail });
       } else {
         gateReasons.push({ code: reason.code, detail: reason.detail });
       }
     }
-    // 保留实际未报成交风险提示；已确认真实账户 + 当前快照时降为警告（不阻断执行与 V3 持久化）。
-    if (accountEvaluation.unreported_trade_risk) {
-      if (lagBypassEligible) {
-        gateWarnings.push({
-          code: 'unreported_trade_lag_warning',
-          detail: accountEvaluation.reported_events_through
-            ? `账本事件记录截止 ${accountEvaluation.reported_events_through}，若期间有手工成交请补录后再核对委托数量。`
-            : '尚未声明账本完整性（reported_events_through 缺失），按可能存在未上报成交披露；请核对并补录后再依赖委托份数。',
-        });
-      } else {
-        gateReasons.push({
-          code: 'unreported_trade_risk',
-          detail: '账户存在未上报交易的风险：可执行数量依赖当前现金与份额，未上报成交可能已使其失效，因此只给示意。',
-        });
-      }
+    // 原始风险与降级披露一律保留（含 account_completeness_undeclared / 滞后提醒）。
+    for (const warning of declaration.warnings) {
+      gateWarnings.push({ code: warning.code, detail: warning.detail });
+    }
+    if (declaration.blocks_execution && declaration.reason) {
+      gateReasons.push({ code: declaration.reason.code, detail: declaration.reason.detail });
     }
   } else {
     gateReasons.push({ code: 'account_gate_unavailable', detail: '账户库中没有任何快照' });
@@ -2161,6 +2153,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
     summary_id: summary.summary_id, status,
     gate: accountEvaluation ? { state_basis: accountEvaluation.state_basis, reasons: accountEvaluation.reasons,
       completeness: accountEvaluation.completeness, unreported_trade_risk: accountEvaluation.unreported_trade_risk,
+      declaration: accountEvaluation.declaration,
       sellable: accountEvaluation.sellable } : null,
     holdings, market, screening, decision_comparison: decisionComparison, lots,
   })).digest('hex');
@@ -2477,11 +2470,13 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       reported_events_through: accountEvaluation?.reported_events_through ?? null,
       last_user_reconciled_at: accountEvaluation?.last_user_reconciled_at ?? null,
       unreported_trade_risk: accountEvaluation?.unreported_trade_risk ?? true,
+      declaration: accountEvaluation?.declaration ?? null,
       reasons: gateReasons,
       warnings: gateWarnings,
       note: '可执行要求：账本可重建的账户状态（同日快照或基线+增量事件）+ REAL_ACCOUNT_VERIFIED + '
-        + '无未交收卖出 + 覆盖决策日的完整性声明。未满足时每个腿 executable=false；'
-        + 'unreported_trade_risk=true 表示可能存在未录入交易，不能声称与券商实时一致。',
+        + '无未交收卖出 + 完整性声明已核实（或声明缺失/滞后但在可执行依据成立时降为提醒）。未满足时每个腿 executable=false；'
+        + 'unreported_trade_risk=true 是原始披露（可能存在未录入交易，不能声称与券商实时一致）；'
+        + 'declaration.blocks_execution 才是完整性声明的执行门控。',
     },
     fact_register: factRegister,
     assumptions: {

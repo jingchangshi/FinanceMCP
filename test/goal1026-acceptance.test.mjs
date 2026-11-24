@@ -411,6 +411,9 @@ test('10.1-5 账户身份已确认但成交完整性未声明 → UNCONFIRMED_RI
   assert.ok(report.gate.warnings.some(w => w.code === 'unreported_trade_lag_warning'),
     JSON.stringify(report.gate.warnings));
   assert.ok(report.gate.unreported_trade_risk === true);
+  assert.equal(report.gate.declaration.risk_basis, 'undeclared');
+  assert.equal(report.gate.declaration.blocks_execution, false);
+  assert.equal(report.gate.declaration.execution_basis, 'same_day_snapshot');
   assert.notEqual(report.status, 'DATA_INSUFFICIENT');
 });
 
@@ -1016,10 +1019,18 @@ test('10.3-13 未确认风险规则不得自动执行', () => {
   });
   // 未上报交易风险（用户保留）→ 即使身份已确认、行情齐备，也不给执行腿。
   assert.equal(report.gate.unreported_trade_risk, true);
+  assert.equal(report.gate.declaration.unreported_trade_risk, true);
+  assert.equal(report.gate.declaration.risk_basis, 'explicit', '显式声明风险必须区别于同日推断滞后');
+  assert.equal(report.gate.declaration.blocks_execution, true, '显式 true 必须阻塞执行');
+  assert.equal(report.gate.declaration.execution_basis, 'same_day_snapshot');
   assert.equal(report.gate.satisfied, false, JSON.stringify(report.gate.reasons));
   assert.ok(report.gate.reasons.some(r => r.code === 'unreported_trade_risk'), JSON.stringify(report.gate.reasons));
   assert.equal(report.data_quality.tiers.account_trade_completeness.status, 'UNCONFIRMED_RISK');
-  for (const option of report.decision_comparison.options) assert.equal(option.executable, false);
+  for (const option of report.decision_comparison.options) {
+    assert.equal(option.executable, false);
+    assert.ok(option.risk_track.blocked_by.includes('unreported_trade_risk'),
+      `${option.action} 风险轨必须披露显式完整性阻塞：${JSON.stringify(option.risk_track.blocked_by)}`);
+  }
   for (const leg of report.first_section.actions.flatMap(a => a.legs)) assert.equal(leg.executable, false);
   assert.notEqual(report.status, 'ACTIONABLE');
   // 研究数量保留为研究参数（FUNDED 测算允许），但绝不升级为可执行。
