@@ -403,7 +403,9 @@ function loadRuntimeAdmission(
   const asOf = options.asOf?.trim();
   if (!accountId || !/^\d{8}$/.test(asOf ?? '')) return { canOpen: true, state };
 
-  const evaluatedAt = `${asOf!.slice(0, 4)}-${asOf!.slice(4, 6)}-${asOf!.slice(6, 8)}T23:59:59.999Z`;
+  // 以 Asia/Shanghai 目标日收盘（15:00 CST = 07:00Z）作为评估时刻；之后记录的准入事件
+  // 不得改变该日的历史回放。23:59:59Z 是北京时间次日 07:59，不能当收盘。
+  const evaluatedAt = `${asOf!.slice(0, 4)}-${asOf!.slice(4, 6)}-${asOf!.slice(6, 8)}T07:00:00.000Z`;
   state.evaluated_as_of = evaluatedAt;
 
   let store: StrategyAdmissionStore | null = null;
@@ -416,6 +418,8 @@ function loadRuntimeAdmission(
       environment: release.applicability.environment,
     };
     const latest = store.history()
+      // 只取评估时刻之前已经记录的事件：明天写入的 RESUME 不能解除昨天的回放。
+      .filter(event => event.recorded_at <= evaluatedAt)
       .filter(event => event.strategy_id === release.strategy.id
         && event.version === release.strategy.version
         && event.release_hash === releaseHash

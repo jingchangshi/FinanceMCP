@@ -17,6 +17,10 @@ export interface PersistedRiskAnchor {
   initial_principal_cents: number;
   hwm_nav_cents: number;
   hwm_date: string;
+  /** 锚点建立时已把哪一天的当日流水折入高水位；同日重跑据此避免重复扣减。 */
+  hwm_flows_applied_through: string | null;
+  /** 锚点建立时已折入的当日外部净流入（分）。 */
+  hwm_applied_same_day_flow_cents: number;
   circuit_breaker_status: CircuitBreakerStatus;
   locked_until_trade_date: string | null;
   updated_at: string;
@@ -39,12 +43,18 @@ export interface StrategyRouterResult {
   should_persist_anchor: boolean;
   anchor_snapshot: {
     initial_principal_cents: number;
+    /** 展示口径 NAV（默认含理财 wealth），用于本金盈亏/回本展示。 */
     current_nav_cents: number;
+    /** 风险/高水位口径 NAV（可投资净值），用于回撤与生命线缓冲。 */
+    hwm_comparison_nav_cents: number;
     cumulative_pnl_cents: number;
     cumulative_return_pct: number;
     recovery_needed_pct: number;
     hwm_nav_cents: number;
     hwm_date: string;
+    /** 锚点建立时已折入的当日流水日期与金额；同日重跑不会重复扣减。 */
+    hwm_flows_applied_through: string | null;
+    hwm_applied_same_day_flow_cents: number;
     /** hwm_date → asOf 的单位净值比（1 = 无真实盈亏；<1 = 回撤）。单位净值不可用时为 null。 */
     hwm_unit_nav_ratio: number | null;
     /** UNIT_NAV = 已按单位净值折算出入金；RAW_NAV = 缺少账本/估值，退化为名义净值比较。 */
@@ -78,7 +88,10 @@ export interface EvaluateStrategyRouterInput {
   marketDb?: DatabaseSync | null;
   accountId: string;
   asOf: string;
+  /** 风险/高水位口径 NAV（可投资净值，通常为总资产 − 理财）。 */
   currentNavCents: number;
+  /** 本金盈亏/回本展示口径 NAV（通常为含理财的总资产）；缺省时等于 currentNavCents。 */
+  displayNavCents?: number;
   fallbackBaselineNavCents?: number;
   marketRegime: MarketRegimeResult;
   phase1LockStockSwing?: boolean;
@@ -128,8 +141,18 @@ export function readRiskAnchor(
   accountId: string,
 ): PersistedRiskAnchor | null {
   if (!portfolioDb || !portfolioTableExists(portfolioDb, 'account_risk_anchor')) return null;
+  const cols = new Set(
+    (portfolioDb.prepare('PRAGMA table_info(account_risk_anchor)').all() as Array<{ name?: string }>)
+      .map(row => row.name)
+      .filter((name): name is string => Boolean(name)),
+  );
+  // 迁移前建立的旧库（只读打开）还没有流水列：按“未记录”读取，写路径扩容后自然补齐。
+  const flowCols = cols.has('hwm_flows_applied_through') && cols.has('hwm_applied_same_day_flow_cents');
   const row = portfolioDb.prepare(
-    'SELECT account_id, initial_principal_cents, hwm_nav_cents, hwm_date, circuit_breaker_status, locked_until_trade_date, updated_at FROM account_risk_anchor WHERE account_id = ?',
+    `SELECT account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
+       ${flowCols ? 'hwm_flows_applied_through, hwm_applied_same_day_flow_cents' : 'NULL AS hwm_flows_applied_through, 0 AS hwm_applied_same_day_flow_cents'},
+       circuit_breaker_status, locked_until_trade_date, updated_at
+     FROM account_risk_anchor WHERE account_id = ?`,
   ).get(accountId) as PersistedRiskAnchor | undefined;
   return row ?? null;
 }
@@ -203,8 +226,10 @@ function readSameDayNetExternalFlowCents(
 interface HwmEvaluation {
   effectiveHwmCents: number;
   effectiveHwmDate: string;
-  /** 用于回撤/生命线缓冲的比较 NAV（同日外部流水场景下为扣流前 NAV）。 */
+  /** 用于回撤/生命线缓冲的比较 NAV（同日外部流水场景下为扣除新增流水后的 NAV）。 */
   comparisonNavCents: number;
+  flowsAppliedThrough: string | null;
+  appliedSameDayFlowCents: number;
   unitNavRatio: number | null;
   basis: 'UNIT_NAV' | 'RAW_NAV';
   shouldAdvanceHwm: boolean;
@@ -215,16 +240,22 @@ interface HwmEvaluation {
  * 高水位判定：有账本基线与估值时按“单位份额折算后的净值比”比较（出入金不改变净值），
  * 否则退化为名义净值比较。单位净值创新高时把锚点推进到当日名义净值——
  * 即使该名义值低于旧高水位（出金后 70 -> 63 的场景）。
+ *
+ * 同日重跑：锚点会记录建立时已折入的当日净流水；之后只处理“新增”流水，
+ * 避免同一天的入金被重复扣减（100 → 110 → 入金 100 首次存 210，重跑不得再得 47.6%）。
  */
 function evaluateHwm(
   input: EvaluateStrategyRouterInput,
   existing: PersistedRiskAnchor | null,
 ): HwmEvaluation {
   if (!existing) {
+    const sameDayFlow = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
     return {
       effectiveHwmCents: Math.max(input.fallbackBaselineNavCents ?? input.currentNavCents, input.currentNavCents),
       effectiveHwmDate: input.asOf,
       comparisonNavCents: input.currentNavCents,
+      flowsAppliedThrough: input.asOf,
+      appliedSameDayFlowCents: sameDayFlow,
       unitNavRatio: null,
       basis: 'RAW_NAV',
       shouldAdvanceHwm: true,
@@ -237,10 +268,13 @@ function evaluateHwm(
     const ratio = (input.currentNavCents / existing.hwm_nav_cents) * (shares.from_units / shares.to_units);
     // 单位份额按 1e-6 精度取整；用极小容差避免无流水日因舍入抖动推进锚点。
     if (input.asOf >= existing.hwm_date && ratio > 1 + 1e-6) {
+      const sameDayFlow = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
       return {
         effectiveHwmCents: input.currentNavCents,
         effectiveHwmDate: input.asOf,
         comparisonNavCents: input.currentNavCents,
+        flowsAppliedThrough: input.asOf,
+        appliedSameDayFlowCents: sameDayFlow,
         unitNavRatio: ratio,
         basis: 'UNIT_NAV',
         shouldAdvanceHwm: true,
@@ -251,6 +285,8 @@ function evaluateHwm(
       effectiveHwmCents: Math.round(input.currentNavCents / ratio),
       effectiveHwmDate: existing.hwm_date,
       comparisonNavCents: input.currentNavCents,
+      flowsAppliedThrough: existing.hwm_flows_applied_through,
+      appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
       unitNavRatio: ratio,
       basis: 'UNIT_NAV',
       shouldAdvanceHwm: false,
@@ -258,16 +294,22 @@ function evaluateHwm(
     };
   }
 
-  // 锚点日 == 目标日（同日建锚或重跑）且无法单位化：用扣流前 NAV 比较，
-  // 避免当日入金/出金被当成真实盈亏触发假熔断。
+  // 锚点日 == 目标日（同日建锚或重跑）且无法单位化：只扣当日“新增”流水，
+  // 已经折入锚点的流水不再重复扣减。
   if (existing.hwm_date === input.asOf) {
     const sameDayFlowCents = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
-    const preFlowNavCents = input.currentNavCents - sameDayFlowCents;
-    if (preFlowNavCents > existing.hwm_nav_cents) {
+    const appliedAtAnchorCents = existing.hwm_flows_applied_through === input.asOf
+      ? existing.hwm_applied_same_day_flow_cents
+      : 0;
+    const incrementalFlowCents = sameDayFlowCents - appliedAtAnchorCents;
+    const preIncrementalNavCents = input.currentNavCents - incrementalFlowCents;
+    if (preIncrementalNavCents > existing.hwm_nav_cents) {
       return {
         effectiveHwmCents: input.currentNavCents,
         effectiveHwmDate: input.asOf,
         comparisonNavCents: input.currentNavCents,
+        flowsAppliedThrough: input.asOf,
+        appliedSameDayFlowCents: sameDayFlowCents,
         unitNavRatio: null,
         basis: 'RAW_NAV',
         shouldAdvanceHwm: true,
@@ -277,7 +319,9 @@ function evaluateHwm(
     return {
       effectiveHwmCents: existing.hwm_nav_cents,
       effectiveHwmDate: existing.hwm_date,
-      comparisonNavCents: preFlowNavCents,
+      comparisonNavCents: preIncrementalNavCents,
+      flowsAppliedThrough: existing.hwm_flows_applied_through,
+      appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
       unitNavRatio: null,
       basis: 'RAW_NAV',
       shouldAdvanceHwm: false,
@@ -286,10 +330,13 @@ function evaluateHwm(
   }
 
   if (input.asOf >= existing.hwm_date && input.currentNavCents > existing.hwm_nav_cents) {
+    const sameDayFlow = readSameDayNetExternalFlowCents(input.portfolioDb, input.accountId, input.asOf);
     return {
       effectiveHwmCents: input.currentNavCents,
       effectiveHwmDate: input.asOf,
       comparisonNavCents: input.currentNavCents,
+      flowsAppliedThrough: input.asOf,
+      appliedSameDayFlowCents: sameDayFlow,
       unitNavRatio: null,
       basis: 'RAW_NAV',
       shouldAdvanceHwm: true,
@@ -300,6 +347,8 @@ function evaluateHwm(
     effectiveHwmCents: existing.hwm_nav_cents,
     effectiveHwmDate: existing.hwm_date,
     comparisonNavCents: input.currentNavCents,
+    flowsAppliedThrough: existing.hwm_flows_applied_through,
+    appliedSameDayFlowCents: existing.hwm_applied_same_day_flow_cents,
     unitNavRatio: null,
     basis: 'RAW_NAV',
     shouldAdvanceHwm: false,
@@ -333,6 +382,8 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
   const navBasis = hwm.basis;
   const shouldAdvanceHwm = hwm.shouldAdvanceHwm;
   let shouldPersistAnchor = hwm.shouldPersistAnchor;
+  // 风险/HWM 用可投资净值；本金盈亏/回本展示用含理财的总资产（displayNavCents）。
+  const displayNavCents = input.displayNavCents ?? input.currentNavCents;
 
   const v3Policy = input.policy ?? loadApprovedV3Policy({ accountId: input.accountId, asOf: input.asOf });
   const deconcActive = Boolean(input.deconcentrationActive);
@@ -344,12 +395,12 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     : v3Policy.l2_normal_post_breaker_equity_bps;
   const l2TriggerPct = l2TriggerBps / 100;
 
-  const cumulativePnlCents = input.currentNavCents - initialPrincipalCents;
+  const cumulativePnlCents = displayNavCents - initialPrincipalCents;
   const cumulativeReturnPct = initialPrincipalCents > 0
-    ? r2(((input.currentNavCents / initialPrincipalCents) - 1) * 100)
+    ? r2(((displayNavCents / initialPrincipalCents) - 1) * 100)
     : 0;
-  const recoveryNeededPct = input.currentNavCents > 0 && input.currentNavCents < initialPrincipalCents
-    ? r2(((initialPrincipalCents - input.currentNavCents) / input.currentNavCents) * 100)
+  const recoveryNeededPct = displayNavCents > 0 && displayNavCents < initialPrincipalCents
+    ? r2(((initialPrincipalCents - displayNavCents) / displayNavCents) * 100)
     : 0;
 
   const hwmDrawdownBps = effectiveHwmCents > 0
@@ -437,12 +488,15 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     should_persist_anchor: shouldPersistAnchor,
     anchor_snapshot: {
       initial_principal_cents: initialPrincipalCents,
-      current_nav_cents: input.currentNavCents,
+      current_nav_cents: displayNavCents,
+      hwm_comparison_nav_cents: comparisonNavCents,
       cumulative_pnl_cents: cumulativePnlCents,
       cumulative_return_pct: cumulativeReturnPct,
       recovery_needed_pct: recoveryNeededPct,
       hwm_nav_cents: effectiveHwmCents,
       hwm_date: effectiveHwmDate,
+      hwm_flows_applied_through: hwm.flowsAppliedThrough,
+      hwm_applied_same_day_flow_cents: hwm.appliedSameDayFlowCents,
       hwm_unit_nav_ratio: unitNavRatio,
       hwm_nav_basis: navBasis,
       hwm_drawdown_bps: hwmDrawdownBps,
@@ -482,8 +536,9 @@ export function persistRiskAnchor(
     portfolioDb.prepare(`
       INSERT INTO account_risk_anchor (
         account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
+        hwm_flows_applied_through, hwm_applied_same_day_flow_cents,
         circuit_breaker_status, locked_until_trade_date, updated_at
-      ) VALUES (?,?,?,?,?,?,?)
+      ) VALUES (?,?,?,?,?,?,?,?,?)
       ON CONFLICT(account_id) DO UPDATE SET
         initial_principal_cents = excluded.initial_principal_cents,
         hwm_nav_cents = CASE
@@ -496,6 +551,16 @@ export function persistRiskAnchor(
           THEN excluded.hwm_date
           ELSE account_risk_anchor.hwm_date
         END,
+        hwm_flows_applied_through = CASE
+          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          THEN excluded.hwm_flows_applied_through
+          ELSE account_risk_anchor.hwm_flows_applied_through
+        END,
+        hwm_applied_same_day_flow_cents = CASE
+          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+          THEN excluded.hwm_applied_same_day_flow_cents
+          ELSE account_risk_anchor.hwm_applied_same_day_flow_cents
+        END,
         circuit_breaker_status = excluded.circuit_breaker_status,
         locked_until_trade_date = excluded.locked_until_trade_date,
         updated_at = excluded.updated_at
@@ -504,9 +569,13 @@ export function persistRiskAnchor(
       router.anchor_snapshot.initial_principal_cents,
       router.anchor_snapshot.hwm_nav_cents,
       router.anchor_snapshot.hwm_date,
+      router.anchor_snapshot.hwm_flows_applied_through,
+      router.anchor_snapshot.hwm_applied_same_day_flow_cents,
       router.circuit_breaker_status,
       router.locked_until_trade_date,
       router.as_of_trade_date,
+      advance,
+      advance,
       advance,
       advance,
     );

@@ -116,7 +116,7 @@ function freshDb() {
   });
 }
 
-function run(db, { marketRegime, cashCents, totalAssetsCents, holdings = [], candidateRows, wealthCents = 0 }) {
+function run(db, { marketRegime, cashCents, totalAssetsCents, holdings = [], candidateRows, wealthCents = 0, stockCandidates = [] }) {
   return runActionEngine({
     portfolioDb: db,
     marketDb: null,
@@ -127,7 +127,7 @@ function run(db, { marketRegime, cashCents, totalAssetsCents, holdings = [], can
     wealthCents,
     totalAssetsCents,
     marketRegime,
-    stockSwingScreen: { candidates: [] },
+    stockSwingScreen: { candidates: stockCandidates },
     candidates: { schema: 'ashare-etf-candidate-screen/1.0', candidates: candidateRows },
   });
 }
@@ -432,5 +432,69 @@ test('P0-3: 蓄水池卖出只有旧报价时改用持仓参考价并明确告�
     );
   } finally {
     db.close();
+  }
+});
+
+test('P0-3: 底盘已满但个股先锋需要资金时，仍卖出超额 511010 融资；无买入腿不得空卖', () => {
+  const stockCandidate = {
+    ts_code: '601001.SH',
+    name: '测试回踩',
+    trade_date: ASOF,
+    entry_ref_price_milli: 10_000,
+    hard_stop_price_milli: 9_200,
+    entry_ref_price_cny: 10,
+    max_chase_price_cny: 10.2,
+    hard_stop_price_cny: 9.2,
+    stop_loss_pct: -8,
+    setup_label_zh: '缩量回踩 20 日均线',
+    reasons_zh: ['测试候选'],
+  };
+  const holdings = [
+    {
+      ts_code: '159558.SZ', name: '半导体设备ETF', quantity: 37_500, sellable_quantity: 37_500,
+      weight: 0.375, market_value_cents: 3_750_000, price_milli: 1000,
+      latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 1000,
+    },
+    {
+      ts_code: '511010.SH', name: '国债ETF', quantity: 625, sellable_quantity: 625,
+      weight: 0.625, market_value_cents: 6_250_000, price_milli: 100_000,
+      latest_bar_date: ASOF, bar_quality: 'READY', ref_cost_milli: 100_000,
+    },
+  ];
+
+  // 有合格个股 → 形成真实股票买入腿 → 才允许卖债融资。
+  const dbWithStock = freshDb();
+  try {
+    const out = run(dbWithStock, {
+      marketRegime: regime('OFFENSIVE', 'GROWTH_LEADING'),
+      cashCents: 0,
+      totalAssetsCents: 10_000_000,
+      holdings,
+      candidateRows: [ROWS.reservoir],
+      stockCandidates: [stockCandidate],
+    });
+    assert.ok(out.actions.some(action => action.code === 'P3-STOCK-SWING-BUY-601001.SH'), '应形成个股买入腿');
+    const action = rebalance(out);
+    assert.ok(action, '融资卖出应附着在再平衡 action 上');
+    assert.ok(sellLegs(action).some(leg => leg.ts_code === '511010.SH' && leg.reason === 'P3_DEFENSIVE_RESERVOIR_FUNDING'));
+  } finally {
+    dbWithStock.close();
+  }
+
+  // 无任何买入腿 → 不得空卖。
+  const dbNoBuys = freshDb();
+  try {
+    const out = run(dbNoBuys, {
+      marketRegime: regime('OFFENSIVE', 'GROWTH_LEADING'),
+      cashCents: 0,
+      totalAssetsCents: 10_000_000,
+      holdings,
+      candidateRows: [ROWS.reservoir],
+      stockCandidates: [],
+    });
+    assert.equal(out.actions.some(action => action.legs.some(leg => leg.side === 'SELL')), false);
+    assert.equal(out.actions.some(action => action.code === 'P3-SUPER-ETF-REBALANCE'), false);
+  } finally {
+    dbNoBuys.close();
   }
 });

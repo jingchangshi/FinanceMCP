@@ -1519,6 +1519,8 @@ function buildTechnicalSections(
       rendered_at: now,
     },
     '1. 全部原始状态码': statusFields,
+    // 执行清单不按一页摘要上限截断：完整动作与腿只在附件层展开（用户版仍只列摘要）。
+    '1b. 完整执行清单': r.execution_plan ?? { count: r.first_section.actions.length, actions: r.first_section.actions },
     '2. 数据源与版本': {
       market_report: r.data_quality.market_report,
       quote_updated_at: r.timestamps.quote_updated_at,

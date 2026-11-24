@@ -87,6 +87,14 @@ function setupAccount({ name, startDay, positions, cashCents, prices }) {
   return { portfolioDb, marketDb };
 }
 
+let bareSeq = 0;
+function bareDb() {
+  bareSeq += 1;
+  return openPortfolioDb(join(dir, `bare-${bareSeq}-portfolio.sqlite`), {
+    marketPath: join(dir, `bare-${bareSeq}-market.sqlite`),
+  });
+}
+
 function evaluate(portfolioDb, marketDb, { asOf, nav, deconcentrationActive = false }) {
   return evaluateStrategyRouter({
     portfolioDb,
@@ -359,5 +367,92 @@ test('P1-2 同日流水：锚点日==目标日的当日入金不得被当成新�
     assert.equal(readRiskAnchor(portfolioDb, ACCOUNT).hwm_nav_cents, 100_000);
   } finally {
     portfolioDb.close();
+  }
+});
+
+test('P1-2 同日重跑不重复扣流水：100→110→入金100 首次存 210，重跑仍 0 回撤', () => {
+  const db = bareDb();
+  try {
+    db.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
+    db.prepare(`
+      INSERT INTO account_risk_anchor
+        (account_id, initial_principal_cents, hwm_nav_cents, hwm_date, circuit_breaker_status, locked_until_trade_date, updated_at)
+      VALUES (?,?,?,?, 'NORMAL', NULL, ?)
+    `).run('real-main', 100_000, 100_000, DAY.d0, DAY.d0);
+    insertCashEvent(db, { id: 'in-100k', type: 'CASH_DEPOSIT', day: DAY.d1, cents: 100_000 });
+
+    const first = evaluate(db, null, { asOf: DAY.d1, nav: 210_000 });
+    assert.equal(first.anchor_snapshot.hwm_nav_cents, 210_000);
+    assert.equal(first.should_advance_hwm, true);
+    assert.equal(persistRiskAnchor(db, first), true);
+    const row = readRiskAnchor(db, 'real-main');
+    assert.equal(row.hwm_nav_cents, 210_000);
+    assert.equal(row.hwm_date, DAY.d1);
+    assert.equal(row.hwm_flows_applied_through, DAY.d1);
+    assert.equal(row.hwm_applied_same_day_flow_cents, 100_000, '锚点必须记录已折入的当日流水');
+
+    const rerun = evaluate(db, null, { asOf: DAY.d1, nav: 210_000 });
+    assert.equal(rerun.anchor_snapshot.hwm_drawdown_bps, 0, '同日无变动重跑不得再扣一次流水');
+    assert.equal(rerun.circuit_breaker_status, 'NORMAL');
+
+    insertCashEvent(db, { id: 'in-50k', type: 'CASH_DEPOSIT', day: DAY.d1, cents: 50_000 });
+    const withNewFlow = evaluate(db, null, { asOf: DAY.d1, nav: 260_000 });
+    assert.equal(withNewFlow.anchor_snapshot.hwm_drawdown_bps, 0, '锚点之后的新增同日流水也不得被当成回撤');
+    assert.equal(withNewFlow.circuit_breaker_status, 'NORMAL');
+  } finally {
+    db.close();
+  }
+});
+
+test('P1-2 回本展示：风险 NAV 用可投资净值，本金盈亏用含理财总资产', () => {
+  const db = bareDb();
+  try {
+    db.prepare('INSERT OR REPLACE INTO account_meta(key, value) VALUES (?, ?)').run('initial_principal_cents:real-main', '100000');
+    const out = evaluateStrategyRouter({
+      portfolioDb: db,
+      marketDb: null,
+      accountId: 'real-main',
+      asOf: DAY.d0,
+      currentNavCents: 80_000,
+      displayNavCents: 100_000,
+      fallbackBaselineNavCents: 80_000,
+      marketRegime: regime,
+    });
+    assert.equal(out.anchor_snapshot.hwm_comparison_nav_cents, 80_000, '风险口径=可投资净值');
+    assert.equal(out.anchor_snapshot.hwm_nav_cents, 80_000);
+    assert.equal(out.anchor_snapshot.current_nav_cents, 100_000, '展示口径=含理财总资产');
+    assert.equal(out.anchor_snapshot.cumulative_pnl_cents, 0, '无损益不得报成亏 2 万');
+    assert.equal(out.anchor_snapshot.cumulative_return_pct, 0);
+    assert.equal(out.anchor_snapshot.recovery_needed_pct, 0, '无损益不得要求上涨 25%');
+  } finally {
+    db.close();
+  }
+});
+
+test('P1-2 旧库迁移：account_risk_anchor 自动补齐当日流水列', () => {
+  bareSeq += 1;
+  const path = join(dir, `legacy-anchor-${bareSeq}-portfolio.sqlite`);
+  const raw = new DatabaseSync(path);
+  raw.exec(`
+    CREATE TABLE account_risk_anchor (
+      account_id TEXT PRIMARY KEY,
+      initial_principal_cents INTEGER NOT NULL,
+      hwm_nav_cents INTEGER NOT NULL,
+      hwm_date TEXT NOT NULL,
+      circuit_breaker_status TEXT NOT NULL DEFAULT 'NORMAL',
+      locked_until_trade_date TEXT,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  raw.close();
+  const db = openPortfolioDb(path, { marketPath: join(dir, `legacy-anchor-${bareSeq}-market.sqlite`) });
+  try {
+    const cols = new Set(
+      db.prepare('PRAGMA table_info(account_risk_anchor)').all().map(row => row.name),
+    );
+    assert.ok(cols.has('hwm_flows_applied_through'), '迁移必须补齐 hwm_flows_applied_through');
+    assert.ok(cols.has('hwm_applied_same_day_flow_cents'), '迁移必须补齐 hwm_applied_same_day_flow_cents');
+  } finally {
+    db.close();
   }
 });
