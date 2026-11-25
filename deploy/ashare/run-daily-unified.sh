@@ -267,17 +267,15 @@ while :; do
   break
 done
 
-# --- Stage 2: Hotspot sync & V2 snapshot ---
+# --- Stage 2: Hotspot sync & V2 snapshot (non-blocking: warn CATALOG_UNAVAILABLE / DATA_DELAYED) ---
 hotspot_exit=0
 set +e
 "$HOTSPOT_SCRIPT"
 hotspot_exit=$?
 set -e
 if [ "$hotspot_exit" -ne 0 ]; then
-  echo "finance-ashare unified note: hotspot exited $hotspot_exit" >&2
-  if [ "$hotspot_exit" -eq 78 ]; then
-    DATA_DELAYED=1
-  fi
+  DATA_DELAYED=1
+  echo "finance-ashare unified WARNING: hotspot exited $hotspot_exit (CATALOG_UNAVAILABLE / DATA_DELAYED); continuing unified daily pipeline" >&2
 fi
 
 # --- Stage 3: Account research record & forward journal review ---
@@ -384,7 +382,5 @@ fi
 if [ "$account_exit" -ne 0 ]; then
   exit "$account_exit"
 fi
-if [ "$hotspot_exit" -ne 0 ]; then
-  exit "$hotspot_exit"
-fi
+# Stage 2 hotspot failure/78 is disclosed above as CATALOG_UNAVAILABLE/DATA_DELAYED without blocking daily.
 exit 0
