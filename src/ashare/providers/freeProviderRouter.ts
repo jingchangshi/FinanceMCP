@@ -1233,37 +1233,8 @@ export async function fetchFreeDataset(
     case 'fund_nav':
       return resolveFundNav(db, params);
 
-    case 'index_classify': {
-      if (!hasTable(db, 'sw_classify')) return [];
-      const src = String(params.src ?? 'SW2021');
-      const level = params.level ? String(params.level) : null;
-      const rows = (level
-        ? db!.prepare('SELECT index_code, name AS industry_name, level, industry_code, is_pub, parent_code, src FROM sw_classify WHERE src = ? AND level = ?').all(src, level)
-        : db!.prepare('SELECT index_code, name AS industry_name, level, industry_code, is_pub, parent_code, src FROM sw_classify WHERE src = ?').all(src)) as Record<string, any>[];
-      return rows;
-    }
-
-    case 'index_member_all':
-      if (!hasTable(db, 'sw_member')) return [];
-      return db!.prepare(
-        'SELECT l1_code, l1_name, l2_code, l2_name, l3_code, l3_name, ts_code, name, in_date, out_date, is_new FROM sw_member',
-      ).all() as Record<string, any>[];
-
     case 'sw_daily':
       return fetchSwIndexDailyFree(db, String(params.ts_code), String(params.start_date), String(params.end_date));
-
-    case 'ths_index': {
-      if (!hasTable(db, 'ths_index')) return [];
-      const type = params.type ? String(params.type) : null;
-      return (type
-        ? db!.prepare('SELECT ts_code, name, count, exchange, list_date, idx_type AS type FROM ths_index WHERE idx_type = ?').all(type)
-        : db!.prepare('SELECT ts_code, name, count, exchange, list_date, idx_type AS type FROM ths_index').all()) as Record<string, any>[];
-    }
-
-    case 'ths_member':
-      if (!hasTable(db, 'ths_member')) return [];
-      return db!.prepare('SELECT ts_code, con_code, con_name FROM ths_member WHERE ts_code = ?')
-        .all(String(params.ts_code)) as Record<string, any>[];
 
     case 'ths_daily':
       return fetchThsIndexDailyFree(db, String(params.ts_code), String(params.start_date), String(params.end_date));

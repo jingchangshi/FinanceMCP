@@ -243,8 +243,8 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       return true;
     }
     case 'hotspot-sync': {
-      // 显式联网同步：申万 L1/L2/L3 + 成分 + 指数日线，同花顺概念/行业目录、成分与指数日线。
-      // 绝不接入 `daily` 定时路径；THS 成分无时点字段，表内恒为 NO_POINT_IN_TIME。
+      // 目录/成分已随 Tushare 退役冻结（显式返回 CATALOG_UNAVAILABLE 且保留既有冻结表）；
+      // 指数日线（sw_daily / ths_daily）继续通过免费多源刷新，空目录时不崩溃。
       const start = h.arg('start') ? h.ymd(h.arg('start'), '--start') : addDays(shanghaiToday(), -400);
       const end = h.arg('end') ? h.ymd(h.arg('end'), '--end') : shanghaiToday();
       const explicitThsCodes = h.arg('ths-codes')?.split(',').map(c => c.trim()).filter(Boolean);
@@ -253,16 +253,14 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       results.push(await syncSwMembers(db));
       results.push(await syncSwIndexDaily(db, { start, end }));
       results.push(await syncThsIndex(db));
-      // Discover AFTER the catalog sync: on a fresh database ths_index was
-      // just populated above, and discovery ensures the schema first.
-      // (Previously this ran before any table existed — first production run
-      // of this command died with "no such table: ths_index".)
       const thsCodes = explicitThsCodes ?? discoverThsCodes(db);
       if (thsCodes.length) {
         results.push(await syncThsMembers(db, { codes: thsCodes }));
         results.push(await syncThsIndexDaily(db, { start, end, codes: thsCodes }));
+      } else {
+        results.push({ dataset: 'ths_index_daily', rows: 0, status: 'CATALOG_UNAVAILABLE', reason: 'no_ths_index_codes' });
       }
-      h.print({ command: 'hotspot-sync', start, end, ths_codes: thsCodes.length, results });
+      h.print({ command: 'hotspot-sync', catalog_status: 'CATALOG_UNAVAILABLE', start, end, ths_codes: thsCodes.length, results });
       return true;
     }
     case 'hotspot-snapshot': {

@@ -189,11 +189,65 @@ test('hotspotCoverage: table_missing before schema, honest quality after', t => 
 
 // ---------------------------------------------------------------- sync module smoke
 
-test('industrySync exposes the six sync entry points (import smoke, no network)', () => {
+test('industrySync catalog syncs return CATALOG_UNAVAILABLE without overwriting frozen tables', async t => {
   for (const name of ['syncSwClassify', 'syncSwMembers', 'syncSwIndexDaily',
     'syncThsIndex', 'syncThsMembers', 'syncThsIndexDaily']) {
     assert.equal(typeof industrySync[name], 'function', name);
   }
+  const db = openAshareDb(':memory:');
+  t.after(() => db.close());
+  ensureHotspotSchema(db);
+  const frozenAt = '2026-10-01T00:00:00.000Z';
+  upsertRows(db, 'sw_classify', ['index_code', 'level', 'name', 'collected_at'], [
+    { index_code: '801010.SI', level: 'L1', name: '农林牧渔', collected_at: frozenAt },
+  ]);
+  upsertRows(db, 'ths_index', ['ts_code', 'name', 'idx_type', 'count', 'exchange', 'list_date', 'collected_at'], [
+    { ts_code: '885431.TI', name: 'CPO概念', idx_type: 'N', count: 120, exchange: '', list_date: '20200101', collected_at: frozenAt },
+  ]);
+  const r1 = await industrySync.syncSwClassify(db);
+  const r2 = await industrySync.syncSwMembers(db);
+  const r3 = await industrySync.syncThsIndex(db);
+  const r4 = await industrySync.syncThsMembers(db, { codes: ['885431.TI'] });
+  for (const r of [r1, r2, r3, r4]) {
+    assert.equal(r.status, 'CATALOG_UNAVAILABLE', r.dataset);
+    assert.equal(r.rows, 0);
+  }
+  assert.equal(r1.cached_rows, 1);
+  assert.equal(db.prepare("SELECT collected_at FROM sw_classify WHERE index_code = '801010.SI'").get().collected_at, frozenAt);
+  assert.equal(db.prepare("SELECT collected_at FROM ths_index WHERE ts_code = '885431.TI'").get().collected_at, frozenAt);
+
+  // Empty catalog never throws in hotspot-sync / syncSwIndexDaily.
+  const emptyDb = openAshareDb(':memory:');
+  t.after(() => emptyDb.close());
+  const swDailyEmpty = await industrySync.syncSwIndexDaily(emptyDb, { start: '20261101', end: '20261110' });
+  assert.equal(swDailyEmpty.status, 'CATALOG_UNAVAILABLE');
+  const { runCommand } = await import('../build/ashare/commands.js');
+  const printed = [];
+  await runCommand(emptyDb, 'hotspot-sync', {
+    arg: () => undefined,
+    flag: () => false,
+    ymd: v => v,
+    print: v => printed.push(v),
+  });
+  assert.equal(printed[0].command, 'hotspot-sync');
+  assert.equal(printed[0].catalog_status, 'CATALOG_UNAVAILABLE');
+});
+
+test('hotspot-snapshot --dry-run remains read-only', async t => {
+  const db = openAshareDb(':memory:');
+  t.after(() => db.close());
+  const { runCommand } = await import('../build/ashare/commands.js');
+  const printed = [];
+  await runCommand(db, 'hotspot-snapshot', {
+    arg: name => (name === 'date' ? '20261030' : undefined),
+    flag: name => name === 'dry-run',
+    ymd: v => v,
+    print: v => printed.push(v),
+  });
+  assert.equal(printed[0].snapshot.as_of, '20261030');
+  assert.equal(printed[0].saved, null);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM hotspot_snapshot_version').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM hotspot_snapshot').get().n, 0);
 });
 
 test('hotspot-sync 首跑安全：discoverThsCodes 空库建表返回 []，不抛 no such table', t => {

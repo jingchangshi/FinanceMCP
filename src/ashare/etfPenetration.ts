@@ -720,8 +720,8 @@ export interface CollectOptions {
   etfCode: string;
   /**
    * 权重有效日期（index_weight 的 trade_date 或 fund_portfolio 的 end_date）。
-   * 空串/缺省时：先读 `$ASHARE_DATA_DIR/etf-weights/<etfCode>.json` 数据文件缓存
-   * （由 weightCaptureCli 只读采集落盘）；缓存也无则 UNAVAILABLE（不 throw）。
+   * 空串/缺省时：只读读取 `$ASHARE_DATA_DIR/etf-weights/<etfCode>.json` 既有一致文件缓存
+   * （原 Tushare 采集脚本已移除，无新权重时诚实返回 UNAVAILABLE，不 throw）。
    */
   weightDate?: string;
   /** 归因/表现窗口的交易日数（默认 20）。 */
@@ -741,7 +741,7 @@ export interface CollectOptions {
   dataDir?: string;
 }
 
-/** `$ASHARE_DATA_DIR/etf-weights/<code>.json` 的文件契约（weightCaptureCli 写入）。 */
+/** `$ASHARE_DATA_DIR/etf-weights/<code>.json` 的只读历史缓存文件契约。 */
 export interface WeightCacheFile {
   schema?: string;
   as_of: string;
