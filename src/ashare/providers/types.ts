@@ -1,6 +1,4 @@
-import { TUSHARE_CONFIG } from '../../config.js';
-
-export type DataProviderMode = 'free' | 'tushare';
+export type DataProviderMode = 'free';
 
 export type MarketSuffix = 'SH' | 'SZ' | 'BJ' | 'SI' | 'TI' | 'OF';
 
@@ -14,16 +12,15 @@ export interface ParsedTsCode {
 }
 
 /**
- * 解析当前行情数据源模式：
- * - `ASHARE_DATA_PROVIDER=free`：强制走免费多源路由（生产默认）；
- * - `ASHARE_DATA_PROVIDER=tushare`：强制走 Tushare Pro；
- * - 未设置或 `auto`：若上下文/环境配置了 TUSHARE_TOKEN 则走 `tushare`（兼容既有离线单测 mock），否则走 `free`。
+ * 解析当前行情数据源模式：免费多源路由（TDX TCP + 腾讯 + 东财）为唯一合法路径。
+ * 不保留 Tushare 兼容开关；显式传入 `'tushare'` 将立即报错拒绝。
  */
 export function resolveDataProviderMode(explicit?: string): DataProviderMode {
   const raw = (explicit ?? process.env.ASHARE_DATA_PROVIDER ?? '').trim().toLowerCase();
-  if (raw === 'free') return 'free';
-  if (raw === 'tushare') return 'tushare';
-  return TUSHARE_CONFIG.API_TOKEN.trim() ? 'tushare' : 'free';
+  if (raw === 'tushare') {
+    throw new Error('ASHARE_DATA_PROVIDER=tushare 已退役移除，仅支持免费多源路径 (free)');
+  }
+  return 'free';
 }
 
 export function normalizeYmd(raw: unknown): string | null {

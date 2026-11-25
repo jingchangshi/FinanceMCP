@@ -100,29 +100,47 @@ test('missing core data produces a NOT_READY report without watchlist or signals
   db.close();
 });
 
-test('batch fetch paginates until a short page and retries transient failures', async () => {
+test('batch fetch uses free router and slices offset/limit cleanly across cashflow retries', async () => {
   const originalFetch = globalThis.fetch;
-  process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
+  const prevHosts = process.env.ASHARE_TDX_HOSTS;
+  process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
   const calls = [];
-  let failOnce = true;
-  globalThis.fetch = async (_url, init) => {
-    const body = JSON.parse(init.body);
-    calls.push(body.params);
-    if (failOnce) {
-      failOnce = false;
-      throw new Error('socket hang up');
+  let failCashflowOnce = true;
+  globalThis.fetch = async url => {
+    const u = String(url);
+    calls.push(u);
+    if (u.includes('RPT_LICO_FN_CPD')) {
+      return new Response(JSON.stringify({
+        result: {
+          pages: 1,
+          data: [0, 1, 2, 3, 4].map(i => ({
+            SECUCODE: `60000${i}.SH`, NOTICE_DATE: '2026-10-24', REPORTDATE: '2026-09-30',
+            BASIC_EPS: 1, WEIGHTAVG_ROE: 10, YSTZ: 5, SJLTZ: 5, XSMLL: 20, MGJYXJJE: 1, PARENT_NETPROFIT: 100,
+          })),
+        },
+      }), { status: 200 });
     }
-    const { offset, limit } = body.params;
-    const total = 5;
-    const items = Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, i) => [`${offset + i}`]);
-    return { ok: true, json: async () => ({ code: 0, data: { fields: ['id'], items } }) };
+    if (u.includes('RPT_DMSK_FN_BALANCE')) {
+      return new Response(JSON.stringify({ result: { pages: 1, data: [] } }), { status: 200 });
+    }
+    if (u.includes('RPT_DMSK_FN_CASHFLOW')) {
+      if (failCashflowOnce) {
+        failCashflowOnce = false;
+        throw new Error('socket hang up');
+      }
+      return new Response(JSON.stringify({ result: { pages: 1, data: [] } }), { status: 200 });
+    }
+    throw new Error(`Unexpected fetch: ${u}`);
   };
   try {
-    const rows = await fetchAll('daily', { trade_date: '20261016' }, undefined, 2);
-    assert.deepEqual(rows.map(r => r.id), ['0', '1', '2', '3', '4']);
-    assert.deepEqual(calls.map(c => c.offset), [0, 0, 2, 4]);
-    assert.ok(calls.every(c => c.trade_date === '20261016'), 'whole-market request by trade date, never per stock');
+    const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
+    clearFreeProviderCache();
+    const rows = await fetchAll('fina_indicator_vip', { period: '20260930', offset: 1, limit: 3 }, 'ts_code,ann_date,end_date');
+    assert.deepEqual(rows.map(r => r.ts_code), ['600001.SH', '600002.SH', '600003.SH']);
+    assert.ok(calls.filter(u => u.includes('RPT_DMSK_FN_CASHFLOW')).length >= 2);
   } finally {
     globalThis.fetch = originalFetch;
+    if (prevHosts === undefined) delete process.env.ASHARE_TDX_HOSTS;
+    else process.env.ASHARE_TDX_HOSTS = prevHosts;
   }
 });

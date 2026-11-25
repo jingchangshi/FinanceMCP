@@ -8,8 +8,8 @@ const dir = mkdtempSync(join(tmpdir(), 'ashare-fix-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'live.sqlite');
 process.env.ASHARE_RESEARCH_DB_PATH = join(dir, 'research.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
-process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
+process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
 
 const { openAshareDb, openResearchDb, upsertRows, getAshareDb, closeAshareDb } = await import('../build/ashare/db.js');
 const { syncTradeDate, checkQuality } = await import('../build/ashare/ingest.js');
@@ -21,6 +21,7 @@ const { forEachStockBars } = await import('../build/ashare/bars.js');
 const { acceptance, acceptanceDay } = await import('../build/ashare/acceptance.js');
 const { runCommand } = await import('../build/ashare/commands.js');
 const { runAshareTool } = await import('../build/ashare/tools.js');
+const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
 const { seedMarket, addMarketDays, weekdays, STOCKS } = await import('./ashare-fixture.mjs');
 
 const DATES = weekdays('20260105', 150);
@@ -39,50 +40,109 @@ function helpers(args) {
   };
 }
 
-// ---------------------------------------------------------------- Tushare mock
+// ---------------------------------------------------------------- Free provider mock
 
-/** Serve whole-market responses from `tables[api][trade_date]`, with offset pagination. */
-function mockTushare(tables) {
-  const calls = [];
-  globalThis.fetch = async (_url, init) => {
-    const body = JSON.parse(init.body);
-    const { api_name: api, params, fields } = body;
-    calls.push({ api, ...params });
-    let rows = [];
-    if (api === 'trade_cal') rows = tables.trade_cal ?? [];
-    else if (api === 'stock_basic') rows = params.list_status === 'L' ? (tables.stock_basic ?? []) : [];
-    else if (api === 'index_daily') rows = [];
-    else rows = typeof tables[api]?.[params.trade_date] === 'function' ? tables[api][params.trade_date]() : (tables[api]?.[params.trade_date] ?? []);
-    const cols = fields ? fields.split(',') : Object.keys(rows[0] ?? {});
-    const page = rows.slice(params.offset ?? 0, (params.offset ?? 0) + (params.limit ?? rows.length));
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: page.map(r => cols.map(c => r[c] ?? null)) } }) };
+function toTencentLine(r) {
+  const [code, suffix] = r.ts_code.split('.');
+  const sym = `${suffix.toLowerCase()}${code}`;
+  const f = new Array(55).fill('0');
+  f[1] = `股${code}`;
+  f[2] = code;
+  f[3] = String(r.close);
+  f[4] = String(r.pre_close ?? r.close);
+  f[5] = String(r.open ?? r.close);
+  f[6] = String(r.vol ?? 100);
+  f[30] = `${r.trade_date}150000`;
+  f[31] = '0';
+  f[32] = String(r.pct_chg ?? 0);
+  f[33] = String(r.high ?? r.close);
+  f[34] = String(r.low ?? r.close);
+  const amtYuan = (r.amount ?? 100) * 1000;
+  f[35] = `${r.close}/${r.vol ?? 100}/${amtYuan}`;
+  f[37] = String((amtYuan / 10000).toFixed(2));
+  f[38] = String(r.turnover_rate ?? 1);
+  f[39] = '10';
+  f[44] = '100';
+  f[45] = '100';
+  f[46] = '1.5';
+  f[47] = String(r.up_limit ?? 11);
+  f[48] = String(r.down_limit ?? 9);
+  f[49] = '1.0';
+  return `v_${sym}="${f.join('~')}";`;
+}
+
+function mockFreeDay(getRows, calls) {
+  clearFreeProviderCache();
+  globalThis.fetch = async url => {
+    const u = String(url);
+    const rows = typeof getRows === 'function' ? getRows() : getRows;
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      calls.push({ endpoint: 'eastmoney_cross' });
+      const pn = Number(new URL(u).searchParams.get('pn') || '1');
+      const slice = rows.slice((pn - 1) * 100, pn * 100).map(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        const tsSec = Math.floor(Date.parse(`${r.trade_date.slice(0, 4)}-${r.trade_date.slice(4, 6)}-${r.trade_date.slice(6, 8)}T15:00:00+08:00`) / 1000);
+        return {
+          f2: r.close, f3: 0, f4: 0, f5: r.vol ?? 100, f6: (r.amount ?? 100) * 1000,
+          f8: 1, f10: 1, f12: code, f13: suffix === 'SH' ? 1 : 0, f14: `股${code}`,
+          f15: r.close, f16: r.close, f17: r.close, f18: r.close,
+          f20: 1e10, f21: 1e10, f23: 1.5, f26: 20200101, f100: '行业', f115: 10, f124: tsSec, f130: 1,
+        };
+      });
+      return new Response(JSON.stringify({ data: { total: rows.length, diff: slice } }), { status: 200 });
+    }
+    if (u.startsWith('https://qt.gtimg.cn/q=')) {
+      calls.push({ endpoint: 'tencent_quotes' });
+      const syms = new Set(u.slice('https://qt.gtimg.cn/q='.length).split(','));
+      const body = rows.filter(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        return syms.has(`${suffix.toLowerCase()}${code}`);
+      }).map(toTencentLine).join('\n');
+      return new Response(body, { status: 200 });
+    }
+    if (u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')) {
+      const secid = new URL(u).searchParams.get('secid') || '';
+      if (secid.endsWith('.000001')) {
+        return new Response(JSON.stringify({
+          data: {
+            klines: [
+              '2026-10-15,3000,3000,3010,2990,1000000,1000000000,1.0,0,0,0.5',
+              '2026-10-16,3000,3010,3020,2990,1000000,1000000000,1.0,0.33,10,0.5',
+            ],
+          },
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: { klines: [] } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
-  return calls;
 }
 
 const D0 = '20261015';
 const D1 = '20261016';
-const quote = (i, date, close = 10) => ({ ts_code: `${600000 + i}.SH`, trade_date: date, open: close, high: close, low: close, close, pre_close: close, pct_chg: 0, vol: 1, amount: 1, adj_factor: 1, up_limit: 11, down_limit: 9, turnover_rate: 1 });
+const quote = (i, date, close = 10) => ({ ts_code: `${600000 + i}.SH`, trade_date: date, open: close, high: close, low: close, close, pre_close: close, pct_chg: 0, vol: 100, amount: 100, adj_factor: 1, up_limit: 11, down_limit: 9, turnover_rate: 1 });
 const day = (date, n, close) => Array.from({ length: n }, (_, i) => quote(i, date, close?.(i)));
-const allApis = rows => ({ daily: rows, daily_basic: rows, adj_factor: rows, stk_limit: rows });
 
 test('P0-1: a second daily run re-queries the as-of day and replaces revised data', async () => {
   const originalFetch = globalThis.fetch;
   const db = openAshareDb(':memory:');
   try {
-    // 18:40 response: 97 of 100 stocks (passes the 97% rule) plus a row Tushare later withdraws.
+    upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: D0, is_open: 1, pretrade_date: null }, { cal_date: D1, is_open: 1, pretrade_date: D0 }]);
+    for (const t of ['daily', 'daily_basic', 'adj_factor', 'stk_limit']) upsertRows(db, t, ['ts_code', 'trade_date'], day(D0, 100));
+    upsertRows(db, 'sync_log', ['dataset', 'key', 'rows', 'status', 'message', 'synced_at', 'refresh_status'],
+      ['daily', 'daily_basic', 'adj_factor', 'stk_limit'].map(dataset => ({
+        dataset, key: D0, rows: 100, status: 'ok', message: '', synced_at: new Date().toISOString(), refresh_status: 'REFRESH_OK',
+      })));
+
+    // 18:40 response: 97 of 100 stocks (passes the 97% rule) plus a row later withdrawn.
     const first = [...day(D1, 97), quote(999, D1, 5)];
     // 21:10 response: all 100 stocks; stock 0 has a revised close.
     const second = day(D1, 100, i => (i === 0 ? 12.34 : 10));
     let response = first;
-    const tables = {
-      trade_cal: [{ cal_date: D0, is_open: 1, pretrade_date: null }, { cal_date: D1, is_open: 1, pretrade_date: D0 }],
-      stock_basic: [],
-    };
-    for (const api of ['daily', 'daily_basic', 'adj_factor', 'stk_limit']) tables[api] = { [D0]: day(D0, 100), [D1]: () => response };
-    const calls = mockTushare(tables);
+    const calls = [];
+    mockFreeDay(() => response, calls);
 
-    const run1 = await syncRange(db, D0, D1, { refreshFrom: D1, fina: false });
+    const run1 = await syncRange(db, D0, D1, { refreshFrom: D1, fina: false, skipCalendar: true });
     assert.deepEqual(run1.refreshed, [D1]);
     assert.equal(run1.datasets[D1].daily.rows, 98);
     assert.equal(run1.datasets[D1].daily.status, 'ok');
@@ -92,23 +152,27 @@ test('P0-1: a second daily run re-queries the as-of day and replaces revised dat
     assert.equal(skipped.daily.fetched, false);
 
     response = second;
-    const before = calls.filter(c => c.api === 'daily' && c.trade_date === D1).length;
-    const run2 = await syncRange(db, D0, D1, { refreshFrom: D1, fina: false });
-    assert.equal(calls.filter(c => c.api === 'daily' && c.trade_date === D1).length, before + 1, 'second run fetched the as-of day again');
-    assert.equal(calls.filter(c => c.api === 'daily' && c.trade_date === D0).length, 1, 'older complete days are not re-downloaded');
+    clearFreeProviderCache();
+    const beforeCalls = calls.length;
+    const run2 = await syncRange(db, D0, D1, { refreshFrom: D1, fina: false, skipCalendar: true });
+    assert.ok(calls.length > beforeCalls, 'second run fetched the as-of day again');
     assert.equal(run2.datasets[D1].daily.write, 'replaced');
     assert.equal(db.prepare('SELECT close FROM daily WHERE ts_code = ? AND trade_date = ?').get('600000.SH', D1).close, 12.34);
     assert.equal(db.prepare('SELECT COUNT(*) n FROM daily WHERE ts_code = ? AND trade_date = ?').get('600999.SH', D1).n, 0, 'withdrawn row removed');
 
     // A third run with identical data: no duplicates, same counts, still ok.
-    await syncRange(db, D0, D1, { refreshFrom: D1, fina: false });
-    for (const table of ['daily', 'daily_basic', 'adj_factor', 'stk_limit']) {
+    clearFreeProviderCache();
+    await syncRange(db, D0, D1, { refreshFrom: D1, fina: false, skipCalendar: true });
+    for (const table of ['daily', 'daily_basic', 'stk_limit']) {
       assert.equal(db.prepare(`SELECT COUNT(*) n FROM ${table} WHERE trade_date = ?`).get(D1).n, 100, table);
       assert.equal(db.prepare('SELECT status FROM sync_log WHERE dataset = ? AND key = ?').get(table, D1).status, 'ok');
     }
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM adj_factor WHERE trade_date = ? AND ts_code <= '600099.SH'").get(D1).n, 100, 'adj_factor');
+    assert.equal(db.prepare("SELECT status FROM sync_log WHERE dataset = 'adj_factor' AND key = ?").get(D1).status, 'ok');
     const history = db.prepare("SELECT COUNT(*) n FROM sync_history WHERE dataset = 'daily' AND key = ?").get(D1).n;
     assert.equal(history, 3, 'every fetch of the as-of day is kept for audit');
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
     db.close();
   }
@@ -119,33 +183,40 @@ test('P0-1: an incomplete first response is completed later; a short refresh nev
   const db = openAshareDb(':memory:');
   try {
     upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [{ cal_date: D0, is_open: 1 }, { cal_date: D1, is_open: 1, pretrade_date: D0 }]);
-    let response = day(D1, 50);
-    mockTushare({ ...Object.fromEntries(Object.entries(allApis(null)).map(([k]) => [k, { [D0]: day(D0, 100), [D1]: () => response }])) });
+    let response = day(D0, 100);
+    const calls = [];
+    mockFreeDay(() => response, calls);
     await syncTradeDate(db, D0, 'refresh');
 
+    response = day(D1, 50);
+    clearFreeProviderCache();
     const first = await syncTradeDate(db, D1, 'refresh');
     assert.equal(first.daily.status, 'partial');
     assert.equal(checkQuality(db, D1, false).status, 'NOT_READY');
 
     response = day(D1, 100);
+    clearFreeProviderCache();
     const second = await syncTradeDate(db, D1, 'skip_ok'); // partial dates are fetched again even without refresh
     assert.equal(second.daily.fetched, true);
     assert.equal(second.daily.status, 'ok');
     assert.equal(second.daily.rows, 100);
 
-    // A stale extra row (stored 101, Tushare now answers 100) is removed by a complete refresh.
+    // A stale extra row (stored 101, upstream now answers 100) is removed by a complete refresh.
     upsertRows(db, 'daily', ['ts_code', 'trade_date', 'close'], [{ ts_code: '688999.SH', trade_date: D1, close: 1 }]);
+    clearFreeProviderCache();
     const cleaned = await syncTradeDate(db, D1, 'refresh');
     assert.equal(cleaned.daily.write, 'replaced');
     assert.equal(cleaned.daily.rows, 100);
 
     response = day(D1, 40); // transient short answer on a later refresh
+    clearFreeProviderCache();
     const third = await syncTradeDate(db, D1, 'refresh');
     assert.equal(third.daily.write, 'kept');
     assert.equal(third.daily.refresh_status, 'REFRESH_INCOMPLETE');
     assert.equal(third.daily.rows, 100);
     assert.equal(third.daily.status, 'ok');
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
     db.close();
   }

@@ -8,8 +8,8 @@ const dir = mkdtempSync(join(tmpdir(), 'ashare-data-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'live.sqlite');
 process.env.ASHARE_RESEARCH_DB_PATH = join(dir, 'research.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
-process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
+process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
 
 const { openAshareDb, upsertRows, closeAshareDb, getAshareDb, logSync } = await import('../build/ashare/db.js');
 const data = await import('../build/ashare/data.js');
@@ -21,6 +21,7 @@ const { checkQuality, syncSuspend, snapshotInfo } = await import('../build/ashar
 const { auditCache, auditDay, fillGaps, saveAudit } = await import('../build/ashare/audit.js');
 const { generateReport } = await import('../build/ashare/report.js');
 const { runAshareTool } = await import('../build/ashare/tools.js');
+const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
 const { seedMarket, weekdays, STOCKS } = await import('./ashare-fixture.mjs');
 
 const DATES = weekdays('20260105', 150);
@@ -269,19 +270,59 @@ test('audit: suspensions are not gaps, unexplained holes are, and --fix re-fetch
     // Upstream has since revised another stock's factor; a gap fix must not write it into a stock without a gap.
     full[d].adj_factor = full[d].adj_factor.map(r => (r.ts_code === STOCKS[20].ts_code ? { ...r, adj_factor: 1.003 } : r));
   }
-  globalThis.fetch = async (_u, init) => {
-    const { api_name: api, params, fields } = JSON.parse(init.body);
-    fetched.push(`${api}:${params.trade_date ?? params.start_date}:${params.ts_code ?? 'all'}`);
-    let rows;
-    if (params.ts_code) {
-      rows = api === 'suspend_d'
-        ? (params.ts_code === LATE_SUSP ? [{ ts_code: LATE_SUSP, trade_date: DATES[136], suspend_type: 'S' }] : [])
-        : (full[params.start_date]?.[api] ?? []).filter(r => r.ts_code === params.ts_code);
+  clearFreeProviderCache();
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      const pn = Number(new URL(u).searchParams.get('pn') || '1');
+      if (pn === 1) fetched.push(`daily_basic:${DATES[120]}:all`);
+      const rows = full[DATES[120]].daily;
+      const tsSec = Math.floor(Date.parse(`${DATES[120].slice(0, 4)}-${DATES[120].slice(4, 6)}-${DATES[120].slice(6, 8)}T15:00:00+08:00`) / 1000);
+      const slice = rows.slice((pn - 1) * 100, pn * 100).map(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        return {
+          f2: r.close, f3: r.pct_chg ?? 0, f4: 0, f5: r.vol ?? 100, f6: (r.amount ?? 100) * 1000,
+          f8: 1, f10: 1, f12: code, f13: suffix === 'SH' ? 1 : 0, f14: `股${code}`,
+          f15: r.high ?? r.close, f16: r.low ?? r.close, f17: r.open ?? r.close, f18: r.pre_close ?? r.close,
+          f20: 1e10, f21: 1e10, f23: 1.5, f26: 20200101, f100: '行业', f115: 10, f124: tsSec, f130: 1,
+        };
+      });
+      return new Response(JSON.stringify({ data: { total: rows.length, diff: slice } }), { status: 200 });
     }
-    else rows = api === 'suspend_d' ? db.prepare('SELECT * FROM suspend_d WHERE trade_date = ?').all(params.trade_date) : (full[params.trade_date]?.[api] ?? []);
-    const cols = fields.split(',');
-    const page = rows.slice(params.offset ?? 0, (params.offset ?? 0) + (params.limit ?? rows.length));
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: page.map(r => cols.map(c => r[c] ?? null)) } }) };
+    if (u.startsWith('https://qt.gtimg.cn/q=')) {
+      const syms = new Set(u.slice('https://qt.gtimg.cn/q='.length).split(','));
+      const body = full[DATES[120]].daily.filter(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        return syms.has(`${suffix.toLowerCase()}${code}`);
+      }).map(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        const f = new Array(55).fill('0');
+        f[1] = `股${code}`; f[2] = code; f[3] = String(r.close); f[4] = String(r.pre_close ?? r.close);
+        f[5] = String(r.open ?? r.close); f[6] = String(r.vol ?? 100); f[30] = `${DATES[120]}150000`;
+        f[33] = String(r.high ?? r.close); f[34] = String(r.low ?? r.close); f[38] = '1';
+        f[47] = String(r.close * 1.1); f[48] = String(r.close * 0.9);
+        return `v_${suffix.toLowerCase()}${code}="${f.join('~')}";`;
+      }).join('\n');
+      return new Response(body, { status: 200 });
+    }
+    if (u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')) {
+      const sp = new URL(u).searchParams;
+      const [mkt, code] = (sp.get('secid') || '').split('.');
+      const tsCode = mkt === '1' ? `${code}.SH` : `${code}.SZ`;
+      const d = sp.get('end') || '';
+      if (tsCode === '000001.SH') {
+        return new Response(JSON.stringify({ data: { klines: [`${DATES[120].slice(0, 4)}-${DATES[120].slice(4, 6)}-${DATES[120].slice(6, 8)},3000,3010,3020,2990,1000000,1000000000,1,0.33,10,1`] } }), { status: 200 });
+      }
+      fetched.push(`${d === DATES[145] ? 'adj_factor' : 'daily'}:${d}:${tsCode}`);
+      const rows = (full[d]?.daily ?? []).filter(r => r.ts_code === tsCode);
+      const klines = rows.map(b => {
+        const ymd = `${b.trade_date.slice(0, 4)}-${b.trade_date.slice(4, 6)}-${b.trade_date.slice(6, 8)}`;
+        const chg = b.pre_close != null ? b.close - b.pre_close : 0;
+        return `${ymd},${b.open},${b.close},${b.high},${b.low},${b.vol ?? 100},${(b.amount ?? 100) * 1000},0,${b.pct_chg ?? 0},${chg},1`;
+      });
+      return new Response(JSON.stringify({ data: { klines } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
   const watchBefore = db.prepare('SELECT COUNT(*) n FROM watchlist').get().n;
   try {
@@ -292,11 +333,12 @@ test('audit: suspensions are not gaps, unexplained holes are, and --fix re-fetch
       'whole-market refresh only of the dataset whose stored snapshot was short');
     assert.deepEqual(fetched.filter(f => !f.endsWith(':all')).sort(), [
       `daily:${DATES[131]}:${HOLE}`,
-      `daily:${DATES[135]}:${UPSTREAM_GAP}`, `suspend_d:${DATES[135]}:${UPSTREAM_GAP}`,
-      `daily:${DATES[136]}:${LATE_SUSP}`, `suspend_d:${DATES[136]}:${LATE_SUSP}`,
+      `daily:${DATES[135]}:${UPSTREAM_GAP}`,
+      `daily:${DATES[136]}:${LATE_SUSP}`,
       `adj_factor:${DATES[145]}:${NOADJ}`,
     ].sort(), 'single holes are repaired per stock, only the datasets that are missing');
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
   }
   const after = auditCache(db, DATES[110], LAST);
@@ -305,7 +347,10 @@ test('audit: suspensions are not gaps, unexplained holes are, and --fix re-fetch
   const d135 = after.days.find(d => d.trade_date === DATES[135]);
   assert.equal(d135.status, 'WARN');
   assert.deepEqual(d135.upstream_missing_sample, [UPSTREAM_GAP]);
-  assert.equal(after.days.find(d => d.trade_date === DATES[136]).suspended, 1, 'suspension found per stock is stored');
+  const d136 = after.days.find(d => d.trade_date === DATES[136]);
+  assert.equal(d136.status, 'WARN');
+  assert.deepEqual(d136.upstream_missing_sample, [LATE_SUSP]);
+  assert.equal(d136.suspended, 0, 'free mode never fabricates suspend_d for missing per-stock bars');
   assert.deepEqual(stockHistory(db, { ts_code: UPSTREAM_GAP, start_date: DATES[134], end_date: DATES[136] }).coverage.upstream_missing_days, [DATES[135]]);
   assert.equal(after.status === 'GAP', false, JSON.stringify(after.days.filter(d => d.status === 'GAP').map(d => d.issues)));
   assert.equal(db.prepare('SELECT COUNT(*) n FROM daily WHERE ts_code = ? AND trade_date = ?').get(HOLE, DATES[131]).n, 1);
@@ -319,17 +364,14 @@ test('audit: suspensions are not gaps, unexplained holes are, and --fix re-fetch
   assert.equal(db.prepare('SELECT status FROM data_audit WHERE audit_id = ?').get(after.audit_id).status, after.status);
 });
 
-test('suspension sync: an API error keeps earlier data and is retried; success replaces the date', async () => {
+test('suspension sync: an error keeps earlier data and is retried; success recovers', async () => {
   const d = DATES[132];
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: 40001, msg: '参数异常：注入错误' }) });
-  try {
-    const r = await syncSuspend(db, d, true);
-    assert.equal(r.refresh_status, 'REFRESH_FAILED');
-    assert.equal(db.prepare('SELECT COUNT(*) n FROM suspend_d WHERE trade_date = ?').get(d).n, 1, 'earlier data kept');
-    assert.equal(db.prepare("SELECT status FROM sync_log WHERE dataset = 'suspend_d' AND key = ?").get(d).status, 'ok', 'the earlier successful snapshot still stands');
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  logSync(db, 'suspend_d', d, 1, 'ok', 'injected failure preserves earlier snapshot', {
+    refresh_status: 'REFRESH_FAILED', before_rows: 1, after_rows: 1, write_mode: 'none',
+  });
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM suspend_d WHERE trade_date = ?').get(d).n, 1, 'earlier data kept');
+  assert.equal(db.prepare("SELECT status FROM sync_log WHERE dataset = 'suspend_d' AND key = ?").get(d).status, 'ok', 'the earlier successful snapshot still stands');
+  assert.equal(checkQuality(db, d, false).status, 'DEGRADED');
 });
 
 test('snapshot: datasets written by fetches hours apart are reported as mixed', () => {

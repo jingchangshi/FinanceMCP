@@ -44,7 +44,7 @@ function encodeTdxVarint(val) {
   return Buffer.from(bytes);
 }
 
-test('resolveDataProviderMode honors explicit override and auto token detection', () => {
+test('resolveDataProviderMode always returns free and rejects tushare compatibility switch', () => {
   const prevProv = process.env.ASHARE_DATA_PROVIDER;
   const prevTok = process.env.TUSHARE_TOKEN;
   try {
@@ -52,12 +52,13 @@ test('resolveDataProviderMode honors explicit override and auto token detection'
     process.env.TUSHARE_TOKEN = 'expired-token';
     assert.equal(resolveDataProviderMode(), 'free');
 
+    assert.throws(() => resolveDataProviderMode('tushare'), /已退役移除/);
     process.env.ASHARE_DATA_PROVIDER = 'tushare';
-    assert.equal(resolveDataProviderMode(), 'tushare');
+    assert.throws(() => resolveDataProviderMode(), /已退役移除/);
 
     delete process.env.ASHARE_DATA_PROVIDER;
     process.env.TUSHARE_TOKEN = 'test-token';
-    assert.equal(resolveDataProviderMode(), 'tushare');
+    assert.equal(resolveDataProviderMode(), 'free');
 
     process.env.TUSHARE_TOKEN = '';
     assert.equal(resolveDataProviderMode(), 'free');

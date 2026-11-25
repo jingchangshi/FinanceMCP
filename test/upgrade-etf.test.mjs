@@ -6,13 +6,13 @@ import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import test from 'node:test';
 const root = process.env.UPGRADE_BUILD_DIR ?? resolve('build');
-process.env.TUSHARE_TOKEN = 'synthetic-test-only';
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
-process.env.ASHARE_TUSHARE_MAX_RETRIES = '0';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
+process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
 const { discoverEtfUniverse, buildEtfOpportunity } = await import(pathToFileURL(resolve(root, 'ashare/etfResearch.js')).href);
 const { screenEtfCandidates } = await import(pathToFileURL(resolve(root, 'ashare/etfUniverse.js')).href);
 const { openAshareDb } = await import(pathToFileURL(resolve(root, 'ashare/db.js')).href);
 const { syncEtfForDaily, ETF_PIPELINE_CODES } = await import(pathToFileURL(resolve(root, 'ashare/etf.js')).href);
+const { clearFreeProviderCache } = await import(pathToFileURL(resolve(root, 'ashare/providers/freeProviderRouter.js')).href);
 function fixture() {
   const db = new DatabaseSync(':memory:');
   db.exec(`CREATE TABLE fund_basic(ts_code TEXT PRIMARY KEY,name TEXT,fund_type TEXT,invest_type TEXT,type TEXT,benchmark TEXT,status TEXT,list_date TEXT,delist_date TEXT,market TEXT);
@@ -106,17 +106,34 @@ test('daily dynamic historical sync is bounded and repeated empty history is coo
       for (const date of ['20261020', '20261021']) db.prepare('INSERT INTO fund_daily(ts_code,trade_date,open,high,low,close,vol,amount) VALUES (?,?,1,1,1,1,10000,50000)').run(code, date);
     }
     db.prepare("INSERT INTO fund_sync_log VALUES ('fund_daily','20261021',1000,'ok','',?)").run(new Date().toISOString());
-    globalThis.fetch = async (_url, init) => {
-      const request = JSON.parse(init.body); calls.push(request);
-      return { ok: true, json: async () => ({ code: 0, data: { fields: request.fields.split(','), items: [] } }) };
+    clearFreeProviderCache();
+    globalThis.fetch = async url => {
+      const u = String(url);
+      calls.push(u);
+      if (u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')) {
+        return new Response(JSON.stringify({ data: { klines: [] } }), { status: 200 });
+      }
+      if (u.startsWith('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get')) {
+        return new Response(JSON.stringify({ data: {} }), { status: 200 });
+      }
+      if (u.startsWith('https://api.fund.eastmoney.com/f10/lsjz')) {
+        return new Response(JSON.stringify({ Data: { LSJZList: [] } }), { status: 200 });
+      }
+      if (u.startsWith('https://qt.gtimg.cn/q=')) {
+        return new Response('', { status: 200 });
+      }
+      if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+        return new Response(JSON.stringify({ data: { total: 0, diff: [] } }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${u}`);
     };
     const first = await syncEtfForDaily(db, '20261021', { days: 1 });
     assert.equal(first.research_universe.selected_dynamic.length, 12);
     assert.equal(first.research_universe.history_requested.length, 12);
-    assert.equal(calls.filter(call => call.api_name === 'fund_daily' && call.params.start_date).length, 12);
+    assert.equal(calls.filter(u => u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')).length, 12);
     const second = await syncEtfForDaily(db, '20261021', { days: 1 });
     assert.deepEqual(second.research_universe.history_requested, []);
-  } finally { globalThis.fetch = original; db.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { clearFreeProviderCache(); globalThis.fetch = original; db.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 test('opportunity compares adjusted historical returns and holdings correlation without inventing NAV or advantage', () => {
   const { db, asOf } = fixture();

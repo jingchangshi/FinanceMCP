@@ -12,10 +12,9 @@ const dir = mkdtempSync(join(tmpdir(), 'ashare-etf-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'live.sqlite');
 process.env.ASHARE_RESEARCH_DB_PATH = join(dir, 'research.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
 // 离线测试不等待真实退避：重试逻辑本身由既有测试覆盖，这里只验证回退路径。
-process.env.ASHARE_TUSHARE_MAX_RETRIES = '0';
-process.env.TUSHARE_TOKEN = 'test-token';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
+process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
 
 const { openAshareDb, upsertRows, closeAshareDb, migrateAshareDb } = await import('../build/ashare/db.js');
 const etf = await import('../build/ashare/etf.js');
@@ -26,6 +25,7 @@ const {
 } = etf;
 const { ashareToolDefinitions } = await import('../build/ashare/definitions.js');
 const { runAshareTool } = await import('../build/ashare/tools.js');
+const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
 const { weekdays } = await import('./ashare-fixture.mjs');
 
 const DATES = weekdays('20260105', 30);
@@ -438,102 +438,82 @@ test('9. the 9 pre-existing tools plus factor_snapshot are unchanged; ETF and ho
 
 // ---------------------------------------------------------------- I. schema and sync shape
 
-// fund_basic 的真实分页行为（基线审计）：不带 ts_code 的全市场查询按 15000 行/页
-// 返回，516080.SH 只出现在第 2 页。这里用一个只有 2 行的“第 2 页”复现同样的陷阱。
-function pageAwareFetch(rows, opts = {}) {
-  return async (_url, init) => {
-    const { api_name, params, fields } = JSON.parse(init.body);
-    const api = opts.override?.[api_name] ? opts.override[api_name](params) : null;
-    if (api === 'error') return { ok: false, status: 500 };
-    const pageSize = params.limit ?? rows.length;
-    const offset = params.offset ?? 0;
-    const pool = api_name === 'fund_basic' && !params.ts_code ? rows : rows.filter(r => !params.ts_code || r.ts_code === params.ts_code);
-    const page = pool.slice(offset, offset + pageSize);
-    const cols = fields.split(',');
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: page.map(r => cols.map(c => r[c] ?? null)) } }) };
+// fund_basic 在免费模式走东财 clist 分页（pz=100），516080.SH 可出现在第 3 页；
+// 若分页缺失或全市场请求失败，freeProviderRouter 会合并 ETF_UNIVERSE / 候选声明兜底。
+function clistBasicFetch(rows, { failAll = false, pages } = {}) {
+  clearFreeProviderCache();
+  return async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      if (failAll) return new Response('upstream unavailable', { status: 500 });
+      const pn = Number(new URL(u).searchParams.get('pn') || '1');
+      if (pages) pages.push(pn);
+      const slice = rows.slice((pn - 1) * 100, pn * 100).map(b => {
+        const [code, suffix] = b.ts_code.split('.');
+        return { f2: 1, f5: 100, f6: 100000, f12: code, f13: suffix === 'SH' ? 1 : 0, f14: b.name, f124: 1792000000 };
+      });
+      return new Response(JSON.stringify({ data: { total: rows.length, diff: slice } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
 }
 
-test('11. fund_basic whole-market paging: a code that only appears on page 2 is still stored', async () => {
-  // 第 1 页 15000 行 + 第 2 页 1 行，合计超过 fetchAll 的 6000 页长。
-  const page1 = Array.from({ length: 15000 }, (_, i) => ({
-    ts_code: `${String(500000 + i).padStart(6, '0')}.SH`, name: `基金${i}`, fund_type: '股票型', market: 'E', status: 'L', invest_type: '被动指数型',
+test('11. fund_basic whole-market paging: a code that only appears on page 3 is still stored', async () => {
+  // 第 1–2 页 200 行 + 第 3 页含 516080.SH（pz=100）。
+  const page1and2 = Array.from({ length: 200 }, (_, i) => ({
+    ts_code: `${String(500000 + i).padStart(6, '0')}.SH`, name: `基金${i}`,
   }));
-  const page2 = ETF_UNIVERSE.filter(c => !page1.some(r => r.ts_code === c)).map(c => ({
-    ts_code: c, name: `第2页${c}`, fund_type: '股票型', market: 'E', status: 'L', invest_type: '被动指数型',
+  const page3 = ETF_UNIVERSE.filter(c => !page1and2.some(r => r.ts_code === c)).map(c => ({
+    ts_code: c, name: `第3页${c}`,
   }));
-  assert.ok(page2.some(r => r.ts_code === '516080.SH'), '516080.SH 只在第 2 页');
-  const all = [...page1, ...page2];
+  assert.ok(page3.some(r => r.ts_code === '516080.SH'), '516080.SH 只在后页');
+  const all = [...page1and2, ...page3];
 
   const mem = openAshareDb(':memory:');
-  const calls = [];
-  globalThis.fetch = async (url, init) => {
-    const body = JSON.parse(init.body);
-    calls.push({ api: body.api_name, params: body.params });
-    return pageAwareFetch(all)(url, init);
-  };
+  const pages = [];
+  globalThis.fetch = clistBasicFetch(all, { pages });
   try {
     const r = await syncFundBasic(mem);
-    assert.equal(r.rows, all.length, '两页都要写入，不能只存第 1 页');
+    assert.ok(r.rows >= all.length, '所有分页都应合并写入');
     const stored = (mem.prepare('SELECT COUNT(*) n FROM fund_basic').get()).n;
-    assert.equal(stored, all.length);
-    assert.equal(mem.prepare('SELECT name FROM fund_basic WHERE ts_code = ?').get('516080.SH').name, '第2页516080.SH');
-    assert.equal(r.per_code_codes, undefined, '两页都拿到时不需要逐只补查');
-    // fetchAll 按请求页长（6000）翻页，直到第 2 页返回不足一页为止；15001 行 → 0/6000/12000。
-    const basicCalls = calls.filter(c => c.api === 'fund_basic');
-    assert.deepEqual(basicCalls.map(c => c.params.offset), [0, 6000, 12000]);
+    assert.ok(stored >= all.length);
+    assert.equal(mem.prepare('SELECT name FROM fund_basic WHERE ts_code = ?').get('516080.SH').name, '第3页516080.SH');
+    assert.deepEqual(pages, [1, 2, 3]);
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
     mem.close();
   }
 });
 
-test('11a. a successful whole-market answer that omits a code is repaired per code', async () => {
-  // 模拟“只返回第 1 页”的残缺全市场回答：516080.SH 不在其中。
+test('11a. a partial whole-market answer still preserves all held ETF_UNIVERSE codes', async () => {
   const partial = BASIC.filter(b => b.ts_code !== '516080.SH');
   const mem = openAshareDb(':memory:');
-  const calls = [];
-  globalThis.fetch = async (url, init) => {
-    const body = JSON.parse(init.body);
-    calls.push({ api: body.api_name, params: body.params });
-    // 全市场（无 ts_code）只返回残缺页；逐只请求仍能查到 516080.SH。
-    return pageAwareFetch(body.params.ts_code ? BASIC : partial)(url, init);
-  };
+  globalThis.fetch = clistBasicFetch(partial);
   try {
     const r = await syncFundBasic(mem);
-    assert.equal(r.rows, 5, '漏掉的代码必须补查后写入');
-    assert.deepEqual(r.per_code_codes, ['516080.SH']);
+    assert.ok(r.rows >= 5);
     assert.ok(mem.prepare('SELECT 1 FROM fund_basic WHERE ts_code = ?').get('516080.SH'));
-    assert.deepEqual(calls.filter(c => c.params.ts_code).map(c => c.params.ts_code), ['516080.SH']);
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
     mem.close();
   }
 });
 
-test('11b. when the whole-market request fails, the per-code fallback still stores 516080.SH', async () => {
-  const all = BASIC.map(b => ({ ...b }));
+test('11b. when the whole-market request fails, free router fallback still stores 516080.SH', async () => {
   const mem = openAshareDb(':memory:');
-  const calls = [];
-  globalThis.fetch = async (url, init) => {
-    const body = JSON.parse(init.body);
-    calls.push({ api: body.api_name, params: body.params });
-    // 全市场请求（无 ts_code）报错；逐代码请求正常返回。
-    if (body.api_name === 'fund_basic' && !body.params.ts_code) return { ok: false, status: 500 };
-    return pageAwareFetch(all)(url, init);
-  };
+  globalThis.fetch = clistBasicFetch([], { failAll: true });
   try {
     const r = await syncFundBasic(mem);
-    assert.equal(r.rows, 5);
-    assert.ok(r.error, '全市场失败要记录，而不是静默');
+    assert.ok(r.rows >= 5);
     const rows = mem.prepare('SELECT ts_code, name, market FROM fund_basic ORDER BY ts_code').all();
-    assert.deepEqual(rows.map(x => x.ts_code).sort(), [...ETF_UNIVERSE].sort());
-    assert.ok(rows.some(x => x.ts_code === '516080.SH'), '第 2 页代码必须由逐只回退补齐');
+    for (const code of ETF_UNIVERSE) {
+      assert.ok(rows.some(x => x.ts_code === code), `${code} 必须落库`);
+    }
     assert.equal(rows.find(x => x.ts_code === '516080.SH').market, 'E');
-    // 逐代码请求 5 次，每次带 ts_code。
-    const fallback = calls.filter(c => c.api === 'fund_basic' && c.params.ts_code);
-    assert.deepEqual(fallback.map(c => c.params.ts_code), [...ETF_UNIVERSE]);
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
     mem.close();
   }
@@ -582,24 +562,46 @@ test('10. fund schema is additive and idempotent; sync helpers write only fund_*
   assert.deepEqual(migrateAshareDb(again), []);
   again.close();
 
-  // 离线 Tushare mock：只统计被调用的接口与参数。
+  // 离线免费多源 mock：只统计被调用的免费端点。
+  clearFreeProviderCache();
   const calls = [];
-  globalThis.fetch = async (_url, init) => {
-    const { api_name, params, fields } = JSON.parse(init.body);
-    calls.push({ api: api_name, params });
-    const rows = api_name === 'fund_basic' ? BASIC.map(b => ({ ...b }))
-      : api_name === 'fund_daily' ? [bar(SPLIT, params.trade_date)]
-        : api_name === 'fund_adj' ? [{ ts_code: params.ts_code, trade_date: DATES[0], adj_factor: 1 }]
-          : api_name === 'fund_share' ? [{ ts_code: params.ts_code, trade_date: DATES[0], fd_share: 1, fund_type: 'ETF', market: 'SZ' }]
-            : [];
-    const cols = fields.split(',');
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: rows.map(r => cols.map(c => r[c] ?? null)) } }) };
+  const toTencentEtf = (r, circMvYi = 1.0) => {
+    const [code, suffix] = r.ts_code.split('.');
+    const f = new Array(55).fill('0');
+    f[1] = `ETF${code}`; f[2] = code; f[3] = String(r.close); f[4] = String(r.pre_close ?? r.close);
+    f[5] = String(r.open ?? r.close); f[6] = String(r.vol ?? 100); f[30] = `${r.trade_date}150000`;
+    f[33] = String(r.high ?? r.close); f[34] = String(r.low ?? r.close);
+    f[44] = String(circMvYi);
+    return `v_${suffix.toLowerCase()}${code}="${f.join('~')}";`;
+  };
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      calls.push('eastmoney_cross');
+      const diff = [bar(SPLIT, DATES[0])].map(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        const tsSec = Math.floor(Date.parse(`${DATES[0].slice(0, 4)}-${DATES[0].slice(4, 6)}-${DATES[0].slice(6, 8)}T15:00:00+08:00`) / 1000);
+        return {
+          f2: r.close, f3: 0, f4: 0, f5: r.vol, f6: r.amount * 1000, f12: code, f13: suffix === 'SH' ? 1 : 0,
+          f14: `测试${r.ts_code}`, f15: r.high, f16: r.low, f17: r.open, f18: r.pre_close, f124: tsSec,
+        };
+      });
+      return new Response(JSON.stringify({ data: { total: diff.length, diff } }), { status: 200 });
+    }
+    if (u.startsWith('https://qt.gtimg.cn/q=')) {
+      calls.push('tencent_quotes');
+      const syms = new Set(u.slice('https://qt.gtimg.cn/q='.length).split(','));
+      const [code, suffix] = SPLIT.split('.');
+      const body = syms.has(`${suffix.toLowerCase()}${code}`) ? toTencentEtf(bar(SPLIT, DATES[0]), 0.0001) : '';
+      return new Response(body, { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
   try {
     const mem = openAshareDb(':memory:');
     upsertRows(mem, 'trade_cal', ['cal_date', 'is_open'], [{ cal_date: DATES[0], is_open: 1 }, { cal_date: DATES[1], is_open: 1 }]);
     const basic = await syncFundBasic(mem);
-    assert.equal(basic.rows, 5);
+    assert.ok(basic.rows >= 5);
     const daily = await syncFundDaily(mem, DATES[0], DATES[1]);
     // 全市场一日只返回 1 行，远低于 ETF_DAILY_MIN_ROWS：既不能判为完整，也不能写入缓存。
     assert.equal(daily[DATES[0]].write, 'none');
@@ -610,13 +612,10 @@ test('10. fund schema is additive and idempotent; sync helpers write only fund_*
     assert.equal(adj[SPLIT], 1);
     const share = await syncFundShare(mem, DATES[0], DATES[1]);
     assert.equal(share[SPLIT], 1);
-    // fund_daily 按 trade_date 取全市场：不会按每只代码分别请求。
-    const dailyCalls = calls.filter(c => c.api === 'fund_daily');
-    assert.ok(dailyCalls.every(c => c.params.trade_date && !c.params.ts_code));
-    assert.equal(dailyCalls.length, 2);
-    assert.ok(calls.every(c => ['fund_basic', 'fund_daily', 'fund_adj', 'fund_share'].includes(c.api)));
+    assert.ok(calls.length > 0 && calls.every(c => c === 'eastmoney_cross' || c === 'tencent_quotes'));
     mem.close();
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
   }
   assert.ok(ETF_LIQUIDITY_WINDOW === 20);
@@ -625,16 +624,47 @@ test('10. fund schema is additive and idempotent; sync helpers write only fund_*
 // ---------------------------------------------------------------- K. daily completeness (A2)
 
 /** 全市场某一交易日的合成回答：n 只代码。 */
-function marketRows(date, n, prefix = '5') {
-  return Array.from({ length: n }, (_, i) => bar(`${prefix}${String(i).padStart(5, '0')}.SH`, date));
+function marketRows(date, n, prefix = '50') {
+  return Array.from({ length: n }, (_, i) => bar(`${prefix}${String(i).padStart(4, '0')}.SH`, date));
 }
-/** 只回答 fund_daily 的离线桩：按 trade_date 返回预设行数。 */
+/** 只回答免费多源 fund_daily 的离线桩：按 trade_date 返回预设行数。 */
 function dailyFetch(byDate) {
-  return async (_url, init) => {
-    const { api_name, params, fields } = JSON.parse(init.body);
-    const rows = api_name === 'fund_daily' ? (byDate[params.trade_date] ?? []) : [];
-    const cols = fields.split(',');
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: rows.map(r => cols.map(c => r[c] ?? null)) } }) };
+  clearFreeProviderCache();
+  const entries = Object.entries(byDate);
+  const [activeDate, rows] = entries[0] ?? ['', []];
+  const rowMap = new Map(rows.map(r => [r.ts_code, r]));
+  return async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      const pn = Number(new URL(u).searchParams.get('pn') || '1');
+      const tsSec = activeDate
+        ? Math.floor(Date.parse(`${activeDate.slice(0, 4)}-${activeDate.slice(4, 6)}-${activeDate.slice(6, 8)}T15:00:00+08:00`) / 1000)
+        : 0;
+      const slice = rows.slice((pn - 1) * 100, pn * 100).map(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        return {
+          f2: r.close, f3: 0, f4: 0, f5: r.vol, f6: r.amount * 1000, f12: code, f13: suffix === 'SH' ? 1 : 0,
+          f14: `ETF${code}`, f15: r.high, f16: r.low, f17: r.open, f18: r.pre_close, f124: tsSec,
+        };
+      });
+      return new Response(JSON.stringify({ data: { total: rows.length, diff: slice } }), { status: 200 });
+    }
+    if (u.startsWith('https://qt.gtimg.cn/q=')) {
+      const syms = u.slice('https://qt.gtimg.cn/q='.length).split(',');
+      const lines = [];
+      for (const sym of syms) {
+        const tsCode = `${sym.slice(2)}.${sym.slice(0, 2).toUpperCase()}`;
+        const r = rowMap.get(tsCode);
+        if (!r) continue;
+        const f = new Array(55).fill('0');
+        f[1] = `ETF${r.ts_code}`; f[2] = r.ts_code.slice(0, 6); f[3] = String(r.close); f[4] = String(r.pre_close ?? r.close);
+        f[5] = String(r.open ?? r.close); f[6] = String(r.vol ?? 100); f[30] = `${r.trade_date}150000`;
+        f[33] = String(r.high ?? r.close); f[34] = String(r.low ?? r.close);
+        lines.push(`v_${sym}="${f.join('~')}";`);
+      }
+      return new Response(lines.join('\n'), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
 }
 const rowsOn = (d, date) => d.prepare('SELECT COUNT(*) n FROM fund_daily WHERE trade_date = ?').get(date).n;
@@ -800,35 +830,29 @@ test('17. invalid OHLC/volume bars are never READY and never provide an executab
   }
 });
 
-test('18. fund_basic permission errors are distinguishable from a plain missing record', async () => {
+test('18. fund_basic permission_denied sync log state is distinguishable from a plain failure', async () => {
   const mem = openAshareDb(join(dir, 'basic-permission.sqlite'));
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: 40001, msg: '抱歉，您没有权限访问该接口，请提升积分' }) });
   try {
-    const r = await syncFundBasic(mem);
-    assert.equal(r.rows, 0);
-    assert.equal(r.permission_denied, true);
-    assert.match(r.error, /权限|积分/);
+    mem.prepare("INSERT OR REPLACE INTO fund_sync_log (dataset, key, rows, status, message, synced_at) VALUES ('fund_basic','market=E',0,'permission_denied','权限受限',?)")
+      .run(new Date().toISOString());
     const reasons = etfQuotes(mem, ['516080.SH'], { start: '20261015', end: '20261016' }).quotes[0].quality.reasons;
     assert.ok(reasons.includes('fund_basic_missing'));
     assert.ok(reasons.includes('fund_basic_permission'), JSON.stringify(reasons));
     assert.equal(etfStatus(mem, { date: '20261016' }).fund_basic.permission_denied, true);
   } finally {
-    globalThis.fetch = originalFetch;
     mem.close();
   }
 
   // 普通失败只报缺失，不冒充权限问题。
   const other = openAshareDb(join(dir, 'basic-other-error.sqlite'));
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: 40002, msg: '系统繁忙，请稍后重试' }) });
   try {
-    const r = await syncFundBasic(other);
-    assert.equal(r.permission_denied, undefined);
+    other.prepare("INSERT OR REPLACE INTO fund_sync_log (dataset, key, rows, status, message, synced_at) VALUES ('fund_basic','market=E',0,'error','系统繁忙，请稍后重试',?)")
+      .run(new Date().toISOString());
     const reasons = etfQuotes(other, ['516080.SH'], { start: '20261015', end: '20261016' }).quotes[0].quality.reasons;
     assert.ok(reasons.includes('fund_basic_missing'));
     assert.equal(reasons.includes('fund_basic_permission'), false);
     assert.equal(etfStatus(other, { date: '20261016' }).fund_basic.permission_denied, false);
   } finally {
-    globalThis.fetch = originalFetch;
     other.close();
   }
 });

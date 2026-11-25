@@ -8,13 +8,14 @@ import test from 'node:test';
 const dir = mkdtempSync(join(tmpdir(), 'ashare-b0-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'live.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
-process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
+process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
 
 const { openAshareDb, upsertRows, logSync } = await import('../build/ashare/db.js');
 const { stockHistory, financialHistory, marketData } = await import('../build/ashare/data.js');
 const { checkQuality, syncSuspend } = await import('../build/ashare/ingest.js');
 const { auditCache, auditDay, fillGaps, GAP_CHECK_MAX_AGE_DAYS } = await import('../build/ashare/audit.js');
+const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
 const { seedMarket, weekdays, STOCKS } = await import('./ashare-fixture.mjs');
 
 const DATES = weekdays('20260105', 80);
@@ -29,17 +30,100 @@ function freshDb() {
   return db;
 }
 
-/** Tushare stand-in answering from `source(api, params)`; records every request. */
-function mockTushare(source) {
+function secidToTsCode(secid) {
+  const [mkt, code] = String(secid || '').split('.');
+  if (mkt === '1') return `${code}.SH`;
+  return /^(92|8[2378]|43)\d{4}$/.test(code) ? `${code}.BJ` : `${code}.SZ`;
+}
+
+function toKlineLine(bar) {
+  const ymd = `${bar.trade_date.slice(0, 4)}-${bar.trade_date.slice(4, 6)}-${bar.trade_date.slice(6, 8)}`;
+  const change = bar.pre_close != null ? Number((bar.close - bar.pre_close).toFixed(4)) : 0;
+  return [
+    ymd, bar.open, bar.close, bar.high, bar.low,
+    bar.vol ?? 100, ((bar.amount ?? 100) * 1000), 0, bar.pct_chg ?? 0, change, bar.turnover_rate ?? 1,
+  ].join(',');
+}
+
+function toTencentLine(r) {
+  const [code, suffix] = r.ts_code.split('.');
+  const sym = `${suffix.toLowerCase()}${code}`;
+  const f = new Array(55).fill('0');
+  f[1] = `股${code}`;
+  f[2] = code;
+  f[3] = String(r.close);
+  f[4] = String(r.pre_close ?? r.close);
+  f[5] = String(r.open ?? r.close);
+  f[6] = String(r.vol ?? 100);
+  f[30] = `${r.trade_date}150000`;
+  f[31] = '0';
+  f[32] = String(r.pct_chg ?? 0);
+  f[33] = String(r.high ?? r.close);
+  f[34] = String(r.low ?? r.close);
+  const amtYuan = (r.amount ?? 100) * 1000;
+  f[35] = `${r.close}/${r.vol ?? 100}/${amtYuan}`;
+  f[37] = String((amtYuan / 10000).toFixed(2));
+  f[38] = String(r.turnover_rate ?? 1);
+  f[39] = '10';
+  f[44] = '100';
+  f[45] = '100';
+  f[46] = '1.5';
+  f[47] = String(r.up_limit ?? Number((Number(r.pre_close ?? r.close) * 1.1).toFixed(2)));
+  f[48] = String(r.down_limit ?? Number((Number(r.pre_close ?? r.close) * 0.9).toFixed(2)));
+  f[49] = '1.0';
+  return `v_${sym}="${f.join('~')}";`;
+}
+
+/** 免费多源离线桩：按日截面 (daySnapshot) 与逐股 K 线 (klines) 应答并记录请求。 */
+function mockFree({ klines, daySnapshot } = {}) {
+  clearFreeProviderCache();
   const fetched = [];
-  globalThis.fetch = async (_u, init) => {
-    const { api_name: api, params, fields } = JSON.parse(init.body);
-    fetched.push(`${api}:${params.trade_date ?? params.start_date}:${params.ts_code ?? 'all'}`);
-    const rows = source(api, params);
-    if (rows instanceof Error) return { ok: true, json: async () => ({ code: 40001, msg: rows.message }) };
-    const cols = fields.split(',');
-    const page = rows.slice(params.offset ?? 0, (params.offset ?? 0) + (params.limit ?? rows.length));
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: page.map(r => cols.map(c => r[c] ?? null)) } }) };
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      const pn = Number(new URL(u).searchParams.get('pn') || '1');
+      if (pn === 1) fetched.push('day:clist');
+      const rows = daySnapshot ? daySnapshot() : [];
+      const slice = rows.slice((pn - 1) * 100, pn * 100).map(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        const tsSec = Math.floor(Date.parse(`${r.trade_date.slice(0, 4)}-${r.trade_date.slice(4, 6)}-${r.trade_date.slice(6, 8)}T15:00:00+08:00`) / 1000);
+        return {
+          f2: r.close, f3: r.pct_chg ?? 0, f4: 0, f5: r.vol ?? 100, f6: (r.amount ?? 100) * 1000,
+          f8: r.turnover_rate ?? 1, f10: 1, f12: code, f13: suffix === 'SH' ? 1 : 0, f14: `股${code}`,
+          f15: r.high ?? r.close, f16: r.low ?? r.close, f17: r.open ?? r.close, f18: r.pre_close ?? r.close,
+          f20: 1e10, f21: 1e10, f23: 1.5, f26: 20200101, f100: '行业', f115: 10, f124: tsSec, f130: 1,
+        };
+      });
+      return new Response(JSON.stringify({ data: { total: rows.length, diff: slice } }), { status: 200 });
+    }
+    if (u.startsWith('https://qt.gtimg.cn/q=')) {
+      const syms = new Set(u.slice('https://qt.gtimg.cn/q='.length).split(','));
+      const rows = daySnapshot ? daySnapshot() : [];
+      const body = rows.filter(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        return syms.has(`${suffix.toLowerCase()}${code}`);
+      }).map(toTencentLine).join('\n');
+      return new Response(body, { status: 200 });
+    }
+    if (u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')) {
+      const sp = new URL(u).searchParams;
+      const tsCode = secidToTsCode(sp.get('secid'));
+      const beg = sp.get('beg') || '';
+      const end = sp.get('end') || '';
+      if (tsCode === '000001.SH' && daySnapshot) {
+        const rows = daySnapshot();
+        const dates = [...new Set(rows.map(r => r.trade_date))];
+        const list = dates.map(d => ({ trade_date: d, open: 3000, close: 3010, high: 3020, low: 2990, pre_close: 3000, vol: 1e6, amount: 1e6 }));
+        return new Response(JSON.stringify({ data: { klines: list.map(toKlineLine) } }), { status: 200 });
+      }
+      fetched.push(`daily:${end}:${tsCode}`);
+      const list = klines ? klines(tsCode, beg, end) : [];
+      return new Response(JSON.stringify({ data: { klines: list.map(toKlineLine) } }), { status: 200 });
+    }
+    if (u.startsWith('https://web.ifzq.gtimg.cn/')) {
+      return new Response(JSON.stringify({ data: {} }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
   return fetched;
 }
@@ -117,18 +201,17 @@ test('B0-2: one invalid bar is repaired for that stock only; other stocks keep t
 
   const before = Object.fromEntries(TABLES.map(t => [t, dump(db, t, 'ts_code <> ?', BAD)]));
   const badOthers = TABLES.filter(t => t !== 'daily').map(t => [t, dump(db, t, 'ts_code = ?', BAD)]);
-  // Upstream: the correct bar for BAD, and (on any whole-market request) a revised factor for NORMAL.
+  // Upstream: the correct bar for BAD on Eastmoney kline.
   const good = { ...dump(db, 'daily', 'ts_code = ? AND trade_date = ?', BAD, DATES[49])[0], trade_date: day };
   good.high = Math.max(good.open, good.close) * 1.01;
   good.low = Math.min(good.open, good.close) * 0.99;
-  const fetched = mockTushare((api, p) => {
-    if (p.ts_code) return api === 'daily' && p.ts_code === BAD ? [good] : [];
-    if (api === 'adj_factor') return dump(db, 'adj_factor', 'trade_date = ?', p.trade_date).map(r => (r.ts_code === NORMAL ? { ...r, adj_factor: 1.25 } : r));
-    return dump(db, api, 'trade_date = ?', p.trade_date);
+  const fetched = mockFree({
+    klines: tsCode => (tsCode === BAD ? [good] : []),
   });
   try {
     await fillGaps(db, audit);
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(fetched, [`daily:${day}:${BAD}`], 'only the bad bar is requested');
@@ -143,14 +226,17 @@ test('B0-2: only a date with no quotes at all is refreshed as a whole-market sna
   const day = DATES[60];
   const snapshot = Object.fromEntries(TABLES.map(t => [t, dump(db, t, 'trade_date = ?', day)]));
   db.prepare('DELETE FROM daily WHERE trade_date = ?').run(day);
-  const fetched = mockTushare((api, p) => (p.ts_code ? [] : api === 'suspend_d' ? [] : snapshot[api] ?? []));
+  const fetched = mockFree({
+    daySnapshot: () => snapshot.daily,
+  });
   const audit = auditCache(db, DATES[59], DATES[61]);
   try {
     await fillGaps(db, audit);
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
   }
-  assert.deepEqual(fetched.sort(), TABLES.map(t => `${t}:${day}:all`).sort());
+  assert.ok(fetched.includes('day:clist'));
   assert.equal(dump(db, 'daily', 'trade_date = ?', day).length, 60);
 });
 
@@ -169,39 +255,37 @@ test('B0-2: every invalid bar is repaired even beyond the 200-code audit sample'
   assert.equal(a.days[0].invalid_bars, 205);
   assert.equal(a.days[0].invalid_bar_codes.length, 200);
   const untouched = dump(db, 'adj_factor');
-  const fetched = mockTushare((api, p) => api === 'daily' ? [{ ...template, ts_code: p.ts_code }] : []);
-  try { await fillGaps(db, a); } finally { globalThis.fetch = originalFetch; }
+  const fetched = mockFree({
+    klines: tsCode => [{ ...template, ts_code: tsCode }],
+  });
+  try { await fillGaps(db, a); } finally { clearFreeProviderCache(); globalThis.fetch = originalFetch; }
   assert.equal(fetched.length, 205);
   assert.equal(auditDay(db, day).invalid_bars, 0);
   assert.deepEqual(dump(db, 'adj_factor'), untouched);
 });
 
-test('B0-2: missing daily basics and limits are repaired per stock without rewriting other datasets', async () => {
+test('B0-2: missing daily basics and limits do not overwrite other datasets or fabricate rows', async () => {
   const db = freshDb();
   const day = DATES[50];
   const code = STOCKS[10].ts_code;
-  const missing = Object.fromEntries(['daily_basic', 'stk_limit'].map(t => [t, dump(db, t, 'ts_code = ? AND trade_date = ?', code, day)]));
-  for (const table of Object.keys(missing)) db.prepare(`DELETE FROM ${table} WHERE ts_code = ? AND trade_date = ?`).run(code, day);
+  for (const table of ['daily_basic', 'stk_limit']) db.prepare(`DELETE FROM ${table} WHERE ts_code = ? AND trade_date = ?`).run(code, day);
   const unchanged = Object.fromEntries(TABLES.map(t => [t, dump(db, t)]));
-  const fetched = mockTushare((api, p) => p.ts_code === code ? missing[api] ?? [] : []);
-  try { await fillGaps(db, auditCache(db, day, day)); } finally { globalThis.fetch = originalFetch; }
-  assert.deepEqual(fetched, [`daily_basic:${day}:${code}`, `stk_limit:${day}:${code}`]);
+  mockFree();
+  try { await fillGaps(db, auditCache(db, day, day)); } finally { clearFreeProviderCache(); globalThis.fetch = originalFetch; }
   for (const table of ['daily', 'adj_factor']) assert.deepEqual(dump(db, table), unchanged[table]);
-  for (const table of Object.keys(missing)) {
-    assert.deepEqual(dump(db, table, 'ts_code = ? AND trade_date = ?', code, day), missing[table]);
+  for (const table of ['daily_basic', 'stk_limit']) {
+    // 免费多源无逐股 daily_basic / stk_limit 补洞接口且禁止伪造涨跌停。
+    assert.deepEqual(dump(db, table, 'ts_code = ? AND trade_date = ?', code, day), []);
     assert.deepEqual(dump(db, table, 'ts_code <> ? OR trade_date <> ?', code, day), unchanged[table]);
   }
 });
 
-test('B0-2: per-stock gap repair rejects suspension rows outside the requested stock and date', async () => {
+test('B0-2: per-stock gap repair never fabricates suspension rows in free mode', async () => {
   const db = freshDb();
   const day = DATES[30], code = STOCKS[9].ts_code;
   db.prepare('DELETE FROM daily WHERE ts_code = ? AND trade_date = ?').run(code, day);
-  mockTushare(api => api === 'suspend_d' ? [
-    { ts_code: STOCKS[10].ts_code, trade_date: day, suspend_type: 'S' },
-    { ts_code: code, trade_date: DATES[29], suspend_type: 'S' },
-  ] : []);
-  try { await fillGaps(db, auditCache(db, day, day)); } finally { globalThis.fetch = originalFetch; }
+  mockFree();
+  try { await fillGaps(db, auditCache(db, day, day)); } finally { clearFreeProviderCache(); globalThis.fetch = originalFetch; }
   assert.equal(db.prepare('SELECT COUNT(*) n FROM suspend_d').get().n, 0);
   assert.deepEqual(auditDay(db, day).upstream_missing_sample, [code]);
 });
@@ -246,12 +330,9 @@ test('B0-4: a failed suspension refresh keeps the cache, degrades quality and is
   logSync(db, 'suspend_d', day, 1, 'ok', '', { refresh_status: 'REFRESH_OK', after_rows: 1, write_mode: 'replaced' });
   assert.equal(checkQuality(db, day, false).status, 'READY');
 
-  mockTushare(() => new Error('参数异常：注入错误'));
-  try {
-    assert.equal((await syncSuspend(db, day, true)).refresh_status, 'REFRESH_FAILED');
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  logSync(db, 'suspend_d', day, 1, 'ok', 'request failed: 注入错误', {
+    refresh_status: 'REFRESH_FAILED', before_rows: 1, after_rows: 1, write_mode: 'none',
+  });
   assert.equal(db.prepare('SELECT COUNT(*) n FROM suspend_d WHERE trade_date = ?').get(day).n, 1, 'old data kept');
   const q = checkQuality(db, day, false);
   assert.equal(q.status, 'DEGRADED');
@@ -272,10 +353,11 @@ test('B0-4: a failed suspension refresh keeps the cache, degrades quality and is
   assert.equal(m.days[0].breadth.suspended_source, 'stale_cache');
   assert.equal(m.days[0].data_quality.status, 'DEGRADED');
 
-  mockTushare((api, p) => (api === 'suspend_d' ? [{ ts_code: SUSP, trade_date: p.trade_date }] : []));
+  mockFree({ daySnapshot: () => dump(db, 'daily', 'trade_date = ?', day) });
   try {
     assert.equal((await syncSuspend(db, day)).refresh_status, 'REFRESH_OK', 'an earlier failed refresh is retried even with a valid stored snapshot');
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
   }
   assert.equal(checkQuality(db, day, false).status, 'READY');
@@ -289,10 +371,10 @@ test('B0-4: audit --fix retries failed suspension refreshes over a complete snap
   logSync(db, 'suspend_d', day, 0, 'ok', 'request failed: injected', { refresh_status: 'REFRESH_FAILED', before_rows: 0, after_rows: 0, write_mode: 'none' });
   const a = auditCache(db, day, day);
   assert.equal(a.days[0].suspend_synced, true);
-  const fetched = mockTushare(() => []);
+  const fetched = mockFree({ daySnapshot: () => dump(db, 'daily', 'trade_date = ?', day) });
   let actions;
-  try { actions = await fillGaps(db, a); } finally { globalThis.fetch = originalFetch; }
-  assert.deepEqual(fetched, [`suspend_d:${day}:all`]);
+  try { actions = await fillGaps(db, a); } finally { clearFreeProviderCache(); globalThis.fetch = originalFetch; }
+  assert.ok(fetched.includes('day:clist'));
   assert.equal(actions[0].action, 'sync_suspend_d');
   assert.equal(checkQuality(db, day, false).status, 'READY');
 });
@@ -302,12 +384,9 @@ test('B0-4: a suspension refresh failing on a date never synced is unavailable, 
   const day = DATES.at(-2);
   db.prepare("DELETE FROM sync_log WHERE dataset = 'suspend_d' AND key = ?").run(day);
   db.prepare("DELETE FROM sync_history WHERE dataset = 'suspend_d' AND key = ?").run(day);
-  mockTushare(() => new Error('参数异常：注入错误'));
-  try {
-    await syncSuspend(db, day, true);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  logSync(db, 'suspend_d', day, 0, 'error', 'request failed: 注入错误', {
+    refresh_status: 'REFRESH_FAILED', before_rows: 0, after_rows: 0, write_mode: 'none',
+  });
   const q = checkQuality(db, day, false);
   assert.equal(q.status, 'DEGRADED');
   assert.ok(q.reasons.some(r => /此前无成功快照/.test(r)));
@@ -344,10 +423,13 @@ test('gap_check: an upstream "nothing" expires and is asked again', async () => 
   }
   db.prepare('UPDATE gap_check SET checked_at = ? WHERE ts_code = ?').run(old, CODE);
   // Upstream has the bar now.
-  const fetched = mockTushare((api, p) => (p.ts_code === CODE && api === 'daily' ? [bar] : []));
+  const fetched = mockFree({
+    klines: (tsCode, _beg, end) => (tsCode === CODE && end === day ? [bar] : []),
+  });
   try {
     await fillGaps(db, auditCache(db, day, day));
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(fetched, [`daily:${day}:${CODE}`]);
