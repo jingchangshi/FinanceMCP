@@ -32,10 +32,10 @@ export interface EastmoneyCrossRow {
   high: number | null;
   low: number | null;
   pre_close: number | null;
-  /** 手 */
-  vol: number;
-  /** 千元 */
-  amount: number;
+  /** 手；null = 未知（不得伪造为 0） */
+  vol: number | null;
+  /** 千元；null = 未知（不得伪造为 0） */
+  amount: number | null;
   turnover_rate: number | null;
   volume_ratio: number | null;
   pe_ttm: number | null;
@@ -58,7 +58,7 @@ function parseEastmoneyCrossItem(item: Record<string, any>): EastmoneyCrossRow |
   const suffix = market === 1 ? 'SH' : (/^(92|8[2378]|43)\d{4}$/.test(code) ? 'BJ' : 'SZ');
   const tsCode = `${code}.${suffix}`;
   const tradeDate = shanghaiDateFromEpochSec(Number(item.f124)) ?? shanghaiTodayYmd();
-  const amountYuan = finiteOrNull(item.f6) ?? 0;
+  const amountYuan = finiteOrNull(item.f6);
   const totalMvYuan = positiveOrNull(item.f20);
   const circMvYuan = positiveOrNull(item.f21);
   const listRaw = normalizeYmd(item.f26);
@@ -71,8 +71,8 @@ function parseEastmoneyCrossItem(item: Record<string, any>): EastmoneyCrossRow |
     close: positiveOrNull(item.f2),
     pct_chg: finiteOrNull(item.f3),
     change: finiteOrNull(item.f4),
-    vol: finiteOrNull(item.f5) ?? 0,
-    amount: Math.round((amountYuan / 1000) * 10000) / 10000,
+    vol: finiteOrNull(item.f5),
+    amount: amountYuan !== null ? Math.round((amountYuan / 1000) * 10000) / 10000 : null,
     turnover_rate: finiteOrNull(item.f8),
     volume_ratio: positiveOrNull(item.f10),
     high: positiveOrNull(item.f15),
@@ -122,10 +122,10 @@ export interface EastmoneyKlineBar {
   close: number;
   high: number;
   low: number;
-  /** 手 */
-  vol: number;
-  /** 千元 */
-  amount: number;
+  /** 手；null = 未知（不得伪造为 0） */
+  vol: number | null;
+  /** 千元；null = 未知（不得伪造为 0） */
+  amount: number | null;
   pct_chg: number | null;
   change: number | null;
   pre_close: number | null;
@@ -151,8 +151,8 @@ export async function fetchEastmoneyKlines(
     const close = Number(p[2]);
     const high = Number(p[3]);
     const low = Number(p[4]);
-    const vol = Number(p[5]);
-    const amountYuan = Number(p[6]);
+    const vol = finiteOrNull(p[5]);
+    const amountYuan = finiteOrNull(p[6]);
     const pctChg = finiteOrNull(p[8]);
     const change = finiteOrNull(p[9]);
     const preClose = change !== null && Number.isFinite(close) ? roundTo(close - change, 4) : null;
@@ -163,8 +163,8 @@ export async function fetchEastmoneyKlines(
       close,
       high,
       low,
-      vol: Number.isFinite(vol) ? vol : 0,
-      amount: Number.isFinite(amountYuan) ? roundTo(amountYuan / 1000, 4) : 0,
+      vol,
+      amount: amountYuan !== null ? roundTo(amountYuan / 1000, 4) : null,
       pct_chg: pctChg,
       change,
       pre_close: preClose,
@@ -175,7 +175,8 @@ export async function fetchEastmoneyKlines(
 
 export interface EastmoneyFundNavRow {
   ts_code: string;
-  ann_date: string;
+  /** 免费净值接口无公告日期，固定 null（不得以 nav_date 冒充） */
+  ann_date: string | null;
   nav_date: string;
   unit_nav: number;
   accum_nav: number | null;
@@ -202,7 +203,7 @@ export async function fetchEastmoneyFundNav(
     const accumNav = positiveOrNull(item.LJJZ);
     out.push({
       ts_code: tsCode,
-      ann_date: navDate,
+      ann_date: null,
       nav_date: navDate,
       unit_nav: unitNav,
       accum_nav: accumNav,

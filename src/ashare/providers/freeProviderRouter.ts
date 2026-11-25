@@ -12,7 +12,6 @@ import { fetchSwIndexDailyFree, fetchThsIndexDailyFree } from './hotspotFreeClie
 import { TdxSession, withTdxSession, type TdxQuote, type TdxSecurityItem, type TdxXdxrEvent } from './tdxClient.js';
 import { fetchTencentDailyBars, fetchTencentQuotes, type TencentQuoteRow } from './tencentClient.js';
 import {
-  computeDefaultLimitPrices,
   inferExchangeLabel,
   inferMarketBoard,
   isAshareStockCode,
@@ -57,7 +56,7 @@ interface NormalizedBar {
   pre_close: number | null;
   change: number | null;
   pct_chg: number | null;
-  vol: number;
+  vol: number | null;
   /** 千元；null = 上游未提供成交额（未知，不是 0）。 */
   amount: number | null;
 }
@@ -297,7 +296,7 @@ async function resolveTradeCal(db: DatabaseSync | null, start: string, end: stri
     try {
       const idxQuotes = await fetchTencentQuotes(['000001.SH']);
       const q = idxQuotes.get('000001.SH');
-      if (q && q.trade_date === today && q.vol > 0 && q.close && q.close > 0) {
+      if (q && q.trade_date === today && q.vol !== null && q.vol > 0 && q.close && q.close > 0) {
         barOpenDates.add(today);
         if (today > latestBarDate) latestBarDate = today;
       }
@@ -559,10 +558,9 @@ async function buildHistoricalStockDay(
   });
 
   for (const { tsCode, bar } of barResults) {
-    const name = nameMap.get(tsCode) ?? null;
-    // 停牌判定只看成交量：腾讯日 K 不返回成交额（amount 未知），若要求 amount > 0，
-    // 腾讯兜底的一天会把全市场误标记为停牌。未知成交额写成 null，不伪造成 0。
-    if (bar && bar.vol > 0 && bar.open > 0 && bar.close > 0) {
+    // 停牌判定只看显式停牌信号（suspend=source_explicit_only），缺 bar 或源故障不写入 suspend_d；
+    // 未知成交额/成交量保持 null；stk_limit 仅保存上游显式限价，不持久化规则推算值。
+    if (bar && bar.vol !== null && bar.vol > 0 && bar.open > 0 && bar.close > 0) {
       daily.push({
         ts_code: tsCode,
         trade_date: tradeDate,
@@ -590,14 +588,9 @@ async function buildHistoricalStockDay(
       });
       const factor = chainAdjFactor(factors.get(tsCode), closes.get(tsCode), bar.pre_close, 0.001);
       adj_factor.push({ ts_code: tsCode, trade_date: tradeDate, adj_factor: factor });
-      const limits = computeDefaultLimitPrices(bar.pre_close ?? bar.close, tsCode, name);
-      stk_limit.push({ ts_code: tsCode, trade_date: tradeDate, up_limit: limits.up_limit, down_limit: limits.down_limit });
     } else {
-      suspend_d.push({ ts_code: tsCode, trade_date: tradeDate, suspend_timing: null });
       const prevF = factors.get(tsCode) ?? 1;
       adj_factor.push({ ts_code: tsCode, trade_date: tradeDate, adj_factor: prevF });
-      const limits = computeDefaultLimitPrices(closes.get(tsCode) ?? null, tsCode, name);
-      stk_limit.push({ ts_code: tsCode, trade_date: tradeDate, up_limit: limits.up_limit, down_limit: limits.down_limit });
     }
   }
   return { tradeDate, daily, daily_basic, adj_factor, stk_limit, suspend_d };
@@ -627,13 +620,13 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
 
   let observedDate = '';
   for (const q of tencentMap.values()) {
-    if (q.vol > 0 && q.trade_date > observedDate) observedDate = q.trade_date;
+    if (q.vol !== null && q.vol > 0 && q.trade_date > observedDate) observedDate = q.trade_date;
   }
 
   const emCross = await getStockCrossCached();
   if (!observedDate) {
     for (const em of emCross.values()) {
-      if (em.vol > 0 && em.trade_date > observedDate) observedDate = em.trade_date;
+      if (em.vol !== null && em.vol > 0 && em.trade_date > observedDate) observedDate = em.trade_date;
     }
   }
   if (!observedDate) {
@@ -685,7 +678,6 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
     const tq = tencentMap.get(tsCode);
     const em = emCross.get(tsCode);
     const tdx = tdxMap.get(tsCode);
-    const name = tq?.name || em?.name || nameMap.get(tsCode) || null;
 
     const matchTq = tq && tq.trade_date === tradeDate ? tq : null;
     const matchEm = em && em.trade_date === tradeDate ? em : null;
@@ -695,14 +687,14 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
     const open = matchTq?.open ?? matchEm?.open ?? tdx?.open ?? null;
     const highRaw = matchTq?.high ?? matchEm?.high ?? tdx?.high ?? null;
     const lowRaw = matchTq?.low ?? matchEm?.low ?? tdx?.low ?? null;
-    const vol = matchTq?.vol ?? matchEm?.vol ?? tdx?.vol ?? 0;
+    const vol = matchTq?.vol ?? matchEm?.vol ?? tdx?.vol ?? null;
     const amount = matchTq?.amount ?? matchEm?.amount ?? tdx?.amount ?? null;
 
-    // 停牌判定只看成交量：成交额未知（腾讯日K不返回）不是停牌证据。
+    // 停牌判定只认显式停牌信号（suspend=source_explicit_only）；缺 bar 或源故障不写入 suspend_d。
     const validBar =
       close !== null && close > 0 &&
       open !== null && open > 0 &&
-      vol > 0 &&
+      vol !== null && vol > 0 &&
       (matchTq !== null || matchEm !== null || tdx !== undefined);
 
     if (validBar) {
@@ -739,25 +731,27 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
       const factor = chainAdjFactor(factors.get(tsCode), closes.get(tsCode), preClose, 0.001);
       adj_factor.push({ ts_code: tsCode, trade_date: tradeDate, adj_factor: factor });
 
-      const defLimits = computeDefaultLimitPrices(preClose, tsCode, name);
-      stk_limit.push({
-        ts_code: tsCode,
-        trade_date: tradeDate,
-        up_limit: matchTq?.up_limit ?? defLimits.up_limit,
-        down_limit: matchTq?.down_limit ?? defLimits.down_limit,
-      });
+      // stk_limit 仅持久化上游腾讯显式提供的涨跌停价，禁止写入规则推算值。
+      if (matchTq?.up_limit != null && matchTq?.down_limit != null) {
+        stk_limit.push({
+          ts_code: tsCode,
+          trade_date: tradeDate,
+          up_limit: matchTq.up_limit,
+          down_limit: matchTq.down_limit,
+        });
+      }
     } else {
-      // 停牌/当日未成交个股：不写 daily 与 daily_basic，只写 suspend_d、adj_factor 与 stk_limit
-      suspend_d.push({ ts_code: tsCode, trade_date: tradeDate, suspend_timing: null });
+      // 无有效成交时保留复权因子连续性；不把缺 bar / 源故障伪造为停牌或推算限价。
       const prevF = factors.get(tsCode) ?? 1;
       adj_factor.push({ ts_code: tsCode, trade_date: tradeDate, adj_factor: prevF });
-      const defLimits = computeDefaultLimitPrices(preClose, tsCode, name);
-      stk_limit.push({
-        ts_code: tsCode,
-        trade_date: tradeDate,
-        up_limit: matchTq?.up_limit ?? defLimits.up_limit,
-        down_limit: matchTq?.down_limit ?? defLimits.down_limit,
-      });
+      if (matchTq?.up_limit != null && matchTq?.down_limit != null) {
+        stk_limit.push({
+          ts_code: tsCode,
+          trade_date: tradeDate,
+          up_limit: matchTq.up_limit,
+          down_limit: matchTq.down_limit,
+        });
+      }
     }
   }
 
@@ -856,12 +850,12 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
 
   let observedDate = '';
   for (const q of tencentMap.values()) {
-    if (q.vol > 0 && q.trade_date > observedDate) observedDate = q.trade_date;
+    if (q.vol !== null && q.vol > 0 && q.trade_date > observedDate) observedDate = q.trade_date;
   }
   const emFunds = await getFundCrossCached();
   if (!observedDate) {
     for (const em of emFunds.values()) {
-      if (em.vol > 0 && em.trade_date > observedDate) observedDate = em.trade_date;
+      if (em.vol !== null && em.vol > 0 && em.trade_date > observedDate) observedDate = em.trade_date;
     }
   }
   if (!observedDate) {
@@ -886,7 +880,7 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
       const bars = await fetchBarsSingle(tsCode, tradeDate, tradeDate, false);
       const b = bars.find(x => x.trade_date === tradeDate);
       // 停牌只看成交量；成交额未知（腾讯兜底）不能当作停牌或 0。
-      if (!b || b.vol <= 0 || b.open <= 0 || b.close <= 0) return null;
+      if (!b || b.vol === null || b.vol <= 0 || b.open <= 0 || b.close <= 0) return null;
       return {
         ts_code: tsCode,
         trade_date: tradeDate,
@@ -933,13 +927,13 @@ async function getFundDaySnapshot(db: DatabaseSync | null, tradeDate: string): P
     const open = matchTq?.open ?? matchEm?.open ?? tdx?.open ?? null;
     const highRaw = matchTq?.high ?? matchEm?.high ?? tdx?.high ?? null;
     const lowRaw = matchTq?.low ?? matchEm?.low ?? tdx?.low ?? null;
-    const vol = matchTq?.vol ?? matchEm?.vol ?? tdx?.vol ?? 0;
+    const vol = matchTq?.vol ?? matchEm?.vol ?? tdx?.vol ?? null;
     const amount = matchTq?.amount ?? matchEm?.amount ?? tdx?.amount ?? null;
 
     if (
       close !== null && close > 0 &&
       open !== null && open > 0 &&
-      vol > 0 &&
+      vol !== null && vol > 0 &&
       (matchTq !== null || matchEm !== null || tdx !== undefined)
     ) {
       const high = highRaw && highRaw > 0 ? Math.max(highRaw, open, close) : Math.max(open, close);
@@ -1174,8 +1168,8 @@ export async function fetchFreeDataset(
           return fetchBarsSingle(tsCode, start, end, false);
         }
         if (api === 'suspend_d') {
-          const bars = await fetchBarsSingle(tsCode, start, end, false);
-          return bars.length === 0 ? [{ ts_code: tsCode, trade_date: end, suspend_timing: null, suspend_type: 'S' }] : [];
+          // suspend=source_explicit_only：免费源无逐股显式停牌接口，缺 bar 不得伪造停牌。
+          return [];
         }
         if (api === 'adj_factor') {
           const bars = await fetchBarsSingle(tsCode, start, end, false);
@@ -1189,11 +1183,8 @@ export async function fetchFreeDataset(
           });
         }
         if (api === 'stk_limit') {
-          const bars = await fetchBarsSingle(tsCode, start, end, false);
-          return bars.map(b => {
-            const limits = computeDefaultLimitPrices(b.pre_close, tsCode, null);
-            return { ts_code: tsCode, trade_date: b.trade_date, up_limit: limits.up_limit, down_limit: limits.down_limit };
-          });
+          // 历史按代码补洞不持久化规则推算涨跌停价，只保留腾讯上游显式限价。
+          return [];
         }
         return [];
       }

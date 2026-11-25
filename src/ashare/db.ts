@@ -233,7 +233,7 @@ function ensureReportRunMode(db: DatabaseSync): void {
 
 /**
  * Refresh bookkeeping. `status` in sync_log/sync_history describes the stored
- * cache (ok / partial / empty); `refresh_status` describes the Tushare request
+ * cache (ok / partial / empty); `refresh_status` describes the upstream request
  * of that attempt (REFRESH_OK / REFRESH_INCOMPLETE / REFRESH_FAILED), so a bad
  * refresh over a good cache is visible instead of hidden by the row count.
  */

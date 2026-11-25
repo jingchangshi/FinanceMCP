@@ -113,7 +113,10 @@ export function inferMarketBoard(code: string, suffix: string): string | null {
   return null;
 }
 
-/** 计算法定/规则默认涨跌停价，仅在上游行情未提供有效 up_limit/down_limit 时兜底使用。 */
+/**
+ * 计算法定/规则默认涨跌停价，仅供运行时下单/风控参考校验；
+ * **严禁持久化写入 `stk_limit` 冒充交易所官方涨跌停价**。
+ */
 export function computeDefaultLimitPrices(
   preClose: number | null,
   tsCode: string,

@@ -74,8 +74,7 @@ function loadIndexBars(db: DatabaseSync, table: 'sw_index_daily' | 'ths_index_da
   tsCode: string, asOf: string, count: number): IndexBar[] {
   if (!hotspotTableExists(db, table) && table !== 'index_daily') return [];
   const pctCol = table === 'index_daily' ? 'pct_chg' : 'pct_change';
-  // Upstream THS `ths_daily` has no turnover-amount field (see THS_DAILY_FIELDS,
-  // docs/tushare-interface-coverage.md). Select NULL instead of a column that
+  // Upstream THS `ths_daily` has no turnover-amount field. Select NULL instead of a column that
   // does not exist: amount_trend then evaluates to null and the composite
   // weight renormalizes over the available factors — the factor is honestly
   // unavailable for THS-sourced sectors, never fabricated from another metric.

@@ -105,7 +105,7 @@ test('1. five ETF basic records map code → name → market → list_date', () 
     assert.equal(x.benchmark, b.benchmark);
     assert.equal(x.status, 'L');
     assert.deepEqual(x.trade_unit, { lot_size: 100, unit: 'share', lot_unit: '手' });
-    assert.equal(x.source, 'tushare.fund_daily');
+    assert.equal(x.source, 'ashare.fund_daily');
     assert.equal(ETF_LOT_SIZE, 100);
     assert.deepEqual(ETF_TRADE_UNIT, x.trade_unit);
     // fee 块：年费率百分比口径，来自 fund_basic 的 m_fee/c_fee。
@@ -113,7 +113,7 @@ test('1. five ETF basic records map code → name → market → list_date', () 
     assert.equal(x.fee.custody_rate_pct, b.c_fee);
     assert.equal(x.fee.total_rate_pct, b.m_fee + b.c_fee);
     assert.equal(x.fee.unit, 'percent_per_year');
-    assert.equal(x.fee.source, 'tushare.fund_basic');
+    assert.equal(x.fee.source, 'ashare.fund_basic');
     assert.equal(x.fee.note, ETF_FEE_NOTE);
   }
 });
@@ -126,7 +126,7 @@ test('1b. fee block survives missing fund_basic with explicit nulls (no fabricat
     custody_rate_pct: null,
     total_rate_pct: null,
     unit: 'percent_per_year',
-    source: 'tushare.fund_basic',
+    source: 'ashare.fund_basic',
     as_of: null,
     note: ETF_FEE_NOTE,
   }, 'fund_basic 缺失时费率显式为 null，块仍在，不编造数字');

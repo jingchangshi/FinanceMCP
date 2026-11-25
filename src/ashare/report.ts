@@ -16,14 +16,14 @@ export { resolveReportPath };
 export const REPORT_SCHEMA_VERSION = 'ashare-report-1.1.0';
 
 export const DATA_SOURCES = [
-  'Tushare Pro trade_cal（交易日历）',
-  'Tushare Pro stock_basic（股票基础信息，行业为当前分类）',
-  'Tushare Pro daily（日线行情，按交易日批量）',
-  'Tushare Pro daily_basic（每日指标：估值/换手/市值）',
-  'Tushare Pro adj_factor（复权因子）',
-  'Tushare Pro stk_limit（涨跌停价）',
-  'Tushare Pro index_daily（核心指数日线）',
-  'Tushare Pro fina_indicator_vip（财务指标，按公告日约束）',
+  '免费多源/本地缓存 trade_cal（交易日历：上证指数 K 线 + 静态法定休市日 + 缓存）',
+  '免费多源/本地缓存 stock_basic（股票基础信息，行业为东财当前分类，退市/暂停状态保留历史缓存）',
+  '免费多源/本地缓存 daily（日线行情：TDX TCP / 东财 / 腾讯）',
+  '免费多源/本地缓存 daily_basic（每日指标：东财/腾讯当前截面 + 历史缓存，非 PIT）',
+  '本地派生/缓存 adj_factor（复权因子：TDX 除权除息 + 链式推导）',
+  '免费多源/本地缓存 stk_limit（涨跌停价：仅存储腾讯上游显式限价，缺失保持缺失）',
+  '免费多源/本地缓存 index_daily（核心指数日线：TDX TCP / 东财 / 腾讯）',
+  '免费多源/本地缓存 fina_indicator（财务指标：东财财务报表，按公告日约束，最新修订口径）',
 ];
 
 const nowCst = () => new Date(Date.now() + 8 * 3600_000).toISOString().replace('Z', '+08:00');
@@ -278,7 +278,7 @@ export function generateReport(db: DatabaseSync, date: string, mode: RunMode = '
       suspended_or_missing: scan.suspended_or_missing,
     },
     sectors: {
-      method: '行业为 Tushare stock_basic 当前行业分类；每行业至少5只扫描股票才纳入。strength 是当日纳入行业之间的横截面复合百分位（0.5×行业成分股20日收益中位数百分位 + 0.3×5日收益中位数百分位 + 0.2×站上MA20比例百分位），用于行业间相对排序，不是市场趋势、全市场宽度或绝对收益指标。amount20_yi 为行业扫描股票各自20日平均成交额之和。',
+      method: '行业为 stock_basic 当前行业分类（东财/本地缓存）；每行业至少5只扫描股票才纳入。strength 是当日纳入行业之间的横截面复合百分位（0.5×行业成分股20日收益中位数百分位 + 0.3×5日收益中位数百分位 + 0.2×站上MA20比例百分位），用于行业间相对排序，不是市场趋势、全市场宽度或绝对收益指标。amount20_yi 为行业扫描股票各自20日平均成交额之和。',
       top: scan.sectors.slice(0, 8).map(sectorView),
       bottom: scan.sectors.slice(-5).reverse().map(sectorView),
       all: scan.sectors.map(sectorView),

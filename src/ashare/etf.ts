@@ -35,7 +35,7 @@ export const ETF_LIQUIDITY_WINDOW = 20;
 export const ETF_DEFAULT_WINDOW_DAYS = 30;
 /** 份额变化估计要求两个份额日相隔不超过该自然日数，否则不视为可比；份额日相对最新行情也按此容差判定是否滞后。 */
 export const ETF_FLOW_MAX_DATE_GAP_DAYS = 45;
-export const ETF_SOURCE = 'tushare.fund_daily';
+export const ETF_SOURCE = 'ashare.fund_daily';
 
 /**
  * 全市场 ETF 日线的最小合理行数。实测 20261016 `fund_daily?trade_date=` 返回 2165 行，
@@ -148,7 +148,7 @@ export interface FundBasicSync {
   permission_denied?: boolean;
 }
 
-/** 上游错误文本是否表示权限/积分不足（callTushare 的受限提示也含这些词）。 */
+/** 上游错误文本是否表示权限/积分不足。 */
 const FUND_PERMISSION_RE = /权限|积分/;
 export function isFundPermissionError(message: string | undefined | null): boolean {
   return !!message && FUND_PERMISSION_RE.test(message);
@@ -390,7 +390,7 @@ export interface FundNavPremium {
 }
 
 /**
- * 同步场内基金单位净值（Tushare `fund_nav`）。
+ * 同步场内基金单位净值（免费源为东方财富历史净值接口；`ann_date` 保持 null）。
  * 首次冷启动（表为空）拉取最近 15 个交易日，常规日频拉取最近 5 个交易日，
  * 并对最新净值仍落后或缺失的跨境 ETF 与重点持仓代码做单页 `callWithRetry(..., { limit: 20 })` 兜底。
  */
@@ -624,13 +624,13 @@ export const ETF_CANDIDATE_HISTORY_DAYS = 120;
 export const ETF_FUND_BASIC_REFRESH_DAYS = 7;
 
 /**
- * 基金费率口径（fee 块）。tushare fund_basic 的 m_fee/c_fee 是年费率百分比
- * （0.5 = 0.5%/年；2026-10-28 与东方财富公开数据对 5 只持仓 ETF 逐只一致）。
+ * 基金费率口径（fee 块）。`fund_basic` 的 `m_fee/c_fee` 是年费率百分比
+ * （0.5 = 0.5%/年）；既有缓存保留已记录费率，新发现基金无免费费率端点时保持 null。
  * 场内二级市场买卖没有申购赎回费，交易成本只有券商佣金——佣金率属于账户侧，
  * 不在本库，不得与基金费率混为一谈，也不得据此声称“费率不明”。
  */
 export const ETF_FEE_NOTE =
-  'm_fee/c_fee 为年费率百分比（0.5 = 0.5%/年），来源 tushare.fund_basic（fee.as_of 为该行刷新时间，'
+  'm_fee/c_fee 为年费率百分比（0.5 = 0.5%/年），来源 ashare.fund_basic（既有缓存冻结保留，新发现基金为 null，fee.as_of 为该行刷新时间，'
   + '基础信息按 ' + ETF_FUND_BASIC_REFRESH_DAYS + ' 个自然日间隔刷新）；场内二级市场买卖无申购赎回费，'
   + '交易成本仅为券商佣金（佣金率属于账户侧数据，不在本库）；管理人/托管人或费率调整由 fund_basic 刷新覆盖。';
 
@@ -654,7 +654,7 @@ function buildFee(basic: any): EtfFee {
     custody_rate_pct: c,
     total_rate_pct: m != null && c != null ? Math.round((m + c) * 10000) / 10000 : null,
     unit: 'percent_per_year',
-    source: 'tushare.fund_basic',
+    source: 'ashare.fund_basic',
     as_of: basic?.updated_at ?? null,
     note: ETF_FEE_NOTE,
   };
@@ -677,10 +677,8 @@ export interface FundHoldingFetch {
 /**
  * 逐只补齐某交易日的基金日线 —— 全市场回答缺失时的**兜底**，不是主路径。
  *
- * 触发场景（真实生产 2026-10-19）：`fund_daily?trade_date=` 返回了 2162 行，但
- * 五只持仓中有两只的上市日期晚于 Tushare 分页的稳定顺序，全市场分页在某些
- * 交易日会漏掉它们。缺失持仓基金是“不可估值”，必须在当天明确处理，而不是
- * 等下一个交易日。
+ * 触发场景（真实生产 2026-10-19）：`fund_daily` 全市场分页在某些交易日会漏掉部分新上市持仓。
+ * 缺失持仓基金是“不可估值”，必须在当天明确处理，而不是等下一个交易日。
  *
  * 安全条件：
  * - 已有合法 bar 且不是 `refresh` 时不发请求（幂等，不重复消耗额度）；
@@ -698,7 +696,7 @@ export async function syncFundDailyCodes(
       .get(code, date) as any;
     const existingValid = !!existing && validateFundBar(existing).valid;
     // 已有合法 bar 就跳过：全市场刷新（含 --refresh）已经覆盖了当天，“逐只兜底”
-    // 只用于补齐全市场回答漏掉/坏掉的持仓，避免重复的 Tushare 调用与重复写入。
+    // 只用于补齐全市场回答漏掉/坏掉的持仓，避免重复的上游调用与重复写入。
     if (existingValid) {
       out.push({ ts_code: code, upstream_rows: 0, written: 0, fetched: false });
       continue;

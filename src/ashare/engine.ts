@@ -18,7 +18,7 @@ export const FACTOR_UNITS = {
   atr_pct: 'ratio (0.04 = 4%)', amount20_yi: 'CNY 100 million', circ_mv_yi: 'CNY 100 million',
   pe_ttm: 'multiple', pb: 'multiple', roe: '%', netprofit_yoy: '% (scoring clips to [-100,100])',
   ocf_to_profit: '% (115.11 = 115.11%; 20 = 20%)', debt_to_assets: '%', eps: 'CNY/share',
-  industry: 'current Tushare stock_basic classification; not historical point-in-time',
+  industry: 'current stock_basic classification (Eastmoney/cache); not historical point-in-time',
 };
 
 export const SCORING_POLICY = {

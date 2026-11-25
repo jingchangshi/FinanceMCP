@@ -83,6 +83,8 @@ const AS_OF_FILTER_NOTE: Partial<Record<ExportDatasetName, string>> = Object.fre
  */
 export const AVAILABILITY_SEMANTICS = Object.freeze({
   price_like: 'trade_date filtering does not establish actual publication or vendor availability time; revisions are unknown',
+  suspend: 'source_explicit_only: only provider-explicit suspension signals are persisted; missing bars or source outages never write suspend_d rows; historical pre-migration cache rows retain legacy semantics',
+  price_limit: 'upstream_explicit_only: only upstream-provided limit prices are persisted; missing limits remain absent and rule-computed limits are never persisted',
   financial_indicator: 'ann_date is a day-level source date; empty ann_date means UNKNOWN and is not PIT-qualified; intraday availability and vendor revisions are unknown',
   data_audit: 'NOT_PIT: end_date filters the audit window, not created_at; the audit may not have existed at as-of',
   identity_classification: 'CURRENT_SNAPSHOT_NOT_PIT: fund_type/market/status have no historical vintage and must not be backfilled',
@@ -460,6 +462,8 @@ function runResearchExportInTransaction(
       name === 'financial_indicator' ? 'financial_indicator'
         : name === 'data_audit' ? 'data_audit'
         : name === 'stock_basic' || name === 'fund_basic' ? 'identity_classification'
+        : name === 'suspend' ? 'suspend'
+        : name === 'price_limit' ? 'price_limit'
         : 'price_like';
     datasetManifest.push({
       dataset: name,

@@ -330,7 +330,7 @@ const unavailableBenchmark = (
   weights, weights_status: null,
   missing_codes: missingCodes,
   backfill: missingCodes.length > 0
-    ? { command: 'finance-ashare etf-sync --start <START> --end <END>', note: '通过既有授权 Tushare 同步路径补齐缺失行情；补齐前保持 UNAVAILABLE，不缩短窗口、不替换成分。' }
+    ? { command: 'finance-ashare etf-sync --start <START> --end <END>', note: '通过免费行情同步路径（finance-ashare etf-sync）补齐缺失行情；补齐前保持 UNAVAILABLE，不缩短窗口、不替换成分。' }
     : null,
   ...extra,
 });
