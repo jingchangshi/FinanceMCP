@@ -23,7 +23,7 @@ async function startServer(env) {
   const port = await reservePort();
   const child = spawn(process.execPath, ['build/httpServer.js'], {
     cwd: process.cwd(),
-    env: { ...process.env, TUSHARE_TOKEN: '', QVERIS_API_KEY: '', TWINGLY_API_KEY: '', NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1', ...env },
+    env: { ...process.env, QVERIS_API_KEY: '', TWINGLY_API_KEY: '', NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let logs = '';
@@ -56,15 +56,15 @@ async function startServer(env) {
   };
 }
 
-test('default profile keeps the original 19 tools and hides the A-share tools', async () => {
+test('default profile keeps the 11 generic tools and hides the A-share tools', async () => {
   const { toolList, getAvailableToolList } = await import('../build/dispatch.js');
-  assert.equal(toolList.length, 19);
+  assert.equal(toolList.length, 11);
   const names = getAvailableToolList().map(t => t.name);
   for (const name of ASHARE_TOOLS) assert.equal(names.includes(name), false);
 });
 
-test('ashare_daily profile exposes only the A-share tools, even with a Tushare credential', async () => {
-  const server = await startServer({ FINANCE_TOOL_PROFILE: 'ashare_daily', TUSHARE_TOKEN: 'server-token' });
+test('ashare_daily profile exposes only the A-share tools, even with a Qveris credential', async () => {
+  const server = await startServer({ FINANCE_TOOL_PROFILE: 'ashare_daily', QVERIS_API_KEY: 'server-qveris-key' });
   try {
     const list = await server.rpc('tools/list', {});
     assert.deepEqual(list.body.result.tools.map(t => t.name), ASHARE_TOOLS);
@@ -90,7 +90,7 @@ test('tool config file and allowlist narrow the exposed set', async () => {
   }
 });
 
-test('MCP_AUTH_TOKEN authenticates clients and the bearer is never used as a Tushare token', async () => {
+test('MCP_AUTH_TOKEN authenticates clients and does not expose deleted Tushare tools', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ashare-http-'));
   const server = await startServer({
     FINANCE_TOOL_PROFILE: 'full',
@@ -106,7 +106,6 @@ test('MCP_AUTH_TOKEN authenticates clients and the bearer is never used as a Tus
     const ok = await server.rpc('tools/list', {}, { Authorization: 'Bearer client-secret' });
     assert.equal(ok.status, 200);
     const names = ok.body.result.tools.map(t => t.name);
-    // No Tushare credential anywhere: if the bearer leaked into the Tushare scope, fund_data would appear.
     assert.equal(names.includes('fund_data'), false);
     assert.ok(ASHARE_TOOLS.every(n => names.includes(n)));
     assert.doesNotMatch(server.logs(), /Found in Authorization Bearer header/);
@@ -118,18 +117,9 @@ test('MCP_AUTH_TOKEN authenticates clients and the bearer is never used as a Tus
 test('request credentials can be ignored entirely', async () => {
   const server = await startServer({ MCP_ACCEPT_REQUEST_CREDENTIALS: '0' });
   try {
-    const list = await server.rpc('tools/list', {}, { 'X-Tushare-Token': 'request-token', Authorization: 'Bearer request-token' });
-    assert.equal(list.body.result.tools.some(t => t.name === 'fund_data'), false);
-  } finally {
-    await server.stop();
-  }
-});
-
-test('legacy Bearer-as-Tushare behaviour is unchanged when client auth is not configured', async () => {
-  const server = await startServer({});
-  try {
-    const list = await server.rpc('tools/list', {}, { Authorization: 'Bearer request-token' });
-    assert.equal(list.body.result.tools.some(t => t.name === 'fund_data'), true);
+    const list = await server.rpc('tools/list', {}, { 'X-Qveris-Api-Key': 'request-key', 'X-Twingly-Api-Key': 'request-twingly', Authorization: 'Bearer request-token' });
+    assert.equal(list.body.result.tools.some(t => t.name === 'macro_econ'), false);
+    assert.equal(list.body.result.tools.some(t => t.name === 'hot_news_7x24'), false);
   } finally {
     await server.stop();
   }

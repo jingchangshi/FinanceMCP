@@ -7,7 +7,7 @@ import test from 'node:test';
 const dir = mkdtempSync(join(tmpdir(), 'ashare-test-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'test.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
 
 const { openAshareDb, upsertRows } = await import('../build/ashare/db.js');
 const { fundamentalsAsOf } = await import('../build/ashare/fundamentals.js');

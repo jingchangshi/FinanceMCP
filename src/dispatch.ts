@@ -5,18 +5,10 @@ import { stockDataMinutes } from './tools/stockDataMinutes.js';
 import { indexData } from './tools/indexData.js';
 import { macroEcon } from './tools/macroEcon.js';
 import { companyPerformance } from './tools/companyPerformance.js';
-import { fundData } from './tools/fundData.js';
-import { fundManagerByName, runFundManagerByName } from './tools/fundManagerByName.js';
-import { convertibleBond } from './tools/convertibleBond.js';
-import { blockTrade } from './tools/blockTrade.js';
-import { moneyFlow } from './tools/moneyFlow.js';
-import { marginTrade } from './tools/marginTrade.js';
 import { companyPerformance_hk } from './tools/companyPerformance_hk.js';
 import { companyPerformance_us } from './tools/companyPerformance_us.js';
 import { csiIndexConstituents } from './tools/csiIndexConstituents.js';
-import { dragonTigerInst } from './tools/dragonTigerInst.js';
 import { hotNews } from './tools/hotNews.js';
-import { futuresData } from './tools/futuresData.js';
 import { routeToolCall } from './utils/dataSourceRouter.js';
 import { isToolSourceAvailable, ToolSource } from './toolAvailability.js';
 import { getConfiguredCredentialSources, getSourcePriority } from './config.js';
@@ -34,18 +26,10 @@ export const toolList = [
   { name: indexData.name, description: indexData.description, inputSchema: indexData.parameters },
   { name: macroEcon.name, description: macroEcon.description, inputSchema: macroEcon.parameters },
   { name: companyPerformance.name, description: companyPerformance.description, inputSchema: companyPerformance.parameters },
-  { name: fundData.name, description: fundData.description, inputSchema: fundData.parameters },
-  { name: fundManagerByName.name, description: fundManagerByName.description, inputSchema: (fundManagerByName as any).inputSchema },
-  { name: convertibleBond.name, description: convertibleBond.description, inputSchema: convertibleBond.parameters },
-  { name: blockTrade.name, description: blockTrade.description, inputSchema: blockTrade.parameters },
-  { name: moneyFlow.name, description: moneyFlow.description, inputSchema: moneyFlow.parameters },
-  { name: marginTrade.name, description: marginTrade.description, inputSchema: marginTrade.parameters },
   { name: companyPerformance_hk.name, description: companyPerformance_hk.description, inputSchema: companyPerformance_hk.parameters },
   { name: companyPerformance_us.name, description: companyPerformance_us.description, inputSchema: companyPerformance_us.parameters },
   { name: csiIndexConstituents.name, description: csiIndexConstituents.description, inputSchema: csiIndexConstituents.parameters },
-  { name: dragonTigerInst.name, description: dragonTigerInst.description, inputSchema: dragonTigerInst.parameters },
   { name: hotNews.name, description: hotNews.description, inputSchema: hotNews.parameters },
-  { name: futuresData.name, description: futuresData.description, inputSchema: futuresData.parameters },
 ];
 
 // Keep this mapping explicit: it is the contract used by tools/list and by the
@@ -53,28 +37,19 @@ export const toolList = [
 const TOOL_SOURCES: Record<string, readonly ToolSource[]> = {
   current_timestamp: ['local'],
   finance_news: ['twingly', 'qveris', 'web'],
-  stock_data: ['tushare', 'qveris', 'binance'],
-  stock_data_minutes: ['tushare', 'qveris', 'binance'],
-  index_data: ['tushare', 'qveris'],
-  macro_econ: ['tushare', 'qveris'],
-  company_performance: ['tushare', 'qveris'],
-  fund_data: ['tushare'],
-  fund_manager_by_name: ['tushare'],
-  convertible_bond: ['tushare'],
-  block_trade: ['tushare'],
-  money_flow: ['tushare'],
-  margin_trade: ['tushare'],
-  company_performance_hk: ['tushare', 'qveris'],
-  company_performance_us: ['tushare', 'qveris'],
-  csi_index_constituents: ['tushare', 'qveris'],
-  dragon_tiger_inst: ['tushare'],
-  hot_news_7x24: ['tushare', 'twingly', 'qveris'],
-  futures_data: ['tushare'],
+  stock_data: ['qveris', 'binance'],
+  stock_data_minutes: ['qveris', 'binance'],
+  index_data: ['qveris'],
+  macro_econ: ['qveris'],
+  company_performance: ['qveris'],
+  company_performance_hk: ['qveris'],
+  company_performance_us: ['qveris'],
+  csi_index_constituents: ['qveris'],
+  hot_news_7x24: ['twingly', 'qveris'],
 };
 
 function toolSources(name: string): readonly ToolSource[] {
-  // New tools default to a credential-backed source until explicitly mapped.
-  return TOOL_SOURCES[name] ?? ['tushare'];
+  return TOOL_SOURCES[name] ?? [];
 }
 
 function primaryCredentialSource(name: string): ToolSource | undefined {
@@ -126,7 +101,7 @@ export function isToolAvailable(name: string): boolean {
     && isToolSourceAvailable(toolSources(name));
 }
 
-export function getAvailableToolList() {
+export function getAvailableToolList(): any[] {
   // A-share tools read the local cache only, so request credentials do not scope them.
   const ashareTools = ashareToolDefinitions.filter(tool => isToolExposed(tool.name));
   // 账户工具**永不**进入公网 tools/list：即使 ASHARE_PORTFOLIO_ENABLED=1 也只在
@@ -206,54 +181,6 @@ async function dispatchNativeTool(name: string, args: Record<string, any>): Prom
         end_date: args?.end_date ? String(args.end_date) : undefined,
         period: args?.period ? String(args.period) : undefined,
       });
-    case 'fund_data':
-      return await fundData.run({
-        ts_code: args?.ts_code ? String(args.ts_code) : undefined,
-        data_type: String(args?.data_type),
-        start_date: args?.start_date ? String(args.start_date) : undefined,
-        end_date: args?.end_date ? String(args.end_date) : undefined,
-        period: args?.period ? String(args.period) : undefined,
-        trade_date: args?.trade_date ? String(args.trade_date) : undefined,
-        name: args?.name ? String(args.name) : undefined,
-        year: args?.year ? String(args.year) : undefined,
-        quarter: args?.quarter ? String(args.quarter) : undefined,
-      });
-    case 'fund_manager_by_name':
-      return await runFundManagerByName({
-        name: String(args?.name),
-        ann_date: args?.ann_date ? String(args.ann_date) : undefined,
-      });
-    case 'convertible_bond':
-      return await convertibleBond.run({
-        ts_code: args?.ts_code ? String(args.ts_code) : undefined,
-        data_type: String(args?.data_type),
-        start_date: args?.start_date ? String(args.start_date) : undefined,
-        end_date: args?.end_date ? String(args.end_date) : undefined,
-        period: args?.period ? String(args.period) : undefined,
-      });
-    case 'block_trade':
-      return await blockTrade.run({
-        code: args?.code ? String(args.code) : undefined,
-        start_date: String(args?.start_date),
-        end_date: String(args?.end_date),
-      });
-    case 'money_flow':
-      return await moneyFlow.run({
-        query_type: args?.query_type ? String(args.query_type) : undefined,
-        ts_code: args?.ts_code ? String(args.ts_code) : undefined,
-        start_date: args?.start_date ? String(args.start_date) : undefined,
-        end_date: args?.end_date ? String(args.end_date) : undefined,
-        content_type: args?.content_type ? String(args.content_type) : undefined,
-        trade_date: args?.trade_date ? String(args.trade_date) : undefined,
-      });
-    case 'margin_trade':
-      return await marginTrade.run({
-        data_type: String(args?.data_type),
-        ts_code: args?.ts_code ? String(args.ts_code) : undefined,
-        start_date: String(args?.start_date),
-        end_date: args?.end_date ? String(args.end_date) : undefined,
-        exchange: args?.exchange ? String(args.exchange) : undefined,
-      });
     case 'company_performance_hk':
       return await companyPerformance_hk.run({
         ts_code: String(args?.ts_code),
@@ -277,19 +204,8 @@ async function dispatchNativeTool(name: string, args: Record<string, any>): Prom
         start_date: String(args?.start_date),
         end_date: String(args?.end_date),
       });
-    case 'dragon_tiger_inst':
-      return await dragonTigerInst.run({
-        trade_date: String(args?.trade_date),
-        ts_code: args?.ts_code ? String(args.ts_code) : undefined,
-      });
     case 'hot_news_7x24':
-      return await hotNews.run({});
-    case 'futures_data':
-      return await futuresData.run({
-        trade_date: String(args?.trade_date),
-        symbol: args?.symbol ? String(args.symbol) : undefined,
-        broker: args?.broker ? String(args.broker) : undefined,
-      });
+      return await hotNews.run({ limit: typeof args?.limit === 'number' ? args.limit : undefined });
     default:
       throw new Error(`Unknown tool: ${name}`);
   }

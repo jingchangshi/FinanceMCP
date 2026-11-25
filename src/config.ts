@@ -6,14 +6,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // 2. 在Smithery部署时，从配置文件中加载
 dotenv.config();
 
-export const DATA_SOURCE_IDS = ['tushare', 'twingly', 'qveris', 'binance'] as const;
+export const DATA_SOURCE_IDS = ['twingly', 'qveris', 'binance'] as const;
 export type DataSourceId = typeof DATA_SOURCE_IDS[number];
 
-export const DEFAULT_SOURCE_PRIORITY: DataSourceId[] = ['tushare', 'twingly', 'qveris', 'binance'];
+export const DEFAULT_SOURCE_PRIORITY: DataSourceId[] = ['twingly', 'qveris', 'binance'];
 
 // 每请求上下文：用于透传用户在 Header 中提交的凭证和数据源优先级。
 type RequestContext = {
-  tushareToken?: string;
   coingeckoApiKey?: string;
   coingeckoProApiKey?: string;
   coingeckoDemoApiKey?: string;
@@ -25,8 +24,7 @@ const requestContext = new AsyncLocalStorage<RequestContext>();
 
 function hasRequestCredentialScope(context?: RequestContext): boolean {
   return Boolean(
-    context?.tushareToken?.trim()
-    || context?.qverisApiKey?.trim()
+    context?.qverisApiKey?.trim()
     || context?.twinglyApiKey?.trim()
     || context?.coingeckoApiKey?.trim()
     || context?.coingeckoProApiKey?.trim()
@@ -45,7 +43,6 @@ function scopedCredential(
 
 export function runWithRequestContext<T>(ctx: Partial<RequestContext>, fn: () => Promise<T>): Promise<T> {
   return requestContext.run({
-    tushareToken: ctx.tushareToken,
     coingeckoApiKey: ctx.coingeckoApiKey,
     coingeckoProApiKey: ctx.coingeckoProApiKey,
     coingeckoDemoApiKey: ctx.coingeckoDemoApiKey,
@@ -55,11 +52,7 @@ export function runWithRequestContext<T>(ctx: Partial<RequestContext>, fn: () =>
   }, fn);
 }
 
-export function getRequestToken(): string | undefined {
-  return scopedCredential(requestContext.getStore()?.tushareToken, process.env.TUSHARE_TOKEN);
-}
-
-export type CredentialSource = Extract<DataSourceId, 'tushare' | 'qveris' | 'twingly'>;
+export type CredentialSource = Extract<DataSourceId, 'qveris' | 'twingly'>;
 
 /**
  * Resolve credential-backed sources for the current request. Explicit request
@@ -69,13 +62,11 @@ export type CredentialSource = Extract<DataSourceId, 'tushare' | 'qveris' | 'twi
 export function getConfiguredCredentialSources(): CredentialSource[] {
   const context = requestContext.getStore();
   const requestSources: CredentialSource[] = [];
-  if (context?.tushareToken?.trim()) requestSources.push('tushare');
   if (context?.qverisApiKey?.trim()) requestSources.push('qveris');
   if (context?.twinglyApiKey?.trim()) requestSources.push('twingly');
   if (requestSources.length > 0) return requestSources;
 
   const configuredSources: CredentialSource[] = [];
-  if (process.env.TUSHARE_TOKEN?.trim()) configuredSources.push('tushare');
   if (process.env.QVERIS_API_KEY?.trim()) configuredSources.push('qveris');
   if (process.env.TWINGLY_API_KEY?.trim()) configuredSources.push('twingly');
   return configuredSources;
@@ -116,26 +107,6 @@ export function getSourcePriority(): DataSourceId[] {
   return requestContext.getStore()?.sourcePriority
     ?? parseSourcePriority(process.env.FINANCE_SOURCE_PRIORITY);
 }
-
-function resolveApiToken(): string | undefined {
-  return getRequestToken();
-}
-
-// 统一配置对象：API_TOKEN 改为 getter，动态读取每请求 Token
-export const TUSHARE_CONFIG = {
-  /**
-   * Tushare API Token（优先使用请求头透传的 Token）
-   */
-  get API_TOKEN(): string {
-    return resolveApiToken() ?? "";
-  },
-
-  /** Tushare 服务器地址 */
-  API_URL: "https://api.tushare.pro",
-
-  /** 超时 ms */
-  TIMEOUT: 30000,
-};
 
 export const COINGECKO_CONFIG = {
   /** 优先使用请求头透传的 Pro Key；否则回退普通 Key；都没有则为空 */

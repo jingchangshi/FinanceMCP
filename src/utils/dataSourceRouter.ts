@@ -2,7 +2,6 @@ import {
   DataSourceId,
   getSourcePriority,
   QVERIS_CONFIG,
-  TUSHARE_CONFIG,
   TWINGLY_CONFIG,
 } from '../config.js';
 import {
@@ -26,7 +25,6 @@ type ToolContent = { type?: string; text?: string; [key: string]: unknown };
 type ToolResult = { content?: ToolContent[]; [key: string]: unknown };
 
 const SOURCE_LABELS: Record<RoutedSource, string> = {
-  tushare: 'Tushare',
   twingly: 'Twingly',
   qveris: 'Qveris',
   binance: 'Binance',
@@ -34,7 +32,7 @@ const SOURCE_LABELS: Record<RoutedSource, string> = {
   local: 'FinanceMCP 本地计算',
 };
 
-function nativeSourceForTool(name: string, args: Record<string, unknown>): RoutedSource {
+function nativeSourceForTool(name: string, args: Record<string, unknown>): RoutedSource | null {
   if (name === 'current_timestamp') return 'local';
   if (name === 'finance_news') return 'web';
   if (
@@ -43,24 +41,25 @@ function nativeSourceForTool(name: string, args: Record<string, unknown>): Route
   ) {
     return 'binance';
   }
-  return 'tushare';
+  return null;
 }
 
 function orderedSources(
-  nativeSource: RoutedSource,
+  nativeSource: RoutedSource | null,
   supportsQveris: boolean,
   supportsTwingly: boolean,
 ): RoutedSource[] {
-  const supported = new Set<RoutedSource>([nativeSource]);
+  const supported = new Set<RoutedSource>(nativeSource ? [nativeSource] : []);
   if (supportsQveris) supported.add('qveris');
   if (supportsTwingly) supported.add('twingly');
 
   const requested = getSourcePriority().filter(source => supported.has(source));
-  return [...new Set<RoutedSource>([...requested, nativeSource])];
+  return nativeSource
+    ? [...new Set<RoutedSource>([...requested, nativeSource])]
+    : requested;
 }
 
 function hasCredential(source: RoutedSource): boolean {
-  if (source === 'tushare') return Boolean(TUSHARE_CONFIG.API_TOKEN);
   if (source === 'qveris') return Boolean(QVERIS_CONFIG.API_KEY);
   if (source === 'twingly') return Boolean(TWINGLY_CONFIG.API_KEY);
   return true;

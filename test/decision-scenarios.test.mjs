@@ -60,7 +60,7 @@ function fixture({ confirmed = true, cash = 200000, positions = null } = {}) {
       fund_type: ts_code === '511010.SH' ? '债券型' : '股票型',
       invest_type: '被动指数型',
       benchmark: ts_code === '511010.SH' ? '国债指数' : '合成指数',
-      // 场内基金一律 market='E'（tushare 口径与 instrument.ts resolveInstrument 一致；
+      // 场内基金一律 market='E'（与 instrument.ts resolveInstrument 一致；
       // 按交易所后缀给 .SH 写 'S' 会让 510300/516080/511010 解析不出 ETF 身份）。
       status: 'L', market: 'E',
     })));

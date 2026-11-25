@@ -227,7 +227,7 @@ async function startServer(env = {}) {
   const port = await reservePort();
   const child = spawn(process.execPath, ['build/httpServer.js'], {
     cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, TUSHARE_TOKEN: '', QVERIS_API_KEY: '', TWINGLY_API_KEY: '', NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1',
+    env: { ...process.env, QVERIS_API_KEY: '', TWINGLY_API_KEY: '', NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1',
       ASHARE_DATA_DIR: dir, ASHARE_DB_PATH: MARKET_DB, ASHARE_PORTFOLIO_DB_PATH: PORTFOLIO_DB, ASHARE_PRIVATE_PORTFOLIO_TOKEN: TOKEN, ASHARE_PRIVATE_RATE_LIMIT: '1000', ...env },
   });
   child.stdout.on('data', () => {}); child.stderr.on('data', () => {});

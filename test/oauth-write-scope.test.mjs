@@ -31,7 +31,7 @@ async function start(extraEnv) {
   const child = spawn(process.execPath, ['build/httpServer.js'], {
     cwd: ROOT,
     env: {
-      ...process.env, TUSHARE_TOKEN: '', QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
+      ...process.env, QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
       NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1',
       MCP_ALLOWED_HOSTS: '127.0.0.1,localhost', FINANCE_TOOL_PROFILE: 'ashare_daily',
       ASHARE_DATA_DIR: dir, ASHARE_DB_PATH: join(dir, 'market.sqlite'), ASHARE_PORTFOLIO_DB_PATH: join(dir, 'portfolio.sqlite'),

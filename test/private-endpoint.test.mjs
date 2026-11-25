@@ -67,7 +67,7 @@ async function startServer(env) {
     cwd: ROOT,
     env: {
       ...process.env,
-      TUSHARE_TOKEN: '', QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
+      QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
       NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1',
       ASHARE_DATA_DIR: dir, ASHARE_DB_PATH: MARKET_DB, ASHARE_PORTFOLIO_DB_PATH: PORTFOLIO_DB,
       ...env,

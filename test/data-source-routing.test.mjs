@@ -41,39 +41,36 @@ async function waitForHealth(port) {
   throw new Error('HTTP test server did not become healthy');
 }
 
-test('keeps the MCP tool surface unchanged', () => {
-  assert.equal(toolList.length, 19);
+test('keeps the free MCP tool surface cleanly narrowed to 11 tools', () => {
+  assert.equal(toolList.length, 11);
   assert.equal(toolList.some(tool => tool.name.startsWith('qveris')), false);
   assert.equal(toolList.some(tool => 'data_source' in (tool.inputSchema?.properties ?? {})), false);
 });
 
 test('normalizes source priority and appends default fallbacks', () => {
-  assert.deepEqual(DEFAULT_SOURCE_PRIORITY, ['tushare', 'twingly', 'qveris', 'binance']);
-  assert.deepEqual(parseSourcePriority('qveris > tushare'), ['qveris', 'tushare', 'twingly', 'binance']);
-  assert.deepEqual(parseSourcePriority('BINANCE,unknown,binance'), ['binance', 'tushare', 'twingly', 'qveris']);
+  assert.deepEqual(DEFAULT_SOURCE_PRIORITY, ['twingly', 'qveris', 'binance']);
+  assert.deepEqual(parseSourcePriority('qveris > twingly'), ['qveris', 'twingly', 'binance']);
+  assert.deepEqual(parseSourcePriority('BINANCE,unknown,binance'), ['binance', 'twingly', 'qveris']);
 });
 
-test('uses Tushare first by default when both credentials exist', async () => {
+test('routes Binance crypto native source cleanly', async () => {
   let nativeCalls = 0;
   const result = await runWithRequestContext({
-    tushareToken: 'ts-test',
-    qverisApiKey: 'qv-test',
-  }, () => routeToolCall('company_performance_us', {
-    ts_code: 'AAPL',
-    data_type: 'income',
-    start_date: '20230101',
-    end_date: '20231231',
+    sourcePriority: ['qveris', 'binance', 'twingly'],
+  }, () => routeToolCall('stock_data', {
+    code: 'BTCUSDT',
+    market_type: 'crypto',
   }, async () => {
     nativeCalls += 1;
-    return { content: [{ type: 'text', text: '# native result' }] };
+    return { content: [{ type: 'text', text: '# binance result' }] };
   }));
 
   assert.equal(nativeCalls, 1);
-  assert.match(textOf(result), /^数据来源: Tushare/m);
+  assert.match(textOf(result), /^数据来源: Binance/m);
   assert.doesNotMatch(textOf(result), /数据源路由:/);
 });
 
-test('routes through Qveris and falls back to Tushare', async () => {
+test('routes through Qveris and never falls back to removed Tushare', async () => {
   const requests = [];
   let mode = 'success';
   const mock = http.createServer(async (request, response) => {
@@ -163,9 +160,8 @@ test('routes through Qveris and falls back to Tushare', async () => {
       period: '20231231',
     };
     const qverisResult = await runWithRequestContext({
-      tushareToken: 'ts-test',
       qverisApiKey: 'qv-test',
-      sourcePriority: ['qveris', 'tushare', 'binance'],
+      sourcePriority: ['qveris', 'twingly', 'binance'],
     }, () => routeToolCall('company_performance_us', args, async () => {
       nativeCalls += 1;
       return { content: [{ type: 'text', text: '# native result' }] };
@@ -184,33 +180,31 @@ test('routes through Qveris and falls back to Tushare', async () => {
 
     mode = 'empty';
     const fallbackResult = await runWithRequestContext({
-      tushareToken: 'ts-test',
       qverisApiKey: 'qv-test',
-      sourcePriority: ['qveris', 'tushare', 'binance'],
+      sourcePriority: ['qveris', 'twingly', 'binance'],
     }, () => routeToolCall('company_performance_us', args, async () => {
       nativeCalls += 1;
-      return { content: [{ type: 'text', text: '# fallback result' }] };
+      return { content: [{ type: 'text', text: '# unexpected fallback' }] };
     }));
 
-    assert.equal(nativeCalls, 1);
-    assert.match(textOf(fallbackResult), /^数据来源: Tushare/m);
-    assert.match(textOf(fallbackResult), /Qveris（接口未覆盖） → Tushare（成功）/);
+    assert.equal(nativeCalls, 0);
+    assert.match(textOf(fallbackResult), /^数据来源: 无/m);
+    assert.match(textOf(fallbackResult), /Qveris（接口未覆盖）/);
 
     mode = 'call-fail';
     const callsBeforeFailure = requests.filter(item => item.url?.startsWith('/tools/execute')).length;
     const failedCallFallback = await runWithRequestContext({
-      tushareToken: 'ts-test',
       qverisApiKey: 'qv-test',
-      sourcePriority: ['qveris', 'tushare', 'binance'],
+      sourcePriority: ['qveris', 'twingly', 'binance'],
     }, () => routeToolCall('company_performance_us', args, async () => {
       nativeCalls += 1;
-      return { content: [{ type: 'text', text: '# fallback after failed call' }] };
+      return { content: [{ type: 'text', text: '# unexpected fallback' }] };
     }));
     const callsAfterFailure = requests.filter(item => item.url?.startsWith('/tools/execute')).length;
 
-    assert.equal(nativeCalls, 2);
+    assert.equal(nativeCalls, 0);
     assert.equal(callsAfterFailure - callsBeforeFailure, 1);
-    assert.match(textOf(failedCallFallback), /^数据来源: Tushare/m);
+    assert.match(textOf(failedCallFallback), /^数据来源: 无/m);
 
     mode = 'success';
     const financePort = await reservePort();
@@ -221,7 +215,6 @@ test('routes through Qveris and falls back to Tushare', async () => {
         ...process.env,
         NODE_ENV: 'production',
         PORT: String(financePort),
-        TUSHARE_TOKEN: '',
         QVERIS_API_KEY: '',
         TWINGLY_API_KEY: '',
         QVERIS_BASE_URL: `http://127.0.0.1:${port}`,
@@ -239,7 +232,7 @@ test('routes through Qveris and falls back to Tushare', async () => {
         headers: {
           'Content-Type': 'application/json',
           'X-Qveris-Api-Key': requestKey,
-          'X-Finance-Source-Priority': 'qveris,tushare,binance',
+          'X-Finance-Source-Priority': 'qveris,twingly,binance',
         },
         body: JSON.stringify({
           jsonrpc: '2.0',
