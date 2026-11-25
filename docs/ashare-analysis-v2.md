@@ -30,7 +30,7 @@
 | amount20_yi、circ_mv_yi | 亿元 |
 | pe_ttm、pb | 倍数 |
 | roe、netprofit_yoy、ocf_to_profit、debt_to_assets | 百分数，115.11 表示 115.11% |
-| industry | 当前 Tushare stock_basic 分类，不是历史时点行业 |
+| industry | 当前 `stock_basic`（东财/本地缓存）分类，不是历史时点行业 |
 
 技术收益窗口是最近有行情的 K 线数量，遇停牌或缺口可能跨越更多交易日；历史评价的持有期则严格按交易所日历计数。
 

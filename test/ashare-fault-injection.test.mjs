@@ -24,7 +24,7 @@ import { join } from 'node:path';
  *    `ETF_NOT_INITIALIZED` in its `errors` array without throwing. The question
  *    is whether that returned error is *reported* or merely swallowed — an entry
  *    that catches and says nothing has converted a visible outage into silence.
- * 2. **The upstream API fails.** Every Tushare call for a day returns an error.
+ * 2. **The upstream API fails.** Every free-source call for a day returns an error.
  *    The stock report must still be produced, with the failure named in it.
  * 3. **The ETF cache cannot be opened at all.** A market cache that exists but
  *    is not a database. `openMarketCache` returns null rather than throwing, and
@@ -141,7 +141,7 @@ const helpers = (args) => {
  * This is the only fixture in the suite that reaches the isolation wrapper's
  * `catch`, and finding it took some work. An uninitialized schema does not throw
  * — `syncEtfForDaily` pushes `ETF_NOT_INITIALIZED` into `errors` and returns
- * normally. A Tushare failure does not throw either: every API call is wrapped in
+ * normally. A free-source failure does not throw either: every API call is wrapped in
  * its own `try`, and `fetchAll` converts "no data" into an empty result. The
  * dynamic-universe history loop reads `fund_sync_log` outside a `try`, but the
  * `count >= 60` guard short-circuits before it on a fixture with few bars.
@@ -231,7 +231,7 @@ test('an uninitialized ETF cache is reported in the daily output, not swallowed'
 });
 
 test('an upstream API failure is reported in the daily output, and the report still runs', async (t) => {
-  // Every Tushare call fails. What must not happen is a silent success: if the
+  // Every free-source call fails. What must not happen is a silent success: if the
   // daily run returns true while saying nothing about the upstream, the operator
   // has a green run over a cache that stopped updating. A total upstream failure
   // may legitimately abort — that is a *named* failure, not a silent one.

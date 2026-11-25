@@ -6,7 +6,7 @@
   <h1>FinanceMCP <sub>Synapse</sub></h1>
 
   <p><strong>Unified, routable, and attributable multi-market financial data for AI agents</strong></p>
-  <p>19 stable MCP tools · Tushare / Qveris / Binance · stdio + Streamable HTTP</p>
+  <p>11 core MCP tools · Free A-Share / Qveris / Twingly / Binance · stdio + Streamable HTTP</p>
 
   <p>
     <a href="https://www.npmjs.com/package/finance-mcp"><img src="https://img.shields.io/npm/v/finance-mcp?style=flat-square&logo=npm&color=cb3837" alt="npm version" /></a>
@@ -37,7 +37,7 @@
 > **Service status: the public hosted service is temporarily unavailable.** The former public domain has expired, so there is currently no official live demo or hosted `/mcp` endpoint. A replacement domain may be introduced later and will be announced in this repository. The npm package, local stdio usage, and self-hosted deployments are unaffected.
 
 > [!IMPORTANT]
-> **v4.11.2** hardens Twingly news routing with input and request-size validation, safer provider fallback, dynamic tool schemas, and additional sensitive-header redaction. The existing 19 tool names and primary integration patterns remain unchanged.
+> **v4.11.2** hardens Twingly news routing with input and request-size validation, safer provider fallback, dynamic tool schemas, and additional sensitive-header redaction; Tushare has been removed, retaining 11 core MCP tools (plus 14 read-only local A-share cache tools enabled via `FINANCE_MCP_TOOL_PROFILE=ashare` or `full`, with free multi-source Eastmoney/Tencent/TDX market data for A-share daily pipelines).
 
 > [!NOTE]
 > To share model prompt/KV-cache routing and conversation lineage across Trae, Cursor, Claude Code, and Codex, optionally run the standalone [`finance-cache-gateway`](./docs/cache-gateway.md). It uses a separate process, port, and configuration; existing MCP tools, stdio, and `/mcp` behavior remain unchanged when it is not enabled.
@@ -49,7 +49,7 @@ FinanceMCP has been integrated with [MarkiNote](https://github.com/wink-wink-win
 🌐 **Live Demo: temporarily unavailable; the domain may change later**
 📝 **MarkiNote: [https://github.com/wink-wink-wink555/MarkiNote](https://github.com/wink-wink-wink555/MarkiNote)**
 
-Within the FinNote architecture, FinanceMCP acts as the core **financial data and MCP tool service layer**. Built with Node.js, Express, and the Model Context Protocol (MCP) SDK, it currently exposes 19 stable MCP tools that provide AI agents with access to stocks, funds, bonds, macroeconomic data, financial news, technical indicators, and multi-market financial data. It supports both local stdio and remote Streamable HTTP transports.
+Within the FinNote architecture, FinanceMCP acts as the core **financial data and MCP tool service layer**. Built with Node.js, Express, and the Model Context Protocol (MCP) SDK, it exposes 11 core MCP tools (plus optional local A-share cache tools) that provide AI agents with access to stocks, indices, macroeconomic data, financial statements, financial news, technical indicators, and multi-market financial data. It supports both local stdio and remote Streamable HTTP transports.
 
 MarkiNote serves as the upper-layer **AI Agent-powered document and knowledge management system**, handling natural-language interaction, AI analysis presentation, Markdown document generation, editing, and long-term knowledge preservation. In the FinNote use case, MarkiNote accesses FinanceMCP through the HTTP / MCP service workflow, allowing real-time financial data capabilities to participate directly in the agent's reasoning and document-generation process.
 
@@ -63,12 +63,12 @@ FinanceMCP can therefore be used not only as a standalone financial-data MCP ser
 
 | | Capability | Description |
 |---|---|---|
-| 🔌 | **Non-invasive extension** | Keeps the existing 19 tool names and schemas; routing happens in request context |
-| 🧭 | **Intelligent routing** | Supports Tushare, optional Qveris, Binance, and public news sources |
+| 🔌 | **Non-invasive extension** | Keeps core tool names and schemas; routing happens in request context |
+| 🧭 | **Intelligent routing** | Supports optional Qveris, Twingly, Binance, public news sources, and free A-share local cache |
 | 🔁 | **Automatic fallback** | Continues by priority when a preferred source is unsupported, unavailable, rate-limited, or times out |
 | 🏷️ | **Transparent attribution** | Every result identifies its source and includes the fallback route when one occurred |
 | 🛡️ | **Request isolation** | HTTP credentials are isolated with AsyncLocalStorage and redacted from logs |
-| 📈 | **Multi-market coverage** | China, Hong Kong, US, indices, funds, bonds, futures, FX, macro, and crypto |
+| 📈 | **Multi-market coverage** | China A-share free cache & local analytics, Hong Kong, US, indices, macro, and crypto |
 | 🧮 | **Indicator engine** | MACD, RSI, KDJ, BOLL, and MA with automatic history prefetch |
 | 🚀 | **Two transports** | Local stdio and remote Streamable HTTP |
 
@@ -78,36 +78,34 @@ FinanceMCP can therefore be used not only as a standalone financial-data MCP ser
 
 ```mermaid
 flowchart LR
-    C[AI / MCP Client] -->|Existing 19 tools| R{FinanceMCP Router}
-    R -->|Default first| T[Tushare]
+    C[AI / MCP Client] -->|11 core tools| R{FinanceMCP Router}
     R -->|Global news| G[Twingly]
     R -->|Optional extension| Q[Qveris]
     R -->|Crypto| B[Binance]
     R -->|News / Time| L[Public sources and local compute]
-    Q -. Unsupported / timeout / rate limit .-> T
-    T -. Not applicable .-> B
-    T & G & Q & B & L --> O[Attributed MCP result]
+    G -. Unsupported / timeout / rate limit .-> Q
+    Q -. Not applicable .-> B
+    G & Q & B & L --> O[Attributed MCP result]
 ```
 
 ### HTTP headers
 
 ```http
-X-Tushare-Token: YOUR_TUSHARE_TOKEN
 X-Qveris-Api-Key: YOUR_QVERIS_API_KEY
 X-Twingly-Api-Key: YOUR_TWINGLY_API_KEY
-X-Finance-Source-Priority: twingly,qveris,tushare,binance
+X-Finance-Source-Priority: twingly,qveris,binance
 ```
 
 Default priority:
 
 ```text
-tushare,twingly,qveris,binance
+twingly,qveris,binance
 ```
 
 Routing behavior:
 
 1. With one credential, FinanceMCP prefers the matching provider.
-2. With multiple credentials and no custom order, Tushare remains first; news tools then try Twingly before Qveris and public sources.
+2. With multiple credentials and no custom order, news tools try Twingly before Qveris and public sources; market and financial tools route to Qveris when `X-Qveris-Api-Key` / `QVERIS_API_KEY` is provided.
 3. `X-Finance-Source-Priority` changes the order per request; unknown values are ignored, duplicates removed, and omitted providers appended in default order.
 4. Unsupported or failed preferred sources fall back automatically. A valid empty result does not trigger duplicate upstream calls.
 5. Qveris runs **Discover → Inspect → Probe → Call**, with at most one potentially billable Call per MCP request.
@@ -115,8 +113,8 @@ Routing behavior:
 Example result prefix:
 
 ```text
-数据来源: Tushare
-数据源路由: Qveris（不支持）→ Tushare（成功）
+数据来源: Qveris（Finnhub）
+数据源路由: Twingly（不支持）→ Qveris（成功）
 
 Existing tool output...
 ```
@@ -130,10 +128,12 @@ Existing tool output...
 ### Credential-scoped tool discovery
 
 `tools/list` filters the MCP catalog by credentials on the current request. A
-Twingly-only request exposes the two existing news tools, a Qveris-only request exposes only tools covered by the Qveris adapter, and a
-Tushare-only request exposes Tushare-backed tools; both credentials expose the
-union. With no credential, only public and local tools are listed. `tools/call`
-enforces the same scope.
+Twingly-only request exposes the two news tools, and a Qveris-only request
+exposes only tools covered by the Qveris adapter; supplying both exposes the
+union. With no credential, only public and local tools (`current_timestamp`,
+`finance_news`, public crypto support on `stock_data`/`stock_data_minutes`, plus
+read-only local A-share cache tools when enabled via `FINANCE_MCP_TOOL_PROFILE`)
+are listed. `tools/call` enforces the same scope.
 
 <a id="providers"></a>
 
@@ -141,21 +141,12 @@ enforces the same scope.
 
 | Provider | Credential | Official access | FinanceMCP configuration |
 |---|---|---|---|
-| **Tushare Pro** | Token required | [Create an account](https://tushare.pro/document/1?doc_id=38) · [Get a Token](https://tushare.pro/document/1?doc_id=39) | stdio: `TUSHARE_TOKEN`; HTTP: `X-Tushare-Token` |
 | **Qveris** | API key required | [Dashboard / API Keys](https://qveris.ai/account?page=api-keys) · [Documentation](https://qveris.ai/docs) | stdio: `QVERIS_API_KEY`; HTTP: `X-Qveris-Api-Key` |
 | **Twingly News Search** | API key required | [Dashboard / API Key](https://app.twingly.com/) · [News API](https://www.twingly.com/news-api/) | stdio: `TWINGLY_API_KEY`; HTTP: `X-Twingly-Api-Key` |
 | **Binance Public API** | **Not required** | [Spot REST API documentation](https://developers.binance.com/docs/binance-spot-api-docs/rest-api) | No configuration; crypto market data uses public endpoints automatically |
+| **Free A-share multi-source cache** | **Not required** | Public Eastmoney / Tencent / TDX market endpoints | `FINANCE_MCP_TOOL_PROFILE=ashare` or `finance-mcp-ashare` CLI |
 | **Baidu News** | **Not required** | No developer API application required | No configuration; used by `finance_news` |
 | **Local system clock** | **Not required** | None | No configuration; used only by `current_timestamp` |
-
-### Tushare Token
-
-1. Register and sign in at [Tushare](https://tushare.pro/).
-2. Open **Profile → Account and TOKEN**, then copy the Token. See the [official Token guide](https://tushare.pro/document/1?doc_id=39).
-3. Set `TUSHARE_TOKEN` locally, or pass the Token in `X-Tushare-Token` for remote MCP requests.
-
-> [!TIP]
-> 🎓 **Verified university students can receive 2,000 Tushare points for free.** The current official process asks students to complete their school/profile information, join the university user group, and submit a student ID or CHSI verification screenshot together with their Tushare ID. Follow the latest instructions on the [student-points page](https://tushare.pro/document/1?doc_id=360). Tushare's service terms state that verified university students and teaching staff can receive **2,000 / 5,000 points**, respectively. Point thresholds and request limits vary by endpoint; check the relevant API documentation and the [permissions page](https://tushare.pro/weborder/#/permission).
 
 ### Qveris API key
 
@@ -174,6 +165,7 @@ enforces the same scope.
 ### Keyless providers
 
 - **Binance**: FinanceMCP calls only public Kline endpoints with security type `NONE`; no Binance account, API key, or trading permission is required.
+- **Free A-share multi-source cache**: built-in Eastmoney, Tencent, and TDX free routing requires no credential; see [docs/ashare-data-service.md](docs/ashare-data-service.md).
 - **Baidu News**: public news search requires no developer credential. If the network or upstream search is unavailable, routing may try a Qveris news capability according to the configured priority.
 
 > [!WARNING]
@@ -198,10 +190,9 @@ Local MCP configuration for Claude Desktop, Cursor, and similar clients:
       "command": "npx",
       "args": ["-y", "finance-mcp"],
       "env": {
-        "TUSHARE_TOKEN": "YOUR_TUSHARE_TOKEN",
         "QVERIS_API_KEY": "YOUR_QVERIS_API_KEY",
         "TWINGLY_API_KEY": "YOUR_TWINGLY_API_KEY",
-        "FINANCE_SOURCE_PRIORITY": "tushare,twingly,qveris,binance"
+        "FINANCE_SOURCE_PRIORITY": "twingly,qveris,binance"
       }
     }
   }
@@ -220,29 +211,29 @@ The public hosted endpoint is currently unavailable. Until a replacement domain 
       "url": "https://your-finance-mcp.example/mcp",
       "timeout": 600,
       "headers": {
-        "X-Tushare-Token": "YOUR_TUSHARE_TOKEN",
         "X-Qveris-Api-Key": "YOUR_QVERIS_API_KEY",
         "X-Twingly-Api-Key": "YOUR_TWINGLY_API_KEY",
-        "X-Finance-Source-Priority": "twingly,qveris,tushare,binance"
+        "X-Finance-Source-Priority": "twingly,qveris,binance"
       }
     }
   }
 }
 ```
 
-All three credentials are optional and may be supplied independently. `Authorization: Bearer ...` and `X-Api-Key` remain compatible Tushare token forms; Qveris and Twingly use dedicated headers.
+Both Qveris and Twingly credentials are optional and may be supplied independently.
 
 <details>
 <summary><strong>Environment variables</strong></summary>
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TUSHARE_TOKEN` | empty | Tushare credential |
 | `QVERIS_API_KEY` | empty | Qveris credential |
 | `QVERIS_BASE_URL` | `https://qveris.ai/api/v1` | Qveris REST API base URL |
 | `TWINGLY_API_KEY` | empty | Twingly News Search credential |
 | `TWINGLY_BASE_URL` | `https://data.twingly.net/news/b/search/v1/search` | Twingly News Search API URL |
-| `FINANCE_SOURCE_PRIORITY` | `tushare,twingly,qveris,binance` | Default stdio/server priority |
+| `FINANCE_SOURCE_PRIORITY` | `twingly,qveris,binance` | Default stdio/server priority |
+| `FINANCE_MCP_TOOL_PROFILE` | `legacy` | Tool profile: `legacy` / `ashare` / `full` |
+| `ASHARE_DATA_DIR` | OS user data dir | Local A-share SQLite cache and analytics directory |
 | `PORT` | `3000` | HTTP server port |
 | `MCP_HTTP_HOST` | `127.0.0.1` | HTTP bind address; containers use `0.0.0.0` |
 | `MCP_ALLOWED_HOSTS` | loopback hostnames | Comma-separated hostname allowlist (without ports); recommended for non-loopback deployments |
@@ -259,37 +250,29 @@ repository.
 
 [docs/deploy-dockhold.md](docs/deploy-dockhold.md) is a worked example on
 [Dockhold](https://dockhold.eu), one managed host among others and not an
-affiliated or preferred one, covering the HTTPS endpoint, where `TUSHARE_TOKEN`
-and `QVERIS_API_KEY` go, and why `MCP_ALLOWED_HOSTS` is strongly recommended
+affiliated or preferred one, covering the HTTPS endpoint, where `QVERIS_API_KEY`
+and `TWINGLY_API_KEY` go, and why `MCP_ALLOWED_HOSTS` is strongly recommended
 once the server is publicly reachable.
 
 <a id="tools"></a>
 
-## 🧰 19 MCP tools
+## 🧰 11 core MCP tools
 
 | Tool | Purpose | Data provider / API |
 |---|---|---|
 | `current_timestamp` | Current UTC+8 timestamp | Local system clock |
 | `finance_news` | Financial-news keyword search | Twingly* · Baidu News · Qveris* |
-| `stock_data` | Multi-market history and technical indicators | Tushare Pro · Qveris* · Binance Public API (crypto) |
-| `stock_data_minutes` | China A-share and crypto intraday bars | Tushare Pro · Qveris* · Binance Public API (crypto) |
-| `index_data` | Index history, metadata, and valuation | Tushare Pro · Qveris* |
-| `macro_econ` | GDP, CPI, PPI, PMI, Shibor, LPR, Libor, Hibor, and more | Tushare Pro · Qveris* |
-| `company_performance` | China company, statement, dividend, ownership, and valuation data | Tushare Pro · Qveris* |
-| `company_performance_hk` | Hong Kong income, balance-sheet, and cash-flow statements | Tushare Pro · Qveris* |
-| `company_performance_us` | US financial statements and indicators | Tushare Pro · Qveris* |
-| `fund_data` | Fund NAV, holdings, dividends, and profiles | Tushare Pro |
-| `fund_manager_by_name` | Fund-manager and managed-fund lookup | Tushare Pro |
-| `convertible_bond` | Convertible-bond lifecycle data | Tushare Pro |
-| `block_trade` | Block-trade details | Tushare Pro |
-| `money_flow` | Stock, market, sector, and cross-border flows | Tushare Pro |
-| `margin_trade` | Margin financing, securities lending, and refinancing | Tushare Pro |
-| `csi_index_constituents` | CSI performance, weights, and financial summaries | Tushare Pro · Qveris* |
-| `dragon_tiger_inst` | Dragon-Tiger institutional trades | Tushare Pro |
-| `hot_news_7x24` | Deduplicated 7×24 financial headlines | Tushare Pro · Twingly* · Qveris* |
-| `futures_data` | Futures-member position rankings | Tushare Pro |
+| `stock_data` | Multi-market history and technical indicators | Binance Public API (crypto) · Qveris* |
+| `stock_data_minutes` | Intraday bars and crypto indicators | Binance Public API (crypto) · Qveris* |
+| `index_data` | Index history, metadata, and valuation | Qveris* |
+| `macro_econ` | GDP, CPI, PPI, PMI, Shibor, LPR, Libor, Hibor, and more | Qveris* |
+| `company_performance` | China company, statement, dividend, ownership, and valuation data | Qveris* |
+| `company_performance_hk` | Hong Kong income, balance-sheet, and cash-flow statements | Qveris* |
+| `company_performance_us` | US financial statements and indicators | Qveris* |
+| `csi_index_constituents` | CSI performance, weights, and financial summaries | Qveris* |
+| `hot_news_7x24` | Deduplicated 7×24 financial headlines | Twingly* · Qveris* |
 
-> **Qveris\*** is a dynamic capability-routing layer. It selects an integrated upstream provider for each request (for example, Finnhub or Tiingo) and returns the chosen provider, capability ID, and source attribution with the Tool result. Tools without Qveris in this table report the capability as unsupported before falling back to their listed native provider.
+> **Qveris\*** is a dynamic capability-routing layer. It selects an integrated upstream provider for each request (for example, Finnhub or Tiingo) and returns the chosen provider, capability ID, and source attribution with the Tool result. Set `FINANCE_MCP_TOOL_PROFILE=ashare` or `full` to additionally expose the 14 read-only local A-share cache and analytics tools (see [docs/tool-availability.md](docs/tool-availability.md)).
 
 ## 📊 Technical indicators
 

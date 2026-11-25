@@ -47,11 +47,11 @@ Keep interface expansion architecture-aligned instead of drifting into one-tool-
   - all new branches added in that batch
 - If production HTTP logs may expose tokens, inject the token through request context or a direct codepath instead of public HTTP headers.
 
-### 6. Update coverage docs every time
+### 6. Keep documentation aligned
 
 After each successful batch update:
 
-- update `docs/tushare-interface-coverage.md`
+- keep tool/deployment documentation accurate
 - if local analysis under `reports/` was refreshed, update that too
 - keep local and cloud copies aligned
 

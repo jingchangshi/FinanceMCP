@@ -6,7 +6,7 @@
   <h1>FinanceMCP <sub>Synapse</sub></h1>
 
   <p><strong>为 AI Agent 提供统一、可路由、可追溯的多市场金融数据</strong></p>
-  <p>19 个稳定 MCP Tools · Tushare / Qveris / Binance · stdio + Streamable HTTP</p>
+  <p>11 个通用 MCP Tools · Free A-Share / Qveris / Twingly / Binance · stdio + Streamable HTTP</p>
 
   <p>
     <a href="https://www.npmjs.com/package/finance-mcp"><img src="https://img.shields.io/npm/v/finance-mcp?style=flat-square&logo=npm&color=cb3837" alt="npm version" /></a>
@@ -37,7 +37,7 @@
 > **服务状态：公网托管服务暂时停止。** 原公网域名已经到期，当前不提供官方在线体验或托管 `/mcp` Endpoint；后续可能更换域名，恢复时间与新地址将通过本仓库公告。npm 包、本地 stdio 使用和自行部署不受影响。
 
 > [!IMPORTANT]
-> **v4.11.2** 加固 Twingly 新闻路由的参数校验、请求大小限制、数据源回退和动态 Tool Schema，并补充敏感请求头脱敏。现有 19 个 Tool 名称与主要调用方式保持不变。
+> **v4.11.2** 加固 Twingly 新闻路由的参数校验、请求大小限制、数据源回退和动态 Tool Schema，并补充敏感请求头脱敏；同时已移除 Tushare 依赖，保留 11 个通用 MCP Tool（另有 14 个只读 A 股本地缓存 Tool 通过 `FINANCE_MCP_TOOL_PROFILE=ashare` 或 `full` 开启，A 股日频模块改用东方财富 / 腾讯财经 / 通达信等免费多源行情）。
 
 > [!NOTE]
 > 需要在 Trae、Cursor、Claude Code 和 Codex 之间共享模型 Prompt/KV-cache 路由及对话 lineage 时，可选启动独立的 [`finance-cache-gateway`](./docs/cache-gateway.md)。它使用单独的进程、端口和配置；不修改现有 MCP Tool、stdio 或 `/mcp` 接口，不启用时现有用法完全不变。
@@ -49,7 +49,7 @@ FinanceMCP 已与 [MarkiNote](https://github.com/wink-wink-wink555/MarkiNote) �
 🌐 **在线体验：暂时停止，后续可能更换域名**
 📝 **MarkiNote：[https://github.com/wink-wink-wink555/MarkiNote](https://github.com/wink-wink-wink555/MarkiNote)**
 
-在 FinNote 的整体架构中，FinanceMCP 作为核心的 **金融数据与 MCP 工具服务层**，基于 Node.js、Express 与 Model Context Protocol（MCP）SDK 构建。目前通过 19 个稳定的 MCP 工具，为 AI Agent 提供股票、基金、债券、宏观经济、财经新闻、技术指标以及多市场行情等金融数据能力，并支持 stdio 与 Streamable HTTP 两种接入方式。
+在 FinNote 的整体架构中，FinanceMCP 作为核心的 **金融数据与 MCP 工具服务层**，基于 Node.js、Express 与 Model Context Protocol（MCP）SDK 构建。目前通过 11 个通用 MCP 工具（以及可选的 A 股缓存工具），为 AI Agent 提供股票、指数、宏观经济、财务报表、财经新闻、技术指标以及多市场行情等金融数据能力，并支持 stdio 与 Streamable HTTP 两种接入方式。
 
 MarkiNote 则作为上层 **AI Agent 智能文档与知识管理系统**，负责承载自然语言交互、AI 分析结果展示、Markdown 文档生成、编辑与长期知识沉淀。在 FinNote 场景中，MarkiNote 通过 HTTP / MCP 服务链路调用 FinanceMCP，使金融数据能力能够直接进入 AI Agent 的推理与文档工作流。
 
@@ -63,12 +63,12 @@ MarkiNote 则作为上层 **AI Agent 智能文档与知识管理系统**，负�
 
 | | 能力 | 说明 |
 |---|---|---|
-| 🔌 | **无侵入式扩展** | 保持现有 19 个 Tool 名称和参数，数据源选择由请求上下文完成 |
-| 🧭 | **智能路由** | 同时支持 Tushare、Qveris、Binance 与公开新闻源 |
+| 🔌 | **无侵入式扩展** | 保持通用 Tool 名称和参数契约，数据源选择由请求上下文完成 |
+| 🧭 | **智能路由** | 支持 Qveris、Twingly、Binance、公开新闻源与免费 A 股本地缓存 |
 | 🔁 | **自动降级** | 首选来源未覆盖、超时、限流或不可用时按优先级继续尝试 |
 | 🏷️ | **来源透明** | 每次返回都标注实际数据来源；发生降级时同时返回完整路由 |
 | 🛡️ | **请求级隔离** | HTTP Key 通过 AsyncLocalStorage 隔离，日志统一脱敏 |
-| 📈 | **多市场覆盖** | A 股、港股、美股、指数、基金、债券、期货、外汇、宏观与加密资产 |
+| 📈 | **多市场覆盖** | A 股免费缓存与本地分析、港股、美股、指数、宏观与加密资产 |
 | 🧮 | **技术指标引擎** | MACD、RSI、KDJ、BOLL、MA 自动扩展历史窗口后再计算 |
 | 🚀 | **双传输模式** | 同时支持本地 stdio 与远程 Streamable HTTP |
 
@@ -78,36 +78,34 @@ MarkiNote 则作为上层 **AI Agent 智能文档与知识管理系统**，负�
 
 ```mermaid
 flowchart LR
-    C[AI / MCP Client] -->|现有 19 个 Tools| R{FinanceMCP Router}
-    R -->|默认优先| T[Tushare]
+    C[AI / MCP Client] -->|11 个通用 Tools| R{FinanceMCP Router}
     R -->|全球新闻| G[Twingly]
     R -->|可选扩展| Q[Qveris]
     R -->|Crypto| B[Binance]
     R -->|News / Time| L[公开源与本地计算]
-    Q -. 未覆盖 / 超时 / 限流 .-> T
-    T -. 不适用 .-> B
-    T & G & Q & B & L --> O[来源标注后的统一 MCP 结果]
+    G -. 未覆盖 / 超时 / 限流 .-> Q
+    Q -. 不适用 .-> B
+    G & Q & B & L --> O[来源标注后的统一 MCP 结果]
 ```
 
 ### HTTP 请求头
 
 ```http
-X-Tushare-Token: YOUR_TUSHARE_TOKEN
 X-Qveris-Api-Key: YOUR_QVERIS_API_KEY
 X-Twingly-Api-Key: YOUR_TWINGLY_API_KEY
-X-Finance-Source-Priority: twingly,qveris,tushare,binance
+X-Finance-Source-Priority: twingly,qveris,binance
 ```
 
 默认优先级：
 
 ```text
-tushare,twingly,qveris,binance
+twingly,qveris,binance
 ```
 
 路由行为：
 
 1. 只传一种凭证时，优先使用该凭证对应的数据源。
-2. 同时传入多种凭证时，默认 Tushare 优先；新闻工具随后尝试 Twingly，再尝试 Qveris 与公共源。
+2. 同时传入多种凭证时，新闻工具优先尝试 Twingly，再尝试 Qveris 与公共源；行情与财务类通用工具在传入 Qveris Key 时路由到 Qveris。
 3. `X-Finance-Source-Priority` 可按请求调整顺序；未知项忽略、重复项去重、遗漏项按默认顺序补齐。
 4. 首选数据源接口未覆盖或调用失败时自动降级；正常空结果不会触发重复请求。
 5. Qveris 内部执行 **Discover → Inspect → Probe → Call**，每次 MCP 请求最多执行一次可能计费的 Call。
@@ -115,8 +113,8 @@ tushare,twingly,qveris,binance
 返回示例：
 
 ```text
-数据来源: Tushare
-数据源路由: Qveris（接口未覆盖） → Tushare（成功）
+数据来源: Qveris（Finnhub）
+数据源路由: Twingly（不支持） → Qveris（成功）
 
 原有工具结果……
 ```
@@ -129,7 +127,7 @@ tushare,twingly,qveris,binance
 
 ### 按凭证动态显示 Tools
 
-`tools/list` 会根据当前 MCP 请求实际携带的凭证裁剪工具目录：只传 Twingly Key 时展示两个现有新闻 Tools，只传 Qveris Key 时只展示 Qveris adapter 覆盖的现有 Tools，只传 Tushare Token 时只展示 Tushare 覆盖的 Tools；同时传入多种凭证时展示并集。没有凭证时仅展示公共数据源与本地工具。`tools/call` 也执行相同校验，避免 AI 调用到当前请求无法使用的数据源。
+`tools/list` 会根据当前 MCP 请求实际携带的凭证裁剪工具目录：只传 Twingly Key 时展示两个新闻 Tools，只传 Qveris Key 时只展示 Qveris adapter 覆盖的 Tools；同时传入多种凭证时展示并集。没有凭证时仅展示公共数据源与本地工具（`current_timestamp`、`finance_news`、`stock_data`、`stock_data_minutes` 公开加密资产部分，以及按 profile 启用的本地只读 A 股缓存工具）。`tools/call` 也执行相同校验，避免 AI 调用到当前请求无法使用的数据源。
 
 <a id="providers"></a>
 
@@ -137,21 +135,12 @@ tushare,twingly,qveris,binance
 
 | 数据源 | 是否需要凭证 | 官方获取入口 | FinanceMCP 配置 |
 |---|---|---|---|
-| **Tushare Pro** | 需要 Token | [注册账号](https://tushare.pro/document/1?doc_id=38) · [获取 Token](https://tushare.pro/document/1?doc_id=39) | stdio：`TUSHARE_TOKEN`；HTTP：`X-Tushare-Token` |
 | **Qveris** | 需要 API Key | [Dashboard / API Keys](https://qveris.ai/account?page=api-keys) · [官方文档](https://qveris.ai/docs) | stdio：`QVERIS_API_KEY`；HTTP：`X-Qveris-Api-Key` |
 | **Twingly News Search** | 需要 API Key | [Dashboard / API Key](https://app.twingly.com/) · [News API](https://www.twingly.com/news-api/) | stdio：`TWINGLY_API_KEY`；HTTP：`X-Twingly-Api-Key` |
 | **Binance Public API** | **不需要** | [Spot REST API 文档](https://developers.binance.com/docs/binance-spot-api-docs/rest-api) | 无需配置；加密资产行情自动使用公开接口 |
+| **免费 A 股多源缓存** | **不需要** | 东方财富 / 腾讯财经 / 通达信公开行情接口 | `FINANCE_MCP_TOOL_PROFILE=ashare` 或使用 `finance-mcp-ashare` CLI |
 | **百度新闻** | **不需要** | 无需申请 API | 无需配置；`finance_news` 使用公开新闻检索 |
 | **本地系统时钟** | **不需要** | 无 | 无需配置；仅供 `current_timestamp` 使用 |
-
-### Tushare Token
-
-1. 在 [Tushare](https://tushare.pro/) 注册并登录。
-2. 进入 **个人中心 → 账号与 TOKEN**，复制 Token；完整步骤见 [官方 Token 指南](https://tushare.pro/document/1?doc_id=39)。
-3. 将 Token 写入本地 `TUSHARE_TOKEN`，或在远程 MCP 请求中通过 `X-Tushare-Token` 传递。
-
-> [!TIP]
-> 🎓 **Tushare 高校学生认证可免费获得 2000 积分。** 当前官方流程要求完善学校和个人资料、加入高校用户群，并向管理员提交学生证或学信网截图及 Tushare ID。入口与最新步骤见 [学生免费积分获取](https://tushare.pro/document/1?doc_id=360)。Tushare 服务协议同时说明，高校学生和教师完成身份确认后分别可获得 **2000 / 5000 积分**权限。不同接口的积分门槛与频次不同，请以对应接口文档和[积分权限页面](https://tushare.pro/weborder/#/permission)为准。
 
 ### Qveris API Key
 
@@ -170,6 +159,7 @@ tushare,twingly,qveris,binance
 ### 无 Key 数据源
 
 - **Binance**：FinanceMCP 当前只调用安全类型为 `NONE` 的公开 K 线接口，不需要 Binance 账号、API Key 或交易权限。
+- **免费 A 股多源缓存**：内置东方财富、腾讯财经与通达信免费路由，无需任何凭证；详见 [docs/ashare-data-service.md](docs/ashare-data-service.md)。
 - **百度新闻**：使用公开新闻搜索，不需要开发者凭证；若网络或上游检索不可用，可按配置的优先级尝试 Qveris 新闻能力。
 
 > [!WARNING]
@@ -194,10 +184,9 @@ Claude Desktop、Cursor 等本地 MCP 客户端配置：
       "command": "npx",
       "args": ["-y", "finance-mcp"],
       "env": {
-        "TUSHARE_TOKEN": "YOUR_TUSHARE_TOKEN",
         "QVERIS_API_KEY": "YOUR_QVERIS_API_KEY",
         "TWINGLY_API_KEY": "YOUR_TWINGLY_API_KEY",
-        "FINANCE_SOURCE_PRIORITY": "tushare,twingly,qveris,binance"
+        "FINANCE_SOURCE_PRIORITY": "twingly,qveris,binance"
       }
     }
   }
@@ -216,29 +205,29 @@ Claude Desktop、Cursor 等本地 MCP 客户端配置：
       "url": "https://your-finance-mcp.example/mcp",
       "timeout": 600,
       "headers": {
-        "X-Tushare-Token": "YOUR_TUSHARE_TOKEN",
         "X-Qveris-Api-Key": "YOUR_QVERIS_API_KEY",
         "X-Twingly-Api-Key": "YOUR_TWINGLY_API_KEY",
-        "X-Finance-Source-Priority": "twingly,qveris,tushare,binance"
+        "X-Finance-Source-Priority": "twingly,qveris,binance"
       }
     }
   }
 }
 ```
 
-三个凭证都是可选的，可以只传其中一个。`Authorization: Bearer ...` 与 `X-Api-Key` 继续兼容为 Tushare Token；Qveris 与 Twingly 使用各自的独立 Header。
+Qveris 与 Twingly 凭证均为可选，可以只传其中一个。
 
 <details>
 <summary><strong>环境变量</strong></summary>
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `TUSHARE_TOKEN` | 空 | Tushare 凭证 |
 | `QVERIS_API_KEY` | 空 | Qveris 凭证 |
 | `QVERIS_BASE_URL` | `https://qveris.ai/api/v1` | Qveris REST API 地址 |
 | `TWINGLY_API_KEY` | 空 | Twingly News Search 凭证 |
 | `TWINGLY_BASE_URL` | `https://data.twingly.net/news/b/search/v1/search` | Twingly News Search API 地址 |
-| `FINANCE_SOURCE_PRIORITY` | `tushare,twingly,qveris,binance` | stdio 或服务端默认优先级 |
+| `FINANCE_SOURCE_PRIORITY` | `twingly,qveris,binance` | stdio 或服务端默认优先级 |
+| `FINANCE_MCP_TOOL_PROFILE` | `legacy` | 工具集 profile：`legacy` / `ashare` / `full` |
+| `ASHARE_DATA_DIR` | 用户数据目录 | A 股本地 SQLite 缓存与分析数据目录 |
 | `PORT` | `3000` | HTTP 服务端口 |
 | `MCP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址；容器部署使用 `0.0.0.0` |
 | `MCP_ALLOWED_HOSTS` | 回环地址白名单 | 逗号分隔的 Host 主机名白名单（不含端口）；非回环部署建议显式配置 |
@@ -252,37 +241,29 @@ Claude Desktop、Cursor 等本地 MCP 客户端配置：
 从环境变量读取 `PORT`，并提供 `GET /health`。后续若启用新的官方域名，将在本仓库公告。
 
 [docs/deploy-dockhold.md](docs/deploy-dockhold.md) 以 [Dockhold](https://dockhold.eu)
-为例（只是其中一种托管方式，并非关联或推荐平台），说明 HTTPS 端点、`TUSHARE_TOKEN`
-与 `QVERIS_API_KEY` 的存放位置，以及为什么在公网可访问时强烈建议设置
+为例（只是其中一种托管方式，并非关联或推荐平台），说明 HTTPS 端点、`QVERIS_API_KEY`
+与 `TWINGLY_API_KEY` 的存放位置，以及为什么在公网可访问时强烈建议设置
 `MCP_ALLOWED_HOSTS`。
 
 <a id="tools"></a>
 
-## 🧰 19 个 MCP Tools
+## 🧰 11 个通用 MCP Tools
 
 | Tool | 功能 | 数据源 / 接口商 |
 |---|---|---|
 | `current_timestamp` | UTC+8 当前时间戳 | 本地系统时钟 |
 | `finance_news` | 财经新闻关键词检索 | Twingly* · 百度新闻 · Qveris* |
-| `stock_data` | 多市场历史行情与技术指标 | Tushare Pro · Qveris* · Binance Public API（加密资产） |
-| `stock_data_minutes` | A 股与加密资产分钟 K 线 | Tushare Pro · Qveris* · Binance Public API（加密资产） |
-| `index_data` | 指数行情、基本信息与估值 | Tushare Pro · Qveris* |
-| `macro_econ` | GDP、CPI、PPI、PMI、Shibor、LPR、Libor、Hibor 等 | Tushare Pro · Qveris* |
-| `company_performance` | A 股公司、财务、分红、股东与估值数据 | Tushare Pro · Qveris* |
-| `company_performance_hk` | 港股利润表、资产负债表与现金流量表 | Tushare Pro · Qveris* |
-| `company_performance_us` | 美股财务报表与指标 | Tushare Pro · Qveris* |
-| `fund_data` | 基金净值、持仓、分红与基础资料 | Tushare Pro |
-| `fund_manager_by_name` | 基金经理及管理基金查询 | Tushare Pro |
-| `convertible_bond` | 可转债全生命周期数据 | Tushare Pro |
-| `block_trade` | 大宗交易明细 | Tushare Pro |
-| `money_flow` | 个股、大盘、行业与互联互通资金流 | Tushare Pro |
-| `margin_trade` | 融资融券与转融券数据 | Tushare Pro |
-| `csi_index_constituents` | CSI 指数表现、成分权重与财务摘要 | Tushare Pro · Qveris* |
-| `dragon_tiger_inst` | 龙虎榜机构交易明细 | Tushare Pro |
-| `hot_news_7x24` | 7×24 财经热点与内容去重 | Tushare Pro · Twingly* · Qveris* |
-| `futures_data` | 期货会员持仓排名 | Tushare Pro |
+| `stock_data` | 多市场历史行情与技术指标 | Binance Public API（加密资产）· Qveris* |
+| `stock_data_minutes` | 分钟 K 线与加密资产指标计算 | Binance Public API（加密资产）· Qveris* |
+| `index_data` | 指数行情、基本信息与估值 | Qveris* |
+| `macro_econ` | GDP、CPI、PPI、PMI、Shibor、LPR、Libor、Hibor 等 | Qveris* |
+| `company_performance` | A 股公司、财务、分红、股东与估值数据 | Qveris* |
+| `company_performance_hk` | 港股利润表、资产负债表与现金流量表 | Qveris* |
+| `company_performance_us` | 美股财务报表与指标 | Qveris* |
+| `csi_index_constituents` | CSI 指数表现、成分权重与财务摘要 | Qveris* |
+| `hot_news_7x24` | 7×24 财经热点与内容去重 | Twingly* · Qveris* |
 
-> **Qveris\*** 是动态数据能力路由层，会按查询自动选择已接入的实际接口商（例如 Finnhub、Tiingo 等）；最终选中的接口商、能力 ID 与数据来源会随 Tool 结果一起返回。未标记 Qveris 的 Tool 会明确返回“接口未覆盖”，再降级到表内原生数据源。
+> **Qveris\*** 是动态数据能力路由层，会按查询自动选择已接入的实际接口商（例如 Finnhub、Tiingo 等）；最终选中的接口商、能力 ID 与数据来源会随 Tool 结果一起返回。未标记 Qveris 的能力在未配置对应凭证时不会外发请求；设置 `FINANCE_MCP_TOOL_PROFILE=ashare` 或 `full` 可额外启用 14 个本地只读 A 股缓存与分析 Tools（见 [docs/tool-availability.md](docs/tool-availability.md)）。
 
 ## 📊 技术指标
 

@@ -1,7 +1,7 @@
 {
   "name": "finance-mcp",
   "version": "4.11.2",
-  "description": "Multi-source financial data MCP server with Tushare, optional Qveris routing, and Binance crypto data",
+  "description": "Multi-source financial data MCP server with free A-share market cache, optional Qveris/Twingly routing, and Binance crypto data",
   "type": "module",
   "engines": {
     "node": ">=20"

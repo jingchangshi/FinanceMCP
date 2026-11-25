@@ -30,7 +30,7 @@ finance-mcp-ashare 容器（唯一长期运行服务，127.0.0.1:8130）
 | 文件 | 作用 |
 |---|---|
 | `src/ashare/db.ts` | SQLite 结构（`daily/adj_factor/stk_limit` 以 `(ts_code, trade_date)` 为主键、`trade_date` 二级索引）、WAL、mmap、批量 upsert、同步日志 |
-| `src/ashare/fetch.ts` | 复用 `callTushare`，增加 offset 分页、最小调用间隔、限频/网络错误退避重试 |
+| `src/ashare/fetch.ts` | 统一走免费多源路由器（`freeProviderRouter`），含 offset 分页、请求失败指数退避重试 |
 | `src/ashare/ingest.ts` | 交易日历、股票列表、按交易日批量下载、指数增量、财务指标、数据质量检查 |
 | `src/ashare/sync.ts` | 区间增量同步 |
 | `src/ashare/indicators.ts` | MA/EMA/MACD/RSI/BOLL（复用并修复上游实现）+ CCI/ATR/量能 |
@@ -49,13 +49,10 @@ finance-mcp-ashare 容器（唯一长期运行服务，127.0.0.1:8130）
 
 1. **RSI 口径**（`src/tools/stockDataDetail/rsi.ts`）：原实现为滚动简单平均（Cutler RSI），改为 Wilder 平滑，与通达信/同花顺 `SMA(X,N,1)` 一致。
 2. **MACD 时间对齐**（`macd.ts`）：原实现对 DIF 求 EMA 后在前面再填充 `slow-1` 个 NaN，导致 DEA/柱状图相对 DIF 整体后移 25 根 K 线；改为对完整 DIF 序列直接求 EMA。
-3. **指标时间索引**（`stockData.ts`、`dataCalculator.ts`）：Tushare 分支在 `reverse()` 前未显式排序（假定接口返回倒序）；截取用户区间时只过滤了行情行而未过滤指标数组。现显式按交易日倒序排序，并用同一掩码过滤行情与指标（`filterRowsAndIndicators`）。MACD/RSI 预热期加长（EMA/Wilder 需要收敛）。
-4. **客户端认证与数据源认证分离**（`httpServer.ts`）：原逻辑把 `Authorization: Bearer` 直接当作 Tushare Token。
-   - `MCP_AUTH_TOKEN` 设置后：Bearer 仅用于客户端认证（常量时间比较，401），永不转发给 Tushare。
-   - 未设置时保持上游行为；可用 `MCP_BEARER_AS_TUSHARE_TOKEN=0` 关闭。
-   - `MCP_ACCEPT_REQUEST_CREDENTIALS=0`：忽略请求中所有数据源凭证，仅使用服务端环境变量。
+3. **指标时间索引**（`stockData.ts`、`dataCalculator.ts`）：排序与截取窗口对齐。
+4. **认证与数据源分离**（`httpServer.ts`）：`MCP_AUTH_TOKEN` 用于客户端 Bearer 认证；`MCP_ACCEPT_REQUEST_CREDENTIALS=0` 禁止请求透传数据源凭证。
    - `MCP_RATE_LIMIT`（每 IP 每分钟）与 `MCP_TRUST_PROXY`（反向代理后获取真实 IP）；新增 `ping` 响应。
-5. **工具暴露配置**（`toolProfile.ts`、`dispatch.ts`）：默认行为不变（19 个工具，A 股工具隐藏）。
+5. **工具暴露配置**（`toolProfile.ts`、`dispatch.ts`）：默认暴露 11 个通用工具，A 股工具默认隐藏。
    - `FINANCE_TOOL_PROFILE=ashare_daily`：只暴露 5 个 A 股工具。
    - `ASHARE_ENABLED=1`：在 full 配置中追加 A 股工具。
    - `FINANCE_ENABLED_TOOLS=a,b`：白名单；`FINANCE_TOOL_CONFIG=/path/tools.json`（`{"profile":"full","enabled_tools":[...]}`）。
@@ -66,7 +63,7 @@ finance-mcp-ashare 容器（唯一长期运行服务，127.0.0.1:8130）
 
 - **按交易日批量**：`daily`、`daily_basic`、`adj_factor`、`stk_limit` 每个交易日各 1 个全市场请求（约 5.5k 行），绝不逐股下载。
 - **分页**：所有请求带 `limit/offset`，直到返回短页为止（`fetchAll`）；`fina_indicator_vip` 单期约 1.1 万行，分 3 页。
-- **速率**：调用间隔 ≥ 160ms（`ASHARE_TUSHARE_MIN_INTERVAL_MS`）；“每分钟最多访问”类错误等待 61s 重试；网络/超时错误指数退避，最多 4 次；权限/参数类错误不重试。
+- **请求重试**：网络/超时错误退避重试（`ASHARE_FETCH_MAX_RETRIES`，默认 4 次）。
 - **缺失与不完整**：某数据集当日条数 < 前一交易日 97% 记为 `partial`，下次运行自动重取；`daily` 命令每次复查最近 5 个交易日。
 - **指数**：8 个核心指数按区间增量（向前补齐历史缺口、向后追加新数据）。
 - **财务**：`fina_indicator_vip` 按报告期批量（最近 12 期，最近 3 期每次刷新），保存 `(ts_code, end_date, ann_date)` 全部版本。
@@ -87,7 +84,7 @@ MCP 工具在当日无报告时：数据未就绪返回 `NOT_READY`；数据已�
 - 指标 `ind-1.0.0`：`src/ashare/indicators.ts` 顶部（前复权，以 as-of 日为基准）。
 - 信号 `sig-1.0.0`：`SIGNAL_DEFINITIONS`（多头趋势、20 日放量突破、MACD 金叉、MACD 底背离、RSI 超卖反弹、布林收口突破、跌破 MA60、MACD 顶背离、短期过热）。
 - 市场状态：沪深300 收盘相对 MA60 与 MA20 五日斜率 → 上升趋势/下降趋势/震荡。
-- 行业强弱：Tushare `stock_basic.industry`；强度 = 0.5·pr(20日中位收益) + 0.3·pr(5日中位收益) + 0.2·pr(站上MA20比例)。
+- 行业强弱：基于当前 `stock_basic.industry`（东财/本地缓存）；强度 = 0.5·pr(20日中位收益) + 0.3·pr(5日中位收益) + 0.2·pr(站上MA20比例)。
 - 评分 `score-1.0.0`：`SCORE_RULES` 与 `analysis.ts` 注释（技术 35 / 流动性 15 / 基本面 30 / 估值 10 / 行业 10）。**评分为启发式排序，不代表盈利概率。**
 - 股票池 `wl-1.0.0`：目标 40（30~50）、单行业 ≤ 4、入池需排名前 40、排名跌出 150 且持有满 5 个交易日才移出、每日新增 ≤ 6、仅当前 10 名候选对排名 > 100 的成员才替换。
 - 证据 `evi-1.0.0`：`evidence.ts` 注释（次日开盘进场、相对等权市场超额、按日期聚类 t 统计、按市场状态分组，区分 `evidence_supported` / `research_only` / `contradicted`）。
@@ -96,7 +93,6 @@ MCP 工具在当日无报告时：数据未就绪返回 `NOT_READY`；数据已�
 
 ```bash
 npm ci && npm run build
-export TUSHARE_TOKEN=...            # 仅服务端环境变量
 export ASHARE_DATA_DIR=$HOME/.local/share/finance-mcp-ashare
 
 node build/ashare/cli.js sync --start 20240102 --end 20261016    # 历史回填（按交易日批量）
@@ -124,7 +120,7 @@ node build/ashare/cli.js migrate                                 # 旧版缓存�
 同日重复同步：`daily` 对 as-of 交易日总是重新请求 `daily/daily_basic/adj_factor/stk_limit` 与核心指数；返回完整（≥ 前一交易日
 和已存条数的 97%）时按交易日整体替换（修订值覆盖、撤回的行删除）。每次请求记入 `sync_history`（`sync_log` 仅保留最新状态）。
 
-缓存完整性与刷新状态分开记录：`status`（ok/partial/empty）描述写入后的本地缓存；`refresh_status` 描述本次 Tushare 请求——
+缓存完整性与刷新状态分开记录：`status`（ok/partial/empty）描述写入后的本地缓存；`refresh_status` 描述本次免费多源同步请求——
 `REFRESH_OK`（完整返回）、`REFRESH_INCOMPLETE`（明显偏短）、`REFRESH_FAILED`（请求报错）；同时记录获取行数、原有行数、同步后行数与写入方式
 （replaced / kept / merged / none）。偏短返回时：已有完整缓存则原样保留上一次快照（kept，不混入部分更新）；缓存本身不完整则合并有效行（merged）。
 请求报错不改动数据。`checkQuality` 输出 `cache_status`（仅看缓存）与各数据集最新 `refresh`：缓存满足门槛但最新刷新不完整或失败时，
@@ -135,7 +131,7 @@ node build/ashare/cli.js migrate                                 # 旧版缓存�
 
 ```bash
 cd deploy/ashare
-cp .env.example .env && chmod 600 .env       # 填 TUSHARE_TOKEN；MCP_AUTH_TOKEN 留空 = ChatGPT “No authentication”
+cp .env.example .env && chmod 600 .env       # 免费多源行情无需外部 Token；MCP_AUTH_TOKEN 留空 = ChatGPT “No authentication”
 docker compose up -d --build                 # 唯一长期服务：finance-mcp-ashare，127.0.0.1:8130
 cp finance-ashare-daily.{service,timer} ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now finance-ashare-daily.timer
@@ -161,7 +157,7 @@ handle /ashare/mcp* {
 - 暴露工具：`ashare_data_status`、`ashare_daily_report`、`ashare_watchlist`、`ashare_stock_analysis`、`ashare_sector_rank`，以及数据查询工具
   `ashare_stock_history`、`ashare_financial_data`、`ashare_market_data`、`ashare_stock_basic`（均 `readOnlyHint`；数据契约见 `docs/ashare-data-service.md`）
 - 定时任务建议在北京时间 21:30 之后运行（两次数据更新之后）；更早调用当日报告会得到 `PENDING`/`NOT_READY`，这是预期行为。
-- 匿名入口的安全边界：工具只读（SQLite 只读连接），只访问本地 A 股缓存，不接受请求中的数据源凭证，不触发 Tushare 等外部 API；
+- 匿名入口的安全边界：工具只读（SQLite 只读连接），只访问本地 A 股缓存，不接受请求中的数据源凭证；
   每 IP 每分钟 30 次（`MCP_RATE_LIMIT`）、请求体 ≤ 64 KB（`MCP_BODY_LIMIT`）、会话表 ≤ 1000（`MCP_MAX_SESSIONS`）。
   匿名开放的实际风险见 `docs/ashare-acceptance.md` §9.5。如需收紧，设置 `MCP_AUTH_TOKEN`（ChatGPT 侧需改用 OAuth，当前不支持静态 Bearer）。
 

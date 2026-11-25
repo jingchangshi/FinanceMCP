@@ -9,7 +9,7 @@ author:
   email: "guangxiangdebizi@gmail.com"
   url: "https://github.com/guangxiangdebizi"
 license: "MIT"
-keywords: [finance, tushare, mcp-server]
+keywords: [finance, stock, ashare, qveris, mcp-server]
 
 # 运行时（Node 版本）要求，可选但建议声明
 dependencies:
@@ -27,10 +27,6 @@ startCommand:
   configSchema:
     type: object
     properties:
-      TUSHARE_TOKEN:
-        type: string
-        title: "Tushare API Token (Optional)"
-        description: "Optional default Tushare API token. Users can override this by providing their own token via X-Tushare-Token header or Authorization: Bearer <token> when connecting."
       QVERIS_API_KEY:
         type: string
         title: "Qveris API Key (Optional)"
@@ -42,7 +38,7 @@ startCommand:
       FINANCE_SOURCE_PRIORITY:
         type: string
         title: "Data Source Priority (Optional)"
-        description: "Comma-separated source order. Default: tushare,qveris,binance."
+        description: "Comma-separated source order. Default: twingly,qveris,binance."
 
   # ——返回实际启动命令的 JS 函数——
   commandFunction: |-
@@ -53,16 +49,14 @@ startCommand:
         NODE_ENV: "production",
         PORT: "3000",
         MCP_HTTP_HOST: "0.0.0.0",
-        TUSHARE_TOKEN: config.TUSHARE_TOKEN || "",
         QVERIS_API_KEY: config.QVERIS_API_KEY || "",
         QVERIS_BASE_URL: config.QVERIS_BASE_URL || "",
-        FINANCE_SOURCE_PRIORITY: config.FINANCE_SOURCE_PRIORITY || "tushare,qveris,binance"
+        FINANCE_SOURCE_PRIORITY: config.FINANCE_SOURCE_PRIORITY || "twingly,qveris,binance"
       }
     })
 
 # ---------- 示例配置，供 UI 展示 ----------
 exampleConfig:
-  TUSHARE_TOKEN: "your_tushare_token_here_or_leave_empty"
   QVERIS_API_KEY: "your_qveris_api_key_here_or_leave_empty"
   QVERIS_BASE_URL: "https://qveris.ai/api/v1"
-  FINANCE_SOURCE_PRIORITY: "tushare,qveris,binance"
+  FINANCE_SOURCE_PRIORITY: "twingly,qveris,binance"

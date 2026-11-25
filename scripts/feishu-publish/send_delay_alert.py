@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send a concise Chinese Feishu IM delay notice when Tushare readiness polls repeatedly."""
+"""Send a concise Chinese Feishu IM delay notice when market data readiness polls repeatedly."""
 
 from __future__ import annotations
 
