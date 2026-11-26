@@ -122,6 +122,14 @@ export const V3_SUPER_ETF_GROWTH_BUCKET: readonly string[] = [
 
 export const V3_SUPER_ETF_DEFENSIVE_BUCKET: readonly string[] = ['159549.SZ', '159207.SZ'] as const;
 
+/** EXP-V3-11 20 只超级行业 ETF 动量先导池（从 23 只 industry_theme 中剔除低波核心与黄金股票）。 */
+export const V3_SUPER_ETF_SECTOR_PIONEER_CODES: readonly string[] = [
+  '158049.SZ', '159045.SZ', '159052.SZ', '159107.SZ', '159153.SZ',
+  '159160.SZ', '159161.SZ', '159241.SZ', '159278.SZ', '159550.SZ',
+  '159599.SZ', '159622.SZ', '159637.SZ', '159692.SZ', '159994.SZ',
+  '510170.SH', '515040.SH', '516150.SH', '560480.SH', '588750.SH',
+] as const;
+
 /** 已核验的东财超级 ETF 免五白名单（共 33 只，佣金万分之0.5，免5元最低消费）。 */
 export const EASTMONEY_SUPER_ETF_CODES: readonly string[] = [
   '159052.SZ', '159207.SZ', '158049.SZ', '159045.SZ', '588750.SH',

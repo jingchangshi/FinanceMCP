@@ -13,6 +13,14 @@ import { loadApprovedV3Policy, type ApprovedV3Policy } from './v3Policy.js';
 export type CircuitBreakerStatus = 'NORMAL' | 'L1_WARN' | 'L2_LOCKED';
 export type SubStrategyStatus = 'ACTIVE' | 'STOP_ONLY' | 'REDUCE_ONLY' | 'LOCKED_PENDING_VALIDATION';
 
+export type DrawdownControlStage =
+  | 'NORMAL'
+  | 'STAGE1_CAP_50'
+  | 'STAGE2_CAP_25'
+  | 'CPPI_CAPPED'
+  | 'L1_WARN'
+  | 'L2_LOCKED';
+
 export interface PersistedRiskAnchor {
   account_id: string;
   initial_principal_cents: number;
@@ -24,6 +32,9 @@ export interface PersistedRiskAnchor {
   hwm_applied_same_day_flow_cents: number;
   /** 高水位口径：TOTAL = 迁移前含理财的总资产峰值；INVESTABLE = 现金+证券可投资净值。 */
   hwm_nav_scope: 'INVESTABLE' | 'TOTAL' | null;
+  work_hwm_nav_cents?: number | null;
+  work_hwm_date?: string | null;
+  ramp_until_trade_date?: string | null;
   circuit_breaker_status: CircuitBreakerStatus;
   locked_until_trade_date: string | null;
   updated_at: string;
@@ -37,6 +48,11 @@ export interface StrategyRouterResult {
   effective_regime: MarketRegimeTier;
   circuit_breaker_status: CircuitBreakerStatus;
   circuit_breaker_label_zh: string;
+  drawdown_control_mode: ApprovedV3Policy['drawdown_control_mode'];
+  drawdown_control_stage: DrawdownControlStage;
+  drawdown_equity_cap_bps: number | null;
+  ramp_until_trade_date: string | null;
+  ramp_factor_bps: number;
   locked_until_trade_date: string | null;
   l2_trigger_drawdown_bps: number;
   post_breaker_equity_bps: number;
@@ -60,6 +76,11 @@ export interface StrategyRouterResult {
     /** 峰日原始基准（写库值）；绝不把展示等价峰写回旧峰日。 */
     hwm_original_nav_cents: number;
     hwm_date: string;
+    /** 工作高水位（v3.3.0 解锁再锚定后用于风控，全历史 true peak 仍严格保留在 hwm_nav_cents）。 */
+    work_hwm_nav_cents: number;
+    work_hwm_date: string;
+    work_hwm_drawdown_bps: number;
+    work_hwm_drawdown_pct: number;
     /** 锚点建立时已折入的当日流水日期与金额；同日重跑不会重复扣减。 */
     hwm_flows_applied_through: string | null;
     hwm_applied_same_day_flow_cents: number;
@@ -79,6 +100,7 @@ export interface StrategyRouterResult {
     target_equity_bps: number;
     base_super_etf_bps: number;
     pioneer_bps: number;
+    sector_pioneer_bps: number;
     defensive_cash_bps: number;
   };
   sub_strategies: {
@@ -134,6 +156,23 @@ export function nextOpenTradeDayAfterN(
   return addCalendarDaysYmd(asOf, Math.ceil(openDays * 1.48));
 }
 
+function countOpenTradeDaysBetween(
+  marketDb: DatabaseSync | null | undefined,
+  fromDate: string,
+  toDate: string,
+): number {
+  if (fromDate >= toDate) return 0;
+  if (marketDb && portfolioTableExists(marketDb, 'trade_cal')) {
+    const row = marketDb.prepare(
+      'SELECT COUNT(*) AS n FROM trade_cal WHERE is_open = 1 AND cal_date > ? AND cal_date <= ?',
+    ).get(fromDate, toDate) as { n?: number } | undefined;
+    if (row && typeof row.n === 'number') return row.n;
+  }
+  const ms = Date.UTC(+toDate.slice(0, 4), +toDate.slice(4, 6) - 1, +toDate.slice(6, 8))
+    - Date.UTC(+fromDate.slice(0, 4), +fromDate.slice(4, 6) - 1, +fromDate.slice(6, 8));
+  return Math.max(0, Math.round((ms / 86_400_000) / 1.48));
+}
+
 export function readInitialPrincipalCents(
   portfolioDb: DatabaseSync | null | undefined,
   accountId: string,
@@ -156,13 +195,15 @@ export function readRiskAnchor(
       .map(row => row.name)
       .filter((name): name is string => Boolean(name)),
   );
-  // 迁移前建立的旧库（只读打开）还没有流水列：按“未记录”读取，写路径扩容后自然补齐。
+  // 迁移前建立的旧库（只读打开）还没有流水列或工作峰值列：按缺省/空值读取，写路径扩容后自然补齐。
   const flowCols = cols.has('hwm_flows_applied_through') && cols.has('hwm_applied_same_day_flow_cents');
   const scopeCol = cols.has('hwm_nav_scope');
+  const workCols = cols.has('work_hwm_nav_cents') && cols.has('work_hwm_date') && cols.has('ramp_until_trade_date');
   const row = portfolioDb.prepare(
     `SELECT account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
        ${flowCols ? 'hwm_flows_applied_through, hwm_applied_same_day_flow_cents' : 'NULL AS hwm_flows_applied_through, 0 AS hwm_applied_same_day_flow_cents'},
        ${scopeCol ? 'hwm_nav_scope' : "'TOTAL' AS hwm_nav_scope"},
+       ${workCols ? 'work_hwm_nav_cents, work_hwm_date, ramp_until_trade_date' : 'NULL AS work_hwm_nav_cents, NULL AS work_hwm_date, NULL AS ramp_until_trade_date'},
        circuit_breaker_status, locked_until_trade_date, updated_at
      FROM account_risk_anchor WHERE account_id = ?`,
   ).get(accountId) as PersistedRiskAnchor | undefined;
@@ -529,14 +570,58 @@ function evaluateHwm(
   };
 }
 
-function targetBucketsFor(regime: MarketRegimeTier): StrategyRouterResult['targets'] {
+function fmtPct(v: number): string {
+  return Math.round(v * 10) % 10 === 0 ? v.toFixed(0) : v.toFixed(1);
+}
+
+function targetBucketsFor(
+  regime: MarketRegimeTier,
+  policy: ApprovedV3Policy,
+  bp1Allowed: boolean,
+): StrategyRouterResult['targets'] {
+  const isV32Legacy = !policy.sector_pioneer_enabled
+    && policy.stock_bp1_min_investable_nav_cny === 0
+    && !policy.stock_bp1_block_during_deconcentration;
+  if (isV32Legacy) {
+    if (regime === 'OFFENSIVE') {
+      return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.OFFENSIVE, base_super_etf_bps: 3750, pioneer_bps: 4750, sector_pioneer_bps: 0, defensive_cash_bps: 1500 };
+    }
+    if (regime === 'STRUCTURAL') {
+      return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.STRUCTURAL, base_super_etf_bps: 2500, pioneer_bps: 3500, sector_pioneer_bps: 0, defensive_cash_bps: 4000 };
+    }
+    if (regime === 'RECOVERY') {
+      const rec = policy.recovery_equity_bps;
+      return { target_equity_bps: rec, base_super_etf_bps: rec, pioneer_bps: 0, sector_pioneer_bps: 0, defensive_cash_bps: 10000 - rec };
+    }
+    return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.DEFENSIVE, base_super_etf_bps: 1500, pioneer_bps: 0, sector_pioneer_bps: 0, defensive_cash_bps: 8500 };
+  }
+
+  if (regime === 'DEFENSIVE') {
+    return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.DEFENSIVE, base_super_etf_bps: 1500, pioneer_bps: 0, sector_pioneer_bps: 0, defensive_cash_bps: 8500 };
+  }
+  if (regime === 'RECOVERY') {
+    const rec = policy.recovery_equity_bps;
+    return { target_equity_bps: rec, base_super_etf_bps: rec, pioneer_bps: 0, sector_pioneer_bps: 0, defensive_cash_bps: 10000 - rec };
+  }
+  const sec = policy.sector_pioneer_enabled ? Math.min(policy.sector_pioneer_max_weight_bps, 2000) : 0;
   if (regime === 'OFFENSIVE') {
-    return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.OFFENSIVE, base_super_etf_bps: 3750, pioneer_bps: 4750, defensive_cash_bps: 1500 };
+    const stock = bp1Allowed ? 3500 : 0;
+    return {
+      target_equity_bps: REGIME_TARGET_EQUITY_BPS.OFFENSIVE,
+      base_super_etf_bps: 8500 - sec - stock,
+      pioneer_bps: stock,
+      sector_pioneer_bps: sec,
+      defensive_cash_bps: 1500,
+    };
   }
-  if (regime === 'STRUCTURAL') {
-    return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.STRUCTURAL, base_super_etf_bps: 2500, pioneer_bps: 3500, defensive_cash_bps: 4000 };
-  }
-  return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.DEFENSIVE, base_super_etf_bps: 1500, pioneer_bps: 0, defensive_cash_bps: 8500 };
+  const stock = bp1Allowed ? 2000 : 0;
+  return {
+    target_equity_bps: REGIME_TARGET_EQUITY_BPS.STRUCTURAL,
+    base_super_etf_bps: 6000 - sec - stock,
+    pioneer_bps: stock,
+    sector_pioneer_bps: sec,
+    defensive_cash_bps: 4000,
+  };
 }
 
 export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): StrategyRouterResult {
@@ -580,31 +665,153 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     ? Math.max(0, Math.round(((effectiveHwmCents - comparisonNavCents) / effectiveHwmCents) * 10000))
     : 0;
   const hwmDrawdownPct = r2(hwmDrawdownBps / 100);
-  const lifelineNavCents = Math.round(effectiveHwmCents * (10000 - l2TriggerBps) / 10000);
-  const lifelineBufferCents = comparisonNavCents - lifelineNavCents;
-  const lifelineBufferPct = effectiveHwmCents > 0
-    ? r2(((comparisonNavCents - lifelineNavCents) / effectiveHwmCents) * 100)
-    : 0;
 
-  let circuitBreakerStatus: CircuitBreakerStatus = 'NORMAL';
-  let lockedUntil: string | null = null;
-  if (
+  const existingLockActive = Boolean(
     existing
     && input.asOf >= existing.updated_at
     && existing.circuit_breaker_status === 'L2_LOCKED'
     && existing.locked_until_trade_date
-    && existing.locked_until_trade_date >= input.asOf
-  ) {
-    circuitBreakerStatus = 'L2_LOCKED';
-    lockedUntil = existing.locked_until_trade_date;
-  } else if (hwmDrawdownBps >= l2TriggerBps) {
-    circuitBreakerStatus = 'L2_LOCKED';
-    lockedUntil = nextOpenTradeDayAfterN(input.marketDb, input.asOf, v3Policy.l2_lock_trade_days);
-    if (existing && input.asOf >= existing.hwm_date) shouldPersistAnchor = true;
-  } else if (hwmDrawdownBps >= v3Policy.l1_warn_drawdown_bps) {
-    circuitBreakerStatus = 'L1_WARN';
-    if (existing && input.asOf >= existing.hwm_date) shouldPersistAnchor = true;
+    && existing.locked_until_trade_date >= input.asOf,
+  );
+  const justUnlocked = Boolean(
+    existing
+    && input.asOf >= existing.updated_at
+    && existing.circuit_breaker_status === 'L2_LOCKED'
+    && existing.locked_until_trade_date
+    && existing.locked_until_trade_date < input.asOf,
+  );
+
+  // 工作高水位（v3.3.0 解锁再锚定）；全历史 true_peak 仍严格保留在 effectiveHwmCents/effectiveHwmDate。
+  let workHwmNavCents = effectiveHwmCents;
+  let workHwmDate = effectiveHwmDate;
+  let rampUntilTradeDate: string | null = null;
+  if (v3Policy.drawdown_control_mode !== 'HARD_STEP_LOCK') {
+    if (existing && (existing.work_hwm_nav_cents == null || !existing.work_hwm_date)) {
+      shouldPersistAnchor = true;
+    }
+    if (justUnlocked && v3Policy.drawdown_unlock_reanchor_enabled) {
+      workHwmNavCents = comparisonNavCents;
+      workHwmDate = input.asOf;
+      rampUntilTradeDate = v3Policy.drawdown_unlock_ramp_trade_days > 0
+        ? nextOpenTradeDayAfterN(input.marketDb, input.asOf, v3Policy.drawdown_unlock_ramp_trade_days)
+        : null;
+      shouldPersistAnchor = true;
+    } else {
+      rampUntilTradeDate = existing?.ramp_until_trade_date && existing.ramp_until_trade_date >= input.asOf
+        ? existing.ramp_until_trade_date
+        : null;
+      const baseWork = existing?.work_hwm_nav_cents && existing.work_hwm_nav_cents > 0
+        ? existing.work_hwm_nav_cents
+        : effectiveHwmCents;
+      const baseWorkDate = existing?.work_hwm_date ?? effectiveHwmDate;
+      const workShares = readUnitSharePair(input.portfolioDb, input.marketDb, input.accountId, baseWorkDate, input.asOf);
+      if (workShares && baseWork > 0) {
+        const wRatio = (comparisonNavCents / baseWork) * (workShares.from_units / workShares.to_units);
+        if (input.asOf >= baseWorkDate && wRatio > 1 + 1e-6) {
+          workHwmNavCents = comparisonNavCents;
+          workHwmDate = input.asOf;
+          shouldPersistAnchor = true;
+        } else {
+          workHwmNavCents = Math.round(comparisonNavCents / wRatio);
+          workHwmDate = baseWorkDate;
+        }
+      } else if (input.asOf >= baseWorkDate && comparisonNavCents > baseWork) {
+        workHwmNavCents = comparisonNavCents;
+        workHwmDate = input.asOf;
+        shouldPersistAnchor = true;
+      } else {
+        workHwmNavCents = baseWork;
+        workHwmDate = baseWorkDate;
+      }
+    }
   }
+  const workHwmDrawdownBps = workHwmNavCents > 0
+    ? Math.max(0, Math.round(((workHwmNavCents - comparisonNavCents) / workHwmNavCents) * 10000))
+    : 0;
+  const workHwmDrawdownPct = r2(workHwmDrawdownBps / 100);
+
+  const lifelineRefHwmCents = v3Policy.drawdown_control_mode === 'HARD_STEP_LOCK' ? effectiveHwmCents : workHwmNavCents;
+  const lifelineNavCents = Math.round(lifelineRefHwmCents * (10000 - l2TriggerBps) / 10000);
+  const lifelineBufferCents = comparisonNavCents - lifelineNavCents;
+  const lifelineBufferPct = lifelineRefHwmCents > 0
+    ? r2(((comparisonNavCents - lifelineNavCents) / lifelineRefHwmCents) * 100)
+    : 0;
+
+  let circuitBreakerStatus: CircuitBreakerStatus = 'NORMAL';
+  let drawdownControlStage: DrawdownControlStage = 'NORMAL';
+  let drawdownEquityCapBps: number | null = null;
+  let lockedUntil: string | null = null;
+
+  if (existingLockActive) {
+    circuitBreakerStatus = 'L2_LOCKED';
+    drawdownControlStage = 'L2_LOCKED';
+    lockedUntil = existing!.locked_until_trade_date;
+  } else if (v3Policy.drawdown_control_mode === 'TWO_STAGE_GRADUAL') {
+    if (workHwmDrawdownBps >= l2TriggerBps) {
+      circuitBreakerStatus = 'L2_LOCKED';
+      drawdownControlStage = 'L2_LOCKED';
+      lockedUntil = nextOpenTradeDayAfterN(input.marketDb, input.asOf, v3Policy.l2_lock_trade_days);
+      rampUntilTradeDate = null;
+      shouldPersistAnchor = true;
+    } else if (workHwmDrawdownBps >= v3Policy.drawdown_stage2_bps) {
+      circuitBreakerStatus = 'L1_WARN';
+      drawdownControlStage = 'STAGE2_CAP_25';
+      drawdownEquityCapBps = v3Policy.drawdown_stage2_cap_bps;
+      if (existing && input.asOf >= existing.hwm_date) shouldPersistAnchor = true;
+    } else if (workHwmDrawdownBps >= v3Policy.drawdown_stage1_bps) {
+      circuitBreakerStatus = 'L1_WARN';
+      drawdownControlStage = 'STAGE1_CAP_50';
+      drawdownEquityCapBps = v3Policy.drawdown_stage1_cap_bps;
+      if (existing && input.asOf >= existing.hwm_date) shouldPersistAnchor = true;
+    }
+  } else if (v3Policy.drawdown_control_mode === 'CPPI_F15_M5') {
+    if (workHwmDrawdownBps >= l2TriggerBps) {
+      circuitBreakerStatus = 'L2_LOCKED';
+      drawdownControlStage = 'L2_LOCKED';
+      lockedUntil = nextOpenTradeDayAfterN(input.marketDb, input.asOf, v3Policy.l2_lock_trade_days);
+      rampUntilTradeDate = null;
+      shouldPersistAnchor = true;
+    } else {
+      const cushion = Math.max(0, 1 - 0.85 / Math.max(0.01, 1 - workHwmDrawdownBps / 10000));
+      const cppiCap = Math.min(8500, Math.max(0, Math.round(cushion * 5 * 10000)));
+      if (workHwmDrawdownBps >= v3Policy.l1_warn_drawdown_bps || cppiCap < 8500) {
+        drawdownEquityCapBps = cppiCap;
+        if (workHwmDrawdownBps >= v3Policy.l1_warn_drawdown_bps) {
+          circuitBreakerStatus = 'L1_WARN';
+          drawdownControlStage = 'CPPI_CAPPED';
+        }
+      }
+    }
+  } else {
+    if (hwmDrawdownBps >= l2TriggerBps) {
+      circuitBreakerStatus = 'L2_LOCKED';
+      drawdownControlStage = 'L2_LOCKED';
+      lockedUntil = nextOpenTradeDayAfterN(input.marketDb, input.asOf, v3Policy.l2_lock_trade_days);
+      if (existing && input.asOf >= existing.hwm_date) shouldPersistAnchor = true;
+    } else if (hwmDrawdownBps >= v3Policy.l1_warn_drawdown_bps) {
+      circuitBreakerStatus = 'L1_WARN';
+      drawdownControlStage = 'L1_WARN';
+      if (existing && input.asOf >= existing.hwm_date) shouldPersistAnchor = true;
+    }
+  }
+
+  let rampFactorBps = 10000;
+  if (
+    v3Policy.drawdown_control_mode !== 'HARD_STEP_LOCK'
+    && circuitBreakerStatus !== 'L2_LOCKED'
+    && rampUntilTradeDate
+    && rampUntilTradeDate >= input.asOf
+    && v3Policy.drawdown_unlock_ramp_trade_days > 0
+  ) {
+    const remaining = countOpenTradeDaysBetween(input.marketDb, input.asOf, rampUntilTradeDate);
+    const total = v3Policy.drawdown_unlock_ramp_trade_days;
+    const elapsed = Math.max(0, total - remaining);
+    rampFactorBps = Math.min(10000, Math.max(5000, Math.round(5000 + 5000 * (elapsed / total))));
+  }
+
+  const bp1CapitalOk = comparisonNavCents >= v3Policy.stock_bp1_min_investable_nav_cny * 100;
+  const bp1DeconcOk = !(v3Policy.stock_bp1_block_during_deconcentration && deconcActive);
+  const bp1Allowed = bp1CapitalOk && bp1DeconcOk;
 
   const effectiveRegime: MarketRegimeTier = circuitBreakerStatus === 'L2_LOCKED'
     ? 'DEFENSIVE'
@@ -614,32 +821,75 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
         target_equity_bps: postBreakerEquityBps,
         base_super_etf_bps: postBreakerEquityBps,
         pioneer_bps: 0,
+        sector_pioneer_bps: 0,
         defensive_cash_bps: 10000 - postBreakerEquityBps,
       }
-    : targetBucketsFor(effectiveRegime);
+    : targetBucketsFor(effectiveRegime, v3Policy, bp1Allowed);
+
+  if (circuitBreakerStatus !== 'L2_LOCKED') {
+    let capBps = targets.target_equity_bps;
+    if (drawdownEquityCapBps !== null) capBps = Math.min(capBps, drawdownEquityCapBps);
+    if (rampFactorBps < 10000) capBps = Math.min(capBps, Math.round(targets.target_equity_bps * rampFactorBps / 10000));
+    if (capBps < targets.target_equity_bps) {
+      if (circuitBreakerStatus === 'L1_WARN') {
+        const secCap = drawdownControlStage === 'STAGE2_CAP_25'
+          ? 0
+          : Math.min(targets.sector_pioneer_bps, Math.floor(capBps * 0.25));
+        targets.pioneer_bps = 0;
+        targets.sector_pioneer_bps = secCap;
+        targets.base_super_etf_bps = Math.max(0, capBps - secCap);
+      } else {
+        const scale = targets.target_equity_bps > 0 ? capBps / targets.target_equity_bps : 0;
+        const scaledSec = Math.round(targets.sector_pioneer_bps * scale);
+        const scaledStock = Math.round(targets.pioneer_bps * scale);
+        targets.sector_pioneer_bps = scaledSec;
+        targets.pioneer_bps = scaledStock;
+        targets.base_super_etf_bps = Math.max(0, capBps - scaledSec - scaledStock);
+      }
+      targets.target_equity_bps = capBps;
+      targets.defensive_cash_bps = 10000 - capBps;
+    }
+  }
 
   const phase1Lock = input.phase1LockStockSwing ?? !v3Policy.approved;
   const sDeconcentrate: SubStrategyStatus = 'ACTIVE';
   const sBaseSuperEtf: SubStrategyStatus = circuitBreakerStatus === 'L2_LOCKED' ? 'REDUCE_ONLY' : 'ACTIVE';
   let sStockSwing: SubStrategyStatus = 'ACTIVE';
-  if (circuitBreakerStatus !== 'NORMAL' || effectiveRegime === 'DEFENSIVE') {
+  if (
+    circuitBreakerStatus !== 'NORMAL'
+    || effectiveRegime === 'DEFENSIVE'
+    || effectiveRegime === 'RECOVERY'
+    || !bp1Allowed
+  ) {
     sStockSwing = 'STOP_ONLY';
   } else if (phase1Lock) {
     sStockSwing = 'LOCKED_PENDING_VALIDATION';
   }
 
+  const l2PctText = fmtPct(l2TriggerPct);
+  const l1PctText = fmtPct(v3Policy.l1_warn_drawdown_bps / 100);
   const breakerLabelZh = circuitBreakerStatus === 'L2_LOCKED'
     ? deconcActive
-      ? `二级熔断锁定（重仓换马期回撤达 ${l2TriggerPct.toFixed(0)}% 前置保护触发，风险权益清零防守至 ${lockedUntil}）`
-      : `二级熔断锁定（高水位回撤达 ${l2TriggerPct.toFixed(0)}%，防守冷静期至 ${lockedUntil}）`
+      ? `二级熔断锁定（重仓换马期回撤达 ${l2PctText}% 前置保护触发，风险权益清零防守至 ${lockedUntil}）`
+      : `二级熔断锁定（高水位回撤达 ${l2PctText}%，防守冷静期至 ${lockedUntil}）`
     : circuitBreakerStatus === 'L1_WARN'
-      ? '一级回撤警戒（高水位回撤超 10%，冻结个股新开仓）'
-      : deconcActive
-        ? `正常受控（重仓换马期启用 ${l2TriggerPct.toFixed(0)}% 前置熔断保护，守卫 ${l2TriggerPct.toFixed(0)}% 生命线）`
-        : `正常受控（位于 ${l2TriggerPct.toFixed(0)}% 熔断生命线之上）`;
+      ? drawdownControlStage === 'STAGE2_CAP_25'
+        ? `二级渐进警戒（工作高水位回撤超 ${fmtPct(v3Policy.drawdown_stage2_bps / 100)}%，权益上限收紧至 ${(drawdownEquityCapBps! / 100).toFixed(0)}%，冻结个股新开仓）`
+        : drawdownControlStage === 'STAGE1_CAP_50'
+          ? `一级渐进警戒（工作高水位回撤超 ${fmtPct(v3Policy.drawdown_stage1_bps / 100)}%，权益上限收紧至 ${(drawdownEquityCapBps! / 100).toFixed(0)}%，冻结个股新开仓）`
+          : `一级回撤警戒（高水位回撤超 ${l1PctText}%，冻结个股新开仓）`
+      : rampFactorBps < 10000
+        ? `解锁爬坡受控（解除熔断后 10 日线性恢复期，权益系数 ${(rampFactorBps / 100).toFixed(0)}%，守卫 ${l2PctText}% 生命线）`
+        : deconcActive
+          ? `正常受控（重仓换马期启用 ${l2PctText}% 前置熔断保护，守卫 ${l2PctText}% 生命线）`
+          : `正常受控（位于 ${l2PctText}% 熔断生命线之上）`;
 
   const stockSwingLabelZh = sStockSwing === 'STOP_ONLY'
-    ? '仅允许执行存量止损或止盈，禁止新开仓'
+    ? !bp1DeconcOk && circuitBreakerStatus === 'NORMAL' && effectiveRegime !== 'DEFENSIVE' && effectiveRegime !== 'RECOVERY'
+      ? '存量重仓换马未完成前由超级行业主题指数基金先导替代，个股仅允许存量止损或止盈'
+      : !bp1CapitalOk && circuitBreakerStatus === 'NORMAL' && effectiveRegime !== 'DEFENSIVE' && effectiveRegime !== 'RECOVERY'
+        ? '可投资净值未满 10 万元门槛，暂由超级行业主题指数基金先导替代，个股仅允许存量止损或止盈'
+        : '仅允许执行存量止损或止盈，禁止新开仓'
     : sStockSwing === 'LOCKED_PENDING_VALIDATION'
       ? '待策略准入验证通过后解锁'
       : '强势股缩量低于 20 日均值回踩 20 日均线买点已解锁运行（平台突破买点已按实证剔除，严守-8%硬止损）';
@@ -652,6 +902,11 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     effective_regime: effectiveRegime,
     circuit_breaker_status: circuitBreakerStatus,
     circuit_breaker_label_zh: breakerLabelZh,
+    drawdown_control_mode: v3Policy.drawdown_control_mode,
+    drawdown_control_stage: drawdownControlStage,
+    drawdown_equity_cap_bps: drawdownEquityCapBps,
+    ramp_until_trade_date: rampUntilTradeDate,
+    ramp_factor_bps: rampFactorBps,
     locked_until_trade_date: lockedUntil,
     l2_trigger_drawdown_bps: l2TriggerBps,
     post_breaker_equity_bps: postBreakerEquityBps,
@@ -670,6 +925,10 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
       hwm_nav_cents: effectiveHwmCents,
       hwm_original_nav_cents: hwm.originalHwmCents,
       hwm_date: effectiveHwmDate,
+      work_hwm_nav_cents: workHwmNavCents,
+      work_hwm_date: workHwmDate,
+      work_hwm_drawdown_bps: workHwmDrawdownBps,
+      work_hwm_drawdown_pct: workHwmDrawdownPct,
       hwm_flows_applied_through: hwm.flowsAppliedThrough,
       hwm_applied_same_day_flow_cents: hwm.appliedSameDayFlowCents,
       hwm_unit_nav_ratio: unitNavRatio,
@@ -706,62 +965,133 @@ export function persistRiskAnchor(
   if (!portfolioDb || !router.should_persist_anchor) return false;
   if (!portfolioTableExists(portfolioDb, 'account_risk_anchor')) return false;
   try {
+    const cols = new Set(
+      (portfolioDb.prepare('PRAGMA table_info(account_risk_anchor)').all() as Array<{ name?: string }>)
+        .map(row => row.name)
+        .filter((name): name is string => Boolean(name)),
+    );
+    const hasWorkCols = cols.has('work_hwm_nav_cents')
+      && cols.has('work_hwm_date')
+      && cols.has('ramp_until_trade_date');
     // 单位新高、同日新流水重基或旧口径迁移都允许改写高水位锚点；名义大小不是写入条件
     // （出金后单位新高 70 -> 63 名义更低，也要落库）。
     const writeHwm = router.should_write_hwm ? 1 : 0;
-    portfolioDb.prepare(`
-      INSERT INTO account_risk_anchor (
-        account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
-        hwm_flows_applied_through, hwm_applied_same_day_flow_cents, hwm_nav_scope,
-        circuit_breaker_status, locked_until_trade_date, updated_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(account_id) DO UPDATE SET
-        initial_principal_cents = excluded.initial_principal_cents,
-        hwm_nav_cents = CASE
-          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
-          THEN excluded.hwm_nav_cents
-          ELSE account_risk_anchor.hwm_nav_cents
-        END,
-        hwm_date = CASE
-          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
-          THEN excluded.hwm_date
-          ELSE account_risk_anchor.hwm_date
-        END,
-        hwm_flows_applied_through = CASE
-          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
-          THEN excluded.hwm_flows_applied_through
-          ELSE account_risk_anchor.hwm_flows_applied_through
-        END,
-        hwm_applied_same_day_flow_cents = CASE
-          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
-          THEN excluded.hwm_applied_same_day_flow_cents
-          ELSE account_risk_anchor.hwm_applied_same_day_flow_cents
-        END,
-        hwm_nav_scope = CASE
-          WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
-          THEN excluded.hwm_nav_scope
-          ELSE account_risk_anchor.hwm_nav_scope
-        END,
-        circuit_breaker_status = excluded.circuit_breaker_status,
-        locked_until_trade_date = excluded.locked_until_trade_date,
-        updated_at = excluded.updated_at
-    `).run(
-      router.account_id,
-      router.anchor_snapshot.initial_principal_cents,
-      router.anchor_snapshot.hwm_original_nav_cents,
-      router.anchor_snapshot.hwm_date,
-      router.anchor_snapshot.hwm_flows_applied_through,
-      router.anchor_snapshot.hwm_applied_same_day_flow_cents,
-      router.anchor_snapshot.hwm_nav_scope,
-      router.circuit_breaker_status,
-      router.locked_until_trade_date,
-      router.as_of_trade_date,
-      writeHwm,
-      writeHwm,
-      writeHwm,
-      writeHwm,
-      writeHwm,
-    );
+    if (hasWorkCols) {
+      portfolioDb.prepare(`
+        INSERT INTO account_risk_anchor (
+          account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
+          hwm_flows_applied_through, hwm_applied_same_day_flow_cents, hwm_nav_scope,
+          work_hwm_nav_cents, work_hwm_date, ramp_until_trade_date,
+          circuit_breaker_status, locked_until_trade_date, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(account_id) DO UPDATE SET
+          initial_principal_cents = excluded.initial_principal_cents,
+          hwm_nav_cents = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_nav_cents
+            ELSE account_risk_anchor.hwm_nav_cents
+          END,
+          hwm_date = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_date
+            ELSE account_risk_anchor.hwm_date
+          END,
+          hwm_flows_applied_through = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_flows_applied_through
+            ELSE account_risk_anchor.hwm_flows_applied_through
+          END,
+          hwm_applied_same_day_flow_cents = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_applied_same_day_flow_cents
+            ELSE account_risk_anchor.hwm_applied_same_day_flow_cents
+          END,
+          hwm_nav_scope = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_nav_scope
+            ELSE account_risk_anchor.hwm_nav_scope
+          END,
+          work_hwm_nav_cents = excluded.work_hwm_nav_cents,
+          work_hwm_date = excluded.work_hwm_date,
+          ramp_until_trade_date = excluded.ramp_until_trade_date,
+          circuit_breaker_status = excluded.circuit_breaker_status,
+          locked_until_trade_date = excluded.locked_until_trade_date,
+          updated_at = excluded.updated_at
+      `).run(
+        router.account_id,
+        router.anchor_snapshot.initial_principal_cents,
+        router.anchor_snapshot.hwm_original_nav_cents,
+        router.anchor_snapshot.hwm_date,
+        router.anchor_snapshot.hwm_flows_applied_through,
+        router.anchor_snapshot.hwm_applied_same_day_flow_cents,
+        router.anchor_snapshot.hwm_nav_scope,
+        router.anchor_snapshot.work_hwm_nav_cents,
+        router.anchor_snapshot.work_hwm_date,
+        router.ramp_until_trade_date,
+        router.circuit_breaker_status,
+        router.locked_until_trade_date,
+        router.as_of_trade_date,
+        writeHwm,
+        writeHwm,
+        writeHwm,
+        writeHwm,
+        writeHwm,
+      );
+    } else {
+      portfolioDb.prepare(`
+        INSERT INTO account_risk_anchor (
+          account_id, initial_principal_cents, hwm_nav_cents, hwm_date,
+          hwm_flows_applied_through, hwm_applied_same_day_flow_cents, hwm_nav_scope,
+          circuit_breaker_status, locked_until_trade_date, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(account_id) DO UPDATE SET
+          initial_principal_cents = excluded.initial_principal_cents,
+          hwm_nav_cents = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_nav_cents
+            ELSE account_risk_anchor.hwm_nav_cents
+          END,
+          hwm_date = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_date
+            ELSE account_risk_anchor.hwm_date
+          END,
+          hwm_flows_applied_through = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_flows_applied_through
+            ELSE account_risk_anchor.hwm_flows_applied_through
+          END,
+          hwm_applied_same_day_flow_cents = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_applied_same_day_flow_cents
+            ELSE account_risk_anchor.hwm_applied_same_day_flow_cents
+          END,
+          hwm_nav_scope = CASE
+            WHEN ? = 1 AND excluded.hwm_date >= account_risk_anchor.hwm_date
+            THEN excluded.hwm_nav_scope
+            ELSE account_risk_anchor.hwm_nav_scope
+          END,
+          circuit_breaker_status = excluded.circuit_breaker_status,
+          locked_until_trade_date = excluded.locked_until_trade_date,
+          updated_at = excluded.updated_at
+      `).run(
+        router.account_id,
+        router.anchor_snapshot.initial_principal_cents,
+        router.anchor_snapshot.hwm_original_nav_cents,
+        router.anchor_snapshot.hwm_date,
+        router.anchor_snapshot.hwm_flows_applied_through,
+        router.anchor_snapshot.hwm_applied_same_day_flow_cents,
+        router.anchor_snapshot.hwm_nav_scope,
+        router.circuit_breaker_status,
+        router.locked_until_trade_date,
+        router.as_of_trade_date,
+        writeHwm,
+        writeHwm,
+        writeHwm,
+        writeHwm,
+        writeHwm,
+      );
+    }
     return true;
   } catch (err: any) {
     if (String(err?.message ?? err).includes('readonly')) return false;

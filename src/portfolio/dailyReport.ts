@@ -447,6 +447,11 @@ export interface V3CockpitSummary {
       latest_in_validity: boolean;
       evaluated_as_of: string | null;
     };
+    defensive_bond_reservoir_etf?: string;
+    drawdown_control_mode?: 'HARD_STEP_LOCK' | 'TWO_STAGE_GRADUAL' | 'CPPI_F15_M5';
+    recovery_overlay_enabled?: boolean;
+    sector_pioneer_enabled?: boolean;
+    lowvol_core_permanent_share_bps?: number;
   };
   principal: {
     initial_principal_cents: number;
@@ -469,16 +474,21 @@ export interface V3CockpitSummary {
     target_equity_pct: number;
     defensive_cash_pct: number;
     pct_above_ma60: number | null;
+    pct_above_ma20?: number | null;
     amount_vs_ma20: number | null;
     limit_down: number | null;
     hs300_above_ma60: boolean | null;
     zz500_above_ma60: boolean | null;
     cyb_above_ma60: boolean | null;
+    recovery_state?: V3ActionEngineOutput['market_regime']['recovery_state'];
   };
   router: {
     effective_regime: V3ActionEngineOutput['router']['effective_regime'];
     circuit_breaker_status: V3ActionEngineOutput['router']['circuit_breaker_status'];
     circuit_breaker_label_zh: string;
+    drawdown_control_mode?: V3ActionEngineOutput['router']['drawdown_control_mode'];
+    drawdown_control_stage?: V3ActionEngineOutput['router']['drawdown_control_stage'];
+    drawdown_equity_cap_bps?: number | null;
     locked_until_trade_date: string | null;
     l2_trigger_drawdown_bps: number;
     post_breaker_equity_bps: number;
@@ -487,6 +497,11 @@ export interface V3CockpitSummary {
     hwm_nav_cents: number;
     hwm_date: string;
     hwm_drawdown_pct: number;
+    work_hwm_nav_cents?: number;
+    work_hwm_date?: string;
+    work_hwm_drawdown_pct?: number;
+    ramp_until_trade_date?: string | null;
+    ramp_factor_bps?: number;
     lifeline_nav_cents: number;
     lifeline_buffer_cents: number;
     lifeline_buffer_pct: number;
@@ -538,6 +553,7 @@ export interface V3CockpitSummary {
   super_etf_candidates: V3ActionEngineOutput['super_etf_candidates'];
   cross_border_monitor: V3ActionEngineOutput['cross_border_monitor'];
   stock_swing_candidates: V3ActionEngineOutput['stock_swing_candidates'];
+  sector_pioneer_candidates?: V3ActionEngineOutput['sector_pioneer_candidates'];
   actions_summary: Array<{
     priority: ActionEnginePlan['priority'];
     code: string;
@@ -2023,7 +2039,8 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
       }
     }
     const anc = engineOut.router.anchor_snapshot;
-    const lifelinePct = (engineOut.router.l2_trigger_drawdown_bps / 100).toFixed(0);
+    const rawL2Pct = engineOut.router.l2_trigger_drawdown_bps / 100;
+    const lifelinePct = Math.round(rawL2Pct * 10) % 10 === 0 ? rawL2Pct.toFixed(0) : rawL2Pct.toFixed(1);
     const preemptiveNote = engineOut.router.deconcentration_preemptive_active
       ? '（存量重仓换马未完成期间启用前置熔断保护）'
       : '';
@@ -2216,6 +2233,11 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
             diagnostics: approvedPolicy.override_diagnostics,
             runtime_can_open: approvedPolicy.runtime_can_open,
             runtime_admission: approvedPolicy.runtime_admission,
+            defensive_bond_reservoir_etf: approvedPolicy.defensive_bond_reservoir_etf,
+            drawdown_control_mode: approvedPolicy.drawdown_control_mode,
+            recovery_overlay_enabled: approvedPolicy.recovery_overlay_enabled,
+            sector_pioneer_enabled: approvedPolicy.sector_pioneer_enabled,
+            lowvol_core_permanent_share_bps: approvedPolicy.lowvol_core_permanent_share_bps,
           },
           principal: {
           initial_principal_cents: engineOut.router.anchor_snapshot.initial_principal_cents,
@@ -2239,6 +2261,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           target_equity_pct: r2(engineOut.router.targets.target_equity_bps / 100),
           defensive_cash_pct: r2(engineOut.router.targets.defensive_cash_bps / 100),
           pct_above_ma60: engineOut.market_regime.breadth.pct_above_ma60,
+          pct_above_ma20: engineOut.market_regime.breadth.pct_above_ma20 ?? null,
           amount_vs_ma20: engineOut.market_regime.breadth.amount_vs_ma20,
           limit_down: engineOut.market_regime.breadth.limit_down,
           hs300_above_ma60:
@@ -2253,11 +2276,15 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
             engineOut.market_regime.growth_anchor.chinext.close !== null && engineOut.market_regime.growth_anchor.chinext.ma60 !== null
               ? engineOut.market_regime.growth_anchor.chinext.close >= engineOut.market_regime.growth_anchor.chinext.ma60
               : null,
+          ...(engineOut.market_regime.recovery_state ? { recovery_state: engineOut.market_regime.recovery_state } : {}),
         },
         router: {
           effective_regime: engineOut.router.effective_regime,
           circuit_breaker_status: engineOut.router.circuit_breaker_status,
           circuit_breaker_label_zh: engineOut.router.circuit_breaker_label_zh,
+          drawdown_control_mode: engineOut.router.drawdown_control_mode,
+          drawdown_control_stage: engineOut.router.drawdown_control_stage,
+          drawdown_equity_cap_bps: engineOut.router.drawdown_equity_cap_bps,
           locked_until_trade_date: engineOut.router.locked_until_trade_date,
           l2_trigger_drawdown_bps: engineOut.router.l2_trigger_drawdown_bps,
           post_breaker_equity_bps: engineOut.router.post_breaker_equity_bps,
@@ -2266,6 +2293,11 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           hwm_nav_cents: engineOut.router.anchor_snapshot.hwm_nav_cents,
           hwm_date: engineOut.router.anchor_snapshot.hwm_date,
           hwm_drawdown_pct: engineOut.router.anchor_snapshot.hwm_drawdown_pct,
+          work_hwm_nav_cents: engineOut.router.anchor_snapshot.work_hwm_nav_cents,
+          work_hwm_date: engineOut.router.anchor_snapshot.work_hwm_date,
+          work_hwm_drawdown_pct: engineOut.router.anchor_snapshot.work_hwm_drawdown_pct,
+          ramp_until_trade_date: engineOut.router.ramp_until_trade_date,
+          ramp_factor_bps: engineOut.router.ramp_factor_bps,
           lifeline_nav_cents: engineOut.router.anchor_snapshot.lifeline_nav_cents,
           lifeline_buffer_cents: engineOut.router.anchor_snapshot.lifeline_buffer_cents,
           lifeline_buffer_pct: engineOut.router.anchor_snapshot.lifeline_buffer_pct,
@@ -2317,6 +2349,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         super_etf_candidates: engineOut.super_etf_candidates,
         cross_border_monitor: engineOut.cross_border_monitor,
         stock_swing_candidates: engineOut.stock_swing_candidates,
+        sector_pioneer_candidates: engineOut.sector_pioneer_candidates,
         actions_summary: executionActions.map((act, idx) => ({
           priority: act.priority ?? engineOut.actions[idx]?.priority ?? 'P3',
           code: act.code,

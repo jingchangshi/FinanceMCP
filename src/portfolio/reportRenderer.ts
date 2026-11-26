@@ -173,6 +173,11 @@ function pctPoint(value: number | null | undefined, digits = 2): string {
   return `${value.toFixed(digits)}%`;
 }
 
+/** 整数/一位小数百分比展示（13.5 -> "13.5", 15 -> "15"）。 */
+function fmtPctNum(value: number): string {
+  return Math.round(value * 10) % 10 === 0 ? value.toFixed(0) : value.toFixed(1);
+}
+
 function toShanghaiDate(now: string | Date): Date {
   return typeof now === 'string' ? new Date(now) : now;
 }
@@ -841,14 +846,14 @@ function renderSectionB(r: DailyReportResult): string {
     if (dec.plan_mode === 'BOTTOM_GRIND_25') {
       items.push(
         `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
-        + `${zh(dec.status_summary_zh)}，动态高水位 ${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+        + `${zh(dec.status_summary_zh)}，动态高水位 ${fmtPctNum(c.router.l2_trigger_drawdown_bps / 100)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
       );
     } else {
       const rebText = dec.rebound_trigger_cny !== null ? `${dec.rebound_trigger_cny.toFixed(3)} 元` : '—';
       const monText = dec.next_monthly_trigger_date ? ymd(dec.next_monthly_trigger_date) : '下一月度首日';
       items.push(
         `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
-        + `159558.SZ 四批换马下次观察位为反弹 +8%（${rebText}）或月度窗口 ${monText}，动态高水位 ${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+        + `159558.SZ 四批换马下次观察位为反弹 +8%（${rebText}）或月度窗口 ${monText}，动态高水位 ${fmtPctNum(c.router.l2_trigger_drawdown_bps / 100)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
       );
     }
   } else {
@@ -929,7 +934,7 @@ function renderSectionC(r: DailyReportResult, view: RenderView): string {
   if (r.v3_cockpit) {
     const c = r.v3_cockpit;
     lines.push(
-      `- **本金回本与动态高水位防线**：初始投入本金 ${yuan(c.principal.initial_principal_cents)} 元，距回本还差 ${yuan(Math.abs(c.principal.to_principal_gap_cents))} 元（需涨 ${c.principal.to_principal_return_needed_pct.toFixed(2)}%）；动态高水位 ${yuan(c.router.hwm_nav_cents)} 元（${ymd(c.router.hwm_date)}），${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）。`,
+      `- **本金回本与动态高水位防线**：初始投入本金 ${yuan(c.principal.initial_principal_cents)} 元，距回本还差 ${yuan(Math.abs(c.principal.to_principal_gap_cents))} 元（需涨 ${c.principal.to_principal_return_needed_pct.toFixed(2)}%）；动态高水位 ${yuan(c.router.hwm_nav_cents)} 元（${ymd(c.router.hwm_date)}），${fmtPctNum(c.router.l2_trigger_drawdown_bps / 100)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）。`,
     );
   }
   return lines.join('\n');
@@ -1209,6 +1214,11 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
       );
     }
     lines.push(`- **个股波段先锋子策略**：${c.router.sub_strategies_zh.stock_swing_label}（执行中严格遵守单笔 -8% 硬止损、+15% 保本上移及 20 日均线移动止盈）。`);
+    if (c.sector_pioneer_candidates && c.sector_pioneer_candidates.length > 0) {
+      lines.push(
+        `- **超级行业动量先导候选（近 20/60 日混合动量前 1 名，单只封顶 20%）**：${c.sector_pioneer_candidates.slice(0, 1).map(cand => `${cand.name}（${cand.ts_code}，收盘 ${cand.close_cny.toFixed(3)} 元，60 日均线 ${cand.ma60_cny.toFixed(3)} 元，混合得分 +${cand.blend_score_pct.toFixed(2)}%）`).join('；')}。`,
+      );
+    }
     if (c.stock_swing_candidates && c.stock_swing_candidates.length > 0) {
       lines.push(
         `- **主板个股强势回踩候选（前 ${c.stock_swing_candidates.length} 名，单只上限 18% / 止损风险上限 1.3%）**：${c.stock_swing_candidates.slice(0, 2).map(cand => `${cand.name}（${cand.ts_code}，参考买价 ${cand.entry_ref_price_cny.toFixed(2)} 元，最高追价 ${cand.max_chase_price_cny.toFixed(2)} 元，硬止损 ${cand.hard_stop_price_cny.toFixed(2)} 元 / ${cand.stop_loss_pct.toFixed(2)}%，年化净资产收益率 ${cand.roe_annualized_pct.toFixed(1)}%）`).join('；')}。`,
@@ -1247,7 +1257,7 @@ function renderSectionG(r: DailyReportResult, view: RenderView): string {
   if (r.v3_cockpit) {
     const c = r.v3_cockpit;
     lines.push(
-      `- **动态高水位熔断防线**：动态高水位 ${yuan(c.router.hwm_nav_cents)} 元对应 ${(c.router.l2_trigger_drawdown_bps / 100).toFixed(0)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）；新建个股严格执行单笔 -8% 硬止损与 +15% 保本上移。`,
+      `- **动态高水位熔断防线**：动态高水位 ${yuan(c.router.hwm_nav_cents)} 元对应 ${fmtPctNum(c.router.l2_trigger_drawdown_bps / 100)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元（当前高水位回撤 ${c.router.hwm_drawdown_pct.toFixed(2)}%，安全缓冲 ${c.router.lifeline_buffer_pct.toFixed(2)}%，${c.router.circuit_breaker_label_zh}）；新建个股严格执行单笔 -8% 硬止损与 +15% 保本上移。`,
     );
   }
   lines.push('- **口径提醒**：以上压力数字是预设情景不是收益预测；账户全历史最大回撤数据不足，不以观察窗口回撤冒充。');
@@ -1459,6 +1469,14 @@ function buildTechnicalSections(
       to_principal_gap_abs_cents: Math.abs(r.v3_cockpit.principal.to_principal_gap_cents),
       to_principal_return_needed_pct: r.v3_cockpit.principal.to_principal_return_needed_pct,
       hwm_nav_cents: r.v3_cockpit.router.hwm_nav_cents,
+      work_hwm_nav_cents: r.v3_cockpit.router.work_hwm_nav_cents ?? null,
+      work_hwm_drawdown_pct: r.v3_cockpit.router.work_hwm_drawdown_pct ?? null,
+      drawdown_equity_cap_pct: r.v3_cockpit.router.drawdown_equity_cap_bps != null
+        ? r.v3_cockpit.router.drawdown_equity_cap_bps / 100
+        : null,
+      pct_above_ma20_pct: r.v3_cockpit.market_regime.pct_above_ma20 != null
+        ? Math.round(r.v3_cockpit.market_regime.pct_above_ma20 * 1000) / 10
+        : null,
       lifeline_nav_cents: r.v3_cockpit.router.lifeline_nav_cents,
       lifeline_buffer_pct: r.v3_cockpit.router.lifeline_buffer_pct,
       hwm_drawdown_pct: r.v3_cockpit.router.hwm_drawdown_pct,
@@ -1471,7 +1489,7 @@ function buildTechnicalSections(
       downside_protect_cny: r.v3_cockpit.deconcentration.downside_protect_cny,
       l2_trigger_drawdown_pct: r.v3_cockpit.router.l2_trigger_drawdown_bps / 100,
       post_breaker_equity_pct: r.v3_cockpit.router.post_breaker_equity_bps / 100,
-      rule_constants_pct: [18, 1.3, 12, 10, 0, 15, 8, -8, 2.5, 2, 0.5, 3, 30],
+      rule_constants_pct: [18, 1.3, 12, 10, 0, 15, 8, -8, 2.5, 2, 0.5, 3, 30, 13.5, 11, 50, 25, 40, 20, 60],
       rule_constants_cny: [8000, 1000, 90, 10, 5],
       action_leg_prices_cny: r.first_section.actions.flatMap(a => a.legs.map(l => l.price_milli !== null ? l.price_milli / 1000 : null)),
       action_leg_fees_cents: r.first_section.actions.flatMap(a => a.legs.map(l => l.fees_cents)),
@@ -1488,6 +1506,13 @@ function buildTechnicalSections(
       cross_border_navs: r.v3_cockpit.cross_border_monitor.map(m => m.unit_nav),
       cross_border_premium_pcts: r.v3_cockpit.cross_border_monitor.map(m => m.premium_pct),
       super_etf_closes_cny: r.v3_cockpit.super_etf_candidates.map(s => s.close_cny),
+      sector_pioneer_candidates_numbers: (r.v3_cockpit.sector_pioneer_candidates ?? []).map(s => ({
+        close_cny: s.close_cny,
+        ma60_cny: s.ma60_cny,
+        ret20_pct: s.ret20_pct,
+        ret60_pct: s.ret60_pct,
+        blend_score_pct: s.blend_score_pct,
+      })),
       stock_swing_candidates_numbers: (r.v3_cockpit.stock_swing_candidates ?? []).map(c => ({
         close_cny: c.close_cny,
         entry_ref_price_cny: c.entry_ref_price_cny,

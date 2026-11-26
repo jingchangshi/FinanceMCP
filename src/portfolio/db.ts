@@ -166,6 +166,9 @@ CREATE TABLE IF NOT EXISTS account_risk_anchor (
   hwm_flows_applied_through TEXT,
   hwm_applied_same_day_flow_cents INTEGER NOT NULL DEFAULT 0,
   hwm_nav_scope TEXT NOT NULL DEFAULT 'TOTAL',
+  work_hwm_nav_cents INTEGER,
+  work_hwm_date TEXT,
+  ramp_until_trade_date TEXT,
   circuit_breaker_status TEXT NOT NULL DEFAULT 'NORMAL',
   locked_until_trade_date TEXT,
   updated_at TEXT NOT NULL
@@ -258,6 +261,15 @@ export function ensurePortfolioV3Schema(db: DatabaseSync): void {
   if (!anchorCols.has('hwm_nav_scope')) {
     // 迁移前的锚点是历史“总资产峰值”（含理财）；新锚点写 INVESTABLE。
     db.exec("ALTER TABLE account_risk_anchor ADD COLUMN hwm_nav_scope TEXT NOT NULL DEFAULT 'TOTAL';");
+  }
+  if (!anchorCols.has('work_hwm_nav_cents')) {
+    db.exec('ALTER TABLE account_risk_anchor ADD COLUMN work_hwm_nav_cents INTEGER;');
+  }
+  if (!anchorCols.has('work_hwm_date')) {
+    db.exec('ALTER TABLE account_risk_anchor ADD COLUMN work_hwm_date TEXT;');
+  }
+  if (!anchorCols.has('ramp_until_trade_date')) {
+    db.exec('ALTER TABLE account_risk_anchor ADD COLUMN ramp_until_trade_date TEXT;');
   }
   const cols = new Set(
     (db.prepare('PRAGMA table_info(deconcentration_plan)').all() as Array<{ name?: string }>)

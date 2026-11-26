@@ -277,6 +277,9 @@ export interface ApprovedV3Policy {
   l2_deconcentration_post_breaker_equity_bps: number;
   l2_lock_trade_days: number;
   defensive_bond_reservoir_etf: string;
+  defensive_bond_reservoir_fallback_etf: string | null;
+  defensive_bond_reservoir_tertiary_etf: string | null;
+  defensive_bond_reservoir_drift_band_bps: number;
   deconcentration_mode: 'STANDARD' | 'BOTTOM_GRIND_25';
   deconcentration_keep_weight_bps: number;
   deconcentration_support_breakdown_confirm_days: number;
@@ -286,11 +289,43 @@ export interface ApprovedV3Policy {
   grind_reload_bias20_max_bps: number;
   grind_take_profit_bps: number;
   grind_drift_harvest_trigger_bps: number;
+  // ---- v3.3.0 五机制集成字段（未配置时保持 v3.2.0/v3.2.1 等价默认行为）
+  recovery_overlay_enabled: boolean;
+  recovery_equity_bps: number;
+  recovery_icepoint_pct_ma60_max_bps: number;
+  recovery_icepoint_pct_ma20_max_bps: number;
+  recovery_icepoint_lookback_days: number;
+  recovery_thrust_pct_ma20_min_bps: number;
+  recovery_thrust_5d_jump_min_bps: number;
+  recovery_thrust_floor_pct_ma20_bps: number;
+  recovery_min_amount_vs_ma20_bps: number;
+  recovery_false_breakout_cooldown_days: number;
+  lowvol_core_permanent_share_bps: number;
+  drawdown_control_mode: 'HARD_STEP_LOCK' | 'TWO_STAGE_GRADUAL' | 'CPPI_F15_M5';
+  drawdown_stage1_bps: number;
+  drawdown_stage1_cap_bps: number;
+  drawdown_stage2_bps: number;
+  drawdown_stage2_cap_bps: number;
+  drawdown_lock_trigger_bps: number;
+  drawdown_unlock_reanchor_enabled: boolean;
+  drawdown_unlock_ramp_trade_days: number;
+  sector_pioneer_enabled: boolean;
+  sector_pioneer_top_k: number;
+  sector_pioneer_max_weight_bps: number;
+  stock_bp1_min_investable_nav_cny: number;
+  stock_bp1_block_during_deconcentration: boolean;
 }
 
 function intParam(params: Record<string, string>, key: string, fallback: number): number {
   const n = Number(params[key]);
   return Number.isSafeInteger(n) ? n : fallback;
+}
+
+function boolParam(params: Record<string, string>, key: string, fallback: boolean): boolean {
+  const v = params[key]?.trim().toLowerCase();
+  if (v === 'true' || v === '1') return true;
+  if (v === 'false' || v === '0') return false;
+  return fallback;
 }
 
 interface OverrideLoadResult {
@@ -481,6 +516,9 @@ export function loadApprovedV3Policy(options: { accountId?: string; asOf?: strin
   const p = release.parameters;
   const approved = release.production_admission === 'APPROVED_FOR_ACCOUNT';
   const deconcMode = p.deconcentration_mode === 'BOTTOM_GRIND_25' ? 'BOTTOM_GRIND_25' : 'STANDARD';
+  const ddRaw = p.drawdown_control_mode?.trim();
+  const drawdownMode: ApprovedV3Policy['drawdown_control_mode'] =
+    ddRaw === 'TWO_STAGE_GRADUAL' || ddRaw === 'CPPI_F15_M5' ? ddRaw : 'HARD_STEP_LOCK';
   return {
     release,
     approved,
@@ -499,12 +537,19 @@ export function loadApprovedV3Policy(options: { accountId?: string; asOf?: strin
     stock_min_order_cny: 8000,
     stock_price_cap_cny: 90,
     l1_warn_drawdown_bps: intParam(p, 'l1_warn_drawdown_bps', 1000),
-    l2_normal_trigger_drawdown_bps: intParam(p, 'l2_hard_lifeline_drawdown_bps', 1500),
-    l2_normal_post_breaker_equity_bps: 1500,
+    l2_normal_trigger_drawdown_bps: intParam(
+      p,
+      'l2_normal_trigger_drawdown_bps',
+      intParam(p, 'drawdown_lock_trigger_bps', intParam(p, 'l2_hard_lifeline_drawdown_bps', 1500)),
+    ),
+    l2_normal_post_breaker_equity_bps: intParam(p, 'l2_normal_post_breaker_equity_bps', 1500),
     l2_preemptive_deconcentration_trigger_drawdown_bps: intParam(p, 'l2_preemptive_trigger_drawdown_bps', 1200),
     l2_deconcentration_post_breaker_equity_bps: intParam(p, 'l2_deconcentration_post_breaker_equity_bps', 0),
     l2_lock_trade_days: intParam(p, 'l2_lock_trade_days', 15),
     defensive_bond_reservoir_etf: p.defensive_bond_reservoir_etf || '511010.SH',
+    defensive_bond_reservoir_fallback_etf: p.defensive_bond_reservoir_fallback_etf?.trim() || null,
+    defensive_bond_reservoir_tertiary_etf: p.defensive_bond_reservoir_tertiary_etf?.trim() || null,
+    defensive_bond_reservoir_drift_band_bps: intParam(p, 'defensive_bond_reservoir_drift_band_bps', 0),
     deconcentration_mode: deconcMode,
     deconcentration_keep_weight_bps: intParam(p, 'deconcentration_keep_weight_bps', 2500),
     deconcentration_support_breakdown_confirm_days: intParam(p, 'deconcentration_support_breakdown_confirm_days', 2),
@@ -514,5 +559,29 @@ export function loadApprovedV3Policy(options: { accountId?: string; asOf?: strin
     grind_reload_bias20_max_bps: intParam(p, 'grind_reload_bias20_max_bps', -650),
     grind_take_profit_bps: intParam(p, 'grind_take_profit_bps', 750),
     grind_drift_harvest_trigger_bps: intParam(p, 'grind_drift_harvest_trigger_bps', 3400),
+    recovery_overlay_enabled: boolParam(p, 'recovery_overlay_enabled', false),
+    recovery_equity_bps: intParam(p, 'recovery_equity_bps', 4000),
+    recovery_icepoint_pct_ma60_max_bps: intParam(p, 'recovery_icepoint_pct_ma60_max_bps', 1500),
+    recovery_icepoint_pct_ma20_max_bps: intParam(p, 'recovery_icepoint_pct_ma20_max_bps', 1500),
+    recovery_icepoint_lookback_days: intParam(p, 'recovery_icepoint_lookback_days', 10),
+    recovery_thrust_pct_ma20_min_bps: intParam(p, 'recovery_thrust_pct_ma20_min_bps', 4500),
+    recovery_thrust_5d_jump_min_bps: intParam(p, 'recovery_thrust_5d_jump_min_bps', 3000),
+    recovery_thrust_floor_pct_ma20_bps: intParam(p, 'recovery_thrust_floor_pct_ma20_bps', 4000),
+    recovery_min_amount_vs_ma20_bps: intParam(p, 'recovery_min_amount_vs_ma20_bps', 11500),
+    recovery_false_breakout_cooldown_days: intParam(p, 'recovery_false_breakout_cooldown_days', 10),
+    lowvol_core_permanent_share_bps: intParam(p, 'lowvol_core_permanent_share_bps', 0),
+    drawdown_control_mode: drawdownMode,
+    drawdown_stage1_bps: intParam(p, 'drawdown_stage1_bps', 800),
+    drawdown_stage1_cap_bps: intParam(p, 'drawdown_stage1_cap_bps', 5000),
+    drawdown_stage2_bps: intParam(p, 'drawdown_stage2_bps', 1100),
+    drawdown_stage2_cap_bps: intParam(p, 'drawdown_stage2_cap_bps', 2500),
+    drawdown_lock_trigger_bps: intParam(p, 'drawdown_lock_trigger_bps', 1350),
+    drawdown_unlock_reanchor_enabled: boolParam(p, 'drawdown_unlock_reanchor_enabled', false),
+    drawdown_unlock_ramp_trade_days: intParam(p, 'drawdown_unlock_ramp_trade_days', 0),
+    sector_pioneer_enabled: boolParam(p, 'sector_pioneer_enabled', false),
+    sector_pioneer_top_k: intParam(p, 'sector_pioneer_top_k', 1),
+    sector_pioneer_max_weight_bps: intParam(p, 'sector_pioneer_max_weight_bps', 2000),
+    stock_bp1_min_investable_nav_cny: intParam(p, 'stock_bp1_min_investable_nav_cny', 0),
+    stock_bp1_block_during_deconcentration: boolParam(p, 'stock_bp1_block_during_deconcentration', false),
   };
 }

@@ -284,6 +284,12 @@ export async function buildIntradayMiddayCheck(opts: MiddayCheckOptions): Promis
   }
   if (deconcPlan?.ts_code && VALID_TS_CODE.test(String(deconcPlan.ts_code))) codeSet.add(String(deconcPlan.ts_code));
   if (policy.defensive_bond_reservoir_etf && VALID_TS_CODE.test(policy.defensive_bond_reservoir_etf)) codeSet.add(policy.defensive_bond_reservoir_etf);
+  if (policy.defensive_bond_reservoir_fallback_etf && VALID_TS_CODE.test(policy.defensive_bond_reservoir_fallback_etf)) {
+    codeSet.add(policy.defensive_bond_reservoir_fallback_etf);
+  }
+  if (policy.defensive_bond_reservoir_tertiary_etf && VALID_TS_CODE.test(policy.defensive_bond_reservoir_tertiary_etf)) {
+    codeSet.add(policy.defensive_bond_reservoir_tertiary_etf);
+  }
   for (const c of extraCodes) codeSet.add(c);
 
   let quoteMap: Map<string, TencentQuoteRow>;
@@ -660,6 +666,9 @@ export async function buildIntradayMiddayCheck(opts: MiddayCheckOptions): Promis
       hwm_nav_cents: hwmNavCents,
       hwm_date: riskAnchor?.hwm_date ?? null,
       live_hwm_drawdown_pct: liveHwmDrawdownPct,
+      drawdown_control_mode: policy.drawdown_control_mode,
+      work_hwm_nav_cents: riskAnchor?.work_hwm_nav_cents ? Number(riskAnchor.work_hwm_nav_cents) : null,
+      work_hwm_date: riskAnchor?.work_hwm_date ?? null,
       deconcentration_preemptive_active: deconcPreemptiveActive,
       l1_trigger_pct: l1TriggerPct,
       l2_trigger_pct: l2TriggerPct,

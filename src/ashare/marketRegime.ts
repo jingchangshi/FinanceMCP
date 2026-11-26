@@ -5,7 +5,7 @@ import { marketBreadth } from './market.js';
 import { latestReportMeta, loadReport } from './report.js';
 
 export type IndexTrendState = 'BULL' | 'RANGE' | 'BEAR';
-export type MarketRegimeTier = 'OFFENSIVE' | 'STRUCTURAL' | 'DEFENSIVE';
+export type MarketRegimeTier = 'OFFENSIVE' | 'STRUCTURAL' | 'RECOVERY' | 'DEFENSIVE';
 export type MarketStyleTier = 'GROWTH_LEADING' | 'VALUE_LEADING' | 'BALANCED';
 
 export interface AnchorTrendSnapshot {
@@ -25,11 +25,35 @@ export interface DailyRegimePoint {
   value_state: IndexTrendState;
   growth_state: IndexTrendState;
   pct_above_ma60: number | null;
+  pct_above_ma20: number | null;
   amount_vs_ma20: number | null;
   limit_down: number | null;
   crash_override: boolean;
   raw_regime: MarketRegimeTier;
   confirmed_regime: MarketRegimeTier;
+}
+
+export interface RecoveryOverlayOptions {
+  enabled: boolean;
+  equityBps?: number;
+  icepointPctMa60Max?: number;
+  icepointPctMa20Max?: number;
+  icepointLookbackDays?: number;
+  thrustPctMa20Min?: number;
+  thrust5dJumpMin?: number;
+  thrustFloorPctMa20?: number;
+  minAmountVsMa20?: number;
+  cooldownDays?: number;
+}
+
+export interface RecoveryOverlayState {
+  active: boolean;
+  triggered_today: boolean;
+  stopped_today: boolean;
+  in_cooldown: boolean;
+  trigger_date: string | null;
+  trigger_low_hs300: number | null;
+  trigger_low_csi500: number | null;
 }
 
 export interface MarketRegimeResult {
@@ -55,6 +79,8 @@ export interface MarketRegimeResult {
   breadth: {
     pct_above_ma60: number | null;
     pct_above_ma60_pct: number | null;
+    pct_above_ma20?: number | null;
+    pct_above_ma20_pct?: number | null;
     amount_yi: number | null;
     amount_ma20_yi: number | null;
     amount_vs_ma20: number | null;
@@ -62,6 +88,7 @@ export interface MarketRegimeResult {
     down: number | null;
     limit_down: number | null;
   };
+  recovery_state?: RecoveryOverlayState;
   history: DailyRegimePoint[];
   regime_label_zh: string;
   style_label_zh: string;
@@ -81,6 +108,10 @@ export interface EvaluateMarketRegimeOptions {
   hysteresisLookbackDays?: number;
   /** 可选（测试注入）：按交易日覆盖全市场站上 MA60 比例（0~1），避免在小样本单测里扫描全市场。 */
   pctAboveMa60ByDate?: Record<string, number>;
+  /** 可选（测试注入）：按交易日覆盖全市场站上 MA20 比例（0~1）。 */
+  pctAboveMa20ByDate?: Record<string, number>;
+  /** 可选：启用 v3.3.0 M2 极端冰点后 5 日宽度推力复苏叠加状态机。 */
+  recoveryOverlay?: RecoveryOverlayOptions;
 }
 
 /**
@@ -105,12 +136,14 @@ const INDEX_STATE_ZH: Record<IndexTrendState, string> = {
 export const REGIME_TARGET_EQUITY_BPS: Record<MarketRegimeTier, number> = {
   OFFENSIVE: 8500,
   STRUCTURAL: 6000,
+  RECOVERY: 4000,
   DEFENSIVE: 1500,
 };
 
 export const REGIME_LABELS_ZH: Record<MarketRegimeTier, string> = {
   OFFENSIVE: '全面进攻档（目标总仓位 85%）',
   STRUCTURAL: '震荡结构档（目标总仓位 60%）',
+  RECOVERY: '冰点复苏试探档（目标总仓位 40%）',
   DEFENSIVE: '空头防守档（目标总仓位 15%）',
 };
 
@@ -218,8 +251,11 @@ function resolveBreadthSnapshot(
   date: string,
   pctOverride: number | undefined,
   allowMarketScan = true,
+  pctOverride20?: number,
+  needMa20 = false,
 ): {
   pctAboveMa60: number | null;
+  pctAboveMa20: number | null;
   amountYi: number | null;
   amountMa20Yi: number | null;
   amountVsMa20: number | null;
@@ -230,6 +266,9 @@ function resolveBreadthSnapshot(
 } {
   let pctAboveMa60: number | null = typeof pctOverride === 'number' && Number.isFinite(pctOverride)
     ? pctOverride
+    : null;
+  let pctAboveMa20: number | null = typeof pctOverride20 === 'number' && Number.isFinite(pctOverride20)
+    ? pctOverride20
     : null;
   let amountYi: number | null = null;
   let amountMa20Yi: number | null = null;
@@ -247,6 +286,9 @@ function resolveBreadthSnapshot(
         if (rep && (rep.as_of_trade_date === date || rep.trade_date === date) && br) {
           if (pctAboveMa60 === null && typeof br.pct_above_ma60 === 'number' && Number.isFinite(br.pct_above_ma60)) {
             pctAboveMa60 = br.pct_above_ma60 / 100;
+          }
+          if (pctAboveMa20 === null && typeof br.pct_above_ma20 === 'number' && Number.isFinite(br.pct_above_ma20)) {
+            pctAboveMa20 = br.pct_above_ma20 / 100;
           }
           if (typeof br.amount_yi === 'number') amountYi = br.amount_yi;
           if (typeof br.amount_ma20_yi === 'number') amountMa20Yi = br.amount_ma20_yi;
@@ -275,13 +317,23 @@ function resolveBreadthSnapshot(
     }
   }
 
-  if (allowMarketScan && pctAboveMa60 === null && tableExists(db, 'daily') && tableExists(db, 'stock_basic')) {
+  if (
+    allowMarketScan
+    && (pctAboveMa60 === null || (needMa20 && pctAboveMa20 === null))
+    && tableExists(db, 'daily')
+    && tableExists(db, 'stock_basic')
+  ) {
     try {
       const dateCountRow = db.prepare('SELECT COUNT(DISTINCT trade_date) n FROM daily WHERE trade_date <= ?').get(date) as { n?: number } | undefined;
       if ((dateCountRow?.n ?? 0) >= 65) {
         const scan = scanMarket(db, date);
-        if (scan.rows.length > 0 && Number.isFinite(scan.pct_above_ma60)) {
-          pctAboveMa60 = scan.pct_above_ma60;
+        if (scan.rows.length > 0) {
+          if (pctAboveMa60 === null && typeof scan.pct_above_ma60 === 'number' && Number.isFinite(scan.pct_above_ma60)) {
+            pctAboveMa60 = scan.pct_above_ma60;
+          }
+          if (pctAboveMa20 === null && typeof scan.pct_above_ma20 === 'number' && Number.isFinite(scan.pct_above_ma20)) {
+            pctAboveMa20 = scan.pct_above_ma20;
+          }
         }
       } else {
         note = '个股日线历史不足 65 根，市场宽度占比暂不可用';
@@ -295,7 +347,7 @@ function resolveBreadthSnapshot(
     ? r2(amountYi / amountMa20Yi, 3)
     : null;
 
-  return { pctAboveMa60, amountYi, amountMa20Yi, amountVsMa20, up, down, limitDown, note };
+  return { pctAboveMa60, pctAboveMa20, amountYi, amountMa20Yi, amountVsMa20, up, down, limitDown, note };
 }
 
 function classifyRawRegime(
@@ -354,6 +406,8 @@ export function evaluateMarketRegime(
       breadth: {
         pct_above_ma60: null,
         pct_above_ma60_pct: null,
+        pct_above_ma20: null,
+        pct_above_ma20_pct: null,
         amount_yi: null,
         amount_ma20_yi: null,
         amount_vs_ma20: null,
@@ -383,9 +437,12 @@ export function evaluateMarketRegime(
   }
   if (!dates.length) dates = [asOf];
   const marketScanFrom = Math.max(0, dates.length - stateLookback);
+  const overlayEnabled = Boolean(opts.recoveryOverlay?.enabled);
 
   const notes: string[] = [];
   const history: DailyRegimePoint[] = [];
+  const hs300Closes: (number | null)[] = [];
+  const csi500Closes: (number | null)[] = [];
   let confirmed: MarketRegimeTier = 'STRUCTURAL';
   let latestValue = emptyAnchor('000300.SH');
   let latestCsi500 = emptyAnchor('000905.SH');
@@ -393,17 +450,33 @@ export function evaluateMarketRegime(
   let latestGrowthState: IndexTrendState = 'RANGE';
   let latestGrowthPctChg: number | null = null;
   let latestGrowthRet20: number | null = null;
-  let latestBreadth = resolveBreadthSnapshot(db, dates[dates.length - 1], opts.pctAboveMa60ByDate?.[dates[dates.length - 1]]);
+  let latestBreadth = resolveBreadthSnapshot(
+    db,
+    dates[dates.length - 1],
+    opts.pctAboveMa60ByDate?.[dates[dates.length - 1]],
+    false,
+    opts.pctAboveMa20ByDate?.[dates[dates.length - 1]],
+    overlayEnabled,
+  );
 
   for (let idx = 0; idx < dates.length; idx += 1) {
     const d = dates[idx];
     const valueA = evaluateIndexAnchor(db, '000300.SH', d);
     const csi500A = evaluateIndexAnchor(db, '000905.SH', d);
     const chinextA = evaluateIndexAnchor(db, '399006.SZ', d);
+    hs300Closes.push(valueA.close);
+    csi500Closes.push(csi500A.close);
     const growthState = synthesizeGrowthState(csi500A, chinextA);
     const growthPctChg = averageFinite([csi500A.pct_chg, chinextA.pct_chg]);
     const growthRet20 = averageFinite([csi500A.ret20_pct, chinextA.ret20_pct]);
-    const b = resolveBreadthSnapshot(db, d, opts.pctAboveMa60ByDate?.[d], idx >= marketScanFrom);
+    const b = resolveBreadthSnapshot(
+      db,
+      d,
+      opts.pctAboveMa60ByDate?.[d],
+      idx >= marketScanFrom,
+      opts.pctAboveMa20ByDate?.[d],
+      overlayEnabled,
+    );
     const raw = classifyRawRegime(valueA.state, growthState, b.pctAboveMa60, b.amountVsMa20);
 
     const crash = valueA.pct_chg !== null
@@ -425,6 +498,7 @@ export function evaluateMarketRegime(
       value_state: valueA.state,
       growth_state: growthState,
       pct_above_ma60: b.pctAboveMa60 !== null ? r2(b.pctAboveMa60, 4) : null,
+      pct_above_ma20: b.pctAboveMa20 !== null ? r2(b.pctAboveMa20, 4) : null,
       amount_vs_ma20: b.amountVsMa20,
       limit_down: b.limitDown,
       crash_override: crash,
@@ -444,10 +518,100 @@ export function evaluateMarketRegime(
     }
   }
 
+  let recoveryState: RecoveryOverlayState | undefined;
+  if (overlayEnabled) {
+    const icepointPct60Max = opts.recoveryOverlay?.icepointPctMa60Max ?? 0.15;
+    const icepointPct20Max = opts.recoveryOverlay?.icepointPctMa20Max ?? 0.15;
+    const icepointLookback = opts.recoveryOverlay?.icepointLookbackDays ?? 10;
+    const thrustPct20Min = opts.recoveryOverlay?.thrustPctMa20Min ?? 0.45;
+    const thrust5dJumpMin = opts.recoveryOverlay?.thrust5dJumpMin ?? 0.30;
+    const thrustFloorPct20 = opts.recoveryOverlay?.thrustFloorPctMa20 ?? 0.40;
+    const minAmountVsMa20 = opts.recoveryOverlay?.minAmountVsMa20 ?? 1.15;
+    const cooldownDays = opts.recoveryOverlay?.cooldownDays ?? 10;
+
+    let recoveryActive = false;
+    let cooldownUntilIdx = -1;
+    let triggerDate: string | null = null;
+    let lowHs300: number | null = null;
+    let lowCsi500: number | null = null;
+    let triggeredToday = false;
+    let stoppedToday = false;
+
+    for (let idx = 0; idx < history.length; idx += 1) {
+      const pt = history[idx];
+      triggeredToday = false;
+      stoppedToday = false;
+
+      if (pt.confirmed_regime !== 'DEFENSIVE') {
+        recoveryActive = false;
+        triggerDate = null;
+        lowHs300 = null;
+        lowCsi500 = null;
+      } else if (recoveryActive) {
+        const hs = hs300Closes[idx];
+        const csi = csi500Closes[idx];
+        const lowBroken = lowHs300 !== null && lowCsi500 !== null && hs !== null && csi !== null
+          && hs < lowHs300 && csi < lowCsi500;
+        if (pt.crash_override || lowBroken) {
+          recoveryActive = false;
+          stoppedToday = true;
+          cooldownUntilIdx = idx + cooldownDays;
+          triggerDate = null;
+          lowHs300 = null;
+          lowCsi500 = null;
+        }
+      } else if (!pt.crash_override && idx > cooldownUntilIdx) {
+        let sawIce60 = false;
+        let sawIce20 = false;
+        const winStart = Math.max(0, idx - icepointLookback);
+        for (let j = winStart; j <= idx; j += 1) {
+          const p60 = history[j].pct_above_ma60;
+          const p20j = history[j].pct_above_ma20;
+          if (p60 !== null && p60 < icepointPct60Max) sawIce60 = true;
+          if (p20j !== null && p20j < icepointPct20Max) sawIce20 = true;
+        }
+        const p20 = pt.pct_above_ma20;
+        const p20Prev5 = idx >= 5 ? history[idx - 5].pct_above_ma20 : null;
+        const jumpOk = p20 !== null && p20Prev5 !== null && (p20 - p20Prev5) >= thrust5dJumpMin;
+        const thrustOk = p20 !== null && p20 >= thrustFloorPct20 && (p20 >= thrustPct20Min || jumpOk);
+        const volOk = pt.amount_vs_ma20 !== null && pt.amount_vs_ma20 >= minAmountVsMa20;
+        if (sawIce60 && sawIce20 && thrustOk && volOk) {
+          let minHs: number | null = null;
+          let min500: number | null = null;
+          for (let j = Math.max(0, idx - 5); j <= idx; j += 1) {
+            const hVal = hs300Closes[j];
+            const cVal = csi500Closes[j];
+            if (hVal !== null && (minHs === null || hVal < minHs)) minHs = hVal;
+            if (cVal !== null && (min500 === null || cVal < min500)) min500 = cVal;
+          }
+          recoveryActive = true;
+          triggeredToday = true;
+          triggerDate = pt.trade_date;
+          lowHs300 = minHs;
+          lowCsi500 = min500;
+        }
+      }
+
+      if (recoveryActive) {
+        pt.confirmed_regime = 'RECOVERY';
+      }
+    }
+
+    recoveryState = {
+      active: recoveryActive,
+      triggered_today: triggeredToday,
+      stopped_today: stoppedToday,
+      in_cooldown: !recoveryActive && (history.length - 1) <= cooldownUntilIdx,
+      trigger_date: triggerDate,
+      trigger_low_hs300: lowHs300,
+      trigger_low_csi500: lowCsi500,
+    };
+  }
+
   const lastPoint = history[history.length - 1];
   const rawRegime = lastPoint.raw_regime;
   const regime = lastPoint.confirmed_regime;
-  const hysteresisHeld = regime !== rawRegime;
+  const hysteresisHeld = regime !== 'RECOVERY' && regime !== rawRegime;
   const crashOverride = lastPoint.crash_override;
   // Display history stays bounded; the confirmed state above is carried from the longer replay.
   const displayHistory = history.slice(Math.max(0, history.length - displayLookback));
@@ -461,15 +625,20 @@ export function evaluateMarketRegime(
     else if (styleSpread < -3) style = 'VALUE_LEADING';
   }
 
-  const targetEquityBps = REGIME_TARGET_EQUITY_BPS[regime];
+  const targetEquityBps = regime === 'RECOVERY' && opts.recoveryOverlay?.equityBps
+    ? opts.recoveryOverlay.equityBps
+    : REGIME_TARGET_EQUITY_BPS[regime];
   const pctMa60Pct = latestBreadth.pctAboveMa60 !== null ? r2(latestBreadth.pctAboveMa60 * 100, 1) : null;
+  const pctMa20Pct = latestBreadth.pctAboveMa20 !== null ? r2(latestBreadth.pctAboveMa20 * 100, 1) : null;
   const volPart = latestBreadth.amountVsMa20 !== null ? `成交量比 ${latestBreadth.amountVsMa20.toFixed(2)} 倍` : '成交量比数据不足';
   const breadthPart = pctMa60Pct !== null ? `站上 60 日线占比 ${pctMa60Pct.toFixed(1)}%` : '全市场站上 60 日线占比不足';
   const hysteresisNote = crashOverride
     ? '触发单日极端暴跌保护，当日直接切换防守档。'
-    : hysteresisHeld
-      ? `当日原始状态为「${REGIME_LABELS_ZH[rawRegime]}」，未满足连续两日确认，按滞回防抖规则维持当前档位。`
-      : '连续两日趋势信号一致确认。';
+    : regime === 'RECOVERY'
+      ? '近 10 日经历极端冰点后出现放量宽度推力，按冰点复苏试探规则切入 40% 权益试探档（跌破触发前 5 日指数低点即退回防守档）。'
+      : hysteresisHeld
+        ? `当日原始状态为「${REGIME_LABELS_ZH[rawRegime]}」，未满足连续两日确认，按滞回防抖规则维持当前档位。`
+        : '连续两日趋势信号一致确认。';
   const styleSpreadTxt = styleSpread !== null
     ? `近 20 日成长锚相对沪深 300 超额 ${styleSpread >= 0 ? '+' : ''}${styleSpread.toFixed(2)}%`
     : '20 日风格剪刀差数据不足';
@@ -505,6 +674,8 @@ export function evaluateMarketRegime(
     breadth: {
       pct_above_ma60: latestBreadth.pctAboveMa60 !== null ? r2(latestBreadth.pctAboveMa60, 4) : null,
       pct_above_ma60_pct: pctMa60Pct,
+      pct_above_ma20: latestBreadth.pctAboveMa20 !== null ? r2(latestBreadth.pctAboveMa20, 4) : null,
+      pct_above_ma20_pct: pctMa20Pct,
       amount_yi: latestBreadth.amountYi,
       amount_ma20_yi: latestBreadth.amountMa20Yi,
       amount_vs_ma20: latestBreadth.amountVsMa20,
@@ -512,6 +683,7 @@ export function evaluateMarketRegime(
       down: latestBreadth.down,
       limit_down: latestBreadth.limitDown,
     },
+    ...(recoveryState ? { recovery_state: recoveryState } : {}),
     history: displayHistory,
     regime_label_zh: REGIME_LABELS_ZH[regime],
     style_label_zh: STYLE_LABELS_ZH[style],
