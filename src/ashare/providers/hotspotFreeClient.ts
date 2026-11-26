@@ -399,16 +399,39 @@ export function parseLeguleguCompositionHtml(
 
 export async function fetchSwMembersFromLegulegu(
   classifyRows: Array<{ index_code: string; level: string | null; name: string | null; parent_code: string | null }>,
-  opts: { concurrency?: number; timeoutMs?: number; minUniqueStocks?: number; maxFailureRatio?: number } = {},
+  opts: {
+    concurrency?: number;
+    timeoutMs?: number;
+    delayMs?: number;
+    minUniqueStocks?: number;
+    maxFailureRatio?: number;
+    maxConsecutiveFailures?: number;
+  } = {},
 ): Promise<SwMemberRow[]> {
   const byCode = new Map(classifyRows.map(r => [r.index_code, r]));
   const l3Rows = classifyRows.filter(r => r.level === 'L3');
   if (!l3Rows.length) throw new Error('sw_classify has no L3 entries');
 
   const collectedAt = new Date().toISOString();
+  const concurrency = Math.max(1, opts.concurrency ?? 1);
   const timeoutMs = opts.timeoutMs ?? 12000;
+  const delayMs = opts.delayMs ?? 1200;
+  const maxConsecutiveFailures = Math.max(1, opts.maxConsecutiveFailures ?? 5);
+
   let failed = 0;
-  const nested = await runPool(l3Rows, opts.concurrency ?? 4, async l3 => {
+  let consecutiveFailures = 0;
+  let lastError = '';
+  let breakerError: Error | null = null;
+  let requestIndex = 0;
+
+  const fetchOneL3 = async (l3: { index_code: string; level: string | null; name: string | null; parent_code: string | null }): Promise<SwMemberRow[]> => {
+    if (breakerError) return [];
+    const idx = requestIndex++;
+    if (idx > 0 && delayMs > 0) {
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+    if (breakerError) return [];
+
     const l2 = l3.parent_code ? byCode.get(l3.parent_code) : undefined;
     const l1 = l2?.parent_code ? byCode.get(l2.parent_code) : undefined;
     const meta = {
@@ -419,22 +442,48 @@ export async function fetchSwMembersFromLegulegu(
       l3Code: l3.index_code,
       l3Name: l3.name ?? '',
     };
+
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const res = await fetch(`https://legulegu.com/stockdata/index-composition?industryCode=${encodeURIComponent(l3.index_code)}`, {
           headers: { 'User-Agent': 'Mozilla/5.0' },
           signal: AbortSignal.timeout(timeoutMs),
         });
+        if (res.status === 429 || res.status === 504) {
+          lastError = `HTTP ${res.status}`;
+          break; // Never retry rate-limited/gateway-timeout URLs to avoid amplifying origin pressure.
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const html = await res.text();
+        consecutiveFailures = 0;
         return parseLeguleguCompositionHtml(html, meta, collectedAt);
-      } catch {
+      } catch (err: any) {
+        lastError = String(err?.message ?? err);
         if (attempt === 0) await new Promise(r => setTimeout(r, 250));
       }
     }
+
     failed++;
-    return [] as SwMemberRow[];
-  });
+    consecutiveFailures++;
+    if (consecutiveFailures >= maxConsecutiveFailures && !breakerError) {
+      breakerError = new Error(
+        `legulegu sw_member circuit breaker tripped after ${consecutiveFailures} consecutive failures (last: ${lastError})`,
+      );
+    }
+    return [];
+  };
+
+  const nested: SwMemberRow[][] = [];
+  if (concurrency <= 1) {
+    for (const l3 of l3Rows) {
+      nested.push(await fetchOneL3(l3));
+      if (breakerError) break;
+    }
+  } else {
+    nested.push(...await runPool(l3Rows, concurrency, fetchOneL3));
+  }
+
+  if (breakerError) throw breakerError;
 
   const maxFailureRatio = opts.maxFailureRatio ?? 0.2;
   if (failed / l3Rows.length > maxFailureRatio) {

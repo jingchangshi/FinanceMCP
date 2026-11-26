@@ -210,7 +210,7 @@ test('industrySync catalog syncs fail closed cleanly with CATALOG_UNAVAILABLE wh
     { ts_code: '885431.TI', name: 'CPO概念', idx_type: 'N', count: 120, exchange: '', list_date: '20200101', collected_at: frozenAt },
   ]);
   const r1 = await industrySync.syncSwClassify(db);
-  const r2 = await industrySync.syncSwMembers(db);
+  const r2 = await industrySync.syncSwMembers(db, { delayMs: 0 });
   const r3 = await industrySync.syncThsIndex(db);
   const r4 = await industrySync.syncThsMembers(db, { codes: ['885431.TI'] });
   for (const r of [r1, r2, r3, r4]) {
@@ -298,7 +298,7 @@ test('industrySync populates SW2021 classify/members and THS industry index via 
   assert.equal(l3.parent_code, '801016.SI');
   assert.equal(l3.src, 'SW2021');
 
-  const mRes = await industrySync.syncSwMembers(db, { minUniqueStocks: 2 });
+  const mRes = await industrySync.syncSwMembers(db, { minUniqueStocks: 2, delayMs: 0 });
   assert.equal(mRes.status, 'OK');
   assert.equal(mRes.rows, 2);
   assert.equal(db.prepare("SELECT out_date FROM sw_member WHERE ts_code='600001.SH'").get().out_date, '20200101', 'historical exited row preserved');
@@ -351,4 +351,78 @@ test('hotspot-sync 首跑安全：discoverThsCodes 空库建表返回 []，不�
     ]);
   assert.deepEqual(industrySync.discoverThsCodes(db), ['881105.TI', '885431.TI'],
     '只取概念/行业类型并按成分数降序，事件型排除');
+});
+
+test('syncSwMembers circuit breaker stops immediately on consecutive HTTP 504 without retries', async t => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = async () => {
+    fetchCount++;
+    return new Response('gateway timeout', { status: 504 });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const db = openAshareDb(':memory:');
+  t.after(() => db.close());
+  ensureHotspotSchema(db);
+  const frozenAt = '2026-10-01T00:00:00.000Z';
+  const classifyRows = [
+    { index_code: '801010.SI', level: 'L1', name: '农林牧渔', parent_code: '0', collected_at: frozenAt },
+    { index_code: '801016.SI', level: 'L2', name: '种植业', parent_code: '801010.SI', collected_at: frozenAt },
+    ...Array.from({ length: 10 }, (_, i) => ({
+      index_code: `85011${i}.SI`,
+      level: 'L3',
+      name: `细分${i}`,
+      parent_code: '801016.SI',
+      collected_at: frozenAt,
+    })),
+  ];
+  upsertRows(db, 'sw_classify', ['index_code', 'level', 'name', 'parent_code', 'collected_at'], classifyRows);
+
+  const res = await industrySync.syncSwMembers(db, { delayMs: 0, maxConsecutiveFailures: 3 });
+  assert.equal(res.status, 'CATALOG_UNAVAILABLE');
+  assert.match(res.reason ?? '', /circuit breaker/i);
+  assert.equal(fetchCount, 3, '504 triggers zero retries and trips breaker after 3 requests instead of sending all 10');
+});
+
+test('syncSwMembers fresh-cache TTL guard skips remote crawl unless force=true', async t => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = async () => {
+    fetchCount++;
+    return new Response('unavailable', { status: 503 });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const db = openAshareDb(':memory:');
+  t.after(() => db.close());
+  ensureHotspotSchema(db);
+  const nowIso = new Date().toISOString();
+  upsertRows(db, 'sw_classify', ['index_code', 'level', 'name', 'parent_code', 'collected_at'], [
+    { index_code: '801010.SI', level: 'L1', name: '农林牧渔', parent_code: '0', collected_at: nowIso },
+    { index_code: '801016.SI', level: 'L2', name: '种植业', parent_code: '801010.SI', collected_at: nowIso },
+    { index_code: '850111.SI', level: 'L3', name: '种子', parent_code: '801016.SI', collected_at: nowIso },
+  ]);
+  upsertRows(db, 'sw_member', ['ts_code', 'l1_code', 'l2_code', 'l3_code', 'l1_name', 'l2_name', 'l3_name', 'name', 'in_date', 'out_date', 'is_new', 'collected_at'], [
+    { ts_code: '600313.SH', l1_code: '801010.SI', l2_code: '801016.SI', l3_code: '850111.SI', l1_name: '农林牧渔', l2_name: '种植业', l3_name: '种子', name: '农发种业', in_date: '20110110', out_date: '', is_new: 'Y', collected_at: nowIso },
+    { ts_code: '000998.SZ', l1_code: '801010.SI', l2_code: '801016.SI', l3_code: '850111.SI', l1_name: '农林牧渔', l2_name: '种植业', l3_name: '种子', name: '隆平高科', in_date: '20001211', out_date: '', is_new: 'Y', collected_at: nowIso },
+  ]);
+
+  const skipped = await industrySync.syncSwMembers(db, { minUniqueStocks: 2, maxAgeDays: 30, delayMs: 0 });
+  assert.equal(skipped.status, 'OK');
+  assert.equal(skipped.rows, 0);
+  assert.equal(skipped.cached_rows, 2);
+  assert.equal(skipped.reason, 'fresh_cache_within_ttl');
+  assert.equal(fetchCount, 0);
+
+  const forced = await industrySync.syncSwMembers(db, {
+    minUniqueStocks: 2,
+    maxAgeDays: 30,
+    delayMs: 0,
+    force: true,
+    maxConsecutiveFailures: 1,
+  });
+  assert.equal(forced.status, 'CATALOG_UNAVAILABLE');
+  assert.equal(forced.cached_rows, 2);
+  assert.ok(fetchCount > 0, 'force=true bypasses TTL cache guard');
 });

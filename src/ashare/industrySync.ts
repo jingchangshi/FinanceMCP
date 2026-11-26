@@ -72,10 +72,43 @@ export async function syncSwClassify(
  */
 export async function syncSwMembers(
   db: DatabaseSync,
-  opts: { concurrency?: number; timeoutMs?: number; minUniqueStocks?: number; maxFailureRatio?: number } = {},
+  opts: {
+    concurrency?: number;
+    timeoutMs?: number;
+    delayMs?: number;
+    minUniqueStocks?: number;
+    maxFailureRatio?: number;
+    maxConsecutiveFailures?: number;
+    maxAgeDays?: number;
+    force?: boolean;
+  } = {},
 ): Promise<HotspotSyncResult> {
   return withSyncDb(db, async () => {
     ensureHotspotSchema(db);
+    const maxAgeDays = opts.maxAgeDays ?? 30;
+    const minUniqueStocks = opts.minUniqueStocks ?? 3000;
+    if (!opts.force && maxAgeDays > 0) {
+      const stats = db.prepare(
+        'SELECT COUNT(*) AS total_rows, COUNT(DISTINCT ts_code) AS unique_stocks, MAX(collected_at) AS latest_collected_at FROM sw_member',
+      ).get() as { total_rows?: number; unique_stocks?: number; latest_collected_at?: string | null } | undefined;
+      const totalRows = Number(stats?.total_rows ?? 0);
+      const uniqueStocks = Number(stats?.unique_stocks ?? 0);
+      const latestCollectedAt = stats?.latest_collected_at ?? null;
+      const latestMs = latestCollectedAt ? Date.parse(latestCollectedAt) : NaN;
+      if (uniqueStocks >= minUniqueStocks && Number.isFinite(latestMs) && (Date.now() - latestMs) <= maxAgeDays * 86_400_000) {
+        logSync(
+          db,
+          'sw_member',
+          'cache_fresh',
+          0,
+          'ok',
+          `SW2021 成分缓存新鲜（${uniqueStocks} 只，最新 ${latestCollectedAt}，TTL ${maxAgeDays}d），跳过远端抓取`,
+          { refresh_status: 'REFRESH_OK', before_rows: totalRows, after_rows: totalRows, write_mode: 'none' },
+        );
+        return { dataset: 'sw_member', rows: 0, cached_rows: totalRows, status: 'OK', reason: 'fresh_cache_within_ttl' };
+      }
+    }
+
     const classifyRows = db.prepare(
       'SELECT index_code, level, name, parent_code FROM sw_classify ORDER BY level, index_code',
     ).all() as Array<{ index_code: string; level: string | null; name: string | null; parent_code: string | null }>;

@@ -31,7 +31,7 @@ const USAGE = `用法: finance-ashare <command> [options]
                                                                  只读研究数据冻结快照导出（生产库只读，as-of 之后的数据拒绝导出）
   investment-research-bundle [--account ID] [--date YYYYMMDD] [--db PATH] [--market-db PATH]
                                                                  私有统一研究事实包；默认最近已收盘日，读取路径不写库
-  hotspot-sync [--start YYYYMMDD] [--end YYYYMMDD] [--ths-codes a,b]  显式联网同步热点行业数据（申万L1/L2/L3+成分+指数日线、同花顺目录/成分/指数日线；绝不接入 daily；THS 成分恒为 NO_POINT_IN_TIME）
+  hotspot-sync [--start YYYYMMDD] [--end YYYYMMDD] [--ths-codes a,b] [--force-members]  显式联网同步热点行业数据（申万L1/L2/L3+成分+指数日线、同花顺目录/成分/指数日线；绝不接入 daily；THS 成分恒为 NO_POINT_IN_TIME）
   hotspot-snapshot [--date YYYYMMDD] [--dry-run] [--full]         生成热点行业 + V2 五族技术视图 + 每股唯一研究状态，写入 hotspot_* 研究表（只写新表；默认只打印摘要，--full 打印全文）
   technical-preview --date YYYYMMDD [--db PATH] [--json|--md] [--out DIR]
                                                                  只读技术方法 V2 预览：五类策略候选 + 共享量价上下文；默认不持久化

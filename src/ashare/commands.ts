@@ -263,7 +263,7 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       const explicitThsCodes = h.arg('ths-codes')?.split(',').map(c => c.trim()).filter(Boolean);
       const results: Array<{ dataset: string; rows: number; status: string }> = [];
       const swClassify = await syncSwClassify(db);
-      const swMembers = await syncSwMembers(db);
+      const swMembers = await syncSwMembers(db, { force: h.flag('force-members') });
       const swDaily = await syncSwIndexDaily(db, { start, end });
       const thsIndex = await syncThsIndex(db);
       results.push(swClassify, swMembers, swDaily, thsIndex);
