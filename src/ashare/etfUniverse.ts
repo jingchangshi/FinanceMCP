@@ -5,7 +5,7 @@ import {
   type EtfCandidateCategory, type EtfCandidateDeclaration,
 } from './etfDeclarations.js';
 import { adjustmentRatio } from './data.js';
-import { buildEtfOpportunity, discoverEtfUniverse, etfIdentity, listedAsOf, type EtfDiscovery } from './etfResearch.js';
+import { buildEtfOpportunity, discoverEtfUniverse, etfIdentity, listedAsOf, selectFundBasicRow, type EtfDiscovery } from './etfResearch.js';
 
 // 声明式候选池在 etfDeclarations.ts 中定义（无依赖），这里原样再导出，保持既有调用方不变。
 export const ETF_UNIVERSE_VERSION = 'v3-etf-candidates-2.0.0';
@@ -458,9 +458,7 @@ function evaluateCandidate(
   const exclusions: EtfCandidateRow['exclusions'] = [];
 
   // ---- fund_basic
-  const basic = db && tables.fund_basic
-    ? (db.prepare('SELECT name, fund_type, invest_type, benchmark, status, list_date, delist_date, market FROM fund_basic WHERE ts_code = ?').get(code) as any)
-    : undefined;
+  const basic = db && tables.fund_basic ? selectFundBasicRow(db, code) : undefined;
   const name = basic?.name ? String(basic.name) : declaration.name_hint;
   const nameSource: EtfCandidateRow['name_source'] = basic?.name ? 'fund_basic' : 'declared_hint';
   if (!tables.fund_basic) statusReasons.push('fund_basic_table_missing');

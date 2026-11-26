@@ -9,10 +9,42 @@ function has(db: DatabaseSync, table: string): boolean {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
 }
 
+const ETF_EXCHANGE_CODE_RE = /^(?:51\d{4}|53\d{4}|56\d{4}|58[89]\d{3})\.SH$|^(?:158\d{3}|159\d{3})\.SZ$/i;
+const ETF_ALLOWED_FUND_TYPES = new Set(['股票型', '债券型', '货币型', '其他', '商品型', 'QDII']);
+const FUND_BASIC_IDENTITY_COLS = [
+  'ts_code', 'name', 'fund_type', 'invest_type', 'type', 'benchmark', 'status', 'list_date', 'delist_date', 'market',
+] as const;
+
+export function selectFundBasicRow(db: DatabaseSync, tsCode: string): any | undefined {
+  const existing = new Set(
+    (db.prepare('PRAGMA table_info(fund_basic)').all() as Array<{ name?: string }>)
+      .map((r) => String(r.name ?? '').toLowerCase()),
+  );
+  const cols = FUND_BASIC_IDENTITY_COLS.filter((c) => existing.has(c));
+  if (cols.length === 0) return undefined;
+  return db.prepare(`SELECT ${cols.join(', ')} FROM fund_basic WHERE ts_code = ?`).get(tsCode);
+}
+
 /** Exchange traded funds must be identified by cached metadata, never by a security prefix alone. */
 export function etfIdentity(basic: any): boolean {
-  return !!basic && !/LOF/i.test(String(basic.name ?? ''))
-    && /ETF|交易型开放式|交易型开放|交易所交易基金/i.test([basic.name, basic.fund_type, basic.invest_type, basic.type].join(' '));
+  if (!basic) return false;
+  const name = String(basic.name ?? '');
+  const fundType = String(basic.fund_type ?? '').trim();
+  const investType = String(basic.invest_type ?? '').trim();
+  const type = String(basic.type ?? '').trim();
+  const benchmark = String(basic.benchmark ?? '').trim();
+  if (/LOF|封闭/i.test(name) || fundType.toUpperCase() === 'REITS') return false;
+  if (/ETF|交易型开放式|交易型开放|交易所交易基金/i.test([name, fundType, investType, type].join(' '))) {
+    return true;
+  }
+  const tsCode = String(basic.ts_code ?? '').trim().toUpperCase();
+  const marketOk = basic.market == null || basic.market === '' || basic.market === 'E' || basic.market === 'SH' || basic.market === 'SZ';
+  const passiveOrExchangeMeta = /被动指数|增强指数|黄金现货|货币型|期货型/.test(investType)
+    || /指数|合约|国债|债券|黄金|收益率/.test(benchmark);
+  return ETF_EXCHANGE_CODE_RE.test(tsCode)
+    && marketOk
+    && ETF_ALLOWED_FUND_TYPES.has(fundType)
+    && passiveOrExchangeMeta;
 }
 
 export function listedAsOf(basic: any, asOf: string): boolean {

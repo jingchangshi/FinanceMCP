@@ -8,7 +8,7 @@ import test from 'node:test';
 const root = process.env.UPGRADE_BUILD_DIR ?? resolve('build');
 process.env.ASHARE_FETCH_MAX_RETRIES = '0';
 process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
-const { discoverEtfUniverse, buildEtfOpportunity } = await import(pathToFileURL(resolve(root, 'ashare/etfResearch.js')).href);
+const { discoverEtfUniverse, buildEtfOpportunity, etfIdentity } = await import(pathToFileURL(resolve(root, 'ashare/etfResearch.js')).href);
 const { screenEtfCandidates } = await import(pathToFileURL(resolve(root, 'ashare/etfUniverse.js')).href);
 const { openAshareDb } = await import(pathToFileURL(resolve(root, 'ashare/db.js')).href);
 const { syncEtfForDaily, ETF_PIPELINE_CODES } = await import(pathToFileURL(resolve(root, 'ashare/etf.js')).href);
@@ -151,4 +151,14 @@ test('opportunity compares adjusted historical returns and holdings correlation 
     db.prepare('DELETE FROM fund_adj WHERE ts_code=? AND trade_date=?').run('511777.SH', asOf);
     assert.equal(buildEtfOpportunity(db, '511777.SH', asOf, []).trend.return_20d_pct, null);
   } finally { db.close(); }
+});
+test('etfIdentity verifies free-source abbreviated ETFs via code+metadata while rejecting LOF/closed/REIT/bare-prefix', () => {
+  assert.equal(etfIdentity({ ts_code: '159549.SZ', name: '红利100', fund_type: '股票型', invest_type: '被动指数型', benchmark: '中证红利低波动100指数收益率×100%', market: 'E' }), true);
+  assert.equal(etfIdentity({ ts_code: '159207.SZ', name: '高股息', fund_type: '股票型', invest_type: '被动指数型', benchmark: '中证智选高股息策略指数收益率×100%', market: 'E' }), true);
+  assert.equal(etfIdentity({ ts_code: '510140.SH', name: '上证指', fund_type: '股票型', invest_type: null, benchmark: '上证综合指数收益率×100%', market: 'E' }), true);
+  assert.equal(etfIdentity({ ts_code: '159558.SZ', name: '半导体E', fund_type: '股票型', invest_type: '被动指数型', benchmark: '中证半导体材料设备主题指数收益率×100%', market: 'E' }), true);
+  assert.equal(etfIdentity({ ts_code: '160777.SZ', name: '测试LOF', fund_type: '股票型', invest_type: '被动指数型', benchmark: '某指数', market: 'E' }), false);
+  assert.equal(etfIdentity({ ts_code: '500777.SH', name: '封闭基金', fund_type: '股票型', invest_type: '被动指数型', benchmark: '某指数', market: 'E' }), false);
+  assert.equal(etfIdentity({ ts_code: '508000.SH', name: '某基础设施REIT', fund_type: 'REITs', invest_type: null, benchmark: null, market: 'E' }), false);
+  assert.equal(etfIdentity({ ts_code: '510300.SH', name: '未知' }), false);
 });

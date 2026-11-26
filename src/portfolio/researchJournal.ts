@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { calculateFees, resolveFeeRules } from './fees.js';
-import { etfIdentity } from '../ashare/etfResearch.js';
+import { etfIdentity, selectFundBasicRow } from '../ashare/etfResearch.js';
 
 export const JOURNAL_VERSION = 'research-journal-20261021-v1';
 export const JOURNAL_SOURCES = ['vps', 'chatgpt', 'hermes', 'gemini', 'combined'] as const;
@@ -270,7 +270,7 @@ export function journalFeeEstimator(portfolioDb: DatabaseSync, marketDb: Databas
     let kind: 'ETF' | 'STOCK' | null = null;
     if (table(marketDb, 'stock_basic') && marketDb.prepare('SELECT ts_code FROM stock_basic WHERE ts_code=?').get(input.ts_code)) kind = 'STOCK';
     if (!kind && table(marketDb, 'fund_basic')) {
-      const basic = marketDb.prepare('SELECT * FROM fund_basic WHERE ts_code=?').get(input.ts_code);
+      const basic = selectFundBasicRow(marketDb, input.ts_code);
       if (etfIdentity(basic)) kind = 'ETF';
     }
     if (!kind) return null;
