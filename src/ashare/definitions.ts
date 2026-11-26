@@ -483,6 +483,26 @@ export const portfolioToolDefinitions: { name: string; description: string; inpu
     annotations: APPEND_ONLY,
     securitySchemes: PRIVATE_APPEND_SCHEMES,
   },
+  {
+    name: 'ashare_intraday_midday_check',
+    description: `纯只读午间/盘中执行与风控检查（下午决策参考）：实时拉取腾讯行情对标大盘双锚（沪深300/中证500/创业板指）、账户实时净值与 L1/L2 熔断距离、昨夜日报买单高开防追（>+2% 放弃）与跨境 ETF 实时溢价红灯（>+2.5% 拦截），以及持仓 -8% 硬止损/MA20/159558 磨底箱体触发线尾盘预演。非交易日自动返回休市状态。严禁写入任何数据库表或前瞻评测账本。${PORTFOLIO_NOTE} 只在 /private/mcp 提供。`,
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        account_id: { type: 'string', description: '账户标识；省略使用本部署唯一真实账户' },
+        extra_codes: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 10,
+          description: '可选：补充实时查询的 A 股或场内 ETF 代码（如 ["510300.SH"]，最多 10 只）',
+        },
+      },
+      required: [],
+    },
+    annotations: READ_ONLY,
+    securitySchemes: PRIVATE_READ_SCHEMES,
+  },
 ];
 
 export const PORTFOLIO_TOOL_NAMES = new Set(portfolioToolDefinitions.map(t => t.name));

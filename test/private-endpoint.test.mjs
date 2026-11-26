@@ -35,6 +35,8 @@ const ACCOUNT_TOOLS = [
   // goal-1027 P0-1：持久化快照只读获取（私有只读）。
   'ashare_research_snapshot_get',
   'ashare_research_combined_append',
+  // V3 盘中执行与风控检查（私有只读）。
+  'ashare_intraday_midday_check',
 ];
 
 // 先准备好合成账户库（CLI 导入，幂等）。

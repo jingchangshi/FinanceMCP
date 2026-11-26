@@ -8,6 +8,7 @@ export interface TencentQuoteRow {
   symbol: string;
   name: string;
   trade_date: string;
+  quote_time?: string | null;
   open: number | null;
   high: number | null;
   low: number | null;
@@ -55,6 +56,9 @@ export function parseTencentQuoteLine(line: string): TencentQuoteRow | null {
   const dateDigits = (p[30] ?? '').replace(/\D/g, '');
   if (dateDigits.length < 8) return null;
   const tradeDate = dateDigits.slice(0, 8);
+  const quoteTime = dateDigits.length >= 14
+    ? `${dateDigits.slice(8, 10)}:${dateDigits.slice(10, 12)}:${dateDigits.slice(12, 14)}`
+    : null;
 
   const close = finiteOrNull(p[3]);
   const preClose = finiteOrNull(p[4]);
@@ -89,6 +93,7 @@ export function parseTencentQuoteLine(line: string): TencentQuoteRow | null {
     symbol: code,
     name,
     trade_date: tradeDate,
+    quote_time: quoteTime,
     open,
     high,
     low,

@@ -17,6 +17,8 @@ import { isPrivateToolExposed, isToolExposed } from './toolProfile.js';
 
 /** 条件化配置比较工具：只在私有端点提供，公网不暴露。 */
 export const DECISION_TOOL_NAME = 'ashare_portfolio_decision';
+/** 午间/盘中执行与风控检查工具：只在私有端点提供，异步拉取腾讯实时行情且纯只读不落库。 */
+export const MIDDAY_CHECK_TOOL_NAME = 'ashare_intraday_midday_check';
 
 export const toolList = [
   { name: timestampTool.name, description: timestampTool.description, inputSchema: timestampTool.parameters },
@@ -236,6 +238,10 @@ export async function dispatchPrivateTool(name: string, args: Record<string, any
   if (name === DECISION_TOOL_NAME) {
     const { runDecisionTool } = await import('./portfolio/decisionTool.js');
     return runDecisionTool(args ?? {});
+  }
+  if (name === MIDDAY_CHECK_TOOL_NAME) {
+    const { runMiddayCheckTool } = await import('./portfolio/middayCheck.js');
+    return runMiddayCheckTool(args ?? {});
   }
   // V1.0 研究/日报工具（C2/C6/D1）：与账本工具分开实现，同样只读。
   const { RESEARCH_PRIVATE_TOOLS, runPortfolioResearchTool } = await import('./portfolio/researchTools.js');

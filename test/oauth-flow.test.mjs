@@ -30,6 +30,8 @@ const ACCOUNT_TOOLS = [
   'ashare_research_thesis_append', 'ashare_research_eval',
   // goal-1027 P0-1/P0-3：持久化快照只读获取与 Combined 联合判断冻结（append-only 写工具）。
   'ashare_research_snapshot_get', 'ashare_research_combined_append',
+  // V3 盘中执行与风控检查（只读）
+  'ashare_intraday_midday_check',
 ];
 
 // 合成账户库（演示快照，不是用户真实账户）。

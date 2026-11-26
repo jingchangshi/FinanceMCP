@@ -40,6 +40,7 @@ const FROZEN_REQUIRED = {
   ashare_research_eval: undefined,
   ashare_research_snapshot_get: undefined,
   ashare_research_combined_append: ['as_of_trade_date'],
+  ashare_intraday_midday_check: [],
 };
 
 const all = [...ashareToolDefinitions, ...portfolioToolDefinitions];
