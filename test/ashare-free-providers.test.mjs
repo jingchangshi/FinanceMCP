@@ -22,7 +22,13 @@ const {
 } = await import('../build/ashare/providers/tdxClient.js');
 const { parseTencentQuoteLine } = await import('../build/ashare/providers/tencentClient.js');
 const { resolveDataProviderMode, computeDefaultLimitPrices } = await import('../build/ashare/providers/types.js');
-const { clearFreeProviderCache, fetchFreeDataset, STATIC_CLOSED_WEEKDAYS } = await import('../build/ashare/providers/freeProviderRouter.js');
+const {
+  clearFreeProviderCache,
+  fetchFreeDataset,
+  MAX_KNOWN_STATIC_CALENDAR_DATE,
+  resolveCalendarSyncEnd,
+  STATIC_CLOSED_WEEKDAYS,
+} = await import('../build/ashare/providers/freeProviderRouter.js');
 
 const originalFetch = globalThis.fetch;
 
@@ -597,5 +603,31 @@ test('2027 State Council holiday weekdays are in the static closed table', () =>
   for (const date of ['20270131', '20270214', '20270508', '20270926', '20271009']) {
     const day = new Date(Date.UTC(+date.slice(0, 4), +date.slice(4, 6) - 1, +date.slice(6, 8))).getUTCDay();
     assert.ok(day === 0 || day === 6, `${date} is a weekend makeup day; weekends are closed by isWeekend`);
+  }
+});
+
+test('resolveCalendarSyncEnd extends trade_cal cleanly through 20271231 with accurate holiday flags', async () => {
+  assert.equal(MAX_KNOWN_STATIC_CALENDAR_DATE, '20271231');
+  assert.equal(resolveCalendarSyncEnd('20261126'), '20271231');
+  assert.equal(resolveCalendarSyncEnd('20271231'), '20271231');
+  assert.equal(resolveCalendarSyncEnd('20280105'), '20280204');
+
+  const db = openAshareDb(':memory:');
+  try {
+    const rows = await fetchFreeDataset('trade_cal', { start_date: '20261224', end_date: '20271231' }, db);
+    upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], rows);
+    const calMap = new Map(rows.map(r => [r.cal_date, r]));
+    assert.equal(calMap.get('20261231')?.is_open, 1);
+    assert.equal(calMap.get('20270101')?.is_open, 0);
+    assert.equal(calMap.get('20270104')?.is_open, 1);
+    assert.equal(calMap.get('20270205')?.is_open, 0);
+    assert.equal(calMap.get('20270212')?.is_open, 0);
+    assert.equal(calMap.get('20270215')?.is_open, 1);
+    assert.equal(calMap.get('20271007')?.is_open, 0);
+    assert.equal(calMap.get('20271008')?.is_open, 1);
+    assert.equal(calMap.get('20271231')?.is_open, 1);
+    assert.equal(calMap.get('20270104')?.pretrade_date, '20261231');
+  } finally {
+    db.close();
   }
 });

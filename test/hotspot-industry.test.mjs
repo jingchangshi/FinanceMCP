@@ -189,17 +189,22 @@ test('hotspotCoverage: table_missing before schema, honest quality after', t => 
 
 // ---------------------------------------------------------------- sync module smoke
 
-test('industrySync catalog syncs return CATALOG_UNAVAILABLE without overwriting frozen tables', async t => {
+test('industrySync catalog syncs fail closed cleanly with CATALOG_UNAVAILABLE when upstream fails', async t => {
   for (const name of ['syncSwClassify', 'syncSwMembers', 'syncSwIndexDaily',
     'syncThsIndex', 'syncThsMembers', 'syncThsIndexDaily']) {
     assert.equal(typeof industrySync[name], 'function', name);
   }
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('upstream unavailable', { status: 503 });
+  t.after(() => { globalThis.fetch = originalFetch; });
+
   const db = openAshareDb(':memory:');
   t.after(() => db.close());
   ensureHotspotSchema(db);
   const frozenAt = '2026-10-01T00:00:00.000Z';
   upsertRows(db, 'sw_classify', ['index_code', 'level', 'name', 'collected_at'], [
     { index_code: '801010.SI', level: 'L1', name: '农林牧渔', collected_at: frozenAt },
+    { index_code: '850111.SI', level: 'L3', name: '种子', collected_at: frozenAt },
   ]);
   upsertRows(db, 'ths_index', ['ts_code', 'name', 'idx_type', 'count', 'exchange', 'list_date', 'collected_at'], [
     { ts_code: '885431.TI', name: 'CPO概念', idx_type: 'N', count: 120, exchange: '', list_date: '20200101', collected_at: frozenAt },
@@ -212,7 +217,7 @@ test('industrySync catalog syncs return CATALOG_UNAVAILABLE without overwriting 
     assert.equal(r.status, 'CATALOG_UNAVAILABLE', r.dataset);
     assert.equal(r.rows, 0);
   }
-  assert.equal(r1.cached_rows, 1);
+  assert.equal(r1.cached_rows, 2);
   assert.equal(db.prepare("SELECT collected_at FROM sw_classify WHERE index_code = '801010.SI'").get().collected_at, frozenAt);
   assert.equal(db.prepare("SELECT collected_at FROM ths_index WHERE ts_code = '885431.TI'").get().collected_at, frozenAt);
 
@@ -231,6 +236,86 @@ test('industrySync catalog syncs return CATALOG_UNAVAILABLE without overwriting 
   });
   assert.equal(printed[0].command, 'hotspot-sync');
   assert.equal(printed[0].catalog_status, 'CATALOG_UNAVAILABLE');
+});
+
+test('industrySync populates SW2021 classify/members and THS industry index via free mock sources while preserving archives', async t => {
+  const originalFetch = globalThis.fetch;
+  const overviewHtml = `
+    <div id="level1Items">
+      <div class="lg-industries-item-chinese-title">801010.SI</div>
+      <div class="lg-industries-item-number">农林牧渔(104)</div>
+    </div>
+    <div id="level2Items">
+      <div class="lg-industries-item-chinese-title">801016.SI</div>
+      <div class="lg-industries-item-number">种植业(20) <span>[农林牧渔]</span></div>
+    </div>
+    <div id="level3Items">
+      <div class="lg-industries-item-chinese-title">850111.SI</div>
+      <div class="lg-industries-item-number">种子(2) <span>[种植业]</span></div>
+    </div>
+  `;
+  const compHtml = `
+    <table>
+      <tr><th>序号</th><th>股票代码</th><th>股票简称</th><th>纳入时间</th></tr>
+      <tr><td>1</td><td>600313.SH</td><td>农发种业</td><td>2011-01-10</td></tr>
+      <tr><td>2</td><td>000998.SZ</td><td>隆平高科</td><td>2000-12-11</td></tr>
+    </table>
+  `;
+  const thsHtml = `<html><body>
+    <a href="https://q.10jqka.com.cn/thshy/detail/code/881121/" target="_blank">半导体</a>
+    <a href="https://q.10jqka.com.cn/thshy/detail/code/881155/" target="_blank">银行</a>
+  </body></html>`;
+  const { default: iconv } = await import('iconv-lite').catch(() => ({ default: null }));
+  const thsBytes = iconv
+    ? iconv.encode(thsHtml, 'gbk')
+    : Buffer.from(thsHtml, 'latin1'); // ASCII fallback if iconv-lite absent; use Buffer for pure test bytes
+
+  globalThis.fetch = async (url) => {
+    const s = String(url);
+    if (s.includes('sw-industry-overview')) return new Response(overviewHtml, { status: 200 });
+    if (s.includes('index-composition?industryCode=850111.SI')) return new Response(compHtml, { status: 200 });
+    if (s.includes('q.10jqka.com.cn/thshy/')) return new Response(thsBytes, { status: 200 });
+    return new Response('not found', { status: 404 });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const db = openAshareDb(':memory:');
+  t.after(() => db.close());
+  ensureHotspotSchema(db);
+  // Pre-seed a historical exited sw_member row + an existing THS concept row + existing I row with count
+  upsertRows(db, 'sw_member', ['ts_code', 'l1_code', 'l2_code', 'l3_code', 'l1_name', 'l2_name', 'l3_name', 'name', 'in_date', 'out_date', 'is_new', 'collected_at'], [
+    { ts_code: '600001.SH', l1_code: '801010.SI', l2_code: '801016.SI', l3_code: '850111.SI', l1_name: '农林牧渔', l2_name: '种植业', l3_name: '种子', name: '旧成分股', in_date: '20100101', out_date: '20200101', is_new: 'N', collected_at: '2026-10-01T00:00:00.000Z' },
+  ]);
+  upsertRows(db, 'ths_index', ['ts_code', 'name', 'idx_type', 'count', 'exchange', 'list_date', 'collected_at'], [
+    { ts_code: '885431.TI', name: 'CPO概念', idx_type: 'N', count: 120, exchange: 'A', list_date: '20200101', collected_at: '2026-10-01T00:00:00.000Z' },
+    { ts_code: '881121.TI', name: '半导体旧', idx_type: 'I', count: 165, exchange: 'A', list_date: '20120101', collected_at: '2026-10-01T00:00:00.000Z' },
+  ]);
+
+  const cRes = await industrySync.syncSwClassify(db, { minL1: 1, minL2: 1, minL3: 1 });
+  assert.equal(cRes.status, 'OK');
+  assert.equal(cRes.rows, 3);
+  const l3 = db.prepare("SELECT parent_code, src FROM sw_classify WHERE index_code='850111.SI'").get();
+  assert.equal(l3.parent_code, '801016.SI');
+  assert.equal(l3.src, 'SW2021');
+
+  const mRes = await industrySync.syncSwMembers(db, { minUniqueStocks: 2 });
+  assert.equal(mRes.status, 'OK');
+  assert.equal(mRes.rows, 2);
+  assert.equal(db.prepare("SELECT out_date FROM sw_member WHERE ts_code='600001.SH'").get().out_date, '20200101', 'historical exited row preserved');
+  assert.equal(db.prepare("SELECT in_date, l1_code, l2_code FROM sw_member WHERE ts_code='600313.SH'").get().in_date, '20110110');
+
+  const tRes = await industrySync.syncThsIndex(db, { minCount: 2 });
+  assert.equal(tRes.status, 'OK');
+  assert.equal(tRes.rows, 2);
+  assert.equal(db.prepare("SELECT idx_type, count FROM ths_index WHERE ts_code='885431.TI'").get().count, 120, 'concept row preserved');
+  const semi = db.prepare("SELECT name, count, list_date FROM ths_index WHERE ts_code='881121.TI'").get();
+  assert.equal(semi.count, 165, 'existing count preserved on industry merge');
+  assert.equal(semi.list_date, '20120101', 'existing list_date preserved');
+  if (iconv) assert.equal(semi.name, '半导体');
+
+  const tmRes = await industrySync.syncThsMembers(db, { codes: ['881121.TI'] });
+  assert.equal(tmRes.status, 'CATALOG_UNAVAILABLE');
+  assert.equal(tmRes.reason, 'ths_member_pagination_gated_401_preserved_cache');
 });
 
 test('hotspot-snapshot --dry-run remains read-only', async t => {

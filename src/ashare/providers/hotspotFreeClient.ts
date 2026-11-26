@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { finiteOrNull, roundTo } from './types.js';
+import { finiteOrNull, roundTo, runPool } from './types.js';
 
 export interface IndustryDailyRow {
   ts_code: string;
@@ -225,4 +225,263 @@ export async function fetchThsIndexDailyFree(
     start,
     end,
   );
+}
+
+// ---------------------------------------------------------------- Free Catalogs (SW2021 via legulegu + THS Industry via 10jqka)
+
+export interface SwClassifyRow {
+  index_code: string;
+  level: 'L1' | 'L2' | 'L3';
+  name: string;
+  industry_code: string;
+  parent_code: string;
+  src: string;
+  is_pub: string;
+  collected_at: string;
+}
+
+export interface SwMemberRow {
+  ts_code: string;
+  l1_code: string;
+  l2_code: string;
+  l3_code: string;
+  l1_name: string;
+  l2_name: string;
+  l3_name: string;
+  name: string;
+  in_date: string;
+  out_date: string;
+  is_new: string;
+  collected_at: string;
+}
+
+export interface ThsIndexRow {
+  ts_code: string;
+  name: string;
+  idx_type: string;
+  exchange: string;
+  collected_at: string;
+}
+
+function stripHtmlTags(raw: string): string {
+  return raw
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function sliceIdSection(html: string, id: string, nextIds: string[]): string {
+  const start = html.indexOf(`id="${id}"`);
+  if (start < 0) return '';
+  let end = html.length;
+  for (const nid of nextIds) {
+    const idx = html.indexOf(`id="${nid}"`, start + id.length);
+    if (idx > start && idx < end) end = idx;
+  }
+  return html.slice(start, end);
+}
+
+export function parseLeguleguSwClassifyHtml(html: string, collectedAt = new Date().toISOString()): SwClassifyRow[] {
+  const levels: Array<{ id: string; nextIds: string[]; level: 'L1' | 'L2' | 'L3' }> = [
+    { id: 'level1Items', nextIds: ['level2Items', 'level3Items'], level: 'L1' },
+    { id: 'level2Items', nextIds: ['level3Items'], level: 'L2' },
+    { id: 'level3Items', nextIds: [], level: 'L3' },
+  ];
+  const parsed: Array<{ index_code: string; level: 'L1' | 'L2' | 'L3'; name: string; parentName: string | null }> = [];
+  const l1ByName = new Map<string, string>();
+  const l2ByName = new Map<string, string>();
+
+  for (const spec of levels) {
+    const chunk = sliceIdSection(html, spec.id, spec.nextIds);
+    if (!chunk) continue;
+    const itemRe = /lg-industries-item-chinese-title[^>]*>\s*([^<\s]+)[\s\S]*?lg-industries-item-number[^>]*>([\s\S]*?)<\/div>/g;
+    let m: RegExpExecArray | null;
+    while ((m = itemRe.exec(chunk)) !== null) {
+      const indexCode = m[1].trim();
+      const numText = stripHtmlTags(m[2]);
+      const nameMatch = numText.match(/^([^\(\[]+)/);
+      const name = (nameMatch?.[1] ?? '').trim();
+      if (!/^\d{6}\.SI$/i.test(indexCode) || !name) continue;
+      const parentMatch = numText.match(/\[([^\]]+)\]/);
+      const parentName = parentMatch ? parentMatch[1].trim() : null;
+      const normalizedCode = indexCode.toUpperCase();
+      if (spec.level === 'L1') l1ByName.set(name, normalizedCode);
+      if (spec.level === 'L2') l2ByName.set(name, normalizedCode);
+      parsed.push({ index_code: normalizedCode, level: spec.level, name, parentName });
+    }
+  }
+
+  return parsed.map(item => {
+    let parentCode = '0';
+    if (item.level === 'L2' && item.parentName) {
+      parentCode = l1ByName.get(item.parentName) ?? '0';
+    } else if (item.level === 'L3' && item.parentName) {
+      parentCode = l2ByName.get(item.parentName) ?? '0';
+    }
+    const code6 = item.index_code.split('.')[0];
+    return {
+      index_code: item.index_code,
+      level: item.level,
+      name: item.name,
+      industry_code: `${code6.slice(2)}00`,
+      parent_code: parentCode,
+      src: 'SW2021',
+      is_pub: '1',
+      collected_at: collectedAt,
+    };
+  });
+}
+
+export async function fetchSwClassifyFromLegulegu(
+  opts: { minL1?: number; minL2?: number; minL3?: number; timeoutMs?: number } = {},
+): Promise<SwClassifyRow[]> {
+  const minL1 = opts.minL1 ?? 25;
+  const minL2 = opts.minL2 ?? 100;
+  const minL3 = opts.minL3 ?? 250;
+  const res = await fetch('https://legulegu.com/stockdata/sw-industry-overview', {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(opts.timeoutMs ?? 12000),
+  });
+  if (!res.ok) throw new Error(`legulegu sw-industry-overview HTTP ${res.status}`);
+  const html = await res.text();
+  const rows = parseLeguleguSwClassifyHtml(html);
+  const c1 = rows.filter(r => r.level === 'L1').length;
+  const c2 = rows.filter(r => r.level === 'L2').length;
+  const c3 = rows.filter(r => r.level === 'L3').length;
+  if (c1 < minL1 || c2 < minL2 || c3 < minL3) {
+    throw new Error(`legulegu sw_classify incomplete: L1=${c1}, L2=${c2}, L3=${c3}`);
+  }
+  return rows;
+}
+
+export function parseLeguleguCompositionHtml(
+  html: string,
+  meta: { l1Code: string; l1Name: string; l2Code: string; l2Name: string; l3Code: string; l3Name: string },
+  collectedAt = new Date().toISOString(),
+): SwMemberRow[] {
+  const out: SwMemberRow[] = [];
+  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  const cellRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+  let rm: RegExpExecArray | null;
+  while ((rm = rowRe.exec(html)) !== null) {
+    const cells: string[] = [];
+    let cm: RegExpExecArray | null;
+    cellRe.lastIndex = 0;
+    while ((cm = cellRe.exec(rm[1])) !== null) {
+      cells.push(stripHtmlTags(cm[1]));
+    }
+    if (cells.length < 4) continue;
+    const tsCode = (cells[1] ?? '').trim().toUpperCase();
+    if (!/^\d{6}\.(SH|SZ|BJ)$/.test(tsCode)) continue;
+    const stockName = (cells[2] ?? '').trim();
+    const rawInDate = (cells[3] ?? '').trim().replace(/-/g, '');
+    const inDate = /^\d{8}$/.test(rawInDate) ? rawInDate : '';
+    out.push({
+      ts_code: tsCode,
+      l1_code: meta.l1Code,
+      l2_code: meta.l2Code,
+      l3_code: meta.l3Code,
+      l1_name: meta.l1Name,
+      l2_name: meta.l2Name,
+      l3_name: meta.l3Name,
+      name: stockName,
+      in_date: inDate,
+      out_date: '',
+      is_new: 'Y',
+      collected_at: collectedAt,
+    });
+  }
+  return out;
+}
+
+export async function fetchSwMembersFromLegulegu(
+  classifyRows: Array<{ index_code: string; level: string | null; name: string | null; parent_code: string | null }>,
+  opts: { concurrency?: number; timeoutMs?: number; minUniqueStocks?: number; maxFailureRatio?: number } = {},
+): Promise<SwMemberRow[]> {
+  const byCode = new Map(classifyRows.map(r => [r.index_code, r]));
+  const l3Rows = classifyRows.filter(r => r.level === 'L3');
+  if (!l3Rows.length) throw new Error('sw_classify has no L3 entries');
+
+  const collectedAt = new Date().toISOString();
+  const timeoutMs = opts.timeoutMs ?? 12000;
+  let failed = 0;
+  const nested = await runPool(l3Rows, opts.concurrency ?? 4, async l3 => {
+    const l2 = l3.parent_code ? byCode.get(l3.parent_code) : undefined;
+    const l1 = l2?.parent_code ? byCode.get(l2.parent_code) : undefined;
+    const meta = {
+      l1Code: l1?.index_code ?? '',
+      l1Name: l1?.name ?? '',
+      l2Code: l2?.index_code ?? '',
+      l2Name: l2?.name ?? '',
+      l3Code: l3.index_code,
+      l3Name: l3.name ?? '',
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(`https://legulegu.com/stockdata/index-composition?industryCode=${encodeURIComponent(l3.index_code)}`, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const html = await res.text();
+        return parseLeguleguCompositionHtml(html, meta, collectedAt);
+      } catch {
+        if (attempt === 0) await new Promise(r => setTimeout(r, 250));
+      }
+    }
+    failed++;
+    return [] as SwMemberRow[];
+  });
+
+  const maxFailureRatio = opts.maxFailureRatio ?? 0.2;
+  if (failed / l3Rows.length > maxFailureRatio) {
+    throw new Error(`legulegu sw_member too many failures: ${failed}/${l3Rows.length}`);
+  }
+  const flat = nested.flat();
+  const uniqueStocks = new Set(flat.map(r => r.ts_code)).size;
+  const minUniqueStocks = opts.minUniqueStocks ?? 3000;
+  if (uniqueStocks < minUniqueStocks) {
+    throw new Error(`legulegu sw_member incomplete: uniqueStocks=${uniqueStocks} < ${minUniqueStocks}`);
+  }
+  return flat;
+}
+
+export function parseThsIndustryIndexHtml(html: string, collectedAt = new Date().toISOString()): ThsIndexRow[] {
+  const seen = new Map<string, ThsIndexRow>();
+  const re = /\/thshy\/detail\/code\/(88\d{4})\/"[^>]*>([^<]+)<\/a>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const tsCode = `${m[1]}.TI`;
+    const name = stripHtmlTags(m[2]);
+    if (!name || seen.has(tsCode)) continue;
+    seen.set(tsCode, {
+      ts_code: tsCode,
+      name,
+      idx_type: 'I',
+      exchange: 'A',
+      collected_at: collectedAt,
+    });
+  }
+  return [...seen.values()];
+}
+
+export async function fetchThsIndustryIndexFrom10jqka(
+  opts: { minCount?: number; timeoutMs?: number } = {},
+): Promise<ThsIndexRow[]> {
+  const res = await fetch('https://q.10jqka.com.cn/thshy/', {
+    headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://q.10jqka.com.cn/' },
+    signal: AbortSignal.timeout(opts.timeoutMs ?? 10000),
+  });
+  if (!res.ok) throw new Error(`10jqka thshy HTTP ${res.status}`);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const html = new TextDecoder('gbk').decode(buf);
+  const rows = parseThsIndustryIndexHtml(html);
+  const minCount = opts.minCount ?? 50;
+  if (rows.length < minCount) {
+    throw new Error(`10jqka ths_index incomplete: ${rows.length} < ${minCount}`);
+  }
+  return rows;
 }

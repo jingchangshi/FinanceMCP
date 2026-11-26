@@ -26,7 +26,16 @@ import {
 //
 // 2027 年安排依据《国务院办公厅关于2027年部分节假日安排的通知》（国办发明电〔2026〕10号，
 // 2026-11-05 发布）。这里只列周一至周五的休市日；周末及调休上班的周六/周日由 isWeekend 处理，
-// A 股周末不交易。resolveTradeCal 对过去日期仍以真实指数 K 线自校正。
+// A股周末不交易。resolveTradeCal 对过去日期仍以真实指数 K 线自校正。
+export const MAX_KNOWN_STATIC_CALENDAR_DATE = '20271231';
+
+/** 计算交易日历同步上界：在静态法定节假日覆盖期内延伸到年末（2027-12-31），超出则回退 +30 天。 */
+export function resolveCalendarSyncEnd(todayYmd: string): string {
+  return todayYmd <= MAX_KNOWN_STATIC_CALENDAR_DATE
+    ? MAX_KNOWN_STATIC_CALENDAR_DATE
+    : addYmdDays(todayYmd, 30);
+}
+
 export const STATIC_CLOSED_WEEKDAYS = new Set([
   // 2025
   '20250101', '20250128', '20250129', '20250130', '20250131', '20250203', '20250204',

@@ -12,6 +12,7 @@ import { syncEtfForDaily, type EtfDailySyncSummary } from './etf.js';
 import { auditCache, fillGaps, saveAudit } from './audit.js';
 // 热点行业同步只在 `hotspot-sync` 显式命令里调用；import 本身不触网。
 import { syncSwClassify, syncSwMembers, syncSwIndexDaily, syncThsIndex, syncThsMembers, syncThsIndexDaily, discoverThsCodes } from './industrySync.js';
+import { resolveCalendarSyncEnd } from './providers/freeProviderRouter.js';
 
 export interface CliHelpers {
   arg(name: string): string | undefined;
@@ -85,7 +86,7 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       // continuity of every later watchlist. Use `report` or `replay` (research database) instead.
       const last = lastLiveDate(db);
       if (last && last > date) throw new Error(`正式股票池已到 ${last}，daily 不能回写更早的 ${date}；历史日期请用 report --date ${date}（研究库）或 replay`);
-      await syncTradeCal(db, addDays(date, -420), addDays(date, 30));
+      await syncTradeCal(db, addDays(date, -420), resolveCalendarSyncEnd(date));
       if (!isTradeDay(db, date)) {
         h.print({ trade_date: date, skipped: true, reason: '非交易日' });
         return true;
@@ -242,25 +243,44 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       process.stdout.write(result.content[0].text + '\n');
       return true;
     }
+    case 'cal-sync': {
+      const today = shanghaiToday();
+      const start = h.arg('start') ? h.ymd(h.arg('start'), '--start') : addDays(today, -30);
+      const end = h.arg('end') ? h.ymd(h.arg('end'), '--end') : resolveCalendarSyncEnd(today);
+      const rows = await syncTradeCal(db, start, end);
+      const bounds = db.prepare(
+        'SELECT MIN(cal_date) min_date, MAX(cal_date) max_date, COUNT(*) count FROM trade_cal',
+      ).get() as { min_date: string | null; max_date: string | null; count: number };
+      h.print({ command: 'cal-sync', start, end, upserted_rows: rows, ...bounds });
+      return true;
+    }
     case 'hotspot-sync': {
-      // 目录/成分已随 Tushare 退役冻结（显式返回 CATALOG_UNAVAILABLE 且保留既有冻结表）；
-      // 指数日线（sw_daily / ths_daily）继续通过免费多源刷新，空目录时不崩溃。
+      // 申万 2021 目录与成分（legulegu）+ THS 行业指数目录（10jqka）走免费公开源并失败保留缓存；
+      // THS 成分受限于翻页 401 鉴权显式返回 CATALOG_UNAVAILABLE（保留缓存）；
+      // 指数日线（sw_daily / ths_daily）通过免费多源刷新，空目录时不崩溃。
       const start = h.arg('start') ? h.ymd(h.arg('start'), '--start') : addDays(shanghaiToday(), -400);
       const end = h.arg('end') ? h.ymd(h.arg('end'), '--end') : shanghaiToday();
       const explicitThsCodes = h.arg('ths-codes')?.split(',').map(c => c.trim()).filter(Boolean);
-      const results: unknown[] = [];
-      results.push(await syncSwClassify(db));
-      results.push(await syncSwMembers(db));
-      results.push(await syncSwIndexDaily(db, { start, end }));
-      results.push(await syncThsIndex(db));
+      const results: Array<{ dataset: string; rows: number; status: string }> = [];
+      const swClassify = await syncSwClassify(db);
+      const swMembers = await syncSwMembers(db);
+      const swDaily = await syncSwIndexDaily(db, { start, end });
+      const thsIndex = await syncThsIndex(db);
+      results.push(swClassify, swMembers, swDaily, thsIndex);
       const thsCodes = explicitThsCodes ?? discoverThsCodes(db);
       if (thsCodes.length) {
         results.push(await syncThsMembers(db, { codes: thsCodes }));
         results.push(await syncThsIndexDaily(db, { start, end, codes: thsCodes }));
       } else {
-        results.push({ dataset: 'ths_index_daily', rows: 0, status: 'CATALOG_UNAVAILABLE', reason: 'no_ths_index_codes' });
+        results.push({ dataset: 'ths_index_daily', rows: 0, status: 'CATALOG_UNAVAILABLE' });
       }
-      h.print({ command: 'hotspot-sync', catalog_status: 'CATALOG_UNAVAILABLE', start, end, ths_codes: thsCodes.length, results });
+      const catalogStatuses = [swClassify.status, swMembers.status, thsIndex.status];
+      const catalogStatus = catalogStatuses.every(s => s === 'OK')
+        ? 'OK'
+        : catalogStatuses.some(s => s === 'OK')
+          ? 'PARTIAL'
+          : 'CATALOG_UNAVAILABLE';
+      h.print({ command: 'hotspot-sync', catalog_status: catalogStatus, start, end, ths_codes: thsCodes.length, results });
       return true;
     }
     case 'hotspot-snapshot': {

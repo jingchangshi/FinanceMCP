@@ -4,6 +4,7 @@ import {
   addDays, DatasetSync, checkQuality, QualityReport, shanghaiToday, syncFinaIndicator, syncIndexDaily,
   syncStockBasic, syncSuspend, syncTradeCal, syncTradeDate, tradeDaysBetween,
 } from './ingest.js';
+import { resolveCalendarSyncEnd } from './providers/freeProviderRouter.js';
 
 export interface SyncSummary {
   start: string;
@@ -32,7 +33,7 @@ export async function syncRange(
   return withSyncDb(db, async () => {
   const t0 = Date.now();
   if (!opts.skipCalendar) {
-    await syncTradeCal(db, addDays(start, -400), addDays(shanghaiToday(), 30));
+    await syncTradeCal(db, addDays(start, -400), resolveCalendarSyncEnd(shanghaiToday()));
   }
   await syncStockBasic(db);
   const days = tradeDaysBetween(db, start, end);

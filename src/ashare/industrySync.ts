@@ -2,13 +2,19 @@ import type { DatabaseSync } from 'node:sqlite';
 import { fetchAll, withSyncDb } from './fetch.js';
 import { logSync, upsertRows } from './db.js';
 import { ensureHotspotSchema } from './hotspotTables.js';
+import {
+  fetchSwClassifyFromLegulegu,
+  fetchSwMembersFromLegulegu,
+  fetchThsIndustryIndexFrom10jqka,
+} from './providers/hotspotFreeClient.js';
 
 /**
- * 热点行业同步层（goal-1028 / V3 免费多源化）：
- * - 目录与成分（sw_classify / sw_member / ths_index / ths_member）原依赖 Tushare；
- *   Tushare 移除后这些函数不再联网或覆写既有的冻结本地表，而是显式返回
- *   `CATALOG_UNAVAILABLE` 并保留缓存；
- * - 指数日线（sw_daily / ths_daily）继续通过免费源（hotspotFreeClient）同步。
+ * 热点行业同步层（V3 免费多源化）：
+ * - 申万 2021 分类与最新成分（sw_classify / sw_member）：通过乐咕乐股免费公开页面同步，
+ *   失败时 fail-closed 保留既有本地缓存并显式返回 `CATALOG_UNAVAILABLE`；
+ * - 同花顺行业指数目录（ths_index idx_type='I'）：通过 10jqka 行业主页同步，保留既有个股数/概念行；
+ * - 同花顺成分分页翻页受限于反爬鉴权（HTTP 401），诚实返回 `CATALOG_UNAVAILABLE` 并保留历史缓存；
+ * - 指数日线（sw_daily / ths_daily）通过免费多源（hotspotFreeClient）同步。
  */
 export interface HotspotSyncResult {
   dataset: string;
@@ -22,7 +28,7 @@ function ok(dataset: string, rows: number): HotspotSyncResult {
   return { dataset, rows, status: 'OK' };
 }
 
-function catalogUnavailable(db: DatabaseSync, dataset: string, reason = 'tushare_removed_no_free_catalog_source'): HotspotSyncResult {
+function catalogUnavailable(db: DatabaseSync, dataset: string, reason = 'free_catalog_source_unavailable'): HotspotSyncResult {
   ensureHotspotSchema(db);
   const cachedRows = Number((db.prepare(`SELECT COUNT(*) n FROM ${dataset}`).get() as any)?.n ?? 0);
   logSync(db, dataset, 'catalog_unavailable', 0, cachedRows > 0 ? 'ok' : 'empty',
@@ -36,21 +42,56 @@ const cacheStatus = (n: number) => (n > 0 ? 'ok' : 'empty');
 
 // ---------------------------------------------------------------- Shenwan 2021
 
+const SW_CLASSIFY_COLUMNS = ['index_code', 'level', 'name', 'industry_code', 'parent_code', 'src', 'is_pub', 'collected_at'];
+const SW_MEMBER_COLUMNS = ['ts_code', 'l1_code', 'l2_code', 'l3_code', 'l1_name', 'l2_name', 'l3_name', 'name', 'in_date', 'out_date', 'is_new', 'collected_at'];
+
 /**
- * 申万 2021 分类目录：Tushare 移除后无在线免费全量目录源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。
+ * 申万 2021 分类目录（免费公开源 legulegu）；失败时保留既有缓存并显式返回 CATALOG_UNAVAILABLE。
  */
 export async function syncSwClassify(
   db: DatabaseSync,
-  _opts: { src?: string } = {},
+  opts: { src?: string; minL1?: number; minL2?: number; minL3?: number } = {},
 ): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => catalogUnavailable(db, 'sw_classify'));
+  return withSyncDb(db, async () => {
+    ensureHotspotSchema(db);
+    try {
+      const rows = await fetchSwClassifyFromLegulegu(opts);
+      const n = upsertRows(db, 'sw_classify', SW_CLASSIFY_COLUMNS, rows);
+      logSync(db, 'sw_classify', 'legulegu', n, cacheStatus(n), `SW2021 ${n} rows`,
+        { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
+      return ok('sw_classify', n);
+    } catch (error: any) {
+      return catalogUnavailable(db, 'sw_classify', String(error?.message ?? error));
+    }
+  });
 }
 
 /**
- * 申万 2021 成分：Tushare 移除后无在线免费 PIT 成分源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。
+ * 申万 2021 成分（免费公开源 legulegu L3 成分表，按唯一主键增量合并并保留既有历史退市/转出档案）；
+ * 拉取不足阈值或失败时保留既有缓存并返回 CATALOG_UNAVAILABLE。
  */
-export async function syncSwMembers(db: DatabaseSync): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => catalogUnavailable(db, 'sw_member'));
+export async function syncSwMembers(
+  db: DatabaseSync,
+  opts: { concurrency?: number; timeoutMs?: number; minUniqueStocks?: number; maxFailureRatio?: number } = {},
+): Promise<HotspotSyncResult> {
+  return withSyncDb(db, async () => {
+    ensureHotspotSchema(db);
+    const classifyRows = db.prepare(
+      'SELECT index_code, level, name, parent_code FROM sw_classify ORDER BY level, index_code',
+    ).all() as Array<{ index_code: string; level: string | null; name: string | null; parent_code: string | null }>;
+    if (!classifyRows.some(r => r.level === 'L3')) {
+      return catalogUnavailable(db, 'sw_member', 'no_sw_classify_l3_codes');
+    }
+    try {
+      const rows = await fetchSwMembersFromLegulegu(classifyRows, opts);
+      const n = upsertRows(db, 'sw_member', SW_MEMBER_COLUMNS, rows);
+      logSync(db, 'sw_member', 'legulegu', n, cacheStatus(n), `SW2021 ${n} member rows`,
+        { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
+      return ok('sw_member', n);
+    } catch (error: any) {
+      return catalogUnavailable(db, 'sw_member', String(error?.message ?? error));
+    }
+  });
 }
 
 const SW_DAILY_FIELDS = 'ts_code,trade_date,open,low,high,close,change,pct_change,vol,amount,pe,pb,float_mv,total_mv';
@@ -93,12 +134,42 @@ export async function syncSwIndexDaily(
 
 // ---------------------------------------------------------------- Tonghuashun
 
-/** THS 概念/行业目录：Tushare 移除后无在线免费目录源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。 */
+/** THS 行业指数目录：通过 10jqka 行业主页免费刷新（`idx_type='I'`），保留既有概念/风格与 count/list_date。 */
 export async function syncThsIndex(
   db: DatabaseSync,
-  _types: string[] = ['N', 'I', 'S', 'ST'],
+  opts: { minCount?: number; timeoutMs?: number } | string[] = {},
 ): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => catalogUnavailable(db, 'ths_index'));
+  return withSyncDb(db, async () => {
+    ensureHotspotSchema(db);
+    const parsedOpts = Array.isArray(opts) ? {} : opts;
+    try {
+      const rows = await fetchThsIndustryIndexFrom10jqka(parsedOpts);
+      const stmt = db.prepare(
+        `INSERT INTO ths_index (ts_code, name, idx_type, exchange, collected_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(ts_code) DO UPDATE SET
+           name = excluded.name,
+           idx_type = excluded.idx_type,
+           exchange = COALESCE(NULLIF(ths_index.exchange, ''), excluded.exchange),
+           collected_at = excluded.collected_at`,
+      );
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const r of rows) {
+          stmt.run(r.ts_code, r.name, r.idx_type, r.exchange, r.collected_at);
+        }
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      logSync(db, 'ths_index', '10jqka_thshy', rows.length, cacheStatus(rows.length), `THS industry ${rows.length} rows`,
+        { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: rows.length });
+      return ok('ths_index', rows.length);
+    } catch (error: any) {
+      return catalogUnavailable(db, 'ths_index', String(error?.message ?? error));
+    }
+  });
 }
 
 /**
@@ -108,18 +179,18 @@ export async function syncThsIndex(
 export function discoverThsCodes(db: DatabaseSync, limit = 30): string[] {
   ensureHotspotSchema(db);
   return (db.prepare(
-    "SELECT ts_code FROM ths_index WHERE idx_type IN ('N','I') ORDER BY count DESC LIMIT ?",
+    "SELECT ts_code FROM ths_index WHERE idx_type IN ('N','I') ORDER BY COALESCE(count, 0) DESC, ts_code LIMIT ?",
   ).all(limit) as Array<{ ts_code: string }>).map(r => r.ts_code);
 }
 
 /**
- * THS 概念成分：Tushare 移除后无在线免费成分源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。
+ * THS 概念/行业成分：同花顺第 2 页起需要前端鉴权（HTTP 401），不绕过权限控制，保留既有缓存并显式返回 CATALOG_UNAVAILABLE。
  */
 export async function syncThsMembers(
   db: DatabaseSync,
   _opts: { codes: string[] },
 ): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => catalogUnavailable(db, 'ths_member'));
+  return withSyncDb(db, async () => catalogUnavailable(db, 'ths_member', 'ths_member_pagination_gated_401_preserved_cache'));
 }
 
 const THS_DAILY_FIELDS = 'ts_code,trade_date,open,high,low,close,pre_close,avg_price,change,pct_change,vol,turnover_rate';
