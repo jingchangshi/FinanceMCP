@@ -724,7 +724,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
 
     // 复权基准换算：tracker 内价格按 entry 基准（entry_adj_factor）存储。除权/拆股后
     // adj_factor 上升而原始价下跌，因此历史价的 asOf 原始口径等价价 =
-    // stored × entryAdj / currentAdj（Tushare hfq 因子口径）。绝不对 h.price_milli 缩放。
+    // stored × entryAdj / currentAdj（本地缓存复权因子口径）。绝不对 h.price_milli 缩放。
     // 旧 OPEN 行缺 entry 基准时回查 entry_date 的真实因子（股票 adj_factor / ETF fund_adj）；
     // 查不到则保持 NULL。只有 entry 与 as-of 两个真实因子齐备时才缩放；缺失任一侧
     // 一律跳过比值（不缩放、不写 1 冒充）。

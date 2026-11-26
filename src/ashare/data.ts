@@ -26,7 +26,7 @@ export const DATA_CONTRACT = {
   version: DATA_CONTRACT_VERSION,
   ts_code: '6 位代码 + 交易所后缀：.SH 上交所、.SZ 深交所、.BJ 北交所（北交所使用 92xxxx 新代码）；也接受 6 位数字或股票全称并解析为唯一代码',
   dates: 'YYYYMMDD（也接受 YYYY-MM-DD），上海时区交易所日期；区间为闭区间 [start_date, end_date]',
-  trade_days: '交易日以 Tushare trade_cal（SSE）为准；区间内非交易日不返回行情，自然日与交易日不混用',
+  trade_days: '交易日以本地缓存 trade_cal（SSE，上证指数 K 线 + 法定休市表维护）为准；区间内非交易日不返回行情，自然日与交易日不混用',
   units: {
     price: '元',
     vol: '手（100 股）',
@@ -40,18 +40,18 @@ export const DATA_CONTRACT = {
   adjust: {
     none: '未复权：交易所原始价格',
     qfq: '前复权：price × adj_factor(t) / adj_factor(base)，base = 查询 end_date 当日或之前最后一个复权因子，不使用 end_date 之后的因子；同一 end_date 分页时价格基准不变',
-    hfq: '后复权：price × adj_factor(t)（Tushare 口径，因子基准随上市以来的除权累计）',
+    hfq: '后复权：price × adj_factor(t)（因子基准随上市以来的除权事件链式累计）',
     missing_factor: '缺少当日复权因子时，复权价格为 null 并标记 adj_factor_missing，不向前填补',
   },
   missing: '缺失值一律为 null，不转换为 0；停牌、未上市/已退市与无法解释的数据缺口分别列出',
   availability: {
-    market_data: 'trade_date = 行情所属交易日；Tushare 未提供逐条发布时间，first_synced_at / last_synced_at 为 FinanceMCP 实际获取时间',
+    market_data: 'trade_date = 行情所属交易日；上游未提供逐条发布时间，first_synced_at / last_synced_at 为 FinanceMCP 实际获取时间',
     financials: 'end_date = 报告期；ann_date = 公告日（历史可得性约束）；as_of 查询只返回 ann_date ≤ as_of 的记录，不返回、不计数 as_of 之后的公告或报告期。ann_date 早于报告期末的记录视为上游异常，不参与 as-of 选择；as-of 查询只提示报告期末与公告日都不晚于 as_of 的此类记录，其余异常只出现在缓存审计（finance-ashare audit 的 global.fina_ann_date_before_period_end）中',
-    suspensions: 'suspend_d 最新一次刷新失败时沿用此前成功快照（如有），相关查询标注 suspend_refresh_failed_days；从未成功同步的日期停牌状态未知',
-    gap_check: `上游缺失确认（upstream_missing_days）是 checked_at 时刻 Tushare 的回答，不代表数据永久不存在；超过 ${GAP_CHECK_MAX_AGE_DAYS} 天的确认列为 upstream_check_expired_days，由 audit --fix 复查`,
+    suspensions: 'suspend_d 采用显式信号口径（suspend=source_explicit_only）：新同步仅记录上游显式停牌且源故障/缺 bar 不写停牌，历史缓存行保留既有记录；刷新失败时沿用此前成功快照（如有）并标注 suspend_refresh_failed_days',
+    gap_check: `上游缺失确认（upstream_missing_days）是 checked_at 时刻的核查结果，不代表数据永久不存在；超过 ${GAP_CHECK_MAX_AGE_DAYS} 天的确认列为 upstream_check_expired_days，由 audit --fix 复查`,
     not_point_in_time: [
-      '财务数据：Tushare 不保留历史修订版本；同一公告日的更正记录（update_flag=1）覆盖原记录，原值不可恢复，因此不是严格 Point-in-Time 财务库',
-      '行业分类、股票名称（含 ST 标记）、上市状态为当前 stock_basic 口径，不代表历史任意日期的状态',
+      '财务数据：上游不保留公告当时的历史修订版本（仅最新修订视图），同一公告日的更正记录覆盖原记录，原值不可恢复，因此不是严格 Point-in-Time 财务库',
+      '行业分类、股票名称（含 ST 标记）、上市状态为当前 stock_basic 口径（退市/暂停状态保留历史缓存，不自动发现新增退市），不代表历史任意日期的状态',
       '股票代码变更（如 300114.SZ → 302132.SZ）未做新旧代码合并，历史行情分别保存在各自代码下',
     ],
   },
@@ -66,7 +66,7 @@ export const FINANCIAL_FIELDS: Record<string, { label: string; unit: string }> =
   or_yoy: { label: '营业收入同比', unit: '%' },
   grossprofit_margin: { label: '销售毛利率', unit: '%' },
   debt_to_assets: { label: '资产负债率', unit: '%' },
-  ocf_to_profit: { label: '经营活动现金净流量相对利润', unit: '%（Tushare 原值为百分数，如 115.11 表示 115.11%）' },
+  ocf_to_profit: { label: '经营活动现金净流量相对利润', unit: '%（百分数；东财口径为经营活动现金净流量/归母净利润×100，历史缓存行可能沿用原口径）' },
   ocfps: { label: '每股经营活动现金流量', unit: '元/股' },
   eps: { label: '基本每股收益', unit: '元/股' },
 };
@@ -137,7 +137,7 @@ export interface Provenance {
 
 const API_NAMES: Record<string, string> = {
   daily: 'daily', daily_basic: 'daily_basic', adj_factor: 'adj_factor', stk_limit: 'stk_limit',
-  suspend_d: 'suspend_d', index_daily: 'index_daily', fina_indicator: 'fina_indicator_vip', stock_basic: 'stock_basic', trade_cal: 'trade_cal',
+  suspend_d: 'suspend_d', index_daily: 'index_daily', fina_indicator: 'fina_indicator', stock_basic: 'stock_basic', trade_cal: 'trade_cal',
 };
 
 /** When FinanceMCP fetched a dataset key (trade date, report period, …) and how the latest request went. */
@@ -145,7 +145,7 @@ export function provenance(db: DatabaseSync, dataset: string, key: string): Prov
   const last = db.prepare('SELECT * FROM sync_log WHERE dataset = ? AND key = ?').get(dataset, key) as any;
   const first = db.prepare('SELECT MIN(synced_at) t FROM sync_history WHERE dataset = ? AND key = ?').get(dataset, key) as any;
   return {
-    source: `Tushare Pro ${API_NAMES[dataset] ?? dataset}`,
+    source: `ashare_cache.${API_NAMES[dataset] ?? dataset}`,
     key,
     first_synced_at: first?.t ?? last?.synced_at ?? null,
     last_synced_at: last?.synced_at ?? null,
@@ -186,7 +186,7 @@ export interface Coverage {
   not_listed_days: number;
   /** After the last bar of a stock with a delisting date: no longer quoted, not a gap. */
   pending_delisting_days: string[];
-  /** A per-stock Tushare check (cache audit) found neither a bar nor a suspension: an upstream gap as of `upstream_checked_at`. */
+  /** A per-stock upstream check (cache audit) found neither a bar nor a suspension: an upstream gap as of `upstream_checked_at`. */
   upstream_missing_days: string[];
   /** Earlier empty responses that need rechecking, classified separately from confirmed upstream gaps. */
   upstream_check_expired_days: string[];
@@ -308,7 +308,7 @@ export function stockHistory(db: DatabaseSync, q: StockHistoryQuery) {
   const warnings: string[] = [];
   if (!basic) warnings.push(`${code} 不在当前 stock_basic 中（可能为代码变更或已从清单移除），名称、行业与上市日期不可得`);
   if (adjMissing.length) warnings.push(`${adjMissing.length} 个交易日缺少复权因子，复权价格为 null`);
-  if (coverage.upstream_missing_days.length) warnings.push(`${coverage.upstream_missing_days.length} 个交易日上游（Tushare）在检查时（upstream_checked_at）确认既无行情也无停牌记录`);
+  if (coverage.upstream_missing_days.length) warnings.push(`${coverage.upstream_missing_days.length} 个交易日上游核查在检查时（upstream_checked_at）确认既无行情也无停牌记录`);
   if (coverage.upstream_check_expired_days.length) warnings.push(`${coverage.upstream_check_expired_days.length} 个交易日的上游缺失确认已过期或检查时间无效，需由 audit --fix 复查`);
   if (coverage.suspend_refresh_failed_days.length) warnings.push(`${coverage.suspend_refresh_failed_days.length} 个交易日停牌数据最新一次刷新失败，停牌分类沿用旧缓存（或未知）: ${coverage.suspend_refresh_failed_days.slice(0, 5).join(',')}`);
   if (coverage.missing_days.length) warnings.push(`${coverage.missing_days.length} 个交易日在上市期内既无行情也无停牌记录${coverage.suspend_data_missing_days ? `（其中 ${coverage.suspend_data_missing_days} 天尚未同步停牌数据）` : ''}`);
@@ -588,7 +588,7 @@ export function marketData(db: DatabaseSync, q: MarketQuery) {
     definitions: {
       up_down: 'pct_chg > 0 / < 0 / = 0 的股票数（仅当日有成交行情的股票）',
       limit_up_down: '收盘价 ≥ 涨停价 − 0.001 / ≤ 跌停价 + 0.001；涨跌停价覆盖率 < 95% 时 limit_counts_complete=false',
-      suspended: 'Tushare suspend_d 当日停牌数；该日停牌数据未同步时为 null。suspended_source: cache = 最新刷新成功；stale_cache = 最新刷新失败，沿用此前成功快照；unavailable = 刷新失败且无成功快照；not_synced = 尚未同步',
+      suspended: 'suspend_d 当日停牌数（新同步仅写显式停牌信号，历史缓存行保留既有记录）；该日停牌数据未同步时为 null。suspended_source: cache = 最新刷新成功；stale_cache = 最新刷新失败，沿用此前成功快照；unavailable = 刷新失败且无成功快照；not_synced = 尚未同步',
       listed: '当前 stock_basic 中按上市/退市日期在当日处于上市期的股票数（当前口径）',
     },
     units: { index_price: '点', vol: '手', amount: '千元', amount_yi: '亿元' },

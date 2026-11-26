@@ -6,7 +6,6 @@ import {
   getConfiguredCredentialSources,
   QVERIS_CONFIG,
   runWithRequestContext,
-  TUSHARE_CONFIG,
   TWINGLY_CONFIG,
 } from '../build/config.js';
 import { routeToolCall } from '../build/utils/dataSourceRouter.js';
@@ -23,23 +22,18 @@ async function listen(server) {
 }
 
 test('a request-scoped Twingly key does not inherit shared server credentials', async () => {
-  const previousTushare = process.env.TUSHARE_TOKEN;
   const previousQveris = process.env.QVERIS_API_KEY;
   const previousTwingly = process.env.TWINGLY_API_KEY;
-  process.env.TUSHARE_TOKEN = 'shared-tushare-token';
   process.env.QVERIS_API_KEY = 'shared-qveris-key';
   process.env.TWINGLY_API_KEY = 'shared-twingly-key';
 
   try {
     await runWithRequestContext({ twinglyApiKey: 'request-twingly-key' }, async () => {
       assert.deepEqual(getConfiguredCredentialSources(), ['twingly']);
-      assert.equal(TUSHARE_CONFIG.API_TOKEN, '');
       assert.equal(QVERIS_CONFIG.API_KEY, '');
       assert.equal(TWINGLY_CONFIG.API_KEY, 'request-twingly-key');
     });
   } finally {
-    if (previousTushare === undefined) delete process.env.TUSHARE_TOKEN;
-    else process.env.TUSHARE_TOKEN = previousTushare;
     if (previousQveris === undefined) delete process.env.QVERIS_API_KEY;
     else process.env.QVERIS_API_KEY = previousQveris;
     if (previousTwingly === undefined) delete process.env.TWINGLY_API_KEY;
@@ -120,7 +114,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
     let nativeCalls = 0;
     const success = await runWithRequestContext({
       twinglyApiKey: 'request-scoped-twingly-key',
-      sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+      sourcePriority: ['twingly', 'qveris', 'binance'],
     }, () => routeToolCall('finance_news', { query: 'Federal Reserve' }, async () => {
       nativeCalls += 1;
       return { content: [{ type: 'text', text: '# public fallback' }] };
@@ -149,7 +143,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
 
     await runWithRequestContext({
       twinglyApiKey: 'request-scoped-twingly-key',
-      sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+      sourcePriority: ['twingly', 'qveris', 'binance'],
     }, () => routeToolCall('finance_news', { query: '"Federal Reserve" inflation' }, async () => {
       nativeCalls += 1;
       return { content: [{ type: 'text', text: '# public fallback' }] };
@@ -159,7 +153,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
     const thirtyTerms = Array.from({ length: 30 }, (_, index) => `term${index}`).join(' ');
     await runWithRequestContext({
       twinglyApiKey: 'request-scoped-twingly-key',
-      sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+      sourcePriority: ['twingly', 'qveris', 'binance'],
     }, () => routeToolCall('finance_news', { query: thirtyTerms }, async () => {
       nativeCalls += 1;
       return { content: [{ type: 'text', text: '# public fallback' }] };
@@ -172,7 +166,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
     await assert.rejects(
       () => runWithRequestContext({
         twinglyApiKey: 'request-scoped-twingly-key',
-        sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+        sourcePriority: ['twingly', 'qveris', 'binance'],
       }, () => routeToolCall('finance_news', { query: tooManyTerms }, async () => {
         nativeCalls += 1;
         return { content: [{ type: 'text', text: '# public fallback' }] };
@@ -185,7 +179,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
     await assert.rejects(
       () => runWithRequestContext({
         twinglyApiKey: 'request-scoped-twingly-key',
-        sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+        sourcePriority: ['twingly', 'qveris', 'binance'],
       }, () => routeToolCall('finance_news', { query: '财'.repeat(6_000) }, async () => {
         nativeCalls += 1;
         return { content: [{ type: 'text', text: '# public fallback' }] };
@@ -198,7 +192,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
     mode = 'empty';
     const emptyFallback = await runWithRequestContext({
       twinglyApiKey: 'request-scoped-twingly-key',
-      sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+      sourcePriority: ['twingly', 'qveris', 'binance'],
     }, () => routeToolCall('finance_news', { query: 'no-match' }, async () => {
       nativeCalls += 1;
       return { content: [{ type: 'text', text: '# public fallback' }] };
@@ -209,7 +203,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
     mode = 'auth';
     const authFallback = await runWithRequestContext({
       twinglyApiKey: 'bad-key',
-      sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+      sourcePriority: ['twingly', 'qveris', 'binance'],
     }, () => routeToolCall('finance_news', { query: 'auth-test' }, async () => {
       nativeCalls += 1;
       return { content: [{ type: 'text', text: '# public fallback after auth failure' }] };
@@ -219,7 +213,7 @@ test('Twingly routes news, preserves 64-bit IDs, groups duplicates, and never re
     mode = 'success';
     const hotResult = await runWithRequestContext({
       twinglyApiKey: 'request-scoped-twingly-key',
-      sourcePriority: ['twingly', 'qveris', 'tushare', 'binance'],
+      sourcePriority: ['twingly', 'qveris', 'binance'],
     }, () => routeToolCall('hot_news_7x24', { limit: 500 }, async () => {
       nativeCalls += 1;
       return { content: [{ type: 'text', text: '# native hot-news fallback' }] };

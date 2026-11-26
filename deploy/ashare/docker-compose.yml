@@ -54,11 +54,11 @@ services:
       ASHARE_OAUTH_DCR_REDIRECT_HOSTS: ${ASHARE_OAUTH_DCR_REDIRECT_HOSTS:-localhost,127.0.0.1,chatgpt.com,chat.openai.com,gemini.google.com,oauth-redirect.googleusercontent.com}
       ASHARE_OAUTH_MAX_CLIENTS: ${ASHARE_OAUTH_MAX_CLIENTS:-50}
       ASHARE_OAUTH_MAX_LOGIN_FAILURES: ${ASHARE_OAUTH_MAX_LOGIN_FAILURES:-10}
-      # Expose only the five A-share tools to ChatGPT.
+      # Expose A-share tools in production profile.
       FINANCE_TOOL_PROFILE: ashare_daily
-      # Default to free multi-source router (TDX TCP + Tencent + Eastmoney); override with 'tushare' if needed.
+      # Free multi-source router (TDX TCP + Tencent + Eastmoney) is the only supported provider.
       ASHARE_DATA_PROVIDER: ${ASHARE_DATA_PROVIDER:-free}
-      # Never take data-source credentials from requests; Tushare comes from TUSHARE_TOKEN in .env.
+      # Never take data-source credentials from requests.
       MCP_ACCEPT_REQUEST_CREDENTIALS: "0"
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-share.shijingchang.cn,localhost,127.0.0.1}
       MCP_RATE_LIMIT: ${MCP_RATE_LIMIT:-30}

@@ -9,12 +9,12 @@ export interface SyncSummary {
   start: string;
   end: string;
   trade_days: number;
-  /** Dates re-queried from Tushare even though they were already synced. */
+  /** Dates re-queried from upstream even though they were already synced. */
   refreshed: string[];
   datasets: Record<string, Record<string, DatasetSync>>;
   quality: Pick<QualityReport, 'trade_date' | 'status' | 'reasons'>[];
   fina?: Record<string, number>;
-  tushare: typeof fetchStats;
+  fetch: typeof fetchStats;
   seconds: number;
 }
 
@@ -64,6 +64,6 @@ export async function syncRange(
   } else {
     fina = await syncFinaIndicator(db, end);
   }
-  return { start, end, trade_days: days.length, refreshed, datasets, quality, fina, tushare: { ...fetchStats }, seconds: Math.round((Date.now() - t0) / 1000) };
+  return { start, end, trade_days: days.length, refreshed, datasets, quality, fina, fetch: { ...fetchStats }, seconds: Math.round((Date.now() - t0) / 1000) };
   });
 }

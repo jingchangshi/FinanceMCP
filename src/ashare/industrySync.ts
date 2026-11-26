@@ -4,29 +4,31 @@ import { logSync, upsertRows } from './db.js';
 import { ensureHotspotSchema } from './hotspotTables.js';
 
 /**
- * Tushare sync functions for the hotspot-industry layer (goal-1028,
- * architecture.md §4.1). Explicit-CLI-triggered only — never part of the
- * daily offline pipeline.
- *
- * Conventions (mirrors ingest.ts): every function ensures the hotspot schema
- * first, stamps rows with one ISO `collected_at`/`synced_at`, upserts through
- * `upsertRows`, ends with `logSync`, and returns `{dataset, rows, status}`.
- * `status` is 'OK' only for a real upstream answer — including an honestly
- * empty one (rows 0 when the API answered and returned nothing); request
- * errors are NOT caught here and propagate exactly as fetch.ts throws them.
- * Rate limiting is entirely fetch.ts's min-interval; no extra sleeps.
- *
- * Everything here needs network at call time; the offline test suite exercises
- * the pure modules (hotspotTables / industryClassification) instead.
+ * 热点行业同步层（goal-1028 / V3 免费多源化）：
+ * - 目录与成分（sw_classify / sw_member / ths_index / ths_member）原依赖 Tushare；
+ *   Tushare 移除后这些函数不再联网或覆写既有的冻结本地表，而是显式返回
+ *   `CATALOG_UNAVAILABLE` 并保留缓存；
+ * - 指数日线（sw_daily / ths_daily）继续通过免费源（hotspotFreeClient）同步。
  */
 export interface HotspotSyncResult {
   dataset: string;
   rows: number;
-  status: 'OK';
+  status: 'OK' | 'CATALOG_UNAVAILABLE';
+  cached_rows?: number;
+  reason?: string;
 }
 
 function ok(dataset: string, rows: number): HotspotSyncResult {
   return { dataset, rows, status: 'OK' };
+}
+
+function catalogUnavailable(db: DatabaseSync, dataset: string, reason = 'tushare_removed_no_free_catalog_source'): HotspotSyncResult {
+  ensureHotspotSchema(db);
+  const cachedRows = Number((db.prepare(`SELECT COUNT(*) n FROM ${dataset}`).get() as any)?.n ?? 0);
+  logSync(db, dataset, 'catalog_unavailable', 0, cachedRows > 0 ? 'ok' : 'empty',
+    `CATALOG_UNAVAILABLE (${reason}): 保留冻结缓存 ${cachedRows} 行`,
+    { refresh_status: 'REFRESH_FAILED', before_rows: cachedRows, after_rows: cachedRows, write_mode: 'none' });
+  return { dataset, rows: 0, cached_rows: cachedRows, status: 'CATALOG_UNAVAILABLE', reason };
 }
 
 /** logSync status vocabulary (stored cache state, same words as ingest.ts). */
@@ -34,74 +36,21 @@ const cacheStatus = (n: number) => (n > 0 ? 'ok' : 'empty');
 
 // ---------------------------------------------------------------- Shenwan 2021
 
-const SW_CLASSIFY_FIELDS = 'index_code,industry_name,level,industry_code,is_pub,parent_code,src';
-const SW_CLASSIFY_COLUMNS = ['index_code', 'level', 'name', 'industry_code', 'parent_code', 'src', 'is_pub', 'collected_at'];
-
 /**
- * 申万 2021 classification (L1 31 / L2 134 / L3 full set). L3 is one
- * paginated fetchAll — large but a single dataset, fetched like the others.
+ * 申万 2021 分类目录：Tushare 移除后无在线免费全量目录源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。
  */
 export async function syncSwClassify(
   db: DatabaseSync,
-  opts: { src?: string } = {},
+  _opts: { src?: string } = {},
 ): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => {
-  const { src = 'SW2021' } = opts;
-  ensureHotspotSchema(db);
-  const collectedAt = new Date().toISOString();
-  const rows: Record<string, any>[] = [];
-  for (const level of ['L1', 'L2', 'L3']) {
-    const page = await fetchAll('index_classify', { src, level }, SW_CLASSIFY_FIELDS);
-    for (const r of page) {
-      rows.push({
-        index_code: r.index_code, level: r.level, name: r.industry_name,
-        industry_code: r.industry_code, parent_code: r.parent_code,
-        src: r.src, is_pub: r.is_pub, collected_at: collectedAt,
-      });
-    }
-  }
-  const n = upsertRows(db, 'sw_classify', SW_CLASSIFY_COLUMNS, rows);
-  logSync(db, 'sw_classify', src, n, cacheStatus(n), `levels L1-L3 ${collectedAt}`,
-    { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
-  return ok('sw_classify', n);
-  });
+  return withSyncDb(db, async () => catalogUnavailable(db, 'sw_classify'));
 }
 
-const SW_MEMBER_FIELDS = 'l1_code,l1_name,l2_code,l2_name,l3_code,l3_name,ts_code,name,in_date,out_date,is_new';
-const SW_MEMBER_COLUMNS = ['ts_code', 'l1_code', 'l2_code', 'l3_code', 'l1_name', 'l2_name', 'l3_name', 'name', 'in_date', 'out_date', 'is_new', 'collected_at'];
-
 /**
- * Whole-market point-in-time members in ONE call (~5922 rows). The upstream
- * `index_code` parameter is effectively ignored by `index_member_all` — the
- * probe verified the same 5922 rows for 801010.SI and 801016.SI — so a
- * placeholder is sent only to satisfy required-param validation; never filter
- * by it. Observed reality in the current response: `out_date` is always NULL
- * and `is_new` always 'Y'; both columns are still stored so the PIT filter
- * has real data to evaluate the day upstream starts filling them.
- * pageSize 6000 covers the whole market in a single page even if the API
- * ignores limit/offset (a short first page stops fetchAll immediately).
+ * 申万 2021 成分：Tushare 移除后无在线免费 PIT 成分源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。
  */
 export async function syncSwMembers(db: DatabaseSync): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => {
-  ensureHotspotSchema(db);
-  const collectedAt = new Date().toISOString();
-  const fetched = await fetchAll(
-    'index_member_all',
-    { index_code: '801010.SI', is_as_js: '0' },
-    SW_MEMBER_FIELDS,
-    6000,
-  );
-  const rows = fetched.map(r => ({
-    ts_code: r.ts_code, l1_code: r.l1_code, l2_code: r.l2_code, l3_code: r.l3_code,
-    l1_name: r.l1_name, l2_name: r.l2_name, l3_name: r.l3_name, name: r.name,
-    in_date: r.in_date, out_date: r.out_date, is_new: r.is_new,
-    collected_at: collectedAt,
-  }));
-  const n = upsertRows(db, 'sw_member', SW_MEMBER_COLUMNS, rows);
-  logSync(db, 'sw_member', 'all', n, cacheStatus(n), `index_member_all ${collectedAt}`,
-    { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
-  return ok('sw_member', n);
-  });
+  return withSyncDb(db, async () => catalogUnavailable(db, 'sw_member'));
 }
 
 const SW_DAILY_FIELDS = 'ts_code,trade_date,open,low,high,close,change,pct_change,vol,amount,pe,pb,float_mv,total_mv';
@@ -114,9 +63,8 @@ function defaultSwCodes(db: DatabaseSync): string[] {
 }
 
 /**
- * 申万指数日线 per index (default: all L1 codes from sw_classify). History
- * starts around 2013 — earlier ranges answer empty, which is a legitimate
- * rows-0 OK, not a failure.
+ * 申万指数日线 per index (default: all L1 codes from sw_classify).
+ * 若本地冻结目录尚无任何 L1 代码，返回 CATALOG_UNAVAILABLE 而不崩溃。
  */
 export async function syncSwIndexDaily(
   db: DatabaseSync,
@@ -127,7 +75,7 @@ export async function syncSwIndexDaily(
   ensureHotspotSchema(db);
   const resolved = codes ?? defaultSwCodes(db);
   if (resolved.length === 0) {
-    throw new Error('sw_index_daily: no index codes — run syncSwClassify first or pass codes');
+    return catalogUnavailable(db, 'sw_index_daily', 'no_sw_classify_codes');
   }
   const syncedAt = new Date().toISOString();
   const rows: Record<string, any>[] = [];
@@ -145,40 +93,17 @@ export async function syncSwIndexDaily(
 
 // ---------------------------------------------------------------- Tonghuashun
 
-const THS_INDEX_FIELDS = 'ts_code,name,count,exchange,list_date,type';
-const THS_INDEX_COLUMNS = ['ts_code', 'name', 'idx_type', 'count', 'exchange', 'list_date', 'collected_at'];
-
-/** THS index directory per type (N concept / I industry / S event / ST style). */
+/** THS 概念/行业目录：Tushare 移除后无在线免费目录源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。 */
 export async function syncThsIndex(
   db: DatabaseSync,
-  types: string[] = ['N', 'I', 'S', 'ST'],
+  _types: string[] = ['N', 'I', 'S', 'ST'],
 ): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => {
-  ensureHotspotSchema(db);
-  const collectedAt = new Date().toISOString();
-  const rows: Record<string, any>[] = [];
-  for (const type of types) {
-    const page = await fetchAll('ths_index', { type }, THS_INDEX_FIELDS);
-    for (const r of page) {
-      rows.push({
-        ts_code: r.ts_code, name: r.name, idx_type: r.type, count: r.count,
-        exchange: r.exchange, list_date: r.list_date, collected_at: collectedAt,
-      });
-    }
-  }
-  const n = upsertRows(db, 'ths_index', THS_INDEX_COLUMNS, rows);
-  logSync(db, 'ths_index', types.join(','), n, cacheStatus(n), `types ${types.join(',')} ${collectedAt}`,
-    { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
-  return ok('ths_index', n);
-  });
+  return withSyncDb(db, async () => catalogUnavailable(db, 'ths_index'));
 }
 
 /**
- * Top THS concept/industry codes by member count — the default set for
- * members + index-daily sync. Ensures the hotspot schema first so a fresh
- * database answers [] instead of throwing "no such table: ths_index"
- * (first production run of goal-1028 died exactly there). Call it AFTER
- * syncThsIndex so a first run has the freshly synced catalog to rank.
+ * Top THS concept/industry codes by member count from local frozen catalog.
+ * Ensures the hotspot schema first so a fresh database answers [].
  */
 export function discoverThsCodes(db: DatabaseSync, limit = 30): string[] {
   ensureHotspotSchema(db);
@@ -187,46 +112,20 @@ export function discoverThsCodes(db: DatabaseSync, limit = 30): string[] {
   ).all(limit) as Array<{ ts_code: string }>).map(r => r.ts_code);
 }
 
-const THS_MEMBER_FIELDS = 'ts_code,con_code,con_name';
-const THS_MEMBER_COLUMNS = ['ts_code', 'con_code', 'con_name', 'quality_status', 'collected_at'];
-
 /**
- * THS constituents per index. `ths_member` has NO time columns upstream and
- * none here: the table records `quality_status = 'NO_POINT_IN_TIME'` as a
- * constant per row (architecture.md §2.2). Historical replay must never
- * backfill from it — current membership is for same-day theme labelling only.
+ * THS 概念成分：Tushare 移除后无在线免费成分源，保留本地冻结表并显式返回 CATALOG_UNAVAILABLE。
  */
 export async function syncThsMembers(
   db: DatabaseSync,
-  opts: { codes: string[] },
+  _opts: { codes: string[] },
 ): Promise<HotspotSyncResult> {
-  return withSyncDb(db, async () => {
-  const { codes } = opts;
-  ensureHotspotSchema(db);
-  if (codes.length === 0) throw new Error('ths_member: codes must not be empty');
-  const collectedAt = new Date().toISOString();
-  const rows: Record<string, any>[] = [];
-  for (const code of codes) {
-    const page = await fetchAll('ths_member', { ts_code: code }, THS_MEMBER_FIELDS);
-    for (const r of page) {
-      rows.push({
-        ts_code: r.ts_code, con_code: r.con_code, con_name: r.con_name,
-        quality_status: 'NO_POINT_IN_TIME', collected_at: collectedAt,
-      });
-    }
-  }
-  const n = upsertRows(db, 'ths_member', THS_MEMBER_COLUMNS, rows);
-  logSync(db, 'ths_member', `codes:${codes.length}`, n, cacheStatus(n),
-    `${codes.length} indices ${collectedAt}`,
-    { refresh_status: 'REFRESH_OK', write_mode: 'merged', after_rows: n });
-  return ok('ths_member', n);
-  });
+  return withSyncDb(db, async () => catalogUnavailable(db, 'ths_member'));
 }
 
 const THS_DAILY_FIELDS = 'ts_code,trade_date,open,high,low,close,pre_close,avg_price,change,pct_change,vol,turnover_rate';
 const THS_DAILY_COLUMNS = ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'avg_price', 'change', 'pct_change', 'vol', 'turnover_rate', 'synced_at'];
 
-/** THS index daily bars per index code over [start, end] (YYYYMMDD). */
+/** THS 概念/行业指数日线：按代码走免费源同步，无代码时返回 CATALOG_UNAVAILABLE。 */
 export async function syncThsIndexDaily(
   db: DatabaseSync,
   opts: { start: string; end: string; codes: string[] },
@@ -234,7 +133,9 @@ export async function syncThsIndexDaily(
   return withSyncDb(db, async () => {
   const { start, end, codes } = opts;
   ensureHotspotSchema(db);
-  if (codes.length === 0) throw new Error('ths_index_daily: codes must not be empty');
+  if (codes.length === 0) {
+    return catalogUnavailable(db, 'ths_index_daily', 'no_ths_index_codes');
+  }
   const syncedAt = new Date().toISOString();
   const rows: Record<string, any>[] = [];
   for (const code of codes) {

@@ -16,7 +16,7 @@ const { openPortfolioDb } = await import('../build/portfolio/db.js');
 const ROOT = process.cwd();
 function cli(args, extraEnv = {}, seed = null) {
   const dir = mkdtempSync(join(tmpdir(), 'cadence-cli-'));
-  const env = { ...process.env, TUSHARE_TOKEN: '', ASHARE_DATA_DIR: dir,
+  const env = { ...process.env, ASHARE_DATA_DIR: dir,
     ASHARE_DB_PATH: join(dir, 'market.sqlite'), ASHARE_PORTFOLIO_DB_PATH: join(dir, 'portfolio.sqlite'),
     ASHARE_RESEARCH_DB_PATH: join(dir, 'research.sqlite'), ...extraEnv };
   delete env.RESEARCH_CADENCE_ENABLED;

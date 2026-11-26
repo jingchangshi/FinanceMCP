@@ -45,7 +45,6 @@ test('HTTP lifecycle preserves proxy hardening and supports session deletion', a
     NODE_ENV: 'production',
     PORT: String(port),
     MCP_ALLOWED_HOSTS: '',
-    TUSHARE_TOKEN: '',
     QVERIS_API_KEY: '',
   };
   delete childEnv.MCP_HTTP_HOST;

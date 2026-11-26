@@ -19,13 +19,13 @@ const dir = mkdtempSync(join(tmpdir(), 'ashare-1019-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'market.sqlite');
 process.env.ASHARE_RESEARCH_DB_PATH = join(dir, 'research.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
-process.env.ASHARE_TUSHARE_MAX_RETRIES = '0';
-process.env.TUSHARE_TOKEN = 'test-token';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
+process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
 
 const { openAshareDb, upsertRows } = await import('../build/ashare/db.js');
 const etf = await import('../build/ashare/etf.js');
 const { syncEtfForDaily, syncFundDailyCodes, fundHoldingCoverage, fundBasicRefreshDue, ETF_UNIVERSE, etfQuotes } = etf;
+const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
 const { openPortfolioDb } = await import('../build/portfolio/db.js');
 const account = await import('../build/portfolio/account.js');
 const { initBaseline, confirmRealAccount } = await import('../build/portfolio/ledger.js');
@@ -46,35 +46,66 @@ function marketDay(date, { omit = [] } = {}) {
   return rows.filter(row => !omit.includes(row.ts_code));
 }
 /**
- * 离线 Tushare 桩：
- * - fund_daily 全市场分页**故意漏掉** omitFromMarket 里的代码（复现上游分页漏行）；
- * - 逐代码查询（带 ts_code）能返回（除 missingUpstream 以外）；
- * - fund_adj / fund_share / fund_basic 返回最小可用数据。
+ * 离线免费多源桩：
+ * - 截面刻意漏掉 omitFromMarket 里的代码（复现上游截面漏行）；
+ * - 逐代码 K 线（eastmoney stock/kline/get）能返回（除 missingUpstream 以外）；
+ * - fund_share 经腾讯 quote 返回流通市值与收盘价。
  */
-function stubFetch({ omitFromMarket = [], missingUpstream = [], calls = [] } = {}) {
-  globalThis.fetch = async (_url, init) => {
-    const { api_name, params, fields } = JSON.parse(init.body);
-    calls.push({ api: api_name, params });
-    let rows;
-    if (api_name === 'fund_basic') rows = BASIC;
-    else if (api_name === 'fund_daily') {
-      if (params.ts_code) {
-        rows = missingUpstream.includes(params.ts_code) ? [] : [bar(params.ts_code, params.trade_date, 2)];
-      } else {
-        rows = marketDay(params.trade_date, { omit: omitFromMarket });
+function stubFetch({ omitFromMarket = [], missingUpstream = [], calls = [], marketRows } = {}) {
+  clearFreeProviderCache();
+  const snapRows = marketRows ?? [
+    ...marketDay(TARGET, { omit: omitFromMarket }),
+    ...BASIC.filter(b => !omitFromMarket.includes(b.ts_code)).map(b => bar(b.ts_code, TARGET)),
+  ];
+  const snapMap = new Map(snapRows.map(r => [r.ts_code, r]));
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      const pn = Number(new URL(u).searchParams.get('pn') || '1');
+      if (pn === 1) calls.push({ api: 'fund_daily', params: { trade_date: TARGET } });
+      const tsSec = Math.floor(Date.parse(`${TARGET.slice(0, 4)}-${TARGET.slice(4, 6)}-${TARGET.slice(6, 8)}T15:00:00+08:00`) / 1000);
+      const slice = snapRows.slice((pn - 1) * 100, pn * 100).map(r => {
+        const [code, suffix] = r.ts_code.split('.');
+        return {
+          f2: r.close, f3: 0, f4: 0, f5: r.vol, f6: r.amount * 1000, f12: code, f13: suffix === 'SH' ? 1 : 0,
+          f14: `测试${r.ts_code}`, f15: r.high, f16: r.low, f17: r.open, f18: r.pre_close, f124: tsSec,
+        };
+      });
+      return new Response(JSON.stringify({ data: { total: snapRows.length, diff: slice } }), { status: 200 });
+    }
+    if (u.startsWith('https://qt.gtimg.cn/q=')) {
+      const syms = u.slice('https://qt.gtimg.cn/q='.length).split(',');
+      const lines = [];
+      for (const sym of syms) {
+        const tsCode = `${sym.slice(2)}.${sym.slice(0, 2).toUpperCase()}`;
+        if (omitFromMarket.includes(tsCode) || missingUpstream.includes(tsCode)) continue;
+        const r = snapMap.get(tsCode) ?? (ETF_UNIVERSE.includes(tsCode) ? bar(tsCode, TARGET, 1) : null);
+        if (!r) continue;
+        const f = new Array(55).fill('0');
+        f[1] = `测试${tsCode}`; f[2] = tsCode.slice(0, 6); f[3] = String(r.close); f[4] = String(r.pre_close ?? r.close);
+        f[5] = String(r.open ?? r.close); f[6] = String(r.vol ?? 100); f[30] = `${TARGET}150000`;
+        f[33] = String(r.high ?? r.close); f[34] = String(r.low ?? r.close);
+        f[44] = String((1000 * r.close) / 10000);
+        lines.push(`v_${sym}="${f.join('~')}";`);
       }
-    } else if (api_name === 'fund_adj') {
-      // 区间查询：返回窗口内每个交易日的因子，避免 qfq 序列缺根。
-      const inWindow = DAYS.filter(date => (!params.start_date || date >= params.start_date) && (!params.end_date || date <= params.end_date));
-      rows = inWindow.map(trade_date => ({ ts_code: params.ts_code, trade_date, adj_factor: 1 }));
-    } else if (api_name === 'fund_share') {
-      const inWindow = DAYS.filter(date => (!params.start_date || date >= params.start_date) && (!params.end_date || date <= params.end_date));
-      rows = missingUpstream.includes(params.ts_code)
-        ? []
-        : inWindow.map(trade_date => ({ ts_code: params.ts_code, trade_date, fd_share: 1000, fund_type: 'ETF', market: 'SZ' }));
-    } else rows = [];
-    const cols = fields.split(',');
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: rows.map(row => cols.map(col => row[col] ?? null)) } }) };
+      return new Response(lines.join('\n'), { status: 200 });
+    }
+    if (u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')) {
+      const sp = new URL(u).searchParams;
+      const [mkt, code] = (sp.get('secid') || '').split('.');
+      const tsCode = mkt === '1' ? `${code}.SH` : `${code}.SZ`;
+      const beg = sp.get('beg') || '';
+      const end = sp.get('end') || '';
+      if (beg === '20261004' && end === TARGET && tsCode !== '000001.SH') {
+        calls.push({ api: 'fund_daily', params: { ts_code: tsCode, trade_date: end } });
+      }
+      if (missingUpstream.includes(tsCode)) return new Response(JSON.stringify({ data: { klines: [] } }), { status: 200 });
+      const b = bar(tsCode, end || TARGET, 2);
+      const ymd = `${(end || TARGET).slice(0, 4)}-${(end || TARGET).slice(4, 6)}-${(end || TARGET).slice(6, 8)}`;
+      const line = `${ymd},${b.open},${b.close},${b.high},${b.low},${b.vol},${b.amount * 1000},0,0,0,1`;
+      return new Response(JSON.stringify({ data: { klines: [line] } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
 }
 
@@ -93,6 +124,8 @@ function seedMarket(name = 'market.sqlite') {
 
 test('B-1 daily 流水线必须同步 ETF：同步完成后持仓目标交易日 READY', async () => {
   const db = seedMarket('b1.sqlite');
+  upsertRows(db, 'fund_share', ['ts_code', 'trade_date', 'fd_share', 'fund_type', 'market'],
+    ETF_UNIVERSE.map(ts_code => ({ ts_code, trade_date: PREV, fd_share: 1000, fund_type: 'ETF', market: ts_code.slice(-2) })));
   const calls = [];
   stubFetch({ calls });
   try {
@@ -207,28 +240,28 @@ test('B-5 ETF 同步失败不破坏已有快照，也不会抛到股票日报之
 });
 
 async function promptDailyThenFail(db) {
-  // 先成功写入目标日，再让上游全部失败：已有行必须保留。
+  // 先成功写入目标日，再让上游截面失败（不触发 200s 候选重试睡眠）：已有行必须保留且状态显式记录。
   stubFetch({});
   await syncEtfForDaily(db, TARGET, { refreshFrom: TARGET });
   const before = db.prepare('SELECT COUNT(*) n FROM fund_daily WHERE trade_date = ?').get(TARGET).n;
-  globalThis.fetch = async () => { throw new Error('network down'); };
+  clearFreeProviderCache();
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get') || u.startsWith('https://qt.gtimg.cn/q=')) {
+      return new Response('upstream down', { status: 503 });
+    }
+    return new Response(JSON.stringify({ data: { klines: [] } }), { status: 200 });
+  };
   const summary = await syncEtfForDaily(db, TARGET, { refreshFrom: TARGET });
   const after = db.prepare('SELECT COUNT(*) n FROM fund_daily WHERE trade_date = ?').get(TARGET).n;
   assert.equal(after, before, '上游失败后当日快照必须保留');
-  assert.ok(summary.errors.length > 0, '失败必须显式记录在上游返回里，而不是静默');
+  assert.ok(summary.fund_daily[TARGET].status !== 'ok' && summary.fund_daily[TARGET].error, '失败必须显式记录在上游返回里，而不是静默');
 }
 
 test('B-6 部分数据：全市场回答偏小（低于下限/收缩）时不替换，只合并或保留', async () => {
   const db = seedMarket('b6.sqlite');
   // 目标日上游只返回 10 行（明显残缺）。
-  globalThis.fetch = async (_url, init) => {
-    const { api_name, params, fields } = JSON.parse(init.body);
-    let rows = [];
-    if (api_name === 'fund_daily' && !params.ts_code) rows = marketDay(params.trade_date).slice(0, 10);
-    else if (api_name === 'fund_daily' && params.ts_code) rows = [bar(params.ts_code, params.trade_date)];
-    const cols = fields.split(',');
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: rows.map(row => cols.map(col => row[col] ?? null)) } }) };
-  };
+  stubFetch({ marketRows: marketDay(TARGET).slice(0, 10) });
   try {
     const summary = await syncEtfForDaily(db, TARGET, { refreshFrom: TARGET });
     assert.notEqual(summary.fund_daily[TARGET].write, 'replaced', '残缺回答不得整日替换');
@@ -237,6 +270,7 @@ test('B-6 部分数据：全市场回答偏小（低于下限/收缩）时不替
     assert.ok(summary.fund_daily[TARGET].status !== 'ok' || summary.errors.length > 0,
       '残缺的全市场回答必须有可审计状态');
   } finally {
+    clearFreeProviderCache();
     globalThis.fetch = originalFetch;
     db.close();
   }

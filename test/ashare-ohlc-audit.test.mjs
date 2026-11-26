@@ -13,14 +13,15 @@ import test from 'node:test';
 const dir = mkdtempSync(join(tmpdir(), 'ashare-ohlc-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'live.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
-process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
+process.env.ASHARE_FETCH_MAX_RETRIES = '0';
+process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
 
 const { openAshareDb, upsertRows, logSync } = await import('../build/ashare/db.js');
 const { checkQuality, INVALID_BAR_SQL } = await import('../build/ashare/ingest.js');
 const { AUDIT_VERSION, auditCache, auditDay, fillGaps } = await import('../build/ashare/audit.js');
 const { analyzeMarket, sourceQualityForDate } = await import('../build/ashare/engine.js');
 const { scanMarket } = await import('../build/ashare/analysis.js');
+const { clearFreeProviderCache } = await import('../build/ashare/providers/freeProviderRouter.js');
 const { seedMarket, weekdays, STOCKS } = await import('./ashare-fixture.mjs');
 
 const DATES = weekdays('20260105', 150);
@@ -46,17 +47,25 @@ function freshDb() {
   return db;
 }
 
-/** Tushare stand-in answering from `source(api, params)`; records every request. */
-function mockTushare(source) {
+/** 免费 K 线修复桩：按 `secid` 返回单个股票的 Eastmoney K 线。 */
+function mockFreeKlineRepair(barForSecid) {
+  clearFreeProviderCache();
   const fetched = [];
-  globalThis.fetch = async (_u, init) => {
-    const { api_name: api, params, fields } = JSON.parse(init.body);
-    fetched.push(`${api}:${params.trade_date ?? params.start_date}:${params.ts_code ?? 'all'}`);
-    const rows = source(api, params);
-    if (rows instanceof Error) return { ok: true, json: async () => ({ code: 40001, msg: rows.message }) };
-    const cols = fields.split(',');
-    const page = rows.slice(params.offset ?? 0, (params.offset ?? 0) + (params.limit ?? rows.length));
-    return { ok: true, json: async () => ({ code: 0, data: { fields: cols, items: page.map(r => cols.map(c => r[c] ?? null)) } }) };
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')) {
+      const secid = new URL(u).searchParams.get('secid') || '';
+      const bar = barForSecid(secid);
+      if (bar) {
+        fetched.push(`daily:${bar.trade_date}:${bar.ts_code}`);
+        const d = `${bar.trade_date.slice(0, 4)}-${bar.trade_date.slice(4, 6)}-${bar.trade_date.slice(6, 8)}`;
+        const chg = bar.pre_close != null ? Number((bar.close - bar.pre_close).toFixed(4)) : 0;
+        const line = `${d},${bar.open},${bar.close},${bar.high},${bar.low},${bar.vol},${(bar.amount ?? 1) * 1000},1,${bar.pct_chg ?? 0},${chg},1`;
+        return new Response(JSON.stringify({ data: { klines: [line] } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: { klines: [] } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
   };
   return fetched;
 }
@@ -160,9 +169,10 @@ for (const c of CASES) {
 
     // d. `audit --fix` repairs that stock and date only, and the day recovers.
     const others = Object.fromEntries(TABLES.map(t => [t, dump(db, t, 'NOT (ts_code = ? AND trade_date = ?)', BAD, MUTATED)]));
-    const fetched = mockTushare((api, p) => (api === 'daily' && p.ts_code === BAD && p.start_date === MUTATED && p.end_date === MUTATED ? [cleanBar] : []));
+    const badSecid = `${BAD.endsWith('.SH') ? 1 : 0}.${BAD.slice(0, 6)}`;
+    const fetched = mockFreeKlineRepair(secid => (secid === badSecid ? cleanBar : null));
     let actions;
-    try { actions = await fillGaps(db, auditCache(db, MUTATED, MUTATED)); } finally { globalThis.fetch = originalFetch; }
+    try { actions = await fillGaps(db, auditCache(db, MUTATED, MUTATED)); } finally { clearFreeProviderCache(); globalThis.fetch = originalFetch; }
     assert.deepEqual(fetched, [`daily:${MUTATED}:${BAD}`], 'only the invalid stock and date are requested');
     assert.deepEqual(actions.filter(a => a.action.startsWith('repair_')), [{ trade_date: MUTATED, action: `repair_bar ${BAD}`, result: { rows: 1 } }]);
     for (const t of TABLES) assert.deepEqual(dump(db, t, 'NOT (ts_code = ? AND trade_date = ?)', BAD, MUTATED), others[t], `${t} of every other stock/day is unchanged`);
@@ -258,9 +268,9 @@ test('repair worklist follows the NULL-safe predicate beyond the display sample'
   assert.equal(a.days[0].invalid_bar_kinds.null_open, 205);
   const bars = new Map(codes.map(code => [code, dump(db, 'daily', 'ts_code = ? AND trade_date = ?', code, day)[0]]));
   // Upstream returns each stored bar with a valid open.
-  const fixed = code => ({ ...bars.get(code), open: bars.get(code).close });
-  const fetched = mockTushare((api, p) => (api === 'daily' && p.ts_code ? [fixed(p.ts_code)] : []));
-  try { await fillGaps(db, a); } finally { globalThis.fetch = originalFetch; }
+  const bySecid = new Map(codes.map(code => [`${code.endsWith('.SH') ? 1 : 0}.${code.slice(0, 6)}`, { ...bars.get(code), open: bars.get(code).close }]));
+  const fetched = mockFreeKlineRepair(secid => bySecid.get(secid) ?? null);
+  try { await fillGaps(db, a); } finally { clearFreeProviderCache(); globalThis.fetch = originalFetch; }
   assert.equal(fetched.length, 205);
   assert.ok(fetched.every(request => request.startsWith(`daily:${day}:`)), 'every request is that date');
   assert.equal(new Set(fetched.map(request => request.split(':')[2])).size, 205);

@@ -12,8 +12,6 @@ const dir = mkdtempSync(join(tmpdir(), 'ashare-snapshot-path-'));
 process.env.ASHARE_DATA_DIR = dir;
 process.env.ASHARE_DB_PATH = join(dir, 'ashare.sqlite');
 process.env.ASHARE_RESEARCH_DB_PATH = join(dir, 'research.sqlite');
-process.env.ASHARE_TUSHARE_MIN_INTERVAL_MS = '0';
-process.env.TUSHARE_TOKEN = process.env.TUSHARE_TOKEN || 'test-token';
 
 const { openAshareDb } = await import('../build/ashare/db.js');
 const { generateReport } = await import('../build/ashare/report.js');

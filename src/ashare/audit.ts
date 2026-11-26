@@ -14,7 +14,7 @@ import {
  * not rely on whole-market row ratios alone. For each trade date:
  * - every stock listed on that date (current stock_basic) without a `daily`
  *   bar is classified, in this order, as suspended (suspend_d), pending
- *   delisting, confirmed missing upstream (a per-stock Tushare check in
+ *   delisting, confirmed missing upstream (a per-stock upstream check in
  *   gap_check, younger than GAP_CHECK_MAX_AGE_DAYS, found neither a bar nor a
  *   suspension), an expired upstream check due for a re-check, or an
  *   unexplained gap. Pending delisting needs a delisting date AND no bar of
@@ -50,7 +50,7 @@ import {
 export const AUDIT_VERSION = 'audit-1.2.0';
 
 /**
- * A gap_check row records what Tushare answered at `checked_at`; an empty
+ * A gap_check row records what the upstream provider answered at `checked_at`; an empty
  * answer is not proof that the data can never exist. Older checks expire and
  * are re-asked by the next `audit --fix`.
  */
@@ -313,7 +313,7 @@ export function saveAudit(db: DatabaseSync, audit: AuditResult, extra: Record<st
  *   that are missing for that stock and date.
  * So stocks without a gap, and datasets without a defect, are never rewritten
  * with upstream values revised since they were stored. A stock still missing
- * afterwards is checked against Tushare suspend_d by code: a suspension found
+ * afterwards is checked against upstream suspend_d by code: a suspension found
  * that way is stored, and the answer is recorded in gap_check with its time
  * (it expires after GAP_CHECK_MAX_AGE_DAYS). Dates without suspension data get
  * suspend_d, and missing index bars are fetched for that date. Quality checks

@@ -53,10 +53,10 @@ redeploy automatically.
 | `PORT` | injected by the platform | Do not set it. The server reads it. |
 | `MCP_HTTP_HOST` | already `0.0.0.0` in the `Dockerfile` | Only set it if you build differently. |
 | `MCP_ALLOWED_HOSTS` | dashboard variable | The hostname the app actually serves on. See below. |
-| `TUSHARE_TOKEN` | Vault, optional | See credentials below. |
-| `QVERIS_API_KEY` | Vault, optional | Same. |
+| `QVERIS_API_KEY` | Vault, optional | See credentials below. |
+| `TWINGLY_API_KEY` | Vault, optional | Optional news search credential. |
 | `QVERIS_BASE_URL` | dashboard variable, optional | Defaults to `https://qveris.ai/api/v1`. |
-| `FINANCE_SOURCE_PRIORITY` | dashboard variable, optional | For example `tushare,qveris,binance`. |
+| `FINANCE_SOURCE_PRIORITY` | dashboard variable, optional | For example `twingly,qveris,binance`. |
 
 ## Host header validation
 
@@ -90,13 +90,13 @@ app receives, and the app will reject every request until you correct it.
 
 FinanceMCP accepts credentials two ways and both keep working here.
 
-**Per request.** The client sends `X-Tushare-Token` and `X-Qveris-Api-Key` on
+**Per request.** The client sends `X-Qveris-Api-Key` / `X-Twingly-Api-Key` on
 every call and the server stores nothing. Credential-scoped discovery means a
-caller with no token sees only the tools that need no credential, so an exposed
-URL does not expose your Tushare quota. This is the safer default for an
+caller with no key sees only the public and Binance/local tools, so an exposed
+URL does not expose your Qveris or Twingly quota. This is the safer default for an
 endpoint that anyone can reach.
 
-**Server side.** Put `TUSHARE_TOKEN` and `QVERIS_API_KEY` in the Dockhold Vault,
+**Server side.** Put `QVERIS_API_KEY` (and optionally `TWINGLY_API_KEY`) in the Dockhold Vault,
 which encrypts them and injects them as environment variables at runtime. Every
 caller then shares your quota, so use this only on an endpoint whose access you
 control.
@@ -113,16 +113,10 @@ control.
 
 > [!WARNING]
 > Whether an app is publicly reachable depends on your plan. On a plan where the
-> app is public, setting `TUSHARE_TOKEN` server side lets anyone who knows the
-> URL spend your Tushare quota. Either leave it unset and pass the token per
+> app is public, setting `QVERIS_API_KEY` server side lets anyone who knows the
+> URL spend your quota. Either leave it unset and pass the key per
 > request, or put the app behind an access token before setting it. Check
 > Dockhold's current plan behaviour at <https://dockhold.eu/pricing>.
-
-If you do lock the app down, note that Dockhold's edge uses
-`Authorization: Bearer <dockhold-token>` for its own access check, and
-FinanceMCP also accepts `Authorization: Bearer` as a Tushare token form. Use the
-dedicated `X-Tushare-Token` header for the Tushare credential so the two do not
-collide.
 
 ## Connect a client
 
@@ -134,7 +128,6 @@ collide.
       "url": "https://<your-app>.dockhold.app/mcp",
       "timeout": 600,
       "headers": {
-        "X-Tushare-Token": "YOUR_TUSHARE_TOKEN",
         "X-Qveris-Api-Key": "YOUR_QVERIS_API_KEY"
       }
     }
@@ -171,7 +164,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/mcp" \
 curl -sS -X POST "$BASE/mcp" \
   -H 'Content-Type: application/json' \
   -H "Mcp-Session-Id: $SID" \
-  -H 'X-Tushare-Token: YOUR_TUSHARE_TOKEN' \
+  -H 'X-Qveris-Api-Key: YOUR_QVERIS_API_KEY' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 ```
 

@@ -18,7 +18,6 @@ const MAX_SESSIONS = Number(process.env.MCP_MAX_SESSIONS || 1000);
 const SENSITIVE_HEADER_NAMES = new Set([
   'authorization',
   'x-api-key',
-  'x-tushare-token',
   'x-qveris-api-key',
   'x-twingly-api-key',
   'x-wusla-signature',
@@ -42,9 +41,6 @@ function redactHeaders(headers: Request['headers']): Record<string, unknown> {
 function redactUrl(rawUrl: string): string {
   try {
     const url = new URL(rawUrl, 'http://localhost');
-    for (const key of ['tushare_token', 'TUSHARE_TOKEN']) {
-      if (url.searchParams.has(key)) url.searchParams.set(key, '[REDACTED]');
-    }
     return `${url.pathname}${url.search}`;
   } catch {
     return rawUrl.split('?')[0];
@@ -64,14 +60,10 @@ function parseConfigHeader(req: Request): Record<string, unknown> | undefined {
 }
 
 // Client authentication and data-source credentials are separate concerns:
-// - MCP_AUTH_TOKEN set: `Authorization: Bearer` authenticates the MCP client
-//   and is never forwarded to Tushare.
-// - MCP_AUTH_TOKEN unset: legacy behaviour, Bearer is read as a Tushare token
-//   unless MCP_BEARER_AS_TUSHARE_TOKEN=0.
+// - MCP_AUTH_TOKEN set: `Authorization: Bearer` authenticates the MCP client.
 // - MCP_ACCEPT_REQUEST_CREDENTIALS=0: ignore every request-supplied data-source
 //   credential and use only the server environment.
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN?.trim() || '';
-const BEARER_AS_TUSHARE_TOKEN = !MCP_AUTH_TOKEN && process.env.MCP_BEARER_AS_TUSHARE_TOKEN !== '0';
 const ACCEPT_REQUEST_CREDENTIALS = process.env.MCP_ACCEPT_REQUEST_CREDENTIALS !== '0';
 
 function bearerToken(req: Request): string | undefined {
@@ -85,45 +77,6 @@ function isClientAuthorized(req: Request): boolean {
   const presented = Buffer.from(bearerToken(req) ?? '');
   const expected = Buffer.from(MCP_AUTH_TOKEN);
   return presented.length === expected.length && timingSafeEqual(presented, expected);
-}
-
-function extractTokenFromHeaders(req: Request): string | undefined {
-  if (!ACCEPT_REQUEST_CREDENTIALS) return undefined;
-  const h = req.headers;
-  
-  // 1. 尝试从标准请求头读取
-  const tokenHeader = (h['x-tushare-token'] || h['x-api-key']) as string | undefined;
-  if (tokenHeader && tokenHeader.trim()) {
-    console.log(`[TOKEN] Found in X-Tushare-Token/X-Api-Key header`);
-    return tokenHeader.trim();
-  }
-  
-  // 2. 尝试从 Authorization Bearer 读取（仅在未启用客户端认证时）
-  const bearer = BEARER_AS_TUSHARE_TOKEN ? bearerToken(req) : undefined;
-  if (bearer) {
-    console.log(`[TOKEN] Found in Authorization Bearer header`);
-    return bearer;
-  }
-  
-  // 3. 🔍 尝试从 Smithery 特殊头读取（可能的头名称）
-  const smitheryConfig = h['x-smithery-config'] || h['x-config'] || h['x-session-config'];
-  if (smitheryConfig) {
-    const config = parseConfigHeader(req);
-    if (typeof config?.TUSHARE_TOKEN === 'string' && config.TUSHARE_TOKEN.trim()) {
-      console.log(`[TOKEN] Extracted Tushare token from request config`);
-      return config.TUSHARE_TOKEN.trim();
-    }
-  }
-  
-  // 4. 🔍 尝试从查询参数读取
-  const query = req.query;
-  if (query.tushare_token || query.TUSHARE_TOKEN) {
-    console.log(`[TOKEN] Found in query parameters`);
-    return (query.tushare_token || query.TUSHARE_TOKEN) as string;
-  }
-  
-  console.log(`[TOKEN] Not found in request, falling back to environment variable`);
-  return undefined;
 }
 
 function extractQverisApiKeyFromHeaders(req: Request): string | undefined {
@@ -223,7 +176,7 @@ app.use(cors({
   methods: ['GET','POST','DELETE','OPTIONS'],
   allowedHeaders: [
     'Content-Type','Accept','Authorization','Mcp-Session-Id','Mcp-Protocol-Version','Last-Event-ID',
-    'X-Tenant-Id','X-Api-Key','X-Tushare-Token','X-Qveris-Api-Key','X-Twingly-Api-Key','X-Finance-Source-Priority',
+    'X-Tenant-Id','X-Api-Key','X-Qveris-Api-Key','X-Twingly-Api-Key','X-Finance-Source-Priority',
     'X-Smithery-Config','X-Config','X-Session-Config'  // Smithery 可能的配置头
   ],
   exposedHeaders: ['Content-Type','Mcp-Session-Id','Mcp-Protocol-Version']
@@ -336,12 +289,10 @@ app.post('/mcp', async (req: Request, res: Response) => {
   }
 
   if (method === 'tools/list') {
-    const token = extractTokenFromHeaders(req);
     const qverisApiKey = extractQverisApiKeyFromHeaders(req);
     const twinglyApiKey = extractTwinglyApiKeyFromHeaders(req);
     const sourcePriority = extractSourcePriorityFromHeaders(req);
     const availableTools = await runWithRequestContext({
-      tushareToken: token,
       qverisApiKey,
       twinglyApiKey,
       sourcePriority,
@@ -372,21 +323,18 @@ app.post('/mcp', async (req: Request, res: Response) => {
 
   if (method === 'tools/call') {
     const { name, arguments: args } = body.params || {};
-    const token = extractTokenFromHeaders(req);
     const qverisApiKey = extractQverisApiKeyFromHeaders(req);
     const twinglyApiKey = extractTwinglyApiKeyFromHeaders(req);
     const sourcePriority = extractSourcePriorityFromHeaders(req);
     const startTime = Date.now();
     console.log(
       `🚀 [MCP-tools/call] Tool: ${name}`
-      + ` | Has Tushare Token: ${!!token}`
       + ` | Has Qveris Key: ${!!qverisApiKey}`
       + ` | Has Twingly Key: ${!!twinglyApiKey}`
     );
     
     try {
       const result = await runWithRequestContext({
-        tushareToken: token,
         qverisApiKey,
         twinglyApiKey,
         sourcePriority,

@@ -6,7 +6,12 @@ import { deflateSync } from 'node:zlib';
 const { openAshareDb, upsertRows } = await import('../build/ashare/db.js');
 const { syncTradeDate, syncIndexDaily, checkQuality } = await import('../build/ashare/ingest.js');
 const { syncRange } = await import('../build/ashare/sync.js');
-const { syncEtfForDaily, resolveFundNavPremium } = await import('../build/ashare/etf.js');
+const { syncEtfForDaily, syncFundNav, resolveFundNavPremium } = await import('../build/ashare/etf.js');
+const {
+  fetchEastmoneyCrossSection,
+  fetchEastmoneyFundNav,
+  fetchEastmoneyKlines,
+} = await import('../build/ashare/providers/eastmoneyClient.js');
 const {
   decodeTdxVarint,
   decodeTdxVolume,
@@ -17,7 +22,7 @@ const {
 } = await import('../build/ashare/providers/tdxClient.js');
 const { parseTencentQuoteLine } = await import('../build/ashare/providers/tencentClient.js');
 const { resolveDataProviderMode, computeDefaultLimitPrices } = await import('../build/ashare/providers/types.js');
-const { clearFreeProviderCache, STATIC_CLOSED_WEEKDAYS } = await import('../build/ashare/providers/freeProviderRouter.js');
+const { clearFreeProviderCache, fetchFreeDataset, STATIC_CLOSED_WEEKDAYS } = await import('../build/ashare/providers/freeProviderRouter.js');
 
 const originalFetch = globalThis.fetch;
 
@@ -39,7 +44,7 @@ function encodeTdxVarint(val) {
   return Buffer.from(bytes);
 }
 
-test('resolveDataProviderMode honors explicit override and auto token detection', () => {
+test('resolveDataProviderMode always returns free and rejects tushare compatibility switch', () => {
   const prevProv = process.env.ASHARE_DATA_PROVIDER;
   const prevTok = process.env.TUSHARE_TOKEN;
   try {
@@ -47,12 +52,13 @@ test('resolveDataProviderMode honors explicit override and auto token detection'
     process.env.TUSHARE_TOKEN = 'expired-token';
     assert.equal(resolveDataProviderMode(), 'free');
 
+    assert.throws(() => resolveDataProviderMode('tushare'), /已退役移除/);
     process.env.ASHARE_DATA_PROVIDER = 'tushare';
-    assert.equal(resolveDataProviderMode(), 'tushare');
+    assert.throws(() => resolveDataProviderMode(), /已退役移除/);
 
     delete process.env.ASHARE_DATA_PROVIDER;
     process.env.TUSHARE_TOKEN = 'test-token';
-    assert.equal(resolveDataProviderMode(), 'tushare');
+    assert.equal(resolveDataProviderMode(), 'free');
 
     process.env.TUSHARE_TOKEN = '';
     assert.equal(resolveDataProviderMode(), 'free');
@@ -414,9 +420,10 @@ test('FreeProviderRouter drives syncRange + syncEtfForDaily to READY and preserv
     const q = checkQuality(db, today, false);
     assert.equal(q.status, 'READY', JSON.stringify(q.reasons));
 
-    // Suspended stock 000635.SZ must be in suspend_d and NOT in daily
+    // Zero-vol / missing bar 000635.SZ is NOT in daily and must NOT be fabricated into suspend_d
+    // under suspend=source_explicit_only.
     assert.equal(db.prepare("SELECT COUNT(*) n FROM daily WHERE ts_code='000635.SZ' AND trade_date=?").get(today).n, 0);
-    assert.equal(db.prepare("SELECT COUNT(*) n FROM suspend_d WHERE ts_code='000635.SZ' AND trade_date=?").get(today).n, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM suspend_d WHERE ts_code='000635.SZ' AND trade_date=?").get(today).n, 0);
 
     // 000001.SZ adj_factor keeps 142.0699 (pre_close 12.25 == prevClose 12.25); 600519 chains ratio 1457.7/1480
     const adj000001 = db.prepare("SELECT adj_factor FROM adj_factor WHERE ts_code='000001.SZ' AND trade_date=?").get(today).adj_factor;
@@ -424,27 +431,145 @@ test('FreeProviderRouter drives syncRange + syncEtfForDaily to READY and preserv
     const adj600519 = db.prepare("SELECT adj_factor FROM adj_factor WHERE ts_code='600519.SH' AND trade_date=?").get(today).adj_factor;
     assert.ok(Math.abs(adj600519 - 100 * (1457.7 / 1480)) < 0.01, `adj600519=${adj600519}`);
 
-    // ETF sync: all 5 holdings READY, fund_adj chains 3.0, fund_nav resolves cross_border premium
+    // ETF sync: all 5 holdings READY, fund_adj chains 3.0, fund_nav resolves cross_border premium and ann_date is null
     const etfRes = await syncEtfForDaily(db, today, { refreshFrom: today, days: 2 });
     assert.deepEqual(etfRes.coverage[today].missing, []);
     const adj159558 = db.prepare("SELECT adj_factor FROM fund_adj WHERE ts_code='159558.SZ' AND trade_date=?").get(today).adj_factor;
     assert.equal(adj159558, 3);
+    const navRow513100 = db.prepare("SELECT ann_date, nav_date, unit_nav FROM fund_nav WHERE ts_code='513100.SH' ORDER BY nav_date DESC LIMIT 1").get();
+    assert.equal(navRow513100.ann_date, null, 'free fund_nav must keep ann_date null rather than copying nav_date');
     const nav513100 = resolveFundNavPremium(db, '513100.SH', 2.167, today, 'cross_border');
     assert.equal(nav513100.unit_nav, 2.167);
     assert.equal(nav513100.buy_blocked, false);
 
-    // Fallback test when BOTH TDX TCP AND Tencent are down -> Eastmoney cross section still drives READY
+    // Fallback test when BOTH TDX TCP AND Tencent are down -> Eastmoney cross section keeps daily READY,
+    // while stk_limit is upstream-explicit-only (Tencent down => no stk_limit refresh => DEGRADED, not READY and not NOT_READY).
     clearFreeProviderCache();
     process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
     installHttpMock(today, { failTencent: true });
     await syncTradeDate(db, today, 'refresh');
     await syncIndexDaily(db, today, today, today);
     const qFallback = checkQuality(db, today, false);
-    assert.equal(qFallback.status, 'READY', JSON.stringify(qFallback.reasons));
+    assert.equal(qFallback.status, 'DEGRADED', JSON.stringify(qFallback.reasons));
+    assert.ok(qFallback.reasons.some(r => r.includes('stk_limit')), JSON.stringify(qFallback.reasons));
   } finally {
     clearFreeProviderCache();
     globalThis.fetch = originalFetch;
     await new Promise(resolve => srv.close(resolve));
+    if (prevProv === undefined) delete process.env.ASHARE_DATA_PROVIDER;
+    else process.env.ASHARE_DATA_PROVIDER = prevProv;
+    if (prevHosts === undefined) delete process.env.ASHARE_TDX_HOSTS;
+    else process.env.ASHARE_TDX_HOSTS = prevHosts;
+    db.close();
+  }
+});
+
+test('Anti-fabrication guards: unknown EM vol/amount stay null, fund_nav ann_date stays null, no synthetic suspend/stk_limit', async () => {
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith('https://push2his.eastmoney.com/api/qt/stock/kline/get')) {
+      return new Response(JSON.stringify({
+        data: {
+          klines: [
+            '2026-11-18,10.0,10.2,10.3,9.9,-,N/A,1.0,2.0,0.2,0.5',
+          ],
+        },
+      }), { status: 200 });
+    }
+    if (u.startsWith('https://push2.eastmoney.com/api/qt/clist/get')) {
+      return new Response(JSON.stringify({
+        data: {
+          total: 1,
+          diff: [{
+            f2: 10.2, f3: 2.0, f4: 0.2, f5: '-', f6: null, f8: 1.0, f10: 1.0,
+            f12: '600000', f13: 1, f14: '浦发银行', f15: 10.3, f16: 9.9, f17: 10.0, f18: 10.0,
+            f20: 1e11, f21: 1e11, f23: 1.0, f26: 19991110, f100: '银行', f115: 6.0,
+            f124: Math.floor(Date.parse('2026-11-18T15:00:00+08:00') / 1000), f130: 1.0,
+          }],
+        },
+      }), { status: 200 });
+    }
+    if (u.startsWith('https://api.fund.eastmoney.com/f10/lsjz')) {
+      return new Response(JSON.stringify({
+        Data: {
+          LSJZList: [{ FSRQ: '2026-11-18', DWJZ: '1.2345', LJJZ: '2.3456' }],
+        },
+      }), { status: 200 });
+    }
+    if (u.startsWith('https://qt.gtimg.cn/q=')) {
+      return new Response('err', { status: 500 });
+    }
+    throw new Error(`Unexpected fetch: ${u}`);
+  };
+  const db = openAshareDb(':memory:');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fund_basic (ts_code TEXT PRIMARY KEY, name TEXT, management TEXT, custodian TEXT, fund_type TEXT, found_date TEXT, due_date TEXT, list_date TEXT, issue_date TEXT, delist_date TEXT, issue_amount REAL, m_fee REAL, c_fee REAL, benchmark TEXT, status TEXT, invest_type TEXT, type TEXT, market TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS fund_daily (ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, open REAL, high REAL, low REAL, close REAL, pre_close REAL, change REAL, pct_chg REAL, vol REAL, amount REAL, PRIMARY KEY (ts_code, trade_date)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS fund_adj (ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, adj_factor REAL, PRIMARY KEY (ts_code, trade_date)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS fund_share (ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, fd_share REAL, fund_type TEXT, market TEXT, PRIMARY KEY (ts_code, trade_date)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS fund_nav (ts_code TEXT NOT NULL, ann_date TEXT, nav_date TEXT NOT NULL, unit_nav REAL, accum_nav REAL, adj_nav REAL, PRIMARY KEY (ts_code, nav_date));
+    CREATE TABLE IF NOT EXISTS fund_sync_log (dataset TEXT NOT NULL, key TEXT NOT NULL, rows INTEGER NOT NULL, status TEXT NOT NULL, message TEXT, synced_at TEXT NOT NULL, PRIMARY KEY (dataset, key)) WITHOUT ROWID;
+  `);
+  upsertRows(db, 'trade_cal', ['cal_date', 'is_open', 'pretrade_date'], [
+    { cal_date: '20261117', is_open: 1, pretrade_date: '20261116' },
+    { cal_date: '20261118', is_open: 1, pretrade_date: '20261117' },
+  ]);
+  upsertRows(db, 'stock_basic', ['ts_code', 'symbol', 'name', 'list_date', 'list_status'], [
+    { ts_code: '600000.SH', symbol: '600000', name: '浦发银行', list_date: '19991110', list_status: 'L' },
+  ]);
+  const prevProv = process.env.ASHARE_DATA_PROVIDER;
+  const prevHosts = process.env.ASHARE_TDX_HOSTS;
+  process.env.ASHARE_DATA_PROVIDER = 'free';
+  process.env.ASHARE_TDX_HOSTS = '127.0.0.1:1';
+  clearFreeProviderCache();
+
+  try {
+    const klines = await fetchEastmoneyKlines('600000.SH', '20261118', '20261118');
+    assert.equal(klines.length, 1);
+    assert.equal(klines[0].vol, null, 'invalid EM kline vol must stay null, not 0');
+    assert.equal(klines[0].amount, null, 'invalid EM kline amount must stay null, not 0');
+
+    const cross = await fetchEastmoneyCrossSection('stock');
+    assert.equal(cross.get('600000.SH')?.vol, null, 'invalid EM cross vol must stay null, not 0');
+    assert.equal(cross.get('600000.SH')?.amount, null, 'invalid EM cross amount must stay null, not 0');
+
+    const navRows = await fetchEastmoneyFundNav('513100.SH', 5);
+    assert.equal(navRows.length, 1);
+    assert.equal(navRows[0].ann_date, null, 'EM fund_nav ann_date must be null, never nav_date');
+    assert.equal(navRows[0].nav_date, '20261118');
+
+    const navSync = await syncFundNav(db, { end: '20261118', days: 1, fallbackCodes: ['513100.SH'] });
+    assert.equal(navSync.errors.length, 0);
+    const navDbRow = db.prepare("SELECT ann_date, nav_date, unit_nav FROM fund_nav WHERE ts_code='513100.SH'").get();
+    assert.equal(navDbRow.ann_date, null);
+    const prem = resolveFundNavPremium(db, '513100.SH', 1.25, '20261118', 'cross_border');
+    assert.equal(prem.unit_nav, 1.2345);
+    assert.equal(prem.buy_blocked, false);
+
+    // Tencent quote with missing p[47]/p[48] must NOT fabricate rule-computed limits.
+    const fNoLim = new Array(55).fill('');
+    fNoLim[1] = '浦发银行';
+    fNoLim[2] = '600000';
+    fNoLim[3] = '10.2';
+    fNoLim[4] = '10.0';
+    fNoLim[5] = '10.0';
+    fNoLim[6] = '1000';
+    fNoLim[30] = '20261118150000';
+    const qNoLim = parseTencentQuoteLine(`v_sh600000="${fNoLim.join('~')}";`);
+    assert.ok(qNoLim);
+    assert.equal(qNoLim.up_limit, null, 'missing Tencent up_limit must stay null');
+    assert.equal(qNoLim.down_limit, null, 'missing Tencent down_limit must stay null');
+
+    // Per-code suspend_d / stk_limit on missing bars or outage must return [] (no fabricated rows).
+    assert.deepEqual(await fetchFreeDataset('suspend_d', { ts_code: '600000.SH', trade_date: '20261118' }, db), []);
+    assert.deepEqual(await fetchFreeDataset('stk_limit', { ts_code: '600000.SH', trade_date: '20261118' }, db), []);
+    // Whole-day snapshot when Tencent is down and EM has vol=null: no suspend_d and no stk_limit rows.
+    await syncTradeDate(db, '20261118', 'refresh');
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM suspend_d WHERE trade_date='20261118'").get().n, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) n FROM stk_limit WHERE trade_date='20261118'").get().n, 0);
+  } finally {
+    clearFreeProviderCache();
+    globalThis.fetch = originalFetch;
     if (prevProv === undefined) delete process.env.ASHARE_DATA_PROVIDER;
     else process.env.ASHARE_DATA_PROVIDER = prevProv;
     if (prevHosts === undefined) delete process.env.ASHARE_TDX_HOSTS;

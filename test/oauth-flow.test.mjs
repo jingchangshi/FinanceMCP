@@ -71,7 +71,7 @@ async function startServer(extraEnv = {}) {
     cwd: ROOT,
     env: {
       ...process.env,
-      TUSHARE_TOKEN: '', QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
+      QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
       NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1',
       MCP_ALLOWED_HOSTS: '127.0.0.1,localhost',
       FINANCE_TOOL_PROFILE: 'ashare_daily',

@@ -11,7 +11,6 @@ function runStdioRequest(request) {
   return new Promise((resolve, reject) => {
     const env = {
       ...process.env,
-      TUSHARE_TOKEN: '',
       QVERIS_API_KEY: '',
     };
     const child = spawn(process.execPath, ['build/index.js'], {

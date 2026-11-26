@@ -510,3 +510,21 @@ test('U15 a fallback bundle for another day is refused, never published as today
   assert.match(res.stderr, /fallback bundle as_of=20261112 != 20261113; refusing to publish another day as today/);
   assert.equal(h.readPythonLog(), '', 'no publish attempt for the wrong-date bundle');
 });
+
+test('U16 Stage 2 hotspot failure or exit 78 discloses CATALOG_UNAVAILABLE/DATA_DELAYED without blocking daily', t => {
+  for (const code of [78, 13]) {
+    const h = setupHarness(t, {
+      dailyPayloads: [{ report: { trade_date: TRADE_DATE, status: 'READY' }, ...readyEtf() }],
+    });
+    const hotspotScript = join(h.dir, `mock-hotspot-${code}.sh`);
+    writeFileSync(hotspotScript, `#!/bin/sh\necho "hotspot failed (${code})" >&2\nexit ${code}\n`);
+    chmodSync(hotspotScript, 0o755);
+
+    const res = h.run({ ASHARE_HOTSPOT_SCRIPT: hotspotScript });
+    assert.equal(res.status, 0, `expected unified exit 0 when hotspot exits ${code}, stderr=${res.stderr}`);
+    assert.match(res.stderr, new RegExp(`hotspot exited ${code}.*CATALOG_UNAVAILABLE / DATA_DELAYED`));
+    assert.match(h.readDockerLog(), /investment-research-record/);
+    const publishLine = h.readPythonLog().trim().split('\n').find(l => l.includes('publish_and_notify.py')) ?? '';
+    assert.match(publishLine, /--data-delayed/);
+  }
+});

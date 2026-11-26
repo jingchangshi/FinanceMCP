@@ -1,5 +1,5 @@
 import {
-  computeDefaultLimitPrices, finiteOrNull, inferSuffixFromCode, parseTsCode, positiveOrNull,
+  finiteOrNull, inferSuffixFromCode, parseTsCode, positiveOrNull,
   roundTo, runPool,
 } from './types.js';
 
@@ -15,8 +15,8 @@ export interface TencentQuoteRow {
   pre_close: number | null;
   change: number | null;
   pct_chg: number | null;
-  /** 手 */
-  vol: number;
+  /** 手；null = 未知（不得伪造为 0） */
+  vol: number | null;
   /** 千元；null = 上游未返回成交额（未知，不是 0，不能当作停牌或零成交证据） */
   amount: number | null;
   turnover_rate: number | null;
@@ -63,7 +63,7 @@ export function parseTencentQuoteLine(line: string): TencentQuoteRow | null {
   const low = finiteOrNull(p[34]);
   const change = finiteOrNull(p[31]);
   const pctChg = finiteOrNull(p[32]);
-  const vol = finiteOrNull(p[6]) ?? 0;
+  const vol = finiteOrNull(p[6]);
 
   let amountQian: number | null = null;
   const amtTuple = (p[35] ?? '').split('/');
@@ -79,13 +79,9 @@ export function parseTencentQuoteLine(line: string): TencentQuoteRow | null {
   const circYi = finiteOrNull(p[44]);
   const totalYi = finiteOrNull(p[45]);
   const pb = positiveOrNull(p[46]);
-  let upLimit = positiveOrNull(p[47]);
-  let downLimit = positiveOrNull(p[48]);
-  if (upLimit === null || downLimit === null) {
-    const fallback = computeDefaultLimitPrices(preClose, tsCode, name);
-    upLimit = upLimit ?? fallback.up_limit;
-    downLimit = downLimit ?? fallback.down_limit;
-  }
+  // 涨跌停价只保留上游腾讯行情提供的原始字段，不回退规则推算值（避免冒充交易所限价持久化）。
+  const upLimit = positiveOrNull(p[47]);
+  const downLimit = positiveOrNull(p[48]);
   const volumeRatio = positiveOrNull(p[49]);
 
   return {

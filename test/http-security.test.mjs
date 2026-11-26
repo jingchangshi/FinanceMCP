@@ -48,7 +48,6 @@ test('local HTTP server rejects DNS rebinding Host headers', async () => {
     ...process.env,
     PORT: String(port),
     MCP_ALLOWED_HOSTS: '',
-    TUSHARE_TOKEN: '',
     QVERIS_API_KEY: '',
   };
   delete childEnv.MCP_HTTP_HOST;
@@ -86,7 +85,6 @@ async function startServer(overrides = {}) {
     ...process.env,
     PORT: String(port),
     MCP_ALLOWED_HOSTS: '',
-    TUSHARE_TOKEN: '',
     QVERIS_API_KEY: '',
     ...overrides,
   };

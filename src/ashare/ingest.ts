@@ -147,11 +147,11 @@ export type SyncMode = 'skip_ok' | 'refresh';
 export interface DatasetSync {
   /** Rows stored for the date after this run. */
   rows: number;
-  /** Whether Tushare was actually queried in this run. */
+  /** Whether the upstream provider was actually queried in this run. */
   fetched: boolean;
   /** Stored cache state: ok / partial / empty. */
   status?: string;
-  /** Outcome of this run's Tushare request, independent of what the cache already held. */
+  /** Outcome of this run's upstream request, independent of what the cache already held. */
   refresh_status?: RefreshStatus;
   fetched_rows?: number;
   before_rows?: number;
@@ -161,12 +161,11 @@ export interface DatasetSync {
 }
 
 /**
- * Download one whole-market trading day per dataset (one paginated request
- * per dataset, never per stock).
+ * Download one whole-market trading day per dataset.
  *
- * `refresh` re-queries Tushare even when the date is already `ok`: the daily
+ * `refresh` re-queries upstream even when the date is already `ok`: the daily
  * pipeline uses it for the as-of day, whose data can still be completed or
- * revised between the 18:40 and 21:10 runs.
+ * revised between runs.
  *
  * Two things are recorded separately. The refresh is REFRESH_OK only when the
  * answer is complete (≥ 97% of the previous day and of what is stored); the
@@ -223,7 +222,7 @@ export async function syncTradeDate(db: DatabaseSync, date: string, mode: SyncMo
 }
 
 /**
- * Suspensions (Tushare suspend_d, suspend_type S) for one trade date. They let
+ * Suspensions (suspend_d, source_explicit_only) for one trade date. They let
  * the audit tell a suspended stock from a real gap in `daily`. A day with no
  * suspensions legitimately returns nothing, so completeness cannot be judged
  * from the row count: a successful request is REFRESH_OK and replaces the
@@ -425,7 +424,7 @@ export interface QualityReport {
   indices_present: string[];
   /** Quality of the stored cache alone, before the latest refresh outcome is considered. */
   cache_status: QualityStatus;
-  /** Latest Tushare refresh per dataset for this date (null = never recorded). */
+  /** Latest upstream refresh per dataset for this date (null = never recorded). */
   refresh: Record<string, RefreshInfo | null>;
   /** When each dataset's stored rows for this date were written; datasets may come from different fetches. */
   snapshot: SnapshotInfo;

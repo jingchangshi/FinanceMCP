@@ -7,19 +7,19 @@
 
 ## 1. 数据来源与覆盖范围
 
-全部来自 Tushare Pro（服务端 `TUSHARE_TOKEN`，8000 积分），日常按交易日整市场批量获取；审计修补按缺陷范围逐股查询。
+默认并唯一支持免费多源路由（TDX TCP + 腾讯截面/分钟 + 东方财富截面/K线/财报/净值，原 Tushare 运行路径已移除；历史冻结列保留只读缓存），日常按交易日整市场/本地缓存增量获取，审计修补按缺陷范围逐股查询。
 
-| 数据集（表） | Tushare 接口 | 主键 | 获取方式 / 频率 | 当前覆盖（2026-10-16） |
+| 数据集（表） | 当前免费源 / 本地口径 | 主键 | 获取方式 / 频率 | 当前覆盖与语义 |
 |---|---|---|---|---|
-| `trade_cal` | `trade_cal`（SSE） | `cal_date` | 每次同步刷新 `start−400 天 ~ 今天+30 天` | 20221128~20261116，961 个交易日 |
-| `stock_basic` | `stock_basic`（L/D/P 三次） | `ts_code` | 每次同步整表刷新（`updated_at`） | 5577 上市 + 339 退市，356 只 92xxxx.BJ |
-| `daily` | `daily` | `(ts_code, trade_date)` | 每交易日一次批量；as-of 日每次运行都复查 | 20240102~20261016，673 天，3,642,948 行 |
-| `daily_basic` | `daily_basic` | `(trade_date, ts_code)` | 同上 | 与 `daily` 一一对应（缺失 0） |
-| `adj_factor` | `adj_factor` | `(ts_code, trade_date)` | 同上 | 有行情的股票缺失 0；停牌股也有因子 |
-| `stk_limit` | `stk_limit` | `(ts_code, trade_date)` | 同上 | 含 86 个不在 `stock_basic` 的代码（B 股等），不影响 A 股 |
-| `suspend_d`（新增） | `suspend_d`（`suspend_type=S`） | `(trade_date, ts_code)` | 每交易日一次；用于区分停牌与缺口 | 20240102~20261016（本轮回填） |
-| `index_daily` | `index_daily`（8 个核心指数） | `(ts_code, trade_date)` | 按指数区间，向前补历史、向后追加，as-of 日复查；`audit --fix` 可补单日空洞 | 20221201~20261016，各 937 根 |
-| `fina_indicator` | `fina_indicator_vip`（按报告期） | `(ts_code, end_date, ann_date)` | 最近 3 个报告期每次刷新，更早的取一次 | 20231231~20260930，12 期，69,187 行 |
+| `trade_cal` | 上证 `000001.SH` K线 + 法定休市表 | `cal_date` | 每次同步刷新 `start−400 天 ~ 今天+30 天` | 交易日历自校正 |
+| `stock_basic` | TDX 证券列表 + 东财截面 | `ts_code` | 每次同步增量更新活跃上市（历史退市冻结保留） | 当前上市活跃 + 冻结历史退市 |
+| `daily` | 东财截面 + 腾讯 Quote + TDX Quote | `(ts_code, trade_date)` | 每交易日批量快照；as-of 日每次运行复查 | OHLCV；缺字段写 null 不伪造 0 |
+| `daily_basic` | 东财截面 + 腾讯 Quote | `(trade_date, ts_code)` | 同上 | 估值/流动性字段；无逐股历史补洞 |
+| `adj_factor` | 东财/TDX `xdxr` + `pre_close` 链式推导 | `(ts_code, trade_date)` | 同上 | 从 `prev_close`/`pre_close` 链式计算 |
+| `stk_limit` | 腾讯Quote 显式涨跌停价 (`upstream_explicit_only`) | `(ts_code, trade_date)` | 同上 | **仅持久化上游显式限价，缺失保持缺失，不写入规则推算值** |
+| `suspend_d` | `source_explicit_only`（历史导入 + 显式停牌接口） | `(trade_date, ts_code)` | 仅存显式上游停牌信号 | **源故障/无 bar 绝不伪造为停牌** |
+| `index_daily` | 东财/腾讯指数日线（8 个核心指数） | `(ts_code, trade_date)` | 按指数区间，向前补历史、向后追加，as-of 日复查 | 8 大核心指数 |
+| `fina_indicator` | 东方财富财报 (`RPT_LICO_FN_CPD` / `BALANCE` / `CASHFLOW`) | `(ts_code, end_date, ann_date)` | 按报告期抓取与增量更新 | 按 `ann_date` 约束；`ocf_to_profit` 为东财衍生近似值 |
 
 审计与同步记录：`sync_log`（每个键最新一次）、`sync_history`（每次请求）、`quality_check`（每日质量）、`data_audit` + `audits/*.json`（历史审计）。
 
@@ -45,7 +45,7 @@
 | 交易日 / 自然日 | 行情按交易日；区间内非交易日不返回行；长度上限用自然日（历史行情 ≤ 3700 天）或交易日（市场数据 ≤ 60 天）明确标注 |
 | 最后可用日期 | 查询的 `end_date` / `as_of_date`：不读取之后的价格、复权因子或公告；`end_date` 晚于缓存最新交易日时给出提示 |
 | 缺失值 | `null`，从不转换为 0；停牌、上市期外、待退市与缺口分别列出 |
-| 来源与时间 | `source[]`：`Tushare Pro <接口>`、`first_synced_at`、`last_synced_at`、`refresh_status`、`cache_status` |
+| 来源与时间 | `source[]`：`ashare_cache.<表>`、`first_synced_at`、`last_synced_at`、`refresh_status`、`cache_status` |
 | 质量 | `data_quality`：`status`（READY/DEGRADED/NOT_READY）与 `cache_status`，见 §5 |
 | 错误 | 参数错误、范围超限返回明确中文错误（MCP 400）；无数据返回 `empty: true` 或空 `rows` 与警告，不以相邻日期替代 |
 | 输出体积 | 历史行情 ≤ 500 行/次（`next_start_date` 分页）；财务 ≤ 40 期；市场 ≤ 60 交易日；基础信息 ≤ 50 个代码或 ≤ 100 条/页（`next_offset`） |
@@ -60,7 +60,7 @@
 | `amount`（个股与指数） | 千元；`amount_yi` = 亿元 |
 | `total_mv`、`circ_mv` | 万元 |
 | `roe`、`roe_dt`、`*_yoy`、`grossprofit_margin`、`debt_to_assets` | % |
-| `ocf_to_profit` | **%**（Tushare 原值为百分数：600519 最新为 115.11，即 115.11%） |
+| `ocf_to_profit` | **%**（早期缓存保留原值，增量期由东财净利润与经营现金流推导百分数） |
 | `eps`、`ocfps` | 元/股 |
 
 > 数据契约发现（正式 V1 保持原规则，研究 V2 修正为 80，见 [分析契约](ashare-analysis-v2.md)）：`score-1.0.0` 的现金流项按 `ocf_to_profit ≥ 0.8` 判断，
@@ -68,7 +68,7 @@
 
 ## 4. 复权方法
 
-设 `f(t)` 为 Tushare `adj_factor`：
+设 `f(t)` 为本地缓存复权因子 `adj_factor`：
 
 - `none`：交易所原始价格。
 - `qfq`（前复权）：`price(t) × f(t) / f(base)`，`base` = 查询 `end_date` 当日或之前该股最后一个复权因子。**不使用 end_date
@@ -97,7 +97,7 @@
 **历史审计与补齐**（`finance-ashare audit [--start] [--end] [--fix]`，`src/ashare/audit.ts`）：逐交易日检查
 1. 整日缺少行情；
 2. 当日处于上市期（当前 `stock_basic` 上市/退市日期）却无行情的股票，分为停牌（`suspend_d`）、待退市（已有退市日、最后一根 K 线之后）、
-   **上游确认缺失**（`gap_check`：按代码向 Tushare 查询，既无行情也无停牌记录）与**无法解释的缺口**——不只看全市场条数比例；
+   **上游确认缺失**（`gap_check`：按代码向免费行情源查询仍无行情且无显式停牌记录）与**无法解释的缺口**——不只看全市场条数比例；
 3. 有行情但缺复权因子 / 每日指标 / 涨跌停价；
 4. 核心与非核心指数缺失；
 5. OHLC、成交量、成交额非法，涨跌幅与昨收不一致。非法判定（`audit-1.2.0`）显式检查 `open/high/low/close IS NULL`，并对成交量/成交额 `NULL` 单独计数：`NULL` 是缺失证据，不转换为 0；`vol = 0` 且 `amount = 0` 合法，`vol = 0` 且 `amount IS NULL` 非法。`auditDay` 的 `invalid_bar_kinds` 给出逐类计数，`checkQuality()` 使用同一判定，任一类命中即 `NOT_READY`（不因覆盖率正常而放行）；
@@ -121,14 +121,14 @@
 | 时间 | 含义 | 字段 |
 |---|---|---|
 | 数据所属时间 | 行情交易日 / 财务报告期 | `trade_date` / `end_date` |
-| 首次发布或披露时间 | 财务为公告日；行情的 Tushare 发布时间不可得 | `ann_date` |
+| 首次发布或披露时间 | 财务为公告日；行情与免费基金净值均无上游精确推送时间 | `ann_date` |
 | FinanceMCP 获取时间 | 本地首次与最近获取时间 | `first_synced_at` / `last_synced_at` |
 
 - 财务：as-of 查询只使用 `ann_date ≤ as_of` 的记录；同一报告期多次公告取 as-of 前最新一条，其余作为 `revisions` 列出变动字段；
   `ann_date` 早于报告期末的记录（当前 1 条：603400.SH 20260630 报告期标注 20260422 公告，数值与 20260803 公告相同）视为上游异常，
   **不参与** as-of 选择（引擎 `financialsAsOf` 与工具同一规则）。常规查询仅列出报告期末及公告日都不晚于 as_of 的异常；其他异常只出现在缓存审计 `global.fina_ann_date_before_period_end`。修复前该记录使引擎在 20260422~20260802 期间
   提前看到尚未结束的报告期；20260430 实测只影响这一只股票，且其当日不在评分候选内，正式输出未变化。
-- 财务不是严格 Point-in-Time：Tushare 不保留修订版本，同一公告日的更正（`update_flag=1`）覆盖原值；
+- 财务不是严格 Point-in-Time：东财接口返回最新修订财务值而非历史发布版本序列，同公告日更正会覆盖原值；
   北交所旧代码（43/83/87）下仍有一份 2023~2026 年的财务记录，与 92 代码的记录重复，工具按所查代码返回。
 - 当前口径数据：行业、名称（ST 标记）、上市状态来自当前 `stock_basic`，不代表历史日期的状态。
 - 代码变更未合并：例如 300114.SZ（2025-02-14 前的 268 根 K 线）→ 302132.SZ。旧代码不在 `stock_basic` 中，

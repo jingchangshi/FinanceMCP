@@ -63,7 +63,7 @@ export const ashareToolDefinitions: { name: string; description: string; inputSc
   },
   {
     name: 'ashare_sector_rank',
-    description: 'A股行业强弱排名（Tushare 行业分类）：20日/5日中位收益、站上MA20比例、成交额与综合强度。',
+    description: 'A股行业强弱排名（stock_basic 当前行业分类）：20日/5日中位收益、站上MA20比例、成交额与综合强度。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -112,7 +112,7 @@ ashareToolDefinitions.push(
   },
   {
     name: 'ashare_financial_data',
-    description: `单只A股财务指标历史（Tushare fina_indicator）：按报告期列出 as_of_date 当时已公告的最新数据（ann_date ≤ as_of_date），含公告日、单位、多次公告的修订字段及截止日已知的上游异常；不披露截止日之后的记录数量或报告期信息。空值保持 null。数据源不保留完整修订历史，不是严格 Point-in-Time 财务库。${DATA_NOTE}`,
+    description: `单只A股财务指标历史（fina_indicator）：按报告期列出 as_of_date 当时已公告的最新数据（ann_date ≤ as_of_date），含公告日、单位、多次公告的修订字段及截止日已知的上游异常；不披露截止日之后的记录数量或报告期信息。空值保持 null。数据源仅提供最新修订视图而非完整修订历史，不是严格 Point-in-Time 财务库。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -149,7 +149,7 @@ ashareToolDefinitions.push(
       properties: {
         ts_codes: { type: 'array', items: { type: 'string' }, description: '股票代码或名称列表' },
         query: { type: 'string', description: '名称、6 位代码或 ts_code 片段' },
-        industry: { type: 'string', description: '行业（Tushare 当前行业分类，精确匹配）' },
+        industry: { type: 'string', description: '行业（stock_basic 当前行业分类，精确匹配）' },
         list_status: { type: 'string', enum: ['L', 'D', 'P'], description: 'L 上市、D 退市、P 暂停上市' },
         limit: { type: 'number', description: '每页条数，默认 20，最大 100' },
         offset: { type: 'number', description: '分页偏移，默认 0' },
@@ -163,7 +163,7 @@ ashareToolDefinitions.push(
 ashareToolDefinitions.push(
   {
     name: 'ashare_etf_quotes',
-    description: `ETF 行情快照（只读本地 fund_* 缓存）：基础信息、基金费率（fee 块：management_rate_pct/custody_rate_pct/total_rate_pct，年费率百分比，来源 tushare.fund_basic，fee.as_of 为刷新时间；场内买卖无申购赎回费，交易成本仅为券商佣金）、最新行情与明确单位换算、复权价格、份额时点值与质量标记。字段单位：价格=元/份，vol=手（1 手 = 100 份，volume_shares=份），amount=千元（amount_cny=元）。fund_share 是份额时点存量，份额变化不是资金净流入，也不等于成交额；仅在两个可比份额日期与价格代理都存在时才给出 net_creation_estimate（净申购规模估计）。行情缺失返回 NOT_READY 且价格字段为 null；行情落后于预期交易日时仍返回真实行情日期并标记 STALE/DEGRADED，不伪造、不用旧数据冒充当日。${DATA_NOTE}`,
+    description: `ETF 行情快照（只读本地 fund_* 缓存）：基础信息、基金费率（fee 块：management_rate_pct/custody_rate_pct/total_rate_pct，年费率百分比，来源 ashare.fund_basic，已有缓存维持冻结、新发现基金为 null，fee.as_of 为刷新时间；场内买卖无申购赎回费，交易成本仅为券商佣金）、最新行情与明确单位换算、复权价格、份额时点值与质量标记。字段单位：价格=元/份，vol=手（1 手 = 100 份，volume_shares=份），amount=千元（amount_cny=元）。fund_share 是份额时点存量，份额变化不是资金净流入，也不等于成交额；仅在两个可比份额日期与价格代理都存在时才给出 net_creation_estimate（净申购规模估计）。行情缺失返回 NOT_READY 且价格字段为 null；行情落后于预期交易日时仍返回真实行情日期并标记 STALE/DEGRADED，不伪造、不用旧数据冒充当日。${DATA_NOTE}`,
     inputSchema: {
       type: 'object',
       properties: {

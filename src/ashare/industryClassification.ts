@@ -7,7 +7,7 @@ import { THS_THEME_RULE_VERSION } from './hotspotTypes.js';
  * and imports only from hotspotTypes.
  */
 
-/** One row of Tushare `index_member_all` / the `sw_member` table. */
+/** One row of `index_member_all` / the `sw_member` table. */
 export interface SwMemberRow {
   ts_code: string;
   l1_code: string;
@@ -38,8 +38,7 @@ const YMD = /^\d{8}$/;
  *   is an exit we cannot prove around, and "unconfirmable availability must
  *   not be dressed up as availability" (§2.2.2).
  *
- * asOf is YYYYMMDD, the format Tushare returns; comparison is lexicographic
- * on that fixed-width form.
+ * asOf is YYYYMMDD; comparison is lexicographic on that fixed-width form.
  */
 export function activeSwMembers(rows: SwMemberRow[], asOf: string): SwMemberRow[] {
   const out: SwMemberRow[] = [];

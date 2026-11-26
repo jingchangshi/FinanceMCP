@@ -66,7 +66,7 @@ async function startServer(env) {
     cwd: ROOT,
     env: {
       ...process.env,
-      TUSHARE_TOKEN: '', QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
+      QVERIS_API_KEY: '', TWINGLY_API_KEY: '',
       NODE_ENV: 'production', PORT: String(port), MCP_HTTP_HOST: '127.0.0.1',
       // 公网 profile 必须暴露九个市场工具，V1-P7 才能验证它们没被私有工具破坏。
       FINANCE_TOOL_PROFILE: 'ashare_daily',
