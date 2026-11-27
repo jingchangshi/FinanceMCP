@@ -547,3 +547,62 @@ class TestV3CockpitSections(unittest.TestCase):
         self.assertIn("已取消低位月度强卖", vis)
         self.assertIn("禁止左侧接飞刀", vis)
         self.assertIn("0.770 元", vis)
+
+    def test_v330_gradual_drawdown_recovery_and_sector_pioneer_clean(self):
+        from feishu_render import check_forbidden, check_internal_tokens, check_markdown_leak, render_xml, strip_tags
+
+        bundle = self._v3_bundle(actionable=False)
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["policy_release"] = {
+            "version": "v3.3.0",
+            "recovery_overlay_enabled": True,
+            "defensive_bond_reservoir_etf": "159649.SZ",
+        }
+        cockpit["market_regime"].update({
+            "regime": "RECOVERY",
+            "regime_label_zh": "冰点复苏试探档（40%）",
+            "target_equity_bps": 4000,
+            "target_equity_pct": 40,
+            "defensive_cash_bps": 6000,
+            "defensive_cash_pct": 60,
+        })
+        cockpit["router"].update({
+            "effective_regime": "RECOVERY",
+            "policy_version": "v3.3.0",
+            "drawdown_control_mode": "TWO_STAGE_GRADUAL",
+            "deconcentration_preemptive_active": True,
+            "l2_trigger_drawdown_bps": 1200,
+        })
+        cockpit["sector_pioneer_candidates"] = [
+            {
+                "ts_code": "159819.SZ",
+                "name": "人工智能ETF易方达",
+                "close_cny": 1.120,
+                "ma60_cny": 1.050,
+                "ret20_pct": 6.45,
+                "ret60_pct": 14.20,
+                "blend_score_pct": 10.33,
+            }
+        ]
+        sections = build_sections(bundle, generated_at="2026-11-26 19:30")
+        self.assertEqual(validate_sections(sections), [])
+        xml = render_xml(sections)
+        vis = strip_tags(xml)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertEqual(check_markdown_leak(vis), [])
+        self.assertIn("v3.3.0", vis)
+        self.assertIn("13.5%", vis)
+        self.assertIn("12% 前置熔断清零高波动权益", vis)
+        self.assertIn("冰点复苏试探档（40%）", vis)
+        self.assertIn("两段渐进控撤", vis)
+        self.assertIn("人工智能ETF易方达", vis)
+
+        cockpit["router"]["deconcentration_preemptive_active"] = False
+        cockpit["router"]["l2_trigger_drawdown_bps"] = 1350
+        sections_normal = build_sections(bundle, generated_at="2026-11-26 19:30")
+        self.assertEqual(validate_sections(sections_normal), [])
+        vis_normal = strip_tags(render_xml(sections_normal))
+        self.assertEqual(check_forbidden(vis_normal), [])
+        self.assertEqual(check_internal_tokens(vis_normal), [])
+        self.assertIn("13.5% 熔断生命线", vis_normal)

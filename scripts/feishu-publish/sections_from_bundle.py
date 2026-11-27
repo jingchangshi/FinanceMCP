@@ -57,6 +57,12 @@ def _fmt_pct(value: Any, digits: int = 2) -> str:
     return f"{value:.{digits}f}%"
 
 
+def _fmt_pct_trim(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "数据不足"
+    return f"{value:.1f}".rstrip("0").rstrip(".") + "%"
+
+
 def _tick_price(value: Any) -> str:
     if not isinstance(value, (int, float)):
         return "不可用"
@@ -325,9 +331,23 @@ def _build_v3_cockpit_sections(
     principal = cockpit.get("principal") or {}
     mr = cockpit.get("market_regime") or {}
     router = cockpit.get("router") or {}
+    policy_rel = cockpit.get("policy_release") or {}
+    policy_ver = str(policy_rel.get("version") or router.get("policy_version") or "").strip()
+    is_gradual = (router.get("drawdown_control_mode") == "TWO_STAGE_GRADUAL")
+    preemptive_active = bool(router.get("deconcentration_preemptive_active"))
     deconc = cockpit.get("deconcentration") or {}
     rem = cockpit.get("reconciliation_reminder") or {}
     sub_zh = router.get("sub_strategies_zh") or {}
+    hard_l2_pct = 13.5 if is_gradual else (
+        float(deconc["normal_lifeline_pct"]) if isinstance(deconc.get("normal_lifeline_pct"), (int, float)) else 15.0
+    )
+    active_l2_pct = (
+        float(router["l2_trigger_drawdown_bps"]) / 100.0
+        if isinstance(router.get("l2_trigger_drawdown_bps"), (int, float))
+        else (12.0 if preemptive_active else hard_l2_pct)
+    )
+    active_l2_txt = _fmt_pct_trim(active_l2_pct)
+    hard_l2_txt = _fmt_pct_trim(hard_l2_pct)
     focus = judgment_of(bundle)["focus"]
     focus_weight = focus.get("weight")
     focus_name = focus.get("name") or focus.get("ts_code") or "最大持仓"
@@ -419,15 +439,16 @@ def _build_v3_cockpit_sections(
         reasons.append(str(rem["message_zh"]))
 
     hwm_dd = router.get("hwm_drawdown_pct")
+    gradual_risk_suffix = "；启用两段渐进控撤（8%压至50%、11%压至25%、13.5%熔断）" if is_gradual else ""
     max_risk = (
         f"第一风险源：{focus_name}（{focus_code}）占比 {_fmt_pct((focus_weight or 0) * 100)}；"
-        f"动态高水位 {_fmt_money(router.get('hwm_nav_cents'))} 对应 15% 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}"
-        f"（当前自高水位回撤 {_fmt_pct(hwm_dd)}，距离生命线安全缓冲 {_fmt_pct(router.get('lifeline_buffer_pct'))}）。"
+        f"动态高水位 {_fmt_money(router.get('hwm_nav_cents'))} 对应 {active_l2_txt} 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}"
+        f"（当前自高水位回撤 {_fmt_pct(hwm_dd)}，距离生命线安全缓冲 {_fmt_pct(router.get('lifeline_buffer_pct'))}{gradual_risk_suffix}）。"
     )
     change_condition = (
         "触发任意以下条件即更新动作："
         + ("；".join(deconc_next) if deconc_next else "159558.SZ 达到分批减仓条件")
-        + "，或账户自动态高水位回撤达到 15% 生命线。"
+        + f"，或账户自动态高水位回撤达到 {active_l2_txt} 生命线。"
     )
     if is_actionable and action_lines:
         execution_note = "已按规则生成可执行份数，请核对委托价格与券商端余额后手动下单。"
@@ -454,7 +475,7 @@ def _build_v3_cockpit_sections(
             f"{_fmt_money(router.get('hwm_nav_cents'))}（{_ymd(router.get('hwm_date'))}）",
         ],
         [
-            "15% 熔断生命线与缓冲",
+            f"{active_l2_txt} 熔断生命线与缓冲",
             f"{_fmt_money(router.get('lifeline_nav_cents'))}（缓冲 {_fmt_pct(router.get('lifeline_buffer_pct'))}）",
         ],
         [
@@ -524,6 +545,21 @@ def _build_v3_cockpit_sections(
                 f"当前权益占比 {_fmt_pct(cur_eq_pct)} 低于本档上限 {_fmt_pct(target_eq_pct, 0)}，"
                 f"账上 {_fmt_money(cash_cents)} 现金可按超级基金（1,000 元起）或主板个股回踩（8,000 元起）阈值释放增量买入预算。"
             )
+    elif eff_regime == "RECOVERY":
+        regime_rule_note = (
+            "当前处于冰点复苏试探档（40%）：连续下跌触发深跌超卖后右侧企稳并获次日量能确认，可分批试探配置；"
+            "若重回高波动破位将退守防守档（15%），若双锚走强且站上60日线达 30% 以上将升入震荡结构档（60%）。"
+        )
+        if isinstance(cur_eq_pct, float) and isinstance(target_eq_pct, (int, float)) and cur_eq_pct >= target_eq_pct:
+            budget_rule_note = (
+                f"当前存量权益（{_fmt_pct(cur_eq_pct)}）已达或高于本档目标上限（{_fmt_pct(target_eq_pct, 0)}），"
+                f"账上 {_fmt_money(cash_cents)} 现金暂作安全缓冲；待市场升入更高档位或存量权益降至上限内后自动释放买入预算。"
+            )
+        else:
+            budget_rule_note = (
+                f"当前权益占比 {_fmt_pct(cur_eq_pct)} 低于本档上限 {_fmt_pct(target_eq_pct, 0)}，"
+                f"账上 {_fmt_money(cash_cents)} 现金可按冰点复苏试探规则分批释放增量买入预算。"
+            )
     else:
         regime_rule_note = (
             "当前处于震荡结构档（60%）：若双锚任一走强且全市场站上60日线达 45% 以上、量比达 0.85 倍并连续两日确认可升入进攻档（85%）；"
@@ -549,7 +585,11 @@ def _build_v3_cockpit_sections(
                 f"上涨 {up if up is not None else '—'} 家 / 下跌 {down if down is not None else '—'} 家，"
                 f"两市成交额 {f'{amt:.0f} 亿' if isinstance(amt, (int, float)) else '—'}。"
             ),
-            "why": "大盘价值锚（沪深300）与成长弹性锚（中证500、创业板指）叠加全市场站上60日线占比和量比，共同决定进攻85%、结构60%、防守15%三档总权益上限（含连续两日收盘防抖确认）。",
+            "why": (
+                "大盘价值锚（沪深300）与成长弹性锚（中证500、创业板指）叠加全市场站上60日线占比和量比，共同决定进攻85%、结构60%、冰点复苏试探40%、防守15%四档总权益上限（含连续两日收盘防抖确认）。"
+                if (policy_rel.get("recovery_overlay_enabled") or is_gradual)
+                else "大盘价值锚（沪深300）与成长弹性锚（中证500、创业板指）叠加全市场站上60日线占比和量比，共同决定进攻85%、结构60%、防守15%三档总权益上限（含连续两日收盘防抖确认）。"
+            ),
             "rule_note": regime_rule_note,
         },
         (
@@ -570,7 +610,7 @@ def _build_v3_cockpit_sections(
                     )
                 ),
                 "why": "取消低位月度强卖，长期留存25%核心半导体设备底仓弹性；仅在60日均线走平+深折价超卖+右侧企稳四门槛齐备时启用单槽+10%战术回补（不设窄幅噪点止损），规避越做越亏风险。",
-                "rule_note": ("；".join(deconc_next) if deconc_next else "按四门槛持续观察") + "（持仓占比降至30%及以下且超额归零后恢复15%标准熔断线）。",
+                "rule_note": ("；".join(deconc_next) if deconc_next else "按四门槛持续观察") + f"（持仓占比降至30%及以下且超额归零后恢复{hard_l2_txt}标准熔断线）。",
             }
             if is_grind25
             else {
@@ -652,6 +692,20 @@ def _build_v3_cockpit_sections(
             "cost": f"{cand.get('fee_label_zh', '万分之0.5佣金免5元')}，{prem}。",
             "gap": super_gap,
         })
+    pioneer_cands = cockpit.get("sector_pioneer_candidates") or []
+    for p_cand in pioneer_cands[:2]:
+        if not isinstance(p_cand, dict):
+            continue
+        options.append({
+            "name": f"超级行业先导候选｜{p_cand.get('name')}（{p_cand.get('ts_code')}）",
+            "upside": (
+                f"收盘 {_tick_price(p_cand.get('close_cny'))} 元（高于60日线 {_tick_price(p_cand.get('ma60_cny'))} 元），"
+                f"近20/60日收益 {p_cand.get('ret20_pct', 0):+.2f}% / {p_cand.get('ret60_pct', 0):+.2f}%，"
+                f"综合动量评分 {p_cand.get('blend_score_pct', 0):+.2f}%。"
+            ),
+            "cost": "东财超级白名单（万分之0.5佣金免5元低消）。",
+            "gap": "当超级行业先导子策略激活且存在可用权益预算时纳入轮动排序，防守或预算受限期仅作跟踪储备。",
+        })
     stock_cands = cockpit.get("stock_swing_candidates") or []
     s_stock_status = (router.get("sub_strategies") or {}).get("s_stock_swing")
     for s_cand in stock_cands[:2]:
@@ -674,11 +728,11 @@ def _build_v3_cockpit_sections(
 
     # 6. 下一交易日关注
     next_date = str(portfolio.get("expected_next_trade_date") or "")
-    preemptive_active = bool(router.get("deconcentration_preemptive_active"))
+    gradual_guard_note = "两段渐进护栏：回撤达 8% 权益上限压至 50%，达 11% 压至 25%。" if is_gradual else ""
     lifeline_text = (
-        f"{_ymd(next_date)}：重仓换马未完成期间启用 12% 前置熔断清零高波动权益（国债与货基豁免），同时盯防 15% 硬生命线 {_fmt_money(router.get('lifeline_nav_cents'))}。"
+        f"{_ymd(next_date)}：重仓换马未完成期间启用 12% 前置熔断清零高波动权益（国债与货基豁免），同时盯防 {hard_l2_txt} 硬生命线 {_fmt_money(router.get('lifeline_nav_cents'))}。{gradual_guard_note}"
         if preemptive_active
-        else f"{_ymd(next_date)}：盯防动态高水位 15% 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}，破线无条件压仓至 15% 以下。"
+        else f"{_ymd(next_date)}：盯防动态高水位 {active_l2_txt} 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}，破线无条件压仓至 15% 以下。{gradual_guard_note}"
     )
     deconc_cond_prefix = "159558.SZ 25%底仓与磨底降本观察位——" if is_grind25 else "159558.SZ 四批换马触发位——"
     conditions: List[str] = [
@@ -687,8 +741,9 @@ def _build_v3_cockpit_sections(
         f"{_ymd(next_date)}：新建个股统一遵循单笔 -8% 硬止损、+15% 提至保本及 20 日均线移动止盈，跨境买入严禁超过 +2.5% 溢价。",
     ]
 
+    policy_ver_clause = f"（{policy_ver}）" if policy_ver else ""
     notes: List[str] = [
-        "本报告由 V3 进取型低频攻防引擎与固定账户账本状态机生成，行情来自本地只读收盘缓存。",
+        f"本报告由 V3 进取型低频攻防引擎{policy_ver_clause}与固定账户账本状态机生成，行情来自本地只读收盘缓存。",
         f"账本最近事件记录截止 {_ymd(gate.get('reported_events_through'))}；{rem.get('message_zh') or '保持定期同步券商交割流水。'}",
     ]
     cb_rows = cockpit.get("cross_border_monitor") or []
@@ -701,9 +756,10 @@ def _build_v3_cockpit_sections(
         notes.append("后台折溢价风控备案（仅作禁买拦截，非重点关注方向）：当日触发超 +2.5% 溢价或净值滞后禁买的跨境品种含 " + cb_summary)
     notes.extend(str(trigger) for trigger in (first_section.get("observation_triggers") or [])[:2] if trigger)
 
+    ver_subtitle = f"｜策略版本 {policy_ver}" if policy_ver else ""
     result = {
         "title": f"A 股攻防实战日报｜{_ymd(as_of)}收盘",
-        "subtitle": f"生成于 {generated_at}（北京时间）｜市场数据截至交易日 {_iso(as_of)}",
+        "subtitle": f"生成于 {generated_at}（北京时间）｜市场数据截至交易日 {_iso(as_of)}{ver_subtitle}",
         "account_status": f"账户数据：{account_status_note}",
         "sections": {
             "今日判断": {

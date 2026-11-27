@@ -42,8 +42,12 @@ NOTIFY_CHAT_ID_ENV = "FEISHU_NOTIFY_CHAT_ID"
 
 _REGIME_ZH = {
     "BULL": "进攻档",
+    "OFFENSIVE": "进攻档",
     "NEUTRAL": "结构档",
+    "STRUCTURE": "结构档",
+    "RECOVERY": "冰点复苏试探档",
     "BEAR": "防守档",
+    "DEFENSIVE": "防守档",
 }
 _SIDE_ZH = {"SELL": "卖出", "BUY": "买入"}
 _URL_RE = re.compile(r"https?://\S+")
@@ -162,13 +166,16 @@ def build_notification_markdown(
     lifeline_buffer = router.get("lifeline_buffer_pct")
     preemptive_active = bool(router.get("deconcentration_preemptive_active"))
     cb_label = str(router.get("circuit_breaker_label_zh") or "正常运作")
+    policy_ver = str((cockpit.get("policy_release") or {}).get("version") or router.get("policy_version") or "").strip()
+    is_gradual = (router.get("drawdown_control_mode") == "TWO_STAGE_GRADUAL")
 
     first_section = portfolio.get("first_section") or {}
     actions = [a for a in (first_section.get("actions") or []) if isinstance(a, dict)]
     is_actionable = bool(portfolio.get("actionable")) and bool(actions)
     next_date = _format_iso_date(str(portfolio.get("expected_next_trade_date") or ""))
 
-    lines: list[str] = [f"**A 股攻防实战日报｜{iso_date} 收盘**"]
+    ver_tag = f"（{policy_ver}）" if policy_ver else ""
+    lines: list[str] = [f"**A 股攻防实战日报{ver_tag}｜{iso_date} 收盘**"]
     if data_delayed:
         # The readiness deadline is configurable on the host
         # (ASHARE_READINESS_DEADLINE_HM); hardcoding 21:15 made the banner lie
@@ -190,7 +197,8 @@ def build_notification_markdown(
     if isinstance(hwm_dd, (int, float)):
         buf_bits.append(f"自高水位回撤 {_fmt_pct(hwm_dd)}")
     if isinstance(lifeline_cents, (int, float)):
-        line_name = "12%前置 / 15%硬生命线" if preemptive_active else "15%熔断生命线"
+        hard_txt = "13.5%" if is_gradual else "15%"
+        line_name = f"12%前置 / {hard_txt}硬生命线" if preemptive_active else f"{hard_txt}熔断生命线"
         buf_bits.append(f"{line_name} {_fmt_yuan(lifeline_cents)}")
     if isinstance(lifeline_buffer, (int, float)):
         buf_bits.append(f"安全缓冲 {_fmt_pct(lifeline_buffer)}")

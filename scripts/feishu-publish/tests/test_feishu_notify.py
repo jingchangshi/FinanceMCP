@@ -334,6 +334,28 @@ class TestFeishuNotify(unittest.TestCase):
         self.assertEqual(res["recipient_flag"], "--chat-id")
         self.assertEqual(len(runner.calls), 2)
 
+    def test_v330_gradual_and_recovery_notify_markdown_clean(self):
+        pub_entry = {
+            "trade_date": "20261126",
+            "document_id": "doc-v330",
+            "document_url": "https://my.feishu.cn/docx/doc-v330",
+        }
+        bundle = self._helper._v3_bundle(actionable=False)
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["policy_release"] = {"version": "v3.3.0"}
+        cockpit["market_regime"].pop("regime_label_zh", None)
+        cockpit["market_regime"]["regime"] = "RECOVERY"
+        cockpit["market_regime"]["target_equity_pct"] = 40
+        cockpit["router"]["drawdown_control_mode"] = "TWO_STAGE_GRADUAL"
+        cockpit["router"]["deconcentration_preemptive_active"] = True
+        md, _ = build_notification_markdown(bundle, pub_entry)
+        vis = _URL_RE.sub("", md)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertIn("v3.3.0", md)
+        self.assertIn("冰点复苏试探档", md)
+        self.assertIn("12%前置 / 13.5%硬生命线", md)
+
 
 if __name__ == "__main__":
     unittest.main()
