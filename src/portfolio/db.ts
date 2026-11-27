@@ -220,6 +220,19 @@ CREATE TABLE IF NOT EXISTS position_stop_tracker (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (account_id, ts_code)
 );
+
+CREATE TABLE IF NOT EXISTS forward_view_overlay (
+  overlay_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  created_date TEXT NOT NULL,
+  expires_trade_date TEXT NOT NULL,
+  equity_delta_bps INTEGER NOT NULL CHECK(equity_delta_bps BETWEEN -1000 AND 1000),
+  invalidation_rule_json TEXT NOT NULL,
+  thesis_summary TEXT NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fvo_account_status
+  ON forward_view_overlay (account_id, status, created_date);
 `;
 
 /** 只读探测指定表是否存在（避免在只读或未迁移的测试库上触发写操作）。 */

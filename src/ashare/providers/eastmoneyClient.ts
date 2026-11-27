@@ -227,6 +227,7 @@ export interface EastmoneyFinancialRow {
   ocf_to_profit: number | null;
   ocfps: number | null;
   eps: number | null;
+  bps: number | null;
   update_flag: string;
 }
 
@@ -258,7 +259,7 @@ export async function fetchEastmoneyFinancials(period: string): Promise<Eastmone
       'RPT_LICO_FN_CPD',
       'REPORTDATE',
       isoPeriod,
-      'SECUCODE,NOTICE_DATE,REPORTDATE,BASIC_EPS,WEIGHTAVG_ROE,YSTZ,SJLTZ,XSMLL,MGJYXJJE,PARENT_NETPROFIT',
+      'SECUCODE,NOTICE_DATE,REPORTDATE,BASIC_EPS,BPS,WEIGHTAVG_ROE,YSTZ,SJLTZ,XSMLL,MGJYXJJE,PARENT_NETPROFIT',
     ),
     fetchDatacenterReport(
       'RPT_DMSK_FN_BALANCE',
@@ -323,8 +324,86 @@ export async function fetchEastmoneyFinancials(period: string): Promise<Eastmone
       ocf_to_profit: ocfToProfit,
       ocfps: finiteOrNull(r.MGJYXJJE) !== null ? roundTo(Number(r.MGJYXJJE), 4) : null,
       eps: finiteOrNull(r.BASIC_EPS) !== null ? roundTo(Number(r.BASIC_EPS), 4) : null,
+      bps: finiteOrNull(r.BPS) !== null ? roundTo(Number(r.BPS), 4) : null,
       update_flag: '0',
     });
   }
   return out;
+}
+
+export interface ChinaBondYieldRow {
+  trade_date: string;
+  cgb_1y_bps: number;
+  cgb_10y_bps: number;
+  term_spread_bps: number;
+  source: 'chinabond_free';
+}
+
+function toIsoDate(ymd: string): string {
+  return `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+}
+
+/**
+ * 拉取中债国债收益率曲线（1Y / 10Y），返回单位为 bps（1% = 100 bps）。
+ */
+export async function fetchChinaBondYieldCurve(
+  startYmd: string,
+  endYmd: string,
+  timeoutMs = 10000,
+): Promise<ChinaBondYieldRow[]> {
+  const url = `https://yield.chinabond.com.cn/cbweb-pbc-web/pbc/historyQuery?startDate=${toIsoDate(startYmd)}&endDate=${toIsoDate(endYmd)}&gjqx=0&qxId=ycqx&locale=cn_ZH`;
+  let lastErr: unknown;
+  let htmlText = '';
+  for (let i = 0; i <= 2; i++) {
+    try {
+      const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      htmlText = await res.text();
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (i < 2) await new Promise(r => setTimeout(r, 350 * (i + 1)));
+    }
+  }
+  if (!htmlText) throw lastErr ?? new Error('ChinaBond yield fetch failed');
+
+  const tableMatches = htmlText.match(/<table[\s\S]*?<\/table>/gi) ?? [];
+  const rowsOut: ChinaBondYieldRow[] = [];
+  for (const tbl of tableMatches) {
+    const trList = tbl.match(/<tr[\s\S]*?<\/tr>/gi) ?? [];
+    if (trList.length < 2) continue;
+    const parseCells = (tr: string) =>
+      (tr.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) ?? []).map(cell =>
+        cell.replace(/<[^>]+>/g, '').replace(/&nbsp;/gi, ' ').trim(),
+      );
+    const firstRow = trList[0];
+    if (!firstRow) continue;
+    const headers = parseCells(firstRow);
+    const curveIdx = headers.findIndex(h => h.includes('曲线名称'));
+    const dateIdx = headers.findIndex(h => h === '日期' || h.includes('日期'));
+    const y1Idx = headers.findIndex(h => h === '1年' || h === '1.0年');
+    const y10Idx = headers.findIndex(h => h === '10年' || h === '10.0年');
+    if (curveIdx < 0 || dateIdx < 0 || y1Idx < 0 || y10Idx < 0) continue;
+
+    for (let r = 1; r < trList.length; r++) {
+      const cells = parseCells(trList[r]);
+      if (cells.length <= Math.max(curveIdx, dateIdx, y1Idx, y10Idx)) continue;
+      if (!cells[curveIdx].includes('中债国债收益率曲线')) continue;
+      const td = normalizeYmd(cells[dateIdx]);
+      const y1Pct = finiteOrNull(cells[y1Idx]);
+      const y10Pct = finiteOrNull(cells[y10Idx]);
+      if (!td || y1Pct === null || y10Pct === null) continue;
+      const cgb1yBps = roundTo(y1Pct * 100, 4);
+      const cgb10yBps = roundTo(y10Pct * 100, 4);
+      rowsOut.push({
+        trade_date: td,
+        cgb_1y_bps: cgb1yBps,
+        cgb_10y_bps: cgb10yBps,
+        term_spread_bps: roundTo(cgb10yBps - cgb1yBps, 4),
+        source: 'chinabond_free',
+      });
+    }
+    if (rowsOut.length > 0) break;
+  }
+  return rowsOut.sort((a, b) => a.trade_date.localeCompare(b.trade_date));
 }

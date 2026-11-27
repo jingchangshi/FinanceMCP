@@ -5,6 +5,7 @@ import { recentTradeDays } from './ingest.js';
 
 /** Explicit research baseline; thresholds are hypotheses, not a validated ranking. */
 export const QUALITY_CORE_VERSION = 'quality-core/1.0';
+export const QUALITY_CORE_V2_VERSION = 'quality-core/2.0';
 export const QUALITY_CORE_RULES = [
   { id: 'close', rule: '基准日有效收盘价 > 0' },
   { id: 'amount20_yi', rule: '最近20个成交bar的日均成交额 >= 1亿元' },
@@ -13,6 +14,64 @@ export const QUALITY_CORE_RULES = [
   { id: 'eps', rule: '最近可用财报每股收益 > 0' },
   { id: 'ocf_to_profit', rule: '最近可用财报经营现金流/利润 > 0%' },
 ] as const;
+
+export const QUALITY_CORE_V2_RULES = [
+  { id: 'roe_dt_annualized', rule: 'PIT 扣非净资产收益率年化 roe_dt > 6%' },
+  { id: 'eps', rule: 'PIT 基本每股收益 eps > 0' },
+  { id: 'ocf_to_profit', rule: 'PIT 经营现金流/归母净利 ocf_to_profit >= 50%' },
+  { id: 'bps', rule: 'PIT 每股净资产 bps > 0' },
+  { id: 'ann_date_pit', rule: '公告日严格满足 end_date <= ann_date <= as_of' },
+] as const;
+
+export function annualizeQuarterMultiplier(endDate: string | null | undefined): number {
+  const md = String(endDate ?? '').slice(4, 8);
+  if (md === '0331') return 4;
+  if (md === '0630') return 2;
+  if (md === '0930') return 4 / 3;
+  return 1;
+}
+
+export interface QualityCoreV2Input {
+  end_date: string | null | undefined;
+  ann_date: string | null | undefined;
+  roe_dt: number | null | undefined;
+  eps: number | null | undefined;
+  ocf_to_profit: number | null | undefined;
+  bps: number | null | undefined;
+}
+
+export interface QualityCoreV2Evaluation {
+  passed: boolean;
+  roe_dt_annualized: number | null;
+  failed_reasons: string[];
+}
+
+/**
+ * 纯函数校验 QualityCore v2（EXP-V3-14 B3 100k 个股防雷门控）：
+ * roe_dt 年化 > 6%, eps > 0, ocf_to_profit >= 50%, bps > 0, end_date <= ann_date <= asOf。
+ */
+export function evaluateQualityCoreV2(row: QualityCoreV2Input | null | undefined, asOf: string): QualityCoreV2Evaluation {
+  if (!row) return { passed: false, roe_dt_annualized: null, failed_reasons: ['MISSING_FINANCIAL_REPORT'] };
+  const failed: string[] = [];
+  const endDate = String(row.end_date ?? '');
+  const annDate = String(row.ann_date ?? '');
+  if (!/^\d{8}$/.test(endDate) || !/^\d{8}$/.test(annDate) || annDate > asOf || annDate < endDate) {
+    failed.push('LOOKAHEAD_ANN_DATE');
+  }
+  const mult = annualizeQuarterMultiplier(endDate);
+  const roeDtAnn = row.roe_dt != null && Number.isFinite(row.roe_dt) ? row.roe_dt * mult : null;
+  if (roeDtAnn === null || !(roeDtAnn > 6.0)) failed.push('LOW_ROE_DT');
+  if (row.eps == null || !Number.isFinite(row.eps) || !(row.eps > 0)) failed.push('NON_POSITIVE_EPS');
+  if (row.ocf_to_profit == null || !Number.isFinite(row.ocf_to_profit) || !(row.ocf_to_profit >= 50.0)) {
+    failed.push('LOW_OCF_TO_PROFIT');
+  }
+  if (row.bps == null || !Number.isFinite(row.bps) || !(row.bps > 0)) failed.push('NON_POSITIVE_BPS');
+  return {
+    passed: failed.length === 0,
+    roe_dt_annualized: roeDtAnn,
+    failed_reasons: failed,
+  };
+}
 
 export function qualityCore(db: DatabaseSync, asOf: string) {
   if (!/^\d{8}$/.test(asOf)) throw new Error('as_of must be YYYYMMDD');

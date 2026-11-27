@@ -5,7 +5,7 @@ import { marketBreadth } from './market.js';
 import { latestReportMeta, loadReport } from './report.js';
 
 export type IndexTrendState = 'BULL' | 'RANGE' | 'BEAR';
-export type MarketRegimeTier = 'OFFENSIVE' | 'STRUCTURAL' | 'RECOVERY' | 'DEFENSIVE';
+export type MarketRegimeTier = 'OFFENSIVE' | 'STRUCTURAL' | 'RECOVERY' | 'ICE_10' | 'DEFENSIVE';
 export type MarketStyleTier = 'GROWTH_LEADING' | 'VALUE_LEADING' | 'BALANCED';
 
 export interface AnchorTrendSnapshot {
@@ -89,6 +89,8 @@ export interface MarketRegimeResult {
     limit_down: number | null;
   };
   recovery_state?: RecoveryOverlayState;
+  ice10_active?: boolean;
+  ice10_remaining_days?: number;
   history: DailyRegimePoint[];
   regime_label_zh: string;
   style_label_zh: string;
@@ -137,6 +139,7 @@ export const REGIME_TARGET_EQUITY_BPS: Record<MarketRegimeTier, number> = {
   OFFENSIVE: 8500,
   STRUCTURAL: 6000,
   RECOVERY: 4000,
+  ICE_10: 3500,
   DEFENSIVE: 1500,
 };
 
@@ -144,6 +147,7 @@ export const REGIME_LABELS_ZH: Record<MarketRegimeTier, string> = {
   OFFENSIVE: '全面进攻档（目标总仓位 85%）',
   STRUCTURAL: '震荡结构档（目标总仓位 60%）',
   RECOVERY: '冰点复苏试探档（目标总仓位 40%）',
+  ICE_10: '冰点阻尼防守档（目标总仓位 35%）',
   DEFENSIVE: '空头防守档（目标总仓位 15%）',
 };
 
@@ -613,6 +617,19 @@ export function evaluateMarketRegime(
   const regime = lastPoint.confirmed_regime;
   const hysteresisHeld = regime !== 'RECOVERY' && regime !== rawRegime;
   const crashOverride = lastPoint.crash_override;
+
+  // v3.4.0 ICE_10：全市场站上 MA60 占比 < 10% 后 15 个交易日窗口（含触发当日）
+  let ice10UntilIdx = -1000;
+  for (let idx = 0; idx < history.length; idx += 1) {
+    const p60 = history[idx].pct_above_ma60;
+    if (p60 !== null && p60 < 0.10) {
+      ice10UntilIdx = idx + 15;
+    }
+  }
+  const lastIdx = history.length - 1;
+  const ice10WindowActive = lastIdx <= ice10UntilIdx;
+  const ice10RemainingDays = ice10WindowActive ? Math.max(0, ice10UntilIdx - lastIdx) : 0;
+  const ice10Active = regime === 'DEFENSIVE' && ice10WindowActive;
   // Display history stays bounded; the confirmed state above is carried from the longer replay.
   const displayHistory = history.slice(Math.max(0, history.length - displayLookback));
 
@@ -684,6 +701,8 @@ export function evaluateMarketRegime(
       limit_down: latestBreadth.limitDown,
     },
     ...(recoveryState ? { recovery_state: recoveryState } : {}),
+    ice10_active: ice10Active,
+    ice10_remaining_days: ice10RemainingDays,
     history: displayHistory,
     regime_label_zh: REGIME_LABELS_ZH[regime],
     style_label_zh: STYLE_LABELS_ZH[style],

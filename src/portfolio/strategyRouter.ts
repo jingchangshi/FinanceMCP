@@ -4,8 +4,14 @@ import {
   type MarketRegimeResult,
   type MarketRegimeTier,
 } from '../ashare/marketRegime.js';
+import type { FundamentalEnvelopeState, FundamentalRegimeResult } from '../ashare/fundamentalRegime.js';
 import { readSnapshot } from './account.js';
 import { portfolioTableExists } from './db.js';
+import {
+  evaluateForwardViewOverlay,
+  type EvaluatedFvoState,
+  type ForwardViewOverlayRow,
+} from './forwardViewOverlay.js';
 import { buildNavSeries, readBaseline } from './ledger.js';
 import { buildLedgerPriceTable } from './riskPolicy.js';
 import { loadApprovedV3Policy, type ApprovedV3Policy } from './v3Policy.js';
@@ -104,6 +110,8 @@ export interface StrategyRouterResult {
     sector_pioneer_bps: number;
     defensive_cash_bps: number;
   };
+  b1_state: FundamentalEnvelopeState;
+  fvo: EvaluatedFvoState;
   sub_strategies: {
     s_deconcentrate: SubStrategyStatus;
     s_base_super_etf: SubStrategyStatus;
@@ -133,6 +141,14 @@ export interface EvaluateStrategyRouterInput {
   deconcentrationMode?: 'STANDARD' | 'BOTTOM_GRIND_25';
   /** 调用方已加载的策略（一次加载传给 router/screen/engine）；缺省时按实际 accountId/asOf 自行加载。 */
   policy?: ApprovedV3Policy;
+  /** v3.4.0 基本面 B1 756d 极值包络评估结果（缺省按中性 100% 透传）。 */
+  fundamentalRegime?: FundamentalRegimeResult | null;
+  /** v3.4.0 已评估的纯标量 FVO 状态（可选覆盖，免重复查库）。 */
+  fvo?: EvaluatedFvoState | null;
+  /** v3.4.0 测试/夹具注入 FVO 行。 */
+  fvoOverride?: Partial<ForwardViewOverlayRow> | null;
+  /** v3.4.0 近 60 交易日 FVO 归因（bps），<= -150bps 时带宽减半至 ±500bps。 */
+  fvoAttribution60dBps?: number | null;
 }
 
 const r2 = (v: number): number => Math.round(v * 100) / 100;
@@ -589,11 +605,64 @@ function fmtPct(v: number): string {
   return Math.round(v * 10) % 10 === 0 ? v.toFixed(0) : v.toFixed(1);
 }
 
+function baseRegimeEquityBpsV34(
+  regime: MarketRegimeTier,
+  policy: ApprovedV3Policy,
+  b1State: FundamentalEnvelopeState,
+): number {
+  if (policy.fundamental_envelope_enabled && b1State === 'EXTREME_UNDERVAL') {
+    if (regime === 'OFFENSIVE') return policy.fundamental_underval_offensive_bps;
+    if (regime === 'STRUCTURAL') return policy.fundamental_underval_structural_bps;
+    if (regime === 'RECOVERY') return policy.fundamental_underval_recovery_bps;
+    if (regime === 'ICE_10') return policy.fundamental_underval_ice10_bps;
+    return policy.fundamental_underval_defensive_bps;
+  }
+  if (policy.fundamental_envelope_enabled && b1State === 'EXTREME_BUBBLE') {
+    if (regime === 'OFFENSIVE') return policy.fundamental_bubble_offensive_bps;
+    if (regime === 'STRUCTURAL') return policy.fundamental_bubble_structural_bps;
+    if (regime === 'RECOVERY') return policy.fundamental_bubble_recovery_bps;
+    if (regime === 'ICE_10') return policy.fundamental_bubble_ice10_bps;
+    return policy.fundamental_bubble_defensive_bps;
+  }
+  if (regime === 'OFFENSIVE') return REGIME_TARGET_EQUITY_BPS.OFFENSIVE;
+  if (regime === 'STRUCTURAL') return REGIME_TARGET_EQUITY_BPS.STRUCTURAL;
+  if (regime === 'RECOVERY') return policy.recovery_equity_bps;
+  if (regime === 'ICE_10') return policy.ice10_equity_bps;
+  return policy.lowvol_core_mode === 'CORE_40' ? 2500 : REGIME_TARGET_EQUITY_BPS.DEFENSIVE;
+}
+
 function targetBucketsFor(
   regime: MarketRegimeTier,
   policy: ApprovedV3Policy,
   bp1Allowed: boolean,
+  b1State: FundamentalEnvelopeState = 'NEUTRAL',
+  fvoDeltaBps = 0,
 ): StrategyRouterResult['targets'] {
+  if (policy.lowvol_core_mode === 'CORE_40') {
+    const baseEq = baseRegimeEquityBpsV34(regime, policy, b1State);
+    const fvoFloor = 2500;
+    const fvoCap = policy.fundamental_envelope_enabled && b1State === 'EXTREME_BUBBLE'
+      ? Math.min(8500, policy.fundamental_bubble_offensive_bps)
+      : 8500;
+    const totalEq = policy.fvo_enabled
+      ? Math.min(fvoCap, Math.max(fvoFloor, baseEq + fvoDeltaBps))
+      : baseEq;
+    const sec = policy.sector_pioneer_enabled && (regime === 'OFFENSIVE' || regime === 'STRUCTURAL')
+      ? Math.min(policy.sector_pioneer_max_weight_bps, 2000)
+      : 0;
+    const coreMin = policy.lowvol_core_permanent_share_bps + policy.gold_core_share_bps;
+    const stockCap = bp1Allowed && (regime === 'OFFENSIVE' || regime === 'STRUCTURAL')
+      ? Math.min(regime === 'OFFENSIVE' ? 3500 : 2000, Math.max(0, totalEq - coreMin - sec))
+      : 0;
+    return {
+      target_equity_bps: totalEq,
+      base_super_etf_bps: Math.max(0, totalEq - sec - stockCap),
+      pioneer_bps: stockCap,
+      sector_pioneer_bps: sec,
+      defensive_cash_bps: Math.max(0, 10000 - totalEq),
+    };
+  }
+
   const isV32Legacy = !policy.sector_pioneer_enabled
     && policy.stock_bp1_min_investable_nav_cny === 0
     && !policy.stock_bp1_block_during_deconcentration;
@@ -611,8 +680,9 @@ function targetBucketsFor(
     return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.DEFENSIVE, base_super_etf_bps: 1500, pioneer_bps: 0, sector_pioneer_bps: 0, defensive_cash_bps: 8500 };
   }
 
-  if (regime === 'DEFENSIVE') {
-    return { target_equity_bps: REGIME_TARGET_EQUITY_BPS.DEFENSIVE, base_super_etf_bps: 1500, pioneer_bps: 0, sector_pioneer_bps: 0, defensive_cash_bps: 8500 };
+  if (regime === 'DEFENSIVE' || regime === 'ICE_10') {
+    const defEq = regime === 'ICE_10' ? policy.ice10_equity_bps : REGIME_TARGET_EQUITY_BPS.DEFENSIVE;
+    return { target_equity_bps: defEq, base_super_etf_bps: defEq, pioneer_bps: 0, sector_pioneer_bps: 0, defensive_cash_bps: 10000 - defEq };
   }
   if (regime === 'RECOVERY') {
     const rec = policy.recovery_equity_bps;
@@ -830,9 +900,36 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
   const bp1DeconcOk = !(v3Policy.stock_bp1_block_during_deconcentration && deconcActive);
   const bp1Allowed = bp1CapitalOk && bp1DeconcOk;
 
+  const b1State: FundamentalEnvelopeState = input.fundamentalRegime?.b1_state ?? 'NEUTRAL';
+  const ice10Triggered = v3Policy.ice10_floor_enabled
+    && input.marketRegime.regime === 'DEFENSIVE'
+    && (Boolean(input.marketRegime.ice10_active) || (input.marketRegime.ice10_remaining_days ?? 0) > 0);
   const effectiveRegime: MarketRegimeTier = circuitBreakerStatus === 'L2_LOCKED'
     ? 'DEFENSIVE'
-    : input.marketRegime.regime;
+    : (ice10Triggered ? 'ICE_10' : input.marketRegime.regime);
+  const fvoState: EvaluatedFvoState = input.fvo
+    ?? (v3Policy.fvo_enabled
+      ? evaluateForwardViewOverlay({
+          portfolioDb: input.portfolioDb,
+          accountId: input.accountId,
+          asOf: input.asOf,
+          circuitBreakerStatus,
+          hwmDrawdownBps,
+          workHwmDrawdownBps,
+          b1State,
+          attribution60dBps: input.fvoAttribution60dBps ?? null,
+          overrideOverlay: input.fvoOverride,
+        })
+      : {
+          active_row: null,
+          raw_delta_bps: 0,
+          effective_delta_bps: 0,
+          attribution_60d_bps: null,
+          band_halved: false,
+          max_abs_delta_bps: 1000,
+          zeroed_reason: null,
+          summary_zh: '0 主观偏移，纯系统运行',
+        });
   const targets: StrategyRouterResult['targets'] = circuitBreakerStatus === 'L2_LOCKED'
     ? {
         target_equity_bps: postBreakerEquityBps,
@@ -841,7 +938,7 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
         sector_pioneer_bps: 0,
         defensive_cash_bps: 10000 - postBreakerEquityBps,
       }
-    : targetBucketsFor(effectiveRegime, v3Policy, bp1Allowed);
+    : targetBucketsFor(effectiveRegime, v3Policy, bp1Allowed, b1State, fvoState.effective_delta_bps);
 
   if (circuitBreakerStatus !== 'L2_LOCKED') {
     let capBps = targets.target_equity_bps;
@@ -876,6 +973,7 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     circuitBreakerStatus !== 'NORMAL'
     || effectiveRegime === 'DEFENSIVE'
     || effectiveRegime === 'RECOVERY'
+    || effectiveRegime === 'ICE_10'
     || !bp1Allowed
   ) {
     sStockSwing = 'STOP_ONLY';
@@ -902,9 +1000,9 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
           : `正常受控（位于 ${l2PctText}% 熔断生命线之上）`;
 
   const stockSwingLabelZh = sStockSwing === 'STOP_ONLY'
-    ? !bp1DeconcOk && circuitBreakerStatus === 'NORMAL' && effectiveRegime !== 'DEFENSIVE' && effectiveRegime !== 'RECOVERY'
+    ? !bp1DeconcOk && circuitBreakerStatus === 'NORMAL' && effectiveRegime !== 'DEFENSIVE' && effectiveRegime !== 'RECOVERY' && effectiveRegime !== 'ICE_10'
       ? '存量重仓换马未完成前由超级行业主题指数基金先导替代，个股仅允许存量止损或止盈'
-      : !bp1CapitalOk && circuitBreakerStatus === 'NORMAL' && effectiveRegime !== 'DEFENSIVE' && effectiveRegime !== 'RECOVERY'
+      : !bp1CapitalOk && circuitBreakerStatus === 'NORMAL' && effectiveRegime !== 'DEFENSIVE' && effectiveRegime !== 'RECOVERY' && effectiveRegime !== 'ICE_10'
         ? '可投资净值未满 10 万元门槛，暂由超级行业主题指数基金先导替代，个股仅允许存量止损或止盈'
         : '仅允许执行存量止损或止盈，禁止新开仓'
     : sStockSwing === 'LOCKED_PENDING_VALIDATION'
@@ -959,6 +1057,8 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
       lifeline_buffer_pct: lifelineBufferPct,
     },
     targets,
+    b1_state: b1State,
+    fvo: fvoState,
     sub_strategies: {
       s_deconcentrate: v3Policy.deconcentration_plan_enabled ? sDeconcentrate : 'STOP_ONLY',
       s_base_super_etf: sBaseSuperEtf,

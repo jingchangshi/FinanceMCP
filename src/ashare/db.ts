@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS adj_factor (
   ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, adj_factor REAL,
   PRIMARY KEY (ts_code, trade_date)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS xdxr (
+  ts_code TEXT NOT NULL, ex_date TEXT NOT NULL, category INTEGER NOT NULL,
+  fenhong REAL, peigujia REAL, songzhuangu REAL, peigu REAL, suogu REAL,
+  updated_at TEXT,
+  PRIMARY KEY (ts_code, ex_date, category)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS xdxr_date ON xdxr(ex_date);
 CREATE TABLE IF NOT EXISTS stk_limit (
   ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, up_limit REAL, down_limit REAL,
   PRIMARY KEY (ts_code, trade_date)
@@ -57,10 +64,27 @@ CREATE TABLE IF NOT EXISTS index_daily (
 CREATE TABLE IF NOT EXISTS fina_indicator (
   ts_code TEXT NOT NULL, end_date TEXT NOT NULL, ann_date TEXT NOT NULL,
   roe REAL, roe_dt REAL, netprofit_yoy REAL, dt_netprofit_yoy REAL, or_yoy REAL,
-  grossprofit_margin REAL, debt_to_assets REAL, ocf_to_profit REAL, ocfps REAL, eps REAL,
+  grossprofit_margin REAL, debt_to_assets REAL, ocf_to_profit REAL, ocfps REAL, eps REAL, bps REAL,
   PRIMARY KEY (ts_code, end_date, ann_date)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS fina_ann ON fina_indicator(ann_date);
+CREATE TABLE IF NOT EXISTS macro_yield_curve (
+  trade_date TEXT PRIMARY KEY,
+  cgb_1y_bps REAL,
+  cgb_10y_bps REAL,
+  term_spread_bps REAL,
+  source TEXT
+);
+CREATE TABLE IF NOT EXISTS market_fundamental_daily (
+  trade_date TEXT PRIMARY KEY,
+  ep_median_bps REAL,
+  bp_median_bps REAL,
+  dv_lowvol_bps REAL,
+  erp_bps REAL,
+  erp_pct_756 REAL,
+  bp_pct_756 REAL,
+  edi_bps REAL
+);
 CREATE TABLE IF NOT EXISTS sync_log (
   dataset TEXT NOT NULL, key TEXT NOT NULL,
   rows INTEGER NOT NULL, status TEXT NOT NULL, message TEXT,
@@ -246,6 +270,14 @@ function ensureSyncColumns(db: DatabaseSync): void {
   }
 }
 
+/** 幂等补齐 fina_indicator.bps 列（兼容历史缓存库）。 */
+function ensureFinaBpsColumn(db: DatabaseSync): void {
+  const cols = (db.prepare('PRAGMA table_info(fina_indicator)').all() as any[]).map(c => c.name);
+  if (cols.length > 0 && !cols.includes('bps')) {
+    db.exec('ALTER TABLE fina_indicator ADD COLUMN bps REAL');
+  }
+}
+
 /** Whether the live schema has every column the read-only MCP connection queries. */
 function schemaCurrent(db: DatabaseSync): boolean {
   const has = (table: string, col: string) => (db.prepare(`PRAGMA table_info(${table})`).all() as any[]).some(c => c.name === col);
@@ -268,6 +300,7 @@ export function openAshareDb(path = ashareDbPath()): DatabaseSync {
   db.exec(MARKET_SCHEMA + STATE_SCHEMA + ETF_SCHEMA);
   ensureReportRunMode(db);
   ensureSyncColumns(db);
+  ensureFinaBpsColumn(db);
   if (STOCK_FIRST_TABLES.some(t => isDateFirst(db, t))) {
     console.error('[ashare] 缓存使用旧主键布局，请运行 `finance-ashare migrate` 以提升扫描性能');
   } else {

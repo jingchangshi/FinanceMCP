@@ -16,7 +16,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from feishu_render import check_forbidden, render_xml, strip_tags, validate_sections  # noqa: E402
+from feishu_render import (  # noqa: E402
+    check_forbidden,
+    check_internal_tokens,
+    check_markdown_leak,
+    render_xml,
+    strip_tags,
+    validate_sections,
+)
 from sections_from_bundle import build_sections  # noqa: E402
 
 
@@ -713,3 +720,55 @@ class TestV3CockpitSections(unittest.TestCase):
         self.assertNotIn("按四批换马持有观察", vis)
         self.assertNotIn("159649.SZ（免五", vis)
         self.assertNotIn("159649.SZ 免五", vis)
+
+    def test_v340_three_pillar_cockpit_and_zero_fvo_clean(self):
+        bundle = self._v3_bundle(actionable=False)
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["market_regime"]["regime"] = "ICE_10"
+        cockpit["market_regime"]["regime_label_zh"] = "冰点阻尼防守档（目标总仓位 35%）"
+        cockpit["market_regime"]["target_equity_bps"] = 3500
+        cockpit["market_regime"]["target_equity_pct"] = 35
+        cockpit["market_regime"]["defensive_cash_bps"] = 6500
+        cockpit["market_regime"]["defensive_cash_pct"] = 65
+        cockpit["router"]["effective_regime"] = "ICE_10"
+        cockpit["fundamental_regime"] = {
+            "available": True,
+            "b1_state": "EXTREME_UNDERVAL",
+            "b1_state_label_zh": "极度低估（756日风险溢价与市净率双确认）",
+            "erp_pct_756": 0.85,
+            "bp_pct_756": 0.75,
+            "dv_lowvol_bps": 465,
+            "term_spread_bps": 62,
+            "edi_bps": 1420,
+        }
+        cockpit["fvo"] = {
+            "raw_delta_bps": 0,
+            "effective_delta_bps": 0,
+            "zeroed_reason": None,
+            "summary_zh": "0 主观偏移，纯系统运行",
+        }
+        sections = build_sections(bundle, generated_at="2026-11-30 19:30")
+        self.assertEqual(validate_sections(sections), [])
+        xml = render_xml(sections)
+        vis = strip_tags(xml)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertEqual(check_markdown_leak(vis), [])
+        self.assertIn("【技术面】", vis)
+        self.assertIn("【基本面】", vis)
+        self.assertIn("【未来预期】", vis)
+        self.assertIn("0 主观偏移，纯系统运行", vis)
+        self.assertIn("期限利差 +62 基点", vis)
+        self.assertIn("盈利扩散度 +14.2%", vis)
+
+        from feishu_notify import build_notification_markdown
+        md, _ = build_notification_markdown(
+            bundle,
+            {"trade_date": "20261130", "document_url": "https://my.feishu.cn/docx/doc-v34"},
+        )
+        self.assertIn("【技术面】", md)
+        self.assertIn("【基本面】", md)
+        self.assertIn("【未来预期】", md)
+        self.assertIn("0 主观偏移，纯系统运行", md)
+        self.assertEqual(check_forbidden(md), [])
+        self.assertEqual(check_internal_tokens(md), [])

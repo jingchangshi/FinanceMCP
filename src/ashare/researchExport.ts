@@ -35,6 +35,8 @@ export const EXPORT_DATASETS = Object.freeze({
   gap_check: 'gap_check',
   data_audit: 'data_audit',
   quality_check: 'quality_check',
+  macro_yield_curve: 'macro_yield_curve',
+  market_fundamental_daily: 'market_fundamental_daily',
 } as const);
 
 export type ExportDatasetName = keyof typeof EXPORT_DATASETS;
@@ -58,6 +60,8 @@ const DATASET_TIME_COLUMN: Record<ExportDatasetName, string | null> = Object.fre
   // 按 end_date 过滤只限制审计窗口，不代表审计在 as-of 日已经产生；见非 PIT 标记。
   data_audit: 'end_date',
   quality_check: 'trade_date',
+  macro_yield_curve: 'trade_date',
+  market_fundamental_daily: 'trade_date',
 });
 
 /**

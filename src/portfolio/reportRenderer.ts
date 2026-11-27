@@ -1312,7 +1312,16 @@ function renderSectionH(r: DailyReportResult): string {
 function renderUser(r: DailyReportResult, weekend: boolean, annotations: AnnotationIndex = new Map()): string {
   const view = buildView(r);
   const title = renderTitle(r, weekend);
+  const pillars = r.v3_cockpit?.three_pillar_cockpit;
+  const cockpitTable = pillars
+    ? [
+        '| 【技术面】 | 【基本面】 | 【未来预期】 |',
+        '|---|---|---|',
+        `| ${zh(pillars.technical_zh)} | ${zh(pillars.fundamental_zh)} | ${zh(pillars.forward_view_zh)} |`,
+      ].join('\n')
+    : null;
   const sections = [
+    ...(cockpitTable ? [cockpitTable] : []),
     `## A. 今日结论\n\n${renderSectionA(r, view)}`,
     `## B. 下一交易日关注重点\n\n${renderSectionB(r)}`,
     `## C. 我的账户\n\n${renderSectionC(r, view)}`,

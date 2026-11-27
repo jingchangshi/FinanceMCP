@@ -321,6 +321,62 @@ export interface ApprovedV3Policy {
   equity_align_drift_band_bps: number;
   chassis_single_etf_per_style_bucket: boolean;
   p1_etf_trailing_sleeves: string[];
+  // ---- v3.4.0 三支柱（CORE_40 + ICE_10 + B1 + REGIME_ONLY + QualityCore v2 + 标量 FVO）
+  lowvol_core_mode: 'LEGACY' | 'CORE_40';
+  gold_core_etf: string;
+  gold_core_share_bps: number;
+  gold_core_drift_band_bps: number;
+  gold_core_min_trade_cny: number;
+  strategic_bond_core_share_bps: number;
+  defensive_bond_reservoir_min_trade_cny: number;
+  satellite_max_share_bps: number;
+  ice10_floor_enabled: boolean;
+  ice10_pct_ma60_max_bps: number;
+  ice10_window_trade_days: number;
+  ice10_equity_bps: number;
+  ice10_disable_on_p0_lock: boolean;
+  fundamental_envelope_enabled: boolean;
+  fundamental_envelope_mode: string;
+  fundamental_envelope_lookback_days: number;
+  fundamental_hysteresis_bps: number;
+  fundamental_underval_erp_enter_bps: number;
+  fundamental_underval_erp_exit_bps: number;
+  fundamental_underval_bp_enter_bps: number;
+  fundamental_underval_bp_exit_bps: number;
+  fundamental_bubble_erp_enter_bps: number;
+  fundamental_bubble_erp_exit_bps: number;
+  fundamental_bubble_bp_enter_bps: number;
+  fundamental_bubble_bp_exit_bps: number;
+  fundamental_underval_offensive_bps: number;
+  fundamental_underval_structural_bps: number;
+  fundamental_underval_recovery_bps: number;
+  fundamental_underval_ice10_bps: number;
+  fundamental_underval_defensive_bps: number;
+  fundamental_bubble_offensive_bps: number;
+  fundamental_bubble_structural_bps: number;
+  fundamental_bubble_recovery_bps: number;
+  fundamental_bubble_ice10_bps: number;
+  fundamental_bubble_defensive_bps: number;
+  align_trigger_mode: 'STANDARD' | 'REGIME_ONLY';
+  satellite_align_drift_band_bps: number;
+  quality_core_version: 'v1' | 'v2';
+  quality_core_roe_dt_ann_min_bps: number;
+  quality_core_eps_min: number;
+  quality_core_ocf_to_profit_min_bps: number;
+  quality_core_bps_min: number;
+  quality_core_strict_ann_date: boolean;
+  stock_bp1_reverify_nav_cny: number;
+  fvo_enabled: boolean;
+  fvo_scalar_only: boolean;
+  fvo_equity_delta_default_bps: number;
+  fvo_max_abs_delta_bps: number;
+  fvo_max_ttl_trade_days: number;
+  fvo_zero_positive_on_l1_or_bubble: boolean;
+  fvo_l1_drawdown_bps: number;
+  fvo_60d_attribution_halve_trigger_bps: number;
+  fvo_60d_attribution_halved_cap_bps: number;
+  policy_freeze_start_date: string | null;
+  policy_freeze_end_date: string | null;
 }
 
 const VALID_BP_STATUSES = new Set(['ENABLED', 'DISABLED', 'DROPPED_NEGATIVE_OOS']);
@@ -331,6 +387,7 @@ const VALID_P1_ETF_SLEEVES = new Set([
   'NONE',
   'SECTOR_PIONEER',
   'CHASSIS_LOWVOL',
+  'CHASSIS_GOLD',
   'CHASSIS_VALUE',
   'CHASSIS_GROWTH',
   'BOND_RESERVOIR',
@@ -347,6 +404,16 @@ export function isVersionAtLeast331(version: string): boolean {
   if (major !== 3) return major > 3;
   if (minor !== 3) return minor > 3;
   return patch >= 1;
+}
+
+export function isVersionAtLeast340(version: string): boolean {
+  const clean = version.trim().replace(/^v/i, '');
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(clean);
+  if (!m) return false;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  if (major !== 3) return major > 3;
+  return minor >= 4;
 }
 
 function parseStrictInt(raw: string | undefined): number | null {
@@ -524,6 +591,120 @@ export function validateV331Parameters(p: Record<string, string>): string[] {
   return errors;
 }
 
+const B2_FORBIDDEN_KEY_SET = new Set([
+  'implied_expectation_tilt',
+  'style_tilt',
+  'fvo_style_tilt',
+  'macro_implied_expectation_enabled',
+  'expectation_style_tilt',
+  'b2_enabled',
+]);
+
+export function findForbiddenB2Keys(params: Record<string, string>): string[] {
+  const hits: string[] = [];
+  for (const key of Object.keys(params)) {
+    const lower = key.trim().toLowerCase();
+    if (lower.startsWith('b2_') || lower.includes('implied_expectation_tilt') || lower.includes('style_tilt') || B2_FORBIDDEN_KEY_SET.has(lower)) {
+      hits.push(key);
+    }
+  }
+  return hits;
+}
+
+export function validateV340Parameters(params: Record<string, string>): string[] {
+  const errors = validateV331Parameters(params);
+  for (const b2Key of findForbiddenB2Keys(params)) {
+    errors.push(`forbidden_b2_param:${b2Key}`);
+  }
+  const reqInt = (key: string, minVal: number, maxVal = Number.MAX_SAFE_INTEGER): number | null => {
+    const parsed = parseStrictInt(params[key]);
+    if (parsed === null || parsed < minVal || parsed > maxVal) {
+      errors.push(`invalid_int:${key}:${params[key] ?? 'MISSING'}`);
+      return null;
+    }
+    return parsed;
+  };
+  const reqBool = (key: string): boolean | null => {
+    const parsed = parseStrictBool(params[key]);
+    if (parsed === null) {
+      errors.push(`invalid_bool:${key}:${params[key] ?? 'MISSING'}`);
+      return null;
+    }
+    return parsed;
+  };
+  const reqEnum = (key: string, allowed: Set<string>): string | null => {
+    const raw = params[key]?.trim();
+    if (!raw || !allowed.has(raw)) {
+      errors.push(`invalid_enum:${key}:${params[key] ?? 'MISSING'}`);
+      return null;
+    }
+    return raw;
+  };
+
+  reqEnum('lowvol_core_mode', new Set(['CORE_40', 'LEGACY']));
+  if (!params.gold_core_etf?.trim()) errors.push('missing_param:gold_core_etf');
+  reqInt('gold_core_share_bps', 0, 5000);
+  reqInt('gold_core_drift_band_bps', 0, 5000);
+  reqInt('gold_core_min_trade_cny', 0);
+  reqInt('strategic_bond_core_share_bps', 0, 5000);
+  reqInt('defensive_bond_reservoir_min_trade_cny', 0);
+  reqInt('satellite_max_share_bps', 0, 10000);
+
+  reqBool('ice10_floor_enabled');
+  reqInt('ice10_pct_ma60_max_bps', 0, 5000);
+  reqInt('ice10_window_trade_days', 1, 60);
+  reqInt('ice10_equity_bps', 0, 10000);
+  reqBool('ice10_disable_on_p0_lock');
+
+  reqBool('fundamental_envelope_enabled');
+  if (!params.fundamental_envelope_mode?.trim()) errors.push('missing_param:fundamental_envelope_mode');
+  reqInt('fundamental_envelope_lookback_days', 60, 2500);
+  reqInt('fundamental_hysteresis_bps', 0, 3000);
+  reqInt('fundamental_underval_erp_enter_bps', 0, 10000);
+  reqInt('fundamental_underval_erp_exit_bps', 0, 10000);
+  reqInt('fundamental_underval_bp_enter_bps', 0, 10000);
+  reqInt('fundamental_underval_bp_exit_bps', 0, 10000);
+  reqInt('fundamental_bubble_erp_enter_bps', 0, 10000);
+  reqInt('fundamental_bubble_erp_exit_bps', 0, 10000);
+  reqInt('fundamental_bubble_bp_enter_bps', 0, 10000);
+  reqInt('fundamental_bubble_bp_exit_bps', 0, 10000);
+  reqInt('fundamental_underval_offensive_bps', 0, 10000);
+  reqInt('fundamental_underval_structural_bps', 0, 10000);
+  reqInt('fundamental_underval_recovery_bps', 0, 10000);
+  reqInt('fundamental_underval_ice10_bps', 0, 10000);
+  reqInt('fundamental_underval_defensive_bps', 0, 10000);
+  reqInt('fundamental_bubble_offensive_bps', 0, 10000);
+  reqInt('fundamental_bubble_structural_bps', 0, 10000);
+  reqInt('fundamental_bubble_recovery_bps', 0, 10000);
+  reqInt('fundamental_bubble_ice10_bps', 0, 10000);
+  reqInt('fundamental_bubble_defensive_bps', 0, 10000);
+
+  reqEnum('align_trigger_mode', new Set(['REGIME_ONLY', 'STANDARD']));
+  reqInt('satellite_align_drift_band_bps', 0, 10000);
+
+  reqEnum('quality_core_version', new Set(['v1', 'v2']));
+  reqInt('quality_core_roe_dt_ann_min_bps', 0, 10000);
+  reqInt('quality_core_eps_min', 0, 10000);
+  reqInt('quality_core_ocf_to_profit_min_bps', 0, 20000);
+  reqInt('quality_core_bps_min', 0, 10000);
+  reqBool('quality_core_strict_ann_date');
+  reqInt('stock_bp1_reverify_nav_cny', 0);
+
+  reqBool('fvo_enabled');
+  const scalarOnly = reqBool('fvo_scalar_only');
+  if (scalarOnly === false) errors.push('invalid_bool:fvo_scalar_only_must_be_true');
+  const fvoDefault = reqInt('fvo_equity_delta_default_bps', -1000, 1000);
+  if (fvoDefault !== null && fvoDefault !== 0) errors.push(`invalid_int:fvo_equity_delta_default_bps:${fvoDefault}`);
+  reqInt('fvo_max_abs_delta_bps', 0, 1000);
+  reqInt('fvo_max_ttl_trade_days', 1, 20);
+  reqBool('fvo_zero_positive_on_l1_or_bubble');
+  reqInt('fvo_l1_drawdown_bps', 0, 5000);
+  reqInt('fvo_60d_attribution_halve_trigger_bps', -5000, 0);
+  reqInt('fvo_60d_attribution_halved_cap_bps', 0, 1000);
+
+  return errors;
+}
+
 function intParam(params: Record<string, string>, key: string, fallback: number): number {
   const n = Number(params[key]);
   return Number.isSafeInteger(n) ? n : fallback;
@@ -616,7 +797,25 @@ function tryLoadOverrideRelease(overridePath: string, embedded: StrategyRelease)
       blocksNewBuys: true,
     };
   }
-  if (isVersionAtLeast331(release.strategy.version)) {
+  for (const b2Key of findForbiddenB2Keys(release.parameters)) {
+    return {
+      release: null,
+      hash: null,
+      diagnostics: [`v3_policy_override_forbidden_b2:${b2Key}`],
+      blocksNewBuys: true,
+    };
+  }
+  if (isVersionAtLeast340(release.strategy.version)) {
+    const schemaErrors = validateV340Parameters(release.parameters);
+    if (schemaErrors.length > 0) {
+      return {
+        release: null,
+        hash: null,
+        diagnostics: schemaErrors.map(err => `v3_policy_override_schema_invalid:${err}`),
+        blocksNewBuys: true,
+      };
+    }
+  } else if (isVersionAtLeast331(release.strategy.version)) {
     const schemaErrors = validateV331Parameters(release.parameters);
     if (schemaErrors.length > 0) {
       return {
@@ -816,5 +1015,60 @@ export function loadApprovedV3Policy(options: { accountId?: string; asOf?: strin
     equity_align_drift_band_bps: intParam(p, 'equity_align_drift_band_bps', 500),
     chassis_single_etf_per_style_bucket: boolParam(p, 'chassis_single_etf_per_style_bucket', false),
     p1_etf_trailing_sleeves: parseSleeveList(p.p1_etf_trailing_sleeves, ['ALL']).sleeves,
+    lowvol_core_mode: p.lowvol_core_mode?.trim() === 'CORE_40' ? 'CORE_40' : 'LEGACY',
+    gold_core_etf: p.gold_core_etf?.trim() || '518880.SH',
+    gold_core_share_bps: intParam(p, 'gold_core_share_bps', 0),
+    gold_core_drift_band_bps: intParam(p, 'gold_core_drift_band_bps', 400),
+    gold_core_min_trade_cny: intParam(p, 'gold_core_min_trade_cny', 5000),
+    strategic_bond_core_share_bps: intParam(p, 'strategic_bond_core_share_bps', 0),
+    defensive_bond_reservoir_min_trade_cny: intParam(p, 'defensive_bond_reservoir_min_trade_cny', 0),
+    satellite_max_share_bps: intParam(p, 'satellite_max_share_bps', 6000),
+    ice10_floor_enabled: boolParam(p, 'ice10_floor_enabled', false),
+    ice10_pct_ma60_max_bps: intParam(p, 'ice10_pct_ma60_max_bps', 1000),
+    ice10_window_trade_days: intParam(p, 'ice10_window_trade_days', 15),
+    ice10_equity_bps: intParam(p, 'ice10_equity_bps', 3500),
+    ice10_disable_on_p0_lock: boolParam(p, 'ice10_disable_on_p0_lock', true),
+    fundamental_envelope_enabled: boolParam(p, 'fundamental_envelope_enabled', false),
+    fundamental_envelope_mode: p.fundamental_envelope_mode?.trim() || 'NONE',
+    fundamental_envelope_lookback_days: intParam(p, 'fundamental_envelope_lookback_days', 756),
+    fundamental_hysteresis_bps: intParam(p, 'fundamental_hysteresis_bps', 500),
+    fundamental_underval_erp_enter_bps: intParam(p, 'fundamental_underval_erp_enter_bps', 8000),
+    fundamental_underval_erp_exit_bps: intParam(p, 'fundamental_underval_erp_exit_bps', 7500),
+    fundamental_underval_bp_enter_bps: intParam(p, 'fundamental_underval_bp_enter_bps', 7000),
+    fundamental_underval_bp_exit_bps: intParam(p, 'fundamental_underval_bp_exit_bps', 6500),
+    fundamental_bubble_erp_enter_bps: intParam(p, 'fundamental_bubble_erp_enter_bps', 1500),
+    fundamental_bubble_erp_exit_bps: intParam(p, 'fundamental_bubble_erp_exit_bps', 2000),
+    fundamental_bubble_bp_enter_bps: intParam(p, 'fundamental_bubble_bp_enter_bps', 1500),
+    fundamental_bubble_bp_exit_bps: intParam(p, 'fundamental_bubble_bp_exit_bps', 2000),
+    fundamental_underval_offensive_bps: intParam(p, 'fundamental_underval_offensive_bps', 8500),
+    fundamental_underval_structural_bps: intParam(p, 'fundamental_underval_structural_bps', 6500),
+    fundamental_underval_recovery_bps: intParam(p, 'fundamental_underval_recovery_bps', 5000),
+    fundamental_underval_ice10_bps: intParam(p, 'fundamental_underval_ice10_bps', 4250),
+    fundamental_underval_defensive_bps: intParam(p, 'fundamental_underval_defensive_bps', 2500),
+    fundamental_bubble_offensive_bps: intParam(p, 'fundamental_bubble_offensive_bps', 7000),
+    fundamental_bubble_structural_bps: intParam(p, 'fundamental_bubble_structural_bps', 5000),
+    fundamental_bubble_recovery_bps: intParam(p, 'fundamental_bubble_recovery_bps', 4000),
+    fundamental_bubble_ice10_bps: intParam(p, 'fundamental_bubble_ice10_bps', 3500),
+    fundamental_bubble_defensive_bps: intParam(p, 'fundamental_bubble_defensive_bps', 2500),
+    align_trigger_mode: p.align_trigger_mode?.trim() === 'REGIME_ONLY' ? 'REGIME_ONLY' : 'STANDARD',
+    satellite_align_drift_band_bps: intParam(p, 'satellite_align_drift_band_bps', intParam(p, 'equity_align_drift_band_bps', 1000)),
+    quality_core_version: p.quality_core_version?.trim() === 'v2' ? 'v2' : 'v1',
+    quality_core_roe_dt_ann_min_bps: intParam(p, 'quality_core_roe_dt_ann_min_bps', 600),
+    quality_core_eps_min: intParam(p, 'quality_core_eps_min', 0),
+    quality_core_ocf_to_profit_min_bps: intParam(p, 'quality_core_ocf_to_profit_min_bps', 5000),
+    quality_core_bps_min: intParam(p, 'quality_core_bps_min', 0),
+    quality_core_strict_ann_date: boolParam(p, 'quality_core_strict_ann_date', false),
+    stock_bp1_reverify_nav_cny: intParam(p, 'stock_bp1_reverify_nav_cny', 95000),
+    fvo_enabled: boolParam(p, 'fvo_enabled', false),
+    fvo_scalar_only: boolParam(p, 'fvo_scalar_only', true),
+    fvo_equity_delta_default_bps: intParam(p, 'fvo_equity_delta_default_bps', 0),
+    fvo_max_abs_delta_bps: intParam(p, 'fvo_max_abs_delta_bps', 1000),
+    fvo_max_ttl_trade_days: intParam(p, 'fvo_max_ttl_trade_days', 20),
+    fvo_zero_positive_on_l1_or_bubble: boolParam(p, 'fvo_zero_positive_on_l1_or_bubble', true),
+    fvo_l1_drawdown_bps: intParam(p, 'fvo_l1_drawdown_bps', 800),
+    fvo_60d_attribution_halve_trigger_bps: intParam(p, 'fvo_60d_attribution_halve_trigger_bps', -150),
+    fvo_60d_attribution_halved_cap_bps: intParam(p, 'fvo_60d_attribution_halved_cap_bps', 500),
+    policy_freeze_start_date: p.policy_freeze_start_date?.trim() || null,
+    policy_freeze_end_date: p.policy_freeze_end_date?.trim() || null,
   };
 }

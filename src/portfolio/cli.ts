@@ -30,6 +30,11 @@ import { runFeeCommand, FEE_USAGE } from './feeCli.js';
 import { runRiskPolicyCommand, RISK_POLICY_USAGE } from './riskPolicyCli.js';
 import { parseTradeCsv } from './tradeImport.js';
 import { cancelDeconcentrationPlan, calibrateDeconcentrationPlan } from './deconcentrationPlan.js';
+import {
+  listForwardViewOverlays,
+  revokeForwardViewOverlay,
+  setForwardViewOverlay,
+} from './forwardViewOverlay.js';
 import { loadFeeContext } from './fees.js';
 import { trustedEvidencePolicy, verifyTrustedRotation } from './trustedEvidence.js';
 import {
@@ -120,6 +125,10 @@ ${RISK_POLICY_USAGE}
         [--trade-date YYYYMMDD] [--market-db PATH] [--reset-triggered]
                                                        校准或取消减仓/磨底降本状态机（--cancel 安全置 CANCELLED 保留历史）；
                                                        修改锚定价必须同时给出价格基准交易日
+  portfolio-fvo <set|revoke|list> --account ID [--delta BPS] [--expires YYYYMMDD]
+        [--created YYYYMMDD] [--invalidation JSON] [--thesis TEXT] [--overlay-id ID]
+        [--active-only] [--market-db PATH] [--db PATH]
+                                                       录入/撤销/查询 v3.4.0 纯标量前瞻主观叠加层（±1000bps，TTL <= 20 交易日）
 
   收盘日报与研究候选（D1/C2/C6）：
   portfolio-daily-report --account ID [--date YYYYMMDD] [--snapshot ID] [--max-actions 0..3] [--format json|user|technical|both|brief] [--output PATH]
@@ -918,6 +927,62 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
           reset_triggered: h.flag('reset-triggered'),
         });
         h.print({ ...result, nav_cents: navCents, current_shares: currentShares, current_price_milli: currentPriceMilli, db: portfolioDbPath() });
+      } finally {
+        db.close();
+      }
+      return true;
+    }
+    case 'portfolio-fvo': {
+      const rawSub = h.arg('action') ?? process.argv[3];
+      const sub = rawSub?.trim().toLowerCase();
+      if (sub !== 'set' && sub !== 'revoke' && sub !== 'list') {
+        throw new Error('用法: portfolio-fvo <set|revoke|list> --account ID ...');
+      }
+      const accountId = requireArg(h, 'account');
+      if (sub === 'list') {
+        const db = openReadOnly(h.arg('db'));
+        try {
+          const resolvedAcc = resolveAccountId(db, accountId).account_id;
+          h.print({
+            account_id: resolvedAcc,
+            overlays: listForwardViewOverlays(db, resolvedAcc, { activeOnly: h.flag('active-only') }),
+            db: portfolioDbPath(),
+          });
+        } finally {
+          db.close();
+        }
+        return true;
+      }
+      const db = openPortfolioDb(h.arg('db'));
+      try {
+        const resolvedAcc = resolveAccountId(db, accountId).account_id;
+        if (sub === 'revoke') {
+          const res = revokeForwardViewOverlay(db, { accountId: resolvedAcc, overlayId: h.arg('overlay-id') });
+          h.print({ ...res, account_id: resolvedAcc, db: portfolioDbPath() });
+          return true;
+        }
+        const deltaBps = intArg(requireArg(h, 'delta'), '--delta')!;
+        const expiresTradeDate = h.ymd(requireArg(h, 'expires'), '--expires');
+        const createdDate = h.arg('created')
+          ? h.ymd(h.arg('created'), '--created')
+          : new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10).replace(/-/g, '');
+        const invalidationRuleJson = requireArg(h, 'invalidation');
+        const thesisSummary = requireArg(h, 'thesis');
+        const market = openMarketCache(h.arg('market-db') ?? ashareDbPath());
+        try {
+          const created = setForwardViewOverlay(db, {
+            overlayId: h.arg('overlay-id'),
+            accountId: resolvedAcc,
+            createdDate,
+            expiresTradeDate,
+            equityDeltaBps: deltaBps,
+            invalidationRuleJson,
+            thesisSummary,
+          }, market);
+          h.print({ ...created, db: portfolioDbPath() });
+        } finally {
+          market?.close();
+        }
       } finally {
         db.close();
       }

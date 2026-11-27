@@ -122,6 +122,9 @@ export const V3_SUPER_ETF_GROWTH_BUCKET: readonly string[] = [
 
 export const V3_SUPER_ETF_DEFENSIVE_BUCKET: readonly string[] = ['159549.SZ', '159207.SZ'] as const;
 
+/** V3.4 CORE_40 实物黄金核心锚（±400bps 宽带 [6%,14%]，单腿调仓 >= ¥5,000）。 */
+export const V3_GOLD_CORE_ETFS: readonly string[] = ['518880.SH'] as const;
+
 /** EXP-V3-11 20 只超级行业 ETF 动量先导池（从 23 只 industry_theme 中剔除低波核心与黄金股票）。 */
 export const V3_SUPER_ETF_SECTOR_PIONEER_CODES: readonly string[] = [
   '158049.SZ', '159045.SZ', '159052.SZ', '159107.SZ', '159153.SZ',

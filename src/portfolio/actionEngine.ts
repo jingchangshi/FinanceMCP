@@ -15,6 +15,11 @@ import {
   type MarketStyleTier,
 } from '../ashare/marketRegime.js';
 import {
+  evaluateFundamentalRegime,
+  type FundamentalRegimeResult,
+} from '../ashare/fundamentalRegime.js';
+import type { ForwardViewOverlayRow } from './forwardViewOverlay.js';
+import {
   screenSectorPioneerCandidates,
   type SectorPioneerCandidate,
   type SectorPioneerScreenResult,
@@ -147,6 +152,7 @@ export interface V3ActionEngineOutput {
   schema: 'portfolio-action-engine/1.0';
   as_of_trade_date: string;
   market_regime: MarketRegimeResult;
+  fundamental_regime: FundamentalRegimeResult;
   router: StrategyRouterResult;
   deconcentration: DeconcentrationEvaluation;
   actions: ActionEnginePlan[];
@@ -530,6 +536,14 @@ export interface RunActionEngineInput {
   alignDue?: boolean;
   /** 可选显式指示市场档位或风格较前一日是否变化（缺省从账本历史/regime 历史推断）。 */
   regimeOrStyleChanged?: boolean;
+  /** v3.4.0 基本面 B1 756d 评估结果（可选直接注入，免重复查库）。 */
+  fundamentalRegime?: FundamentalRegimeResult | null;
+  /** v3.4.0 前瞻主观标量 FVO 测试注入。 */
+  fvoOverride?: Partial<ForwardViewOverlayRow> | null;
+  /** v3.4.0 近 60 交易日 FVO 归因（bps）。 */
+  fvoAttribution60dBps?: number | null;
+  /** v3.4.0 BP1 开仓前可投资净值 >=95k 二次复核标记（默认 true）。 */
+  bp1Reverified?: boolean;
 }
 
 interface PendingRiskSell {
@@ -560,6 +574,7 @@ interface RegimeStylePoint {
   date: string;
   regime: string;
   style: string;
+  eff_budget_bps?: number;
 }
 
 interface PersistedRegimeStyleHistory {
@@ -743,6 +758,17 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
   const hwmBaselineCents = input.baselineTotalAssetsCents === undefined
     ? undefined
     : Math.max(0, input.baselineTotalAssetsCents - wealthCents);
+  const fundamentalRegime: FundamentalRegimeResult = input.fundamentalRegime
+    ?? (policy.fundamental_envelope_enabled
+      ? evaluateFundamentalRegime(input.marketDb, input.asOf, {
+          erpHighEnter: policy.fundamental_underval_erp_enter_bps / 10000,
+          erpHighExit: policy.fundamental_underval_erp_exit_bps / 10000,
+          bpHighEnter: policy.fundamental_underval_bp_enter_bps / 10000,
+          bpHighExit: policy.fundamental_underval_bp_exit_bps / 10000,
+          lowEnter: Math.min(policy.fundamental_bubble_erp_enter_bps, policy.fundamental_bubble_bp_enter_bps) / 10000,
+          lowExit: Math.max(policy.fundamental_bubble_erp_exit_bps, policy.fundamental_bubble_bp_exit_bps) / 10000,
+        })
+      : evaluateFundamentalRegime(null, input.asOf));
   const router = evaluateStrategyRouter({
     portfolioDb: input.portfolioDb,
     marketDb: input.marketDb,
@@ -756,6 +782,9 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     deconcentrationActive,
     deconcentrationMode: deconcControl.mode,
     policy,
+    fundamentalRegime,
+    fvoOverride: input.fvoOverride,
+    fvoAttribution60dBps: input.fvoAttribution60dBps,
   });
 
   const holding159558 = input.holdings.find(h => h.ts_code === '159558.SZ');
@@ -839,6 +868,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       schema: 'portfolio-action-engine/1.0',
       as_of_trade_date: input.asOf,
       market_regime: regime,
+      fundamental_regime: fundamentalRegime,
       router,
       deconcentration,
       actions,
@@ -862,6 +892,63 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     resolveFeeRules({ db: input.portfolioDb, accountId: input.accountId, code, kind, asOf: input.asOf });
 
   const investableAssetsCents = Math.max(0, input.totalAssetsCents - wealthCents);
+  const minStockOrderCentsPre = policy.stock_min_order_cny * 100;
+  const bp1ReverifyOk = (input.bp1Reverified ?? true)
+    && (policy.stock_bp1_reverify_nav_cny <= 0 || hwmNavCents >= policy.stock_bp1_reverify_nav_cny * 100);
+  if (
+    router.sub_strategies.s_stock_swing === 'ACTIVE'
+    && !bp1ReverifyOk
+  ) {
+    blockers.push(`可投资净值未通过开仓前 ${(policy.stock_bp1_reverify_nav_cny / 10000).toFixed(1)} 万元二次复核，本次暂不开新股。`);
+  }
+  const plannedStockSlots: Array<{ ts_code: string; target_cents: number }> = [];
+  if (
+    useExecArchV2
+    && policy.lowvol_core_mode === 'CORE_40'
+    && runtimeCanOpen
+    && bp1ReverifyOk
+    && router.circuit_breaker_status === 'NORMAL'
+    && (router.effective_regime === 'OFFENSIVE' || router.effective_regime === 'STRUCTURAL')
+    && router.sub_strategies.s_stock_swing === 'ACTIVE'
+    && screenedStockCandidates.length > 0
+  ) {
+    let simOpenCount = input.holdings.filter(h => !isEtfCode(h.ts_code) && h.quantity > 0).length;
+    let simHeldStockCents = input.holdings.reduce(
+      (s, h) => s + (!isEtfCode(h.ts_code) && h.quantity > 0 ? h.market_value_cents : 0),
+      0,
+    );
+    let simPioneerRem = Math.max(0, Math.round(investableAssetsCents * (router.targets.pioneer_bps / 10000)) - simHeldStockCents);
+    for (const cand of screenedStockCandidates) {
+      if (simOpenCount >= policy.stock_max_positions || simPioneerRem < minStockOrderCentsPre) break;
+      if (input.holdings.some(h => h.ts_code === cand.ts_code && h.quantity > 0)) continue;
+      if (!(cand.entry_ref_price_milli > 0) || !(cand.hard_stop_price_milli > 0)) continue;
+      const rules = feeFor(cand.ts_code, 'STOCK');
+      const sized = sizeStockSwingOrder({
+        navCents: investableAssetsCents,
+        entryPriceMilli: cand.entry_ref_price_milli,
+        hardStopPriceMilli: cand.hard_stop_price_milli,
+        availableCashCents: simPioneerRem,
+        commissionRate: rules.commission_rate,
+        commissionMinCents: rules.commission_min_cents,
+        transferFeeRate: rules.transfer_fee_rate,
+        maxRiskBps: policy.stock_risk_budget_bps,
+        maxWeightBps: policy.stock_max_single_weight_bps,
+        minOrderCents: minStockOrderCentsPre,
+      });
+      if (sized.shares < 100 || sized.skipped_reason !== null) continue;
+      plannedStockSlots.push({ ts_code: cand.ts_code, target_cents: sized.gross_cents });
+      simPioneerRem = Math.max(0, simPioneerRem - sized.gross_cents);
+      simOpenCount += 1;
+    }
+  }
+  const p0CapCheckBps = router.circuit_breaker_status === 'L2_LOCKED'
+    ? router.targets.target_equity_bps
+    : router.drawdown_equity_cap_bps;
+  const p0ReduceApplied = p0CapCheckBps !== null && input.holdings.reduce(
+    (s, h) => s + (isRiskEquityHolding(h.ts_code) ? h.market_value_cents : 0),
+    0,
+  ) > Math.round(investableAssetsCents * (p0CapCheckBps / 10000)) + Math.round(investableAssetsCents * 0.02);
+
   const targetPortfolio: TargetPortfolioResult | null = useExecArchV2
     ? buildTargetPortfolio({
         policy,
@@ -872,6 +959,8 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         holdings: input.holdings,
         candidates: input.candidates,
         sectorPioneerCandidates,
+        plannedStockSlots,
+        p0ReduceApplied,
       })
     : null;
 
@@ -986,6 +1075,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           const sleeve: PortfolioSleeve = slot?.sleeve ?? classifyHoldingSleeve(h.ts_code, {
             activeSectorPioneerCodes: targetPortfolio.activeSectorPioneerCodes,
             bondCodes: targetPortfolio.bondCodes,
+            goldCodes: targetPortfolio.goldCodes,
           });
           addPendingSell({
             priority: 'P0',
@@ -1225,6 +1315,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       : classifyHoldingSleeve(h.ts_code, {
           activeSectorPioneerCodes: targetPortfolio?.activeSectorPioneerCodes,
           bondCodes: targetPortfolio?.bondCodes,
+          goldCodes: targetPortfolio?.goldCodes,
           includeInactiveSectorPoolAsPioneer: policy.sector_pioneer_enabled,
         });
     if (!isStock) {
@@ -1638,7 +1729,10 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
             : (parsed.curr.date === input.asOf && parsed.prev && parsed.prev.date < input.asOf ? parsed.prev : null);
           if (refPoint) {
             matchedMeta = true;
-            inferredRegimeOrStyleChanged = refPoint.regime !== router.effective_regime || refPoint.style !== regime.style;
+            inferredRegimeOrStyleChanged = policy.align_trigger_mode === 'REGIME_ONLY'
+              ? (refPoint.regime !== router.effective_regime
+                  || (refPoint.eff_budget_bps !== undefined && refPoint.eff_budget_bps !== router.targets.target_equity_bps))
+              : (refPoint.regime !== router.effective_regime || refPoint.style !== regime.style);
           }
         }
       } catch { /* 只读或无记录则回退 history 推断 */ }
@@ -1674,13 +1768,18 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         if (slot?.sleeve === 'UNMANAGED_LEGACY') unmanagedLegacyBeforeCents += h.market_value_cents;
       }
     }
-    // P-3: 偏离按 P0 后持仓与目标权重比较；另加债基 1000bps 偏离判定
-    let maxTargetDriftCents = 0;
+    // P-3: 偏离按 P0 后持仓与目标权重比较（各槽位可配独立漂移带，如黄金 400bps / 卫星 1000bps）；另加债基 1000bps 偏离判定
+    let anySlotDriftExceeded = false;
     for (const slot of targetPortfolio.slots.values()) {
       if (!isRiskEquitySleeve(slot.sleeve) || slot.target_cents <= 0) continue;
       const postP0Held = heldValueCents(slot.ts_code);
       const drift = Math.abs(slot.target_cents - postP0Held);
-      if (drift > maxTargetDriftCents) maxTargetDriftCents = drift;
+      const slotBandCents = Math.round(
+        investableAssetsCents * ((slot.drift_band_bps || policy.equity_align_drift_band_bps) / 10000),
+      );
+      if (drift >= slotBandCents) {
+        anySlotDriftExceeded = true;
+      }
     }
     const curBondForAlign = totalReservoirHeldCents() ?? 0;
     const targetBondSlotCents = targetPortfolio.primaryBondCode
@@ -1698,7 +1797,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
             || regimeOrStyleChanged
             || router.just_unlocked
             || p0Triggered
-            || maxTargetDriftCents >= driftBandCents
+            || anySlotDriftExceeded
             || bondDriftCents >= bondDriftBandCents
           ),
         );
@@ -1728,7 +1827,10 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           if (actual < 100 || !(h.price_milli > 0)) return;
           const priceCents = h.price_milli / 10;
           const grossCents = roundCent(actual * priceCents);
-          if (!isClearance && !SUPER_SET.has(h.ts_code) && grossCents < 200_000) return;
+          const minNonClearSellCents = targetPortfolio.goldCodes.has(h.ts_code)
+            ? Math.max(500_000, (policy.gold_core_min_trade_cny ?? 5000) * 100)
+            : 200_000;
+          if (!isClearance && !SUPER_SET.has(h.ts_code) && grossCents < minNonClearSellCents) return;
           const kind: 'ETF' | 'STOCK' = isEtfCode(h.ts_code) ? 'ETF' : 'STOCK';
           const rules = feeFor(h.ts_code, kind);
           const fees = calculateFees(grossCents, 'sell', rules);
@@ -1742,6 +1844,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           const sleeve: PortfolioSleeve = slot?.sleeve ?? classifyHoldingSleeve(h.ts_code, {
             activeSectorPioneerCodes: targetPortfolio.activeSectorPioneerCodes,
             bondCodes: targetPortfolio.bondCodes,
+            goldCodes: targetPortfolio.goldCodes,
           });
           addPendingSell({
             priority: 'P3',
@@ -1932,6 +2035,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     ];
     let etfFeesEstimated = false;
     let stockBuysAdded = 0;
+    let stockFeesPaidCents = 0;
     let sectorBuysAdded = 0;
     let fundingActionIndex = -1;
 
@@ -1939,27 +2043,34 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     const chassisSlots = [...targetPortfolio.slots.values()]
       .filter(s =>
         s.sleeve === 'CHASSIS_LOWVOL'
+        || s.sleeve === 'CHASSIS_GOLD'
         || s.sleeve === 'CHASSIS_VALUE'
         || s.sleeve === 'CHASSIS_GROWTH',
       );
-    const pendingChassisBuys: Array<{ slot: (typeof chassisSlots)[number]; row: EtfCandidateRow; gapCents: number; heldCents: number; minOrderCents: number }> = [];
+    const pendingChassisBuys: Array<{ slot: (typeof chassisSlots)[number]; row: EtfCandidateRow; gapCents: number; heldCents: number; minOrderCents: number; slotDriftBandCents: number }> = [];
     let totalChassisGapCents = 0;
     const allowSubBandTopUp = regimeOrStyleChanged || router.just_unlocked || p0Triggered;
     if (runtimeCanOpen && router.circuit_breaker_status !== 'L2_LOCKED' && alignDue && remainingRiskEquityRoomCents > 0) {
       for (const slot of chassisSlots) {
         if (slot.buy_blocked || soldCodesToday.has(slot.ts_code)) continue;
-        const row = superByCode.get(slot.ts_code);
+        const row = superByCode.get(slot.ts_code)
+          ?? (input.candidates?.candidates ?? []).find(c => c.ts_code === slot.ts_code && c.included && !c.data?.buy_blocked && (c.data?.latest_close_milli ?? 0) > 0);
         if (!row) continue;
         const held = heldValueCents(slot.ts_code);
         let gapCents = Math.max(0, slot.target_cents - held);
-        if (row.category === 'industry_theme') {
+        if (row.category === 'industry_theme' && slot.sleeve !== 'CHASSIS_GOLD') {
           gapCents = Math.min(gapCents, Math.max(0, Math.floor(0.20 * input.totalAssetsCents) - held));
         }
-        // P-2: 已持有的目标内代码，若缺口 < 5% 且非档位/风格切换、非解锁日、非 P0 触发，跳过小额补仓；门槛为超级 ETF ¥1,000 / 普通 ETF ¥5,000
-        if (held > 0 && !allowSubBandTopUp && gapCents < driftBandCents) continue;
-        const minOrderCents = SUPER_SET.has(slot.ts_code) ? 100_000 : 500_000;
+        const slotDriftBandCents = Math.round(
+          investableAssetsCents * ((slot.drift_band_bps || policy.equity_align_drift_band_bps) / 10000),
+        );
+        // P-2: 已持有的目标内代码，若缺口 < 对应漂移带且非档位变更、非解锁日、非 P0 触发，跳过小额补仓；门槛为超级 ETF ¥1,000 / 普通与黄金 ETF ¥5,000
+        if (held > 0 && !allowSubBandTopUp && gapCents < slotDriftBandCents) continue;
+        const minOrderCents = slot.sleeve === 'CHASSIS_GOLD'
+          ? Math.max(500_000, (policy.gold_core_min_trade_cny ?? 5000) * 100)
+          : (SUPER_SET.has(slot.ts_code) ? 100_000 : 500_000);
         if (gapCents >= minOrderCents) {
-          pendingChassisBuys.push({ slot, row, gapCents, heldCents: held, minOrderCents });
+          pendingChassisBuys.push({ slot, row, gapCents, heldCents: held, minOrderCents, slotDriftBandCents });
           totalChassisGapCents += gapCents;
         }
       }
@@ -1970,7 +2081,9 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
       let stockIntentNetCents = 0;
       let intentRoomCents = remainingRiskEquityRoomCents;
       if (
-        router.effective_regime !== 'DEFENSIVE'
+        bp1ReverifyOk
+        && router.effective_regime !== 'DEFENSIVE'
+        && router.effective_regime !== 'ICE_10'
         && router.sub_strategies.s_stock_swing === 'ACTIVE'
         && stockSwingCandidates.length > 0
       ) {
@@ -2039,14 +2152,14 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         for (const pending of pendingChassisBuys) {
           const budgetCents = Math.min(Math.floor(pending.gapCents * intentScale), intentRoomCents);
           const priceMilli = pending.row.data.latest_close_milli ?? 0;
-          if (!(priceMilli > 0) || budgetCents < 100_000) continue;
+          if (!(priceMilli > 0) || budgetCents < pending.minOrderCents) continue;
           const rules = feeFor(pending.row.ts_code, 'ETF');
           const sized = sizeEtfBuy({
             priceMilli,
             budgetCents,
             availableCashCents: budgetCents * 2,
             rules,
-            minGrossCents: 100_000,
+            minGrossCents: pending.minOrderCents,
           });
           if (sized && sized.gross_cents <= intentRoomCents) {
             etfIntentNetCents += sized.net_cents;
@@ -2146,7 +2259,9 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
 
       // ---- 个股波段先锋开仓（严格服从 remainingRiskEquityRoomCents 与同日禁回买）
       if (
-        router.effective_regime !== 'DEFENSIVE'
+        bp1ReverifyOk
+        && router.effective_regime !== 'DEFENSIVE'
+        && router.effective_regime !== 'ICE_10'
         && router.sub_strategies.s_stock_swing === 'ACTIVE'
         && screenedStockCandidates.length > 0
       ) {
@@ -2189,6 +2304,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           remainingRiskEquityRoomCents = Math.max(0, remainingRiskEquityRoomCents - sized.gross_cents);
           openStockCount += 1;
           stockBuysAdded += 1;
+          stockFeesPaidCents += sized.fees_cents;
           const entryCny = (cand.entry_ref_price_milli / 1000).toFixed(2);
           const stopCny = (cand.hard_stop_price_milli / 1000).toFixed(2);
           const weightPct = (sized.weight_bps / 100).toFixed(1);
@@ -2251,7 +2367,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
           const sized = sizeEtfBuy({
             priceMilli: cand.close_milli,
             budgetCents,
-            availableCashCents: Math.min(workingCashCents - cashBufferCents, remainingRiskEquityRoomCents),
+            availableCashCents: workingCashCents - cashBufferCents,
             rules,
             minGrossCents: minSecOrderCents,
           });
@@ -2301,7 +2417,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
         const defensiveAfterPioneers = defensiveAssetsCents();
         const cashRoomCents = defensiveAfterPioneers === null
           ? Math.max(0, workingCashCents)
-          : Math.max(0, defensiveAfterPioneers - targetDefensiveCents);
+          : Math.max(0, defensiveAfterPioneers - targetDefensiveCents) + Math.min(cashBufferCents, stockFeesPaidCents);
         const usableEquityBudgetCents = Math.max(0, Math.min(remainingRiskEquityRoomCents, cashRoomCents));
         const budgetScale = totalChassisGapCents > 0
           ? Math.min(1, usableEquityBudgetCents / totalChassisGapCents)
@@ -2313,13 +2429,13 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
             if (remainingRiskEquityRoomCents < pending.minOrderCents) continue;
             const budgetCents = Math.min(Math.floor(pending.gapCents * budgetScale), remainingRiskEquityRoomCents);
             const priceMilli = pending.row.data.latest_close_milli ?? 0;
-            if (pending.heldCents > 0 && !allowSubBandTopUp && budgetCents < driftBandCents) continue;
+            if (pending.heldCents > 0 && !allowSubBandTopUp && budgetCents < pending.slotDriftBandCents) continue;
             if (!(priceMilli > 0) || budgetCents < pending.minOrderCents) continue;
             const rules = feeFor(pending.row.ts_code, 'ETF');
             const sized = sizeEtfBuy({
               priceMilli,
               budgetCents,
-              availableCashCents: Math.min(workingCashCents - cashBufferCents, remainingRiskEquityRoomCents),
+              availableCashCents: workingCashCents - cashBufferCents,
               rules,
               minGrossCents: pending.minOrderCents,
             });
@@ -2536,6 +2652,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     ];
     let etfFeesEstimated = false;
     let stockBuysAdded = 0;
+    let stockFeesPaidCents = 0;
     let sectorBuysAdded = 0;
     let fundingActionIndex = -1;
 
@@ -3052,6 +3169,7 @@ export function runActionEngine(input: RunActionEngineInput): V3ActionEngineOutp
     schema: 'portfolio-action-engine/1.0',
     as_of_trade_date: input.asOf,
     market_regime: regime,
+    fundamental_regime: fundamentalRegime,
     router,
     deconcentration,
     actions,
@@ -3084,6 +3202,7 @@ export function syncAccountV3State(
         date: output.as_of_trade_date,
         regime: output.router.effective_regime,
         style: output.market_regime.style,
+        eff_budget_bps: output.router.targets.target_equity_bps,
       };
       let nextPrev: RegimeStylePoint | undefined;
       if (old) {

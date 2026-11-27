@@ -15,6 +15,7 @@ export interface Fundamentals {
   ocf_to_profit: number | null;
   ocfps: number | null;
   eps: number | null;
+  bps?: number | null;
 }
 
 /** Announcement-date constrained financials for every stock (see financialsAsOf in data.ts). */

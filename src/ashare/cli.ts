@@ -37,6 +37,7 @@ const USAGE = `用法: finance-ashare <command> [options]
                                                                  只读技术方法 V2 预览：五类策略候选 + 共享量价上下文；默认不持久化
   technical-study --dates YYYYMMDD[,YYYYMMDD...] | --start/--end [--as-of YYYYMMDD] [--horizons 3,5,10,20]
                                                                  V2 候选的描述性前瞻观察（只读；复用 T+1/费用/3-20日评价与三组对照）
+  import-v34-pit-seed [--cache-dir DIR] [--db PATH]              一次性无损幂等导入 40 季 PIT 财报、中债收益率曲线与日频基本面底座
   migrate                                                        将旧版缓存主键布局迁移为按股票连续存储
 
   账户子命令（独立 portfolio.sqlite，只读演示账户，默认不在 MCP 暴露）：
@@ -164,6 +165,11 @@ async function main() {
       process.stderr.write(USAGE + '\n');
       process.exitCode = 2;
     }
+    return;
+  }
+  if (command === 'import-v34-pit-seed') {
+    const { runImportV34PitSeed } = await import('./pitSeedImporter.js');
+    print(runImportV34PitSeed({ cacheDir: arg('cache-dir'), targetDbPath: arg('db') }));
     return;
   }
   const db = openAshareDb();

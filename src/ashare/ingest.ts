@@ -298,7 +298,7 @@ export async function syncIndexDaily(db: DatabaseSync, end: string, defaultStart
 
 // ---------------------------------------------------------------- financials
 
-const FINA_FIELDS = 'ts_code,ann_date,end_date,roe,roe_dt,netprofit_yoy,dt_netprofit_yoy,or_yoy,grossprofit_margin,debt_to_assets,ocf_to_profit,ocfps,eps,update_flag';
+const FINA_FIELDS = 'ts_code,ann_date,end_date,roe,roe_dt,netprofit_yoy,dt_netprofit_yoy,or_yoy,grossprofit_margin,debt_to_assets,ocf_to_profit,ocfps,eps,bps,update_flag';
 
 export function reportPeriods(end: string, count: number): string[] {
   const periods: string[] = [];

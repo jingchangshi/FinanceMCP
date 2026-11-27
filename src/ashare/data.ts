@@ -69,6 +69,7 @@ export const FINANCIAL_FIELDS: Record<string, { label: string; unit: string }> =
   ocf_to_profit: { label: '经营活动现金净流量相对利润', unit: '%（百分数；东财口径为经营活动现金净流量/归母净利润×100，历史缓存行可能沿用原口径）' },
   ocfps: { label: '每股经营活动现金流量', unit: '元/股' },
   eps: { label: '基本每股收益', unit: '元/股' },
+  bps: { label: '每股净资产', unit: '元/股' },
 };
 
 export class DataQueryError extends Error {}

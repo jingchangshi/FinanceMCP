@@ -555,6 +555,21 @@ def _build_v3_cockpit_sections(
                 f"当前权益占比 {_fmt_pct(cur_eq_pct)} 低于本档上限 {_fmt_pct(target_eq_pct, 0)}，"
                 f"账上 {_fmt_money(cash_cents)} 现金可按超级基金（1,000 元起）或主板个股回踩（8,000 元起）阈值释放增量买入预算。"
             )
+    elif eff_regime == "ICE_10":
+        regime_rule_note = (
+            "当前处于冰点阻尼防守档（35%）：全市场站上60日线占比跌破 10% 后触发 15 交易日阻尼防超卖误砍；"
+            "若触及二阶段回撤熔断锁则立即退回 10% 生命线，否则待窗口期结束或升入复苏/结构档后再行调整。"
+        )
+        if isinstance(cur_eq_pct, float) and isinstance(target_eq_pct, (int, float)) and cur_eq_pct >= target_eq_pct:
+            budget_rule_note = (
+                f"当前存量权益（{_fmt_pct(cur_eq_pct)}）已达或高于本档目标上限（{_fmt_pct(target_eq_pct, 0)}），"
+                f"账上 {_fmt_money(cash_cents)} 现金与国债蓄水池保持防御配置。"
+            )
+        else:
+            budget_rule_note = (
+                f"当前权益占比 {_fmt_pct(cur_eq_pct)} 低于本档上限 {_fmt_pct(target_eq_pct, 0)}，"
+                f"可按核心底波与黄金、国债目标比例分批补充配置。"
+            )
     elif eff_regime == "RECOVERY":
         regime_rule_note = (
             "当前处于冰点复苏试探档（40%）：连续下跌触发深跌超卖后右侧企稳并获次日量能确认，可分批试探配置；"
@@ -789,11 +804,38 @@ def _build_v3_cockpit_sections(
         notes.append("后台折溢价风控备案（仅作禁买拦截，非重点关注方向）：当日触发超 +2.5% 溢价或净值滞后禁买的跨境品种含 " + cb_summary)
     notes.extend(str(trigger) for trigger in (first_section.get("observation_triggers") or [])[:2] if trigger)
 
+    pillars_raw = cockpit.get("three_pillar_cockpit") if isinstance(cockpit.get("three_pillar_cockpit"), dict) else {}
+    fr = cockpit.get("fundamental_regime") if isinstance(cockpit.get("fundamental_regime"), dict) else {}
+    fvo = cockpit.get("fvo") if isinstance(cockpit.get("fvo"), dict) else {}
+    erp_pct = fr.get("erp_pct_756")
+    bp_pct = fr.get("bp_pct_756")
+    dv_bps = fr.get("dv_lowvol_bps")
+    spread_bps = fr.get("term_spread_bps")
+    edi_bps = fr.get("edi_bps")
+    b1_zh = str(fr.get("b1_state_label_zh") or "中性状态（100% 透传技术面档位）")
+    erp_txt = f"{erp_pct * 100:.1f}%" if isinstance(erp_pct, (int, float)) else "待补充"
+    bp_txt = f"{bp_pct * 100:.1f}%" if isinstance(bp_pct, (int, float)) else "待补充"
+    dv_txt = f"{dv_bps / 100.0:.2f}%" if isinstance(dv_bps, (int, float)) else "待补充"
+    spread_txt = f"{spread_bps:+.0f} 基点" if isinstance(spread_bps, (int, float)) else "待补充"
+    edi_txt = f"{edi_bps / 100.0:+.1f}%" if isinstance(edi_bps, (int, float)) else "待补充"
+    fvo_eff = fvo.get("effective_delta_bps")
+    fvo_zh = (
+        str(fvo.get("summary_zh") or "0 主观偏移，纯系统运行")
+        if isinstance(fvo_eff, (int, float)) and fvo_eff != 0
+        else "0 主观偏移，纯系统运行"
+    )
+    cockpit_pillars = {
+        "technical": str(pillars_raw.get("technical_zh") or f"{mr.get('regime_label_zh', '结构震荡档')}｜{mr.get('style_label_zh', '风格均衡')}，站上60日线 {pct_ma60_txt}；{router.get('circuit_breaker_label_zh', '正常受控')}"),
+        "fundamental": str(pillars_raw.get("fundamental_zh") or f"{b1_zh}（756日风险溢价分位 {erp_txt}、市净率分位 {bp_txt}、低波股息率 {dv_txt}）"),
+        "forward_view": str(pillars_raw.get("forward_view_zh") or f"只读参考：国债10Y-1Y期限利差 {spread_txt}，季报盈利扩散度 {edi_txt}；主观视角：{fvo_zh}"),
+    }
+
     ver_subtitle = f"｜策略版本 {policy_ver}" if policy_ver else ""
     result = {
         "title": f"A 股攻防实战日报｜{_ymd(as_of)}收盘",
         "subtitle": f"生成于 {generated_at}（北京时间）｜市场数据截至交易日 {_iso(as_of)}{ver_subtitle}",
         "account_status": f"账户数据：{account_status_note}",
+        "cockpit_pillars": cockpit_pillars,
         "sections": {
             "今日判断": {
                 "conclusion": conclusion,

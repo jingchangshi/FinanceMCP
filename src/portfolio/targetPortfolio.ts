@@ -1,4 +1,5 @@
 import {
+  V3_GOLD_CORE_ETFS,
   V3_SUPER_ETF_DEFENSIVE_BUCKET,
   V3_SUPER_ETF_GROWTH_BUCKET,
   V3_SUPER_ETF_VALUE_BUCKET,
@@ -31,6 +32,7 @@ export interface TargetSlot {
 export interface TargetPortfolioResult {
   slots: Map<string, TargetSlot>;
   bondCodes: Set<string>;
+  goldCodes: Set<string>;
   primaryBondCode: string | null;
   activeSectorPioneerCodes: Set<string>;
   chassisTargetCodes: Set<string>;
@@ -38,10 +40,12 @@ export interface TargetPortfolioResult {
 }
 
 interface ChassisBucketSpec {
-  sleeve: 'CHASSIS_LOWVOL' | 'CHASSIS_VALUE' | 'CHASSIS_GROWTH';
+  sleeve: 'CHASSIS_LOWVOL' | 'CHASSIS_GOLD' | 'CHASSIS_VALUE' | 'CHASSIS_GROWTH';
   codes: readonly string[];
   share_bps: number;
   max_slots: number;
+  override_cents?: number;
+  drift_band_bps?: number;
 }
 
 function chassisBucketSpecs(
@@ -159,6 +163,10 @@ export interface BuildTargetPortfolioInput {
   holdings: readonly TargetHoldingInput[];
   candidates?: EtfCandidateScreenResult | null;
   sectorPioneerCandidates?: readonly SectorPioneerCandidate[];
+  /** Optional planned BP1 stock buys for CORE_40 residual satellite reallocation. */
+  plannedStockSlots?: ReadonlyArray<{ ts_code: string; target_cents: number }>;
+  /** True when P0 drawdown reduction is active so CORE_40 gold does not hold silently. */
+  p0ReduceApplied?: boolean;
 }
 
 /**
@@ -190,6 +198,9 @@ export function buildTargetPortfolio(input: BuildTargetPortfolioInput): TargetPo
     if (raw) bondCodes.add(raw);
   }
 
+  const goldCode = policy.gold_core_etf || V3_GOLD_CORE_ETFS[0];
+  const goldCodes = new Set<string>(policy.lowvol_core_mode === 'CORE_40' && goldCode ? [goldCode] : []);
+
   const activeSectorPioneerCodes = new Set<string>();
   const activeSectorPioneers = policy.sector_pioneer_enabled && router.targets.sector_pioneer_bps > 0
     ? (input.sectorPioneerCandidates ?? []).slice(0, Math.max(1, policy.sector_pioneer_top_k))
@@ -198,10 +209,13 @@ export function buildTargetPortfolio(input: BuildTargetPortfolioInput): TargetPo
     activeSectorPioneerCodes.add(cand.ts_code);
   }
 
-  const equityDriftBandBps = policy.equity_align_drift_band_bps;
+  const equityDriftBandBps = policy.lowvol_core_mode === 'CORE_40'
+    ? policy.satellite_align_drift_band_bps
+    : policy.equity_align_drift_band_bps;
   const bondDriftBandBps = policy.defensive_bond_reservoir_drift_band_bps;
 
   // 1) Sector Pioneer targets (if enabled)
+  let allocatedSectorPioneerCents = 0;
   if (activeSectorPioneers.length > 0 && router.targets.sector_pioneer_bps > 0) {
     const perSlotCapBps = Math.min(2000, Math.floor(router.targets.sector_pioneer_bps / activeSectorPioneers.length));
     for (const cand of activeSectorPioneers) {
@@ -211,6 +225,7 @@ export function buildTargetPortfolio(input: BuildTargetPortfolioInput): TargetPo
       const rawTargetCents = Math.round(investableAssetsCents * (perSlotCapBps / 10000));
       const effCents = buyBlocked ? Math.min(rawTargetCents, heldVal) : rawTargetCents;
       const effBps = investableAssetsCents > 0 ? Math.round((effCents / investableAssetsCents) * 10000) : 0;
+      allocatedSectorPioneerCents += effCents;
       slots.set(cand.ts_code, {
         ts_code: cand.ts_code,
         sleeve: 'SECTOR_PIONEER',
@@ -222,10 +237,157 @@ export function buildTargetPortfolio(input: BuildTargetPortfolioInput): TargetPo
     }
   }
 
-  // 2) Chassis ETF buckets (unconditional 1+1+2 when chassis_single_etf_per_style_bucket=true)
+  // 1b) BP1 stock holdings / planned buys (computed before CORE_40 chassis so unused BP1 budget flows to satellite ETFs)
+  const stockHoldings = input.holdings.filter(
+    h => h.quantity > 0 && classifyHoldingSleeve(h.ts_code, { activeSectorPioneerCodes, bondCodes, goldCodes }) === 'STOCK_BP1',
+  );
+  let remainingStockBudgetCents = Math.round(investableAssetsCents * (router.targets.pioneer_bps / 10000));
+  const maxStockSlotCents = Math.round(investableAssetsCents * (policy.stock_max_single_weight_bps / 10000));
+  let allocatedStockCents = 0;
+
+  for (const h of stockHoldings) {
+    if (router.targets.pioneer_bps <= 0 || remainingStockBudgetCents <= 0) {
+      slots.set(h.ts_code, {
+        ts_code: h.ts_code,
+        sleeve: 'STOCK_BP1',
+        target_bps: 0,
+        target_cents: 0,
+        drift_band_bps: equityDriftBandBps,
+        buy_blocked: false,
+      });
+    } else {
+      const keepCents = Math.min(h.market_value_cents, maxStockSlotCents, remainingStockBudgetCents);
+      remainingStockBudgetCents = Math.max(0, remainingStockBudgetCents - keepCents);
+      allocatedStockCents += keepCents;
+      slots.set(h.ts_code, {
+        ts_code: h.ts_code,
+        sleeve: 'STOCK_BP1',
+        target_bps: investableAssetsCents > 0 ? Math.round((keepCents / investableAssetsCents) * 10000) : 0,
+        target_cents: keepCents,
+        drift_band_bps: equityDriftBandBps,
+        buy_blocked: false,
+      });
+    }
+  }
+  for (const ps of input.plannedStockSlots ?? []) {
+    if (slots.has(ps.ts_code) || ps.target_cents <= 0 || remainingStockBudgetCents <= 0) continue;
+    const allocCents = Math.min(ps.target_cents, maxStockSlotCents, remainingStockBudgetCents);
+    if (allocCents <= 0) continue;
+    remainingStockBudgetCents = Math.max(0, remainingStockBudgetCents - allocCents);
+    allocatedStockCents += allocCents;
+    slots.set(ps.ts_code, {
+      ts_code: ps.ts_code,
+      sleeve: 'STOCK_BP1',
+      target_bps: investableAssetsCents > 0 ? Math.round((allocCents / investableAssetsCents) * 10000) : 0,
+      target_cents: allocCents,
+      drift_band_bps: equityDriftBandBps,
+      buy_blocked: false,
+    });
+  }
+
+  // 2) Chassis ETF buckets
   const chassisTargetCodes = new Set<string>();
   const targetBaseEtfBps = router.targets.base_super_etf_bps;
-  if (targetBaseEtfBps > 0) {
+  if (policy.lowvol_core_mode === 'CORE_40' && router.targets.target_equity_bps > 0) {
+    const totalEqCents = Math.round(investableAssetsCents * (router.targets.target_equity_bps / 10000));
+    const coreLvNominal = Math.round(investableAssetsCents * (policy.lowvol_core_permanent_share_bps / 10000));
+    const goldNominal = Math.round(investableAssetsCents * (policy.gold_core_share_bps / 10000));
+    const coreTotalNominal = coreLvNominal + goldNominal;
+    const coreScale = coreTotalNominal > totalEqCents && coreTotalNominal > 0
+      ? totalEqCents / coreTotalNominal
+      : 1;
+    const coreLvCents = Math.round(coreLvNominal * coreScale);
+    const goldNominalCents = Math.max(0, Math.min(totalEqCents - coreLvCents, Math.round(goldNominal * coreScale)));
+
+    const goldHeldCents = goldCode ? (holdingsByCode.get(goldCode)?.market_value_cents ?? 0) : 0;
+    const goldDriftBandCents = Math.round(investableAssetsCents * (policy.gold_core_drift_band_bps / 10000));
+    const goldMinTradeCents = (policy.gold_core_min_trade_cny ?? 5000) * 100;
+    const goldDiffCents = Math.abs(goldHeldCents - goldNominalCents);
+    const holdGoldSilently = Boolean(
+      router.circuit_breaker_status !== 'L2_LOCKED'
+      && !input.p0ReduceApplied
+      && goldHeldCents > 0
+      && goldHeldCents <= totalEqCents - coreLvCents
+      && (goldDiffCents < goldDriftBandCents || goldDiffCents < goldMinTradeCents),
+    );
+    const goldEffectiveCents = holdGoldSilently ? goldHeldCents : goldNominalCents;
+    const satelliteEtfCents = Math.max(
+      0,
+      totalEqCents - coreLvCents - goldEffectiveCents - allocatedSectorPioneerCents - allocatedStockCents,
+    );
+
+    const coreSpecs: ChassisBucketSpec[] = [
+      {
+        sleeve: 'CHASSIS_LOWVOL',
+        codes: V3_SUPER_ETF_DEFENSIVE_BUCKET,
+        share_bps: 0,
+        max_slots: 2,
+        override_cents: coreLvCents,
+        drift_band_bps: equityDriftBandBps,
+      },
+      {
+        sleeve: 'CHASSIS_GOLD',
+        codes: [goldCode],
+        share_bps: 0,
+        max_slots: 1,
+        override_cents: goldEffectiveCents,
+        drift_band_bps: policy.gold_core_drift_band_bps,
+      },
+    ];
+    if (satelliteEtfCents > 0) {
+      const growthRatio = marketRegime.style === 'GROWTH_LEADING' ? 0.65
+        : marketRegime.style === 'VALUE_LEADING' ? 0.35 : 0.50;
+      const growthCents = Math.round(satelliteEtfCents * growthRatio);
+      const valueCents = Math.max(0, satelliteEtfCents - growthCents);
+      coreSpecs.push(
+        {
+          sleeve: 'CHASSIS_GROWTH',
+          codes: policy.chassis_single_etf_per_style_bucket ? V3_SUPER_ETF_GROWTH_BUCKET : V3_SUPER_ETF_GROWTH_BUCKET.slice(0, 3),
+          share_bps: 0,
+          max_slots: policy.chassis_single_etf_per_style_bucket ? 1 : 3,
+          override_cents: growthCents,
+          drift_band_bps: equityDriftBandBps,
+        },
+        {
+          sleeve: 'CHASSIS_VALUE',
+          codes: V3_SUPER_ETF_VALUE_BUCKET,
+          share_bps: 0,
+          max_slots: policy.chassis_single_etf_per_style_bucket ? 1 : V3_SUPER_ETF_VALUE_BUCKET.length,
+          override_cents: valueCents,
+          drift_band_bps: equityDriftBandBps,
+        },
+      );
+    }
+
+    for (const spec of coreSpecs) {
+      const bucketTargetCents = spec.override_cents ?? 0;
+      if (bucketTargetCents <= 0) continue;
+      const picked = selectChassisBucketMembers(
+        spec,
+        holdingsByCode,
+        candidateByCode,
+        spec.sleeve === 'CHASSIS_GOLD' ? true : policy.chassis_single_etf_per_style_bucket,
+      );
+      if (picked.length === 0) continue;
+      const perSlotCents = Math.floor(bucketTargetCents / picked.length);
+      for (const code of picked) {
+        chassisTargetCodes.add(code);
+        const cRow = candidateByCode.get(code);
+        const buyBlocked = Boolean(cRow && (!cRow.included || cRow.data?.buy_blocked));
+        const heldVal = holdingsByCode.get(code)?.market_value_cents ?? 0;
+        const effCents = buyBlocked ? Math.min(perSlotCents, heldVal) : perSlotCents;
+        const effBps = investableAssetsCents > 0 ? Math.round((effCents / investableAssetsCents) * 10000) : 0;
+        slots.set(code, {
+          ts_code: code,
+          sleeve: spec.sleeve,
+          target_bps: effBps,
+          target_cents: effCents,
+          drift_band_bps: spec.drift_band_bps ?? equityDriftBandBps,
+          buy_blocked: buyBlocked,
+        });
+      }
+    }
+  } else if (targetBaseEtfBps > 0) {
     const specs = chassisBucketSpecs(
       router.effective_regime,
       marketRegime.style,
@@ -302,43 +464,11 @@ export function buildTargetPortfolio(input: BuildTargetPortfolioInput): TargetPo
     });
   }
 
-  // 4) Explicitly record every existing holding in the target map
+  // 4) Explicitly record remaining existing holdings in the target map
   const unmanagedLegacyCodes = new Set<string>();
-  const stockHoldings = input.holdings.filter(
-    h => h.quantity > 0 && classifyHoldingSleeve(h.ts_code, { activeSectorPioneerCodes, bondCodes }) === 'STOCK_BP1',
-  );
-  let remainingStockBudgetCents = Math.round(investableAssetsCents * (router.targets.pioneer_bps / 10000));
-  const maxStockSlotCents = Math.round(investableAssetsCents * (policy.stock_max_single_weight_bps / 10000));
-
-  for (const h of stockHoldings) {
-    if (router.targets.pioneer_bps <= 0 || remainingStockBudgetCents <= 0) {
-      slots.set(h.ts_code, {
-        ts_code: h.ts_code,
-        sleeve: 'STOCK_BP1',
-        target_bps: 0,
-        target_cents: 0,
-        drift_band_bps: equityDriftBandBps,
-        buy_blocked: false,
-      });
-    } else {
-      // Held BP1 stock keeps up to min(held, single stock cap, remaining pioneer budget)
-      // so risk-budget-sized positions are not churned unless cap/regime cuts them.
-      const keepCents = Math.min(h.market_value_cents, maxStockSlotCents, remainingStockBudgetCents);
-      remainingStockBudgetCents = Math.max(0, remainingStockBudgetCents - keepCents);
-      slots.set(h.ts_code, {
-        ts_code: h.ts_code,
-        sleeve: 'STOCK_BP1',
-        target_bps: investableAssetsCents > 0 ? Math.round((keepCents / investableAssetsCents) * 10000) : 0,
-        target_cents: keepCents,
-        drift_band_bps: equityDriftBandBps,
-        buy_blocked: false,
-      });
-    }
-  }
-
   for (const h of input.holdings) {
     if (h.quantity <= 0 || slots.has(h.ts_code)) continue;
-    const sleeve = classifyHoldingSleeve(h.ts_code, { activeSectorPioneerCodes, bondCodes });
+    const sleeve = classifyHoldingSleeve(h.ts_code, { activeSectorPioneerCodes, bondCodes, goldCodes });
     if (sleeve === 'UNMANAGED_LEGACY') unmanagedLegacyCodes.add(h.ts_code);
     slots.set(h.ts_code, {
       ts_code: h.ts_code,
@@ -353,6 +483,7 @@ export function buildTargetPortfolio(input: BuildTargetPortfolioInput): TargetPo
   return {
     slots,
     bondCodes,
+    goldCodes,
     primaryBondCode,
     activeSectorPioneerCodes,
     chassisTargetCodes,

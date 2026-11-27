@@ -12,6 +12,13 @@ import { fetchSwIndexDailyFree, fetchThsIndexDailyFree } from './hotspotFreeClie
 import { TdxSession, withTdxSession, type TdxQuote, type TdxSecurityItem, type TdxXdxrEvent } from './tdxClient.js';
 import { fetchTencentDailyBars, fetchTencentQuotes, type TencentQuoteRow } from './tencentClient.js';
 import {
+  backfillDailyBasicDvTtm,
+  computeDvTtmPit,
+  hasXdxrTable,
+  loadXdxrKnowledge,
+  upsertXdxrBatch,
+} from '../dividendYield.js';
+import {
   inferExchangeLabel,
   inferMarketBoard,
   isAshareStockCode,
@@ -168,24 +175,32 @@ async function getFundCrossCached(): Promise<Map<string, EastmoneyCrossRow>> {
   }
 }
 
-async function fetchBarsSingle(
+interface BarsWithXdxrResult {
+  bars: NormalizedBar[];
+  xdxr: TdxXdxrEvent[] | null;
+}
+
+async function fetchBarsWithXdxrSingle(
   tsCode: string,
   start: string,
   end: string,
   isIndex = false,
-): Promise<NormalizedBar[]> {
+): Promise<BarsWithXdxrResult> {
   const parsed = parseTsCode(tsCode);
+  let capturedXdxr: TdxXdxrEvent[] | null = null;
   // 1) 优先 TDX 原生 TCP K线（股票/ETF/指数均最快、无反爬限制）
   if (parsed.tdxMarket !== null) {
     try {
       // 除权除息事件与 K 线同一会话取回：TDX 日 K 是不复权原始价，昨收取前一根原始收盘
       // 会在除权日丢失参考价跳空，adj_factor 因而永远不会在除权日跳变。
-      const { bars: tdxBars, xdxr } = await withTdxSession(async s => {
+      const { bars: tdxBars, xdxr, xdxrOk } = await withTdxSession(async s => {
         const bars = await s.getBars(9, parsed.tdxMarket!, parsed.code, 0, 800, isIndex);
         let events: TdxXdxrEvent[] = [];
+        let ok = false;
         if (!isIndex) {
           try {
             events = await s.getXdxrInfo(parsed.tdxMarket!, parsed.code);
+            ok = true;
           } catch {
             // 除权信息失败不编造参考价：保留原始前收（旧因子），并记录一次明确的数据质量警告。
             if (!xdxrUnavailableWarned) {
@@ -195,8 +210,9 @@ async function fetchBarsSingle(
             events = [];
           }
         }
-        return { bars, xdxr: events };
+        return { bars, xdxr: events, xdxrOk: ok };
       });
+      if (xdxrOk) capturedXdxr = xdxr;
       const xdxrByDate = new Map(xdxr.filter(e => e.category === 1).map(e => [e.date, e]));
       const filtered = tdxBars.filter(b => b.trade_date >= start && b.trade_date <= end && b.close > 0);
       if (filtered.length > 0) {
@@ -226,7 +242,7 @@ async function fetchBarsSingle(
             amount: cur.amount,
           });
         }
-        if (out.length > 0) return out;
+        if (out.length > 0) return { bars: out, xdxr: capturedXdxr };
       }
     } catch { /* fallback to Eastmoney */ }
   }
@@ -254,28 +270,40 @@ async function fetchBarsSingle(
         amount: cur.amount,
       });
     }
-    if (out.length > 0) return out;
+    if (out.length > 0) return { bars: out, xdxr: capturedXdxr };
   } catch { /* fallback to Tencent */ }
 
   // 3) 末级兜底腾讯日K
   try {
     const tcBars = await fetchTencentDailyBars(tsCode, start, end);
-    return tcBars.map(b => ({
-      ts_code: tsCode,
-      trade_date: b.trade_date,
-      open: b.open,
-      high: Math.max(b.high, b.open, b.close),
-      low: Math.min(b.low, b.open, b.close),
-      close: b.close,
-      pre_close: b.pre_close,
-      change: b.pre_close !== null ? roundTo(b.close - b.pre_close, 4) : null,
-      pct_chg: b.pct_chg,
-      vol: b.vol,
-      amount: b.amount,
-    }));
+    return {
+      bars: tcBars.map(b => ({
+        ts_code: tsCode,
+        trade_date: b.trade_date,
+        open: b.open,
+        high: Math.max(b.high, b.open, b.close),
+        low: Math.min(b.low, b.open, b.close),
+        close: b.close,
+        pre_close: b.pre_close,
+        change: b.pre_close !== null ? roundTo(b.close - b.pre_close, 4) : null,
+        pct_chg: b.pct_chg,
+        vol: b.vol,
+        amount: b.amount,
+      })),
+      xdxr: capturedXdxr,
+    };
   } catch {
-    return [];
+    return { bars: [], xdxr: capturedXdxr };
   }
+}
+
+async function fetchBarsSingle(
+  tsCode: string,
+  start: string,
+  end: string,
+  isIndex = false,
+): Promise<NormalizedBar[]> {
+  return (await fetchBarsWithXdxrSingle(tsCode, start, end, isIndex)).bars;
 }
 
 async function resolveTradeCal(db: DatabaseSync | null, start: string, end: string): Promise<Record<string, any>[]> {
@@ -529,6 +557,52 @@ async function fetchTdxQuotesBatched(
   return out;
 }
 
+function tryPersistXdxrBatch(
+  db: DatabaseSync | null,
+  eventsByCode: ReadonlyMap<string, readonly TdxXdxrEvent[]>,
+): void {
+  if (!db || !eventsByCode.size || !hasXdxrTable(db)) return;
+  try {
+    upsertXdxrBatch(db, eventsByCode);
+  } catch { /* read-only DBs keep in-memory events without failing */ }
+}
+
+async function fetchXdxrBatchSafe(
+  db: DatabaseSync | null,
+  tsCodes: readonly string[],
+): Promise<Map<string, TdxXdxrEvent[]>> {
+  const out = new Map<string, TdxXdxrEvent[]>();
+  const reqItems: Array<{ tsCode: string; market: 0 | 1; code: string }> = [];
+  for (const tsCode of tsCodes) {
+    const { code, tdxMarket } = parseTsCode(tsCode);
+    if (tdxMarket !== null && /^\d{6}$/.test(code)) reqItems.push({ tsCode, market: tdxMarket, code });
+  }
+  if (!reqItems.length) return out;
+
+  for (let i = 0; i < reqItems.length; i += 80) {
+    const chunk = reqItems.slice(i, i + 80);
+    const chunkMap = new Map<string, TdxXdxrEvent[]>();
+    try {
+      await withTdxSession(async session => {
+        for (const item of chunk) {
+          try {
+            const events = await session.getXdxrInfo(item.market, item.code);
+            chunkMap.set(item.tsCode, events);
+          } catch { /* skip single broken code */ }
+        }
+      });
+    } catch {
+      // TDX hosts completely unreachable: abort remaining chunks cleanly.
+      break;
+    }
+    if (chunkMap.size) {
+      for (const [k, v] of chunkMap.entries()) out.set(k, v);
+      tryPersistXdxrBatch(db, chunkMap);
+    }
+  }
+  return out;
+}
+
 async function buildHistoricalStockDay(
   db: DatabaseSync | null,
   tradeDate: string,
@@ -543,10 +617,14 @@ async function buildHistoricalStockDay(
       const storedAdj = db.prepare('SELECT * FROM adj_factor WHERE trade_date = ?').all(tradeDate) as Record<string, any>[];
       const storedLimit = db.prepare('SELECT * FROM stk_limit WHERE trade_date = ?').all(tradeDate) as Record<string, any>[];
       const storedSusp = db.prepare('SELECT * FROM suspend_d WHERE trade_date = ?').all(tradeDate) as Record<string, any>[];
+      const closeByCode = new Map<string, number>();
+      for (const d of storedDaily) {
+        if (d.close != null && Number.isFinite(d.close) && d.close > 0) closeByCode.set(String(d.ts_code), Number(d.close));
+      }
       return {
         tradeDate,
         daily: storedDaily,
-        daily_basic: storedBasic,
+        daily_basic: backfillDailyBasicDvTtm(db, tradeDate, storedBasic, closeByCode),
         adj_factor: storedAdj,
         stk_limit: storedLimit,
         suspend_d: storedSusp,
@@ -562,14 +640,18 @@ async function buildHistoricalStockDay(
   const { factors, closes } = loadPrevFactorAndClose(db, 'adj_factor', 'daily', tradeDate);
 
   const barResults = await runPool(stockCodes, 12, async tsCode => {
-    const bars = await fetchBarsSingle(tsCode, tradeDate, tradeDate, false);
-    return { tsCode, bar: bars.find(b => b.trade_date === tradeDate) ?? null };
+    const { bars, xdxr } = await fetchBarsWithXdxrSingle(tsCode, tradeDate, tradeDate, false);
+    return { tsCode, bar: bars.find(b => b.trade_date === tradeDate) ?? null, xdxr };
   });
 
-  for (const { tsCode, bar } of barResults) {
+  const fetchedXdxr = new Map<string, TdxXdxrEvent[]>();
+  const closeByCode = new Map<string, number>();
+  for (const { tsCode, bar, xdxr } of barResults) {
+    if (xdxr !== null) fetchedXdxr.set(tsCode, xdxr);
     // 停牌判定只看显式停牌信号（suspend=source_explicit_only），缺 bar 或源故障不写入 suspend_d；
     // 未知成交额/成交量保持 null；stk_limit 仅保存上游显式限价，不持久化规则推算值。
     if (bar && bar.vol !== null && bar.vol > 0 && bar.open > 0 && bar.close > 0) {
+      closeByCode.set(tsCode, bar.close);
       daily.push({
         ts_code: tsCode,
         trade_date: tradeDate,
@@ -591,7 +673,7 @@ async function buildHistoricalStockDay(
         pe_ttm: null,
         pb: null,
         ps_ttm: null,
-        dv_ttm: null,
+        dv_ttm: xdxr !== null ? computeDvTtmPit(bar.close, tradeDate, xdxr) : null,
         total_mv: null,
         circ_mv: null,
       });
@@ -602,7 +684,9 @@ async function buildHistoricalStockDay(
       adj_factor.push({ ts_code: tsCode, trade_date: tradeDate, adj_factor: prevF });
     }
   }
-  return { tradeDate, daily, daily_basic, adj_factor, stk_limit, suspend_d };
+  tryPersistXdxrBatch(db, fetchedXdxr);
+  const filledDailyBasic = backfillDailyBasicDvTtm(db, tradeDate, daily_basic, closeByCode, fetchedXdxr);
+  return { tradeDate, daily, daily_basic: filledDailyBasic, adj_factor, stk_limit, suspend_d };
 }
 
 async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): Promise<DayStockSnapshot> {
@@ -682,6 +766,8 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
   const adj_factor: Record<string, any>[] = [];
   const stk_limit: Record<string, any>[] = [];
   const suspend_d: Record<string, any>[] = [];
+  const closeByCode = new Map<string, number>();
+  const exJumpCodes = new Set<string>();
 
   for (const tsCode of listedSet) {
     const tq = tencentMap.get(tsCode);
@@ -692,7 +778,8 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
     const matchEm = em && em.trade_date === tradeDate ? em : null;
 
     const close = matchTq?.close ?? matchEm?.close ?? tdx?.close ?? null;
-    const preClose = matchTq?.pre_close ?? matchEm?.pre_close ?? tdx?.pre_close ?? closes.get(tsCode) ?? null;
+    const prevStoredClose = closes.get(tsCode);
+    const preClose = matchTq?.pre_close ?? matchEm?.pre_close ?? tdx?.pre_close ?? prevStoredClose ?? null;
     const open = matchTq?.open ?? matchEm?.open ?? tdx?.open ?? null;
     const highRaw = matchTq?.high ?? matchEm?.high ?? tdx?.high ?? null;
     const lowRaw = matchTq?.low ?? matchEm?.low ?? tdx?.low ?? null;
@@ -707,6 +794,13 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
       (matchTq !== null || matchEm !== null || tdx !== undefined);
 
     if (validBar) {
+      closeByCode.set(tsCode, close!);
+      if (
+        prevStoredClose && prevStoredClose > 0 && preClose && preClose > 0
+        && Math.abs(prevStoredClose - preClose) / prevStoredClose >= 0.0002
+      ) {
+        exJumpCodes.add(tsCode);
+      }
       const high = highRaw && highRaw > 0 ? Math.max(highRaw, open!, close!) : Math.max(open!, close!);
       const low = lowRaw && lowRaw > 0 ? Math.min(lowRaw, open!, close!) : Math.min(open!, close!);
       const pctChg = matchTq?.pct_chg ?? matchEm?.pct_chg ?? (preClose && preClose > 0 ? roundTo(((close! - preClose) / preClose) * 100, 4) : null);
@@ -732,7 +826,7 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
         pe_ttm: matchTq?.pe_ttm ?? matchEm?.pe_ttm ?? null,
         pb: matchTq?.pb ?? matchEm?.pb ?? null,
         ps_ttm: matchEm?.ps_ttm ?? null,
-        dv_ttm: null,
+        dv_ttm: (matchTq as any)?.dv_ttm ?? (matchEm as any)?.dv_ttm ?? null,
         total_mv: matchTq?.total_mv ?? matchEm?.total_mv ?? null,
         circ_mv: matchTq?.circ_mv ?? matchEm?.circ_mv ?? null,
       });
@@ -764,7 +858,17 @@ async function getStockDaySnapshot(db: DatabaseSync | null, tradeDate: string): 
     }
   }
 
-  const snap: DayStockSnapshot = { tradeDate, daily, daily_basic, adj_factor, stk_limit, suspend_d };
+  const { knownCodes } = loadXdxrKnowledge(db, tradeDate);
+  const needXdxr = (db || listedSet.length <= 200)
+    ? [...closeByCode.keys()].filter(code => {
+      if (parseTsCode(code).tdxMarket === null) return false;
+      return !knownCodes.has(code) || exJumpCodes.has(code);
+    })
+    : [];
+  const fetchedXdxr = needXdxr.length > 0 ? await fetchXdxrBatchSafe(db, needXdxr) : new Map<string, TdxXdxrEvent[]>();
+  const filledDailyBasic = backfillDailyBasicDvTtm(db, tradeDate, daily_basic, closeByCode, fetchedXdxr);
+
+  const snap: DayStockSnapshot = { tradeDate, daily, daily_basic: filledDailyBasic, adj_factor, stk_limit, suspend_d };
   cachedStockDay.set(tradeDate, { at: Date.now(), data: snap });
   return snap;
 }
@@ -1141,6 +1245,7 @@ async function resolveFinancials(db: DatabaseSync | null, period: string): Promi
       ocf_to_profit: r.ocf_to_profit ?? prev.ocf_to_profit,
       ocfps: r.ocfps ?? prev.ocfps,
       eps: r.eps ?? prev.eps,
+      bps: r.bps ?? prev.bps,
     };
   });
   cachedFinaPeriod.set(period, { at: Date.now(), rows: merged });

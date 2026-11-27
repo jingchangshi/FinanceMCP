@@ -3,6 +3,7 @@ import { inferBoard } from '../portfolio/rules.js';
 import { loadApprovedV3Policy, type ApprovedV3Policy } from '../portfolio/v3Policy.js';
 import { scanMarket } from './analysis.js';
 import { addDays, recentTradeDays } from './ingest.js';
+import { annualizeQuarterMultiplier, evaluateQualityCoreV2 } from './qualityCore.js';
 import { rpsFromCloses } from './rps.js';
 
 export const STOCK_SWING_SCREENER_SCHEMA = 'ashare-v3-stock-swing/1.0';
@@ -36,8 +37,11 @@ export interface StockSwingCandidate {
   amount20_yi: number;
   circ_mv_yi: number;
   roe_annualized_pct: number;
+  roe_dt_annualized_pct?: number | null;
   eps: number;
+  bps?: number | null;
   ocf_to_profit_pct: number;
+  quality_core_version?: 'v1' | 'v2';
   composite_score: number;
   reasons_zh: string[];
   trailing_exit_rule_zh: string;
@@ -67,6 +71,8 @@ export interface ScreenStockSwingOptions {
   strictSectorGate?: boolean;
   /** 调用方已加载的策略（与 router/engine 共用），避免重复读取覆盖文件/准入库。 */
   policy?: ApprovedV3Policy;
+  /** 显式指定 QualityCore 版本（v3.4.0 默认 v2，v3.1.0..v3.3.1 默认 v1）。 */
+  qualityCoreVersion?: 'v1' | 'v2';
 }
 
 interface PreQualifiedStock {
@@ -80,16 +86,10 @@ interface PreQualifiedStock {
   amount20_yi: number;
   circ_mv_yi: number;
   roe_annualized_pct: number;
+  roe_dt_annualized_pct: number | null;
   eps: number;
+  bps: number | null;
   ocf_to_profit_pct: number;
-}
-
-function annualizeRoeMultiplier(endDate: string | null | undefined): number {
-  const md = String(endDate ?? '').slice(4, 8);
-  if (md === '0331') return 4;
-  if (md === '0630') return 2;
-  if (md === '0930') return 4 / 3;
-  return 1;
 }
 
 /**
@@ -103,6 +103,7 @@ export function screenStockSwingCandidates(
   options: ScreenStockSwingOptions = {},
 ): StockSwingScreenResult {
   const policy = options.policy ?? loadApprovedV3Policy({ asOf });
+  const qcVersion: 'v1' | 'v2' = options.qualityCoreVersion ?? (policy.quality_core_version === 'v2' ? 'v2' : 'v1');
   const maxCandidates = options.maxCandidates ?? policy.stock_max_positions;
   const priceCapCny = options.priceCapCny ?? policy.stock_price_cap_cny;
   const minAmount20Yi = options.minAmount20Yi ?? 1.5;
@@ -222,10 +223,22 @@ export function screenStockSwingCandidates(
       // 4. Point-in-time QualityCore (ann_date <= asOf already enforced by scanMarket).
       const f = row.fundamentals;
       if (!f) return;
-      const roeAnn = f.roe != null && Number.isFinite(f.roe) ? f.roe * annualizeRoeMultiplier(f.end_date) : NaN;
+      const mult = annualizeQuarterMultiplier(f.end_date);
+      const roeAnn = f.roe != null && Number.isFinite(f.roe) ? f.roe * mult : NaN;
       const epsVal = f.eps != null && Number.isFinite(f.eps) ? f.eps : NaN;
       const ocfPct = f.ocf_to_profit != null && Number.isFinite(f.ocf_to_profit) ? f.ocf_to_profit : NaN;
-      if (!(roeAnn > 5.0) || !(epsVal > 0) || !(ocfPct > 50.0)) return;
+      const bpsVal = f.bps != null && Number.isFinite(f.bps) ? f.bps : null;
+      let roeDtAnn: number | null = f.roe_dt != null && Number.isFinite(f.roe_dt) ? f.roe_dt * mult : null;
+      if (qcVersion === 'v2') {
+        const v2 = evaluateQualityCoreV2(
+          { end_date: f.end_date, ann_date: f.ann_date, roe_dt: f.roe_dt, eps: f.eps, ocf_to_profit: f.ocf_to_profit, bps: f.bps },
+          asOf,
+        );
+        if (!v2.passed) return;
+        roeDtAnn = v2.roe_dt_annualized;
+      } else {
+        if (!(roeAnn > 5.0) || !(epsVal > 0) || !(ocfPct > 50.0)) return;
+      }
       if (row.eligible === false && row.ineligible_reason === '最近已披露财报亏损') return;
       if (!FINANCIAL_INDUSTRIES.has(row.industry) && f.debt_to_assets != null && f.debt_to_assets > 80) return;
 
@@ -290,8 +303,10 @@ export function screenStockSwingCandidates(
         low_5d_cny: r2(safeLow5Raw),
         amount20_yi: r2(row.amount20_yi),
         circ_mv_yi: r2(row.circ_mv_yi),
-        roe_annualized_pct: r2(roeAnn),
+        roe_annualized_pct: r2(Number.isFinite(roeAnn) ? roeAnn : (roeDtAnn ?? 0)),
+        roe_dt_annualized_pct: roeDtAnn !== null ? r2(roeDtAnn) : null,
         eps: r2(epsVal),
+        bps: bpsVal !== null ? r2(bpsVal) : null,
         ocf_to_profit_pct: r2(ocfPct),
       });
     },
@@ -371,8 +386,11 @@ export function screenStockSwingCandidates(
       amount20_yi: item.amount20_yi,
       circ_mv_yi: item.circ_mv_yi,
       roe_annualized_pct: item.roe_annualized_pct,
+      roe_dt_annualized_pct: item.roe_dt_annualized_pct,
       eps: item.eps,
+      bps: item.bps,
       ocf_to_profit_pct: item.ocf_to_profit_pct,
+      quality_core_version: qcVersion,
       composite_score: compositeScore,
       reasons_zh: [
         `相对强度百分位达 ${r2(rpsBest).toFixed(1)}${secRank !== null ? `，所属行业「${item.industry}」排名第 ${secRank}/${sectorCount} 位（前 30%）` : ''}`,

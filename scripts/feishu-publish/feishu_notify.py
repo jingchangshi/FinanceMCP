@@ -46,6 +46,7 @@ _REGIME_ZH = {
     "NEUTRAL": "结构档",
     "STRUCTURE": "结构档",
     "RECOVERY": "冰点复苏试探档",
+    "ICE_10": "冰点阻尼防守档",
     "BEAR": "防守档",
     "DEFENSIVE": "防守档",
 }
@@ -204,6 +205,34 @@ def build_notification_markdown(
         buf_bits.append(f"安全缓冲 {_fmt_pct(lifeline_buffer)}")
     safety_summary = "，".join(buf_bits) if buf_bits else humanize_text(cb_label)
     lines.append(f"- **账户总资产**：{_fmt_yuan(total_cents)}（{humanize_text(cb_label)}｜{safety_summary}）")
+
+    if cockpit:
+        pillars_raw = cockpit.get("three_pillar_cockpit") if isinstance(cockpit.get("three_pillar_cockpit"), dict) else {}
+        fr = cockpit.get("fundamental_regime") if isinstance(cockpit.get("fundamental_regime"), dict) else {}
+        fvo = cockpit.get("fvo") if isinstance(cockpit.get("fvo"), dict) else {}
+        b1_zh = str(fr.get("b1_state_label_zh") or "中性状态（100% 透传技术面档位）")
+        erp_pct = fr.get("erp_pct_756")
+        bp_pct = fr.get("bp_pct_756")
+        spread_bps = fr.get("term_spread_bps")
+        edi_bps = fr.get("edi_bps")
+        pct60 = mr.get("pct_above_ma60")
+        pct60_txt = f"{pct60 * 100.0:.1f}%" if isinstance(pct60, (int, float)) else "待补充"
+        erp_txt = f"{erp_pct * 100.0:.1f}%" if isinstance(erp_pct, (int, float)) else "待补充"
+        bp_txt = f"{bp_pct * 100.0:.1f}%" if isinstance(bp_pct, (int, float)) else "待补充"
+        spread_txt = f"{spread_bps:+.0f} 基点" if isinstance(spread_bps, (int, float)) else "待补充"
+        edi_txt = f"{edi_bps / 100.0:+.1f}%" if isinstance(edi_bps, (int, float)) else "待补充"
+        fvo_eff = fvo.get("effective_delta_bps")
+        fvo_zh = (
+            str(fvo.get("summary_zh") or "0 主观偏移，纯系统运行")
+            if isinstance(fvo_eff, (int, float)) and fvo_eff != 0
+            else "0 主观偏移，纯系统运行"
+        )
+        tech_col = str(pillars_raw.get("technical_zh") or f"{regime_zh}（{style_zh}，站上60日线 {pct60_txt}；{cb_label}）")
+        fund_col = str(pillars_raw.get("fundamental_zh") or f"{b1_zh}（756日风险溢价分位 {erp_txt}、市净率分位 {bp_txt}）")
+        fwd_col = str(pillars_raw.get("forward_view_zh") or f"只读参考：10Y-1Y期限利差 {spread_txt}，季报盈利扩散度 {edi_txt}；{fvo_zh}")
+        lines.append(f"- **【技术面】**：{humanize_text(tech_col)}")
+        lines.append(f"- **【基本面】**：{humanize_text(fund_col)}")
+        lines.append(f"- **【未来预期】**：{humanize_text(fwd_col)}")
 
     deconc_cancelled = (deconc.get("plan_present") is False) or (str(deconc.get("plan_status") or "") == "CANCELLED")
     tranches = [t for t in (deconc.get("tranches") or []) if isinstance(t, dict)]

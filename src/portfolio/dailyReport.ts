@@ -486,6 +486,39 @@ export interface V3CockpitSummary {
     zz500_above_ma60: boolean | null;
     cyb_above_ma60: boolean | null;
     recovery_state?: V3ActionEngineOutput['market_regime']['recovery_state'];
+    ice10_active?: boolean;
+    ice10_remaining_days?: number;
+  };
+  fundamental_regime?: {
+    available: boolean;
+    b1_state: V3ActionEngineOutput['fundamental_regime']['b1_state'];
+    b1_state_label_zh: string;
+    erp_pct_756: number | null;
+    bp_pct_756: number | null;
+    erp_bps: number | null;
+    dv_lowvol_bps: number | null;
+    cgb_1y_bps: number | null;
+    cgb_10y_bps: number | null;
+    term_spread_bps: number | null;
+    edi_bps: number | null;
+    stale_fallback_days: number;
+    warning: string | null;
+    summary_zh: string;
+  };
+  fvo?: {
+    overlay_id: string | null;
+    raw_delta_bps: number;
+    effective_delta_bps: number;
+    expires_trade_date: string | null;
+    attribution_60d_bps: number | null;
+    band_halved: boolean;
+    zeroed_reason: string | null;
+    summary_zh: string;
+  };
+  three_pillar_cockpit?: {
+    technical_zh: string;
+    fundamental_zh: string;
+    forward_view_zh: string;
   };
   router: {
     effective_regime: V3ActionEngineOutput['router']['effective_regime'];
@@ -2298,7 +2331,63 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
               ? engineOut.market_regime.growth_anchor.chinext.close >= engineOut.market_regime.growth_anchor.chinext.ma60
               : null,
           ...(engineOut.market_regime.recovery_state ? { recovery_state: engineOut.market_regime.recovery_state } : {}),
+          ...(engineOut.market_regime.ice10_active !== undefined ? { ice10_active: engineOut.market_regime.ice10_active } : {}),
+          ...(engineOut.market_regime.ice10_remaining_days !== undefined ? { ice10_remaining_days: engineOut.market_regime.ice10_remaining_days } : {}),
         },
+        fundamental_regime: {
+          available: engineOut.fundamental_regime.available,
+          b1_state: engineOut.fundamental_regime.b1_state,
+          b1_state_label_zh: engineOut.fundamental_regime.b1_state_label_zh,
+          erp_pct_756: engineOut.fundamental_regime.erp_pct_756,
+          bp_pct_756: engineOut.fundamental_regime.bp_pct_756,
+          erp_bps: engineOut.fundamental_regime.erp_bps,
+          dv_lowvol_bps: engineOut.fundamental_regime.dv_lowvol_bps,
+          cgb_1y_bps: engineOut.fundamental_regime.cgb_1y_bps,
+          cgb_10y_bps: engineOut.fundamental_regime.cgb_10y_bps,
+          term_spread_bps: engineOut.fundamental_regime.term_spread_bps,
+          edi_bps: engineOut.fundamental_regime.edi_bps,
+          stale_fallback_days: engineOut.fundamental_regime.stale_fallback_days,
+          warning: engineOut.fundamental_regime.warning,
+          summary_zh: engineOut.fundamental_regime.summary_zh,
+        },
+        fvo: {
+          overlay_id: engineOut.router.fvo.active_row?.overlay_id ?? null,
+          raw_delta_bps: engineOut.router.fvo.raw_delta_bps,
+          effective_delta_bps: engineOut.router.fvo.effective_delta_bps,
+          expires_trade_date: engineOut.router.fvo.active_row?.expires_trade_date ?? null,
+          attribution_60d_bps: engineOut.router.fvo.attribution_60d_bps,
+          band_halved: engineOut.router.fvo.band_halved,
+          zeroed_reason: engineOut.router.fvo.zeroed_reason,
+          summary_zh: engineOut.router.fvo.summary_zh,
+        },
+        three_pillar_cockpit: (() => {
+          const fr = engineOut.fundamental_regime;
+          const fvo = engineOut.router.fvo;
+          const mr = engineOut.market_regime;
+          const pct60Txt = mr.breadth.pct_above_ma60 !== null
+            ? `${(mr.breadth.pct_above_ma60 * 100).toFixed(1)}%`
+            : '待补充';
+          const iceTxt = (mr.ice10_remaining_days ?? 0) > 0
+            ? `，冰点阻尼窗口余 ${mr.ice10_remaining_days} 日`
+            : '';
+          const technical_zh = `${mr.regime_label_zh}（${mr.style_label_zh}，站上60日线 ${pct60Txt}${iceTxt}；${engineOut.router.circuit_breaker_label_zh}）`;
+          const erpPctTxt = fr.erp_pct_756 !== null ? `${(fr.erp_pct_756 * 100).toFixed(1)}%` : '待补充';
+          const bpPctTxt = fr.bp_pct_756 !== null ? `${(fr.bp_pct_756 * 100).toFixed(1)}%` : '待补充';
+          const dvTxt = fr.dv_lowvol_bps !== null ? `${(fr.dv_lowvol_bps / 100).toFixed(2)}%` : '待补充';
+          const staleNote = fr.stale_fallback_days > 0 ? `；慢变量沿用前 ${fr.stale_fallback_days} 交易日有效值` : '';
+          const fundamental_zh = `${fr.b1_state_label_zh}（756日风险溢价分位 ${erpPctTxt}、市净率分位 ${bpPctTxt}、低波股息率 ${dvTxt}${staleNote}）`;
+          const spreadTxt = fr.term_spread_bps !== null
+            ? `${fr.term_spread_bps >= 0 ? '+' : ''}${Math.round(fr.term_spread_bps)} 基点`
+            : '待补充';
+          const ediTxt = fr.edi_bps !== null
+            ? `${fr.edi_bps >= 0 ? '+' : ''}${(fr.edi_bps / 100).toFixed(1)}%`
+            : '待补充';
+          const fvoTxt = fvo.effective_delta_bps === 0
+            ? '0 主观偏移，纯系统运行'
+            : fvo.summary_zh;
+          const forward_view_zh = `只读参考：国债10Y-1Y期限利差 ${spreadTxt}，季报盈利扩散度 ${ediTxt}；主观视角：${fvoTxt}`;
+          return { technical_zh, fundamental_zh, forward_view_zh };
+        })(),
         router: {
           effective_regime: engineOut.router.effective_regime,
           circuit_breaker_status: engineOut.router.circuit_breaker_status,

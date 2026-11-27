@@ -10,6 +10,10 @@ import { withSyncDb } from './fetch.js';
 import { acceptance } from './acceptance.js';
 import { syncEtfForDaily, type EtfDailySyncSummary } from './etf.js';
 import { auditCache, fillGaps, saveAudit } from './audit.js';
+import {
+  computeAndStoreMarketFundamentalDaily,
+  syncMacroYieldCurve,
+} from './marketFundamentalDaily.js';
 // 热点行业同步只在 `hotspot-sync` 显式命令里调用；import 本身不触网。
 import { syncSwClassify, syncSwMembers, syncSwIndexDaily, syncThsIndex, syncThsMembers, syncThsIndexDaily, discoverThsCodes } from './industrySync.js';
 import { resolveCalendarSyncEnd } from './providers/freeProviderRouter.js';
@@ -99,6 +103,18 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       // ChatGPT 读到的是当日的 ETF 收盘行情。整个 ETF 段落被隔离：任何失败只写入
       // 返回值，不中断股票日报（任务书 B2.9）。
       const etf = await syncEtfForDailySafe(db, start, date);
+      let macroYield: unknown;
+      let fundamentalDaily: unknown;
+      try {
+        macroYield = await syncMacroYieldCurve(db, date);
+      } catch (err: any) {
+        macroYield = { trade_date: date, status: 'failed', warning: String(err?.message ?? err).slice(0, 200) };
+      }
+      try {
+        fundamentalDaily = computeAndStoreMarketFundamentalDaily(db, date);
+      } catch (err: any) {
+        fundamentalDaily = { trade_date: date, status: 'failed', warning: String(err?.message ?? err).slice(0, 200) };
+      }
       const evidence = loadVerdicts(db).meta;
       const ageDays = evidence.computed_at ? (Date.now() - Date.parse(evidence.computed_at)) / 86400_000 : Infinity;
       let evidenceRefreshed = false;
@@ -111,6 +127,8 @@ export async function runCommand(db: DatabaseSync, command: string, h: CliHelper
       h.print({
         sync: { ...rest, quality: sync.quality.slice(-3), as_of_datasets: datasets[date] },
         etf: { ...etf, fund_daily: etf.fund_daily, holdings: etf.holdings, coverage: etf.coverage },
+        macro_yield: macroYield,
+        market_fundamental_daily: fundamentalDaily,
         evidence_refreshed: evidenceRefreshed,
         report: reportSummary(meta, report),
       });

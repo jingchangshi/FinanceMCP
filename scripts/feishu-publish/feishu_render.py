@@ -292,6 +292,15 @@ def render_xml(sections: Dict[str, Any]) -> str:
         f"<p>{_esc(sections['subtitle'])}</p>",
         f"<p>{_esc(sections['account_status'])}</p>",
     ]
+    pillars = sections.get("cockpit_pillars")
+    if isinstance(pillars, dict) and all(str(pillars.get(k) or "").strip() for k in ("technical", "fundamental", "forward_view")):
+        blocks.append(
+            _table(
+                ["【技术面】", "【基本面】", "【未来预期】"],
+                [[str(pillars["technical"]), str(pillars["fundamental"]), str(pillars["forward_view"])]],
+                [180, 180, 180],
+            )
+        )
 
     judgment = _section_of(sections, "今日判断")
     blocks.append(_heading(1, "今日判断"))
