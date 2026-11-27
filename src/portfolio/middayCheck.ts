@@ -236,7 +236,7 @@ export async function buildIntradayMiddayCheck(opts: MiddayCheckOptions): Promis
     ? (opts.portfolioDb.prepare('SELECT * FROM account_risk_anchor WHERE account_id = ?').get(account.account_id) as Record<string, any> | undefined)
     : undefined;
 
-  const deconcPlan = portfolioTableExists(opts.portfolioDb, 'deconcentration_plan')
+  const deconcPlan = policy.deconcentration_plan_enabled && portfolioTableExists(opts.portfolioDb, 'deconcentration_plan')
     ? (opts.portfolioDb.prepare("SELECT * FROM deconcentration_plan WHERE account_id = ? AND status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1").get(account.account_id) as Record<string, any> | undefined)
     : undefined;
 
@@ -687,7 +687,9 @@ export async function buildIntradayMiddayCheck(opts: MiddayCheckOptions): Promis
     afternoon_checklist_zh: checklist,
     discipline_guardrails_zh: [
       '本工具纯只读且完全隔离：不写账本、不修改快照、不写入盘后前瞻评测账本。',
-      '11:30 午盘只是执行与风控检查窗口；MA20 离场线与 0.780 箱体支撑以 14:45–15:00 收盘确认为准，防止午间诱空误操作。',
+      policy.deconcentration_plan_enabled
+        ? '11:30 午盘只是执行与风控检查窗口；MA20 离场线与 0.780 箱体支撑以 14:45–15:00 收盘确认为准，防止午间诱空误操作。'
+        : '11:30 午盘只是执行与风控检查窗口；MA20 离场线与档位回撤检查均以 14:45–15:00 收盘确认为准，防止午间诱空误操作。',
       '拟买入标的实时涨超昨夜参考价 +2% 一律放弃追高；跨境 ETF 实时溢价 > +2.5% 或净值滞后 > 3 日一律拦截。',
     ],
   };

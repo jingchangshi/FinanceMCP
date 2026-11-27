@@ -336,6 +336,8 @@ def _build_v3_cockpit_sections(
     is_gradual = (router.get("drawdown_control_mode") == "TWO_STAGE_GRADUAL")
     preemptive_active = bool(router.get("deconcentration_preemptive_active"))
     deconc = cockpit.get("deconcentration") or {}
+    align = cockpit.get("align_summary") or {}
+    deconc_cancelled = (deconc.get("plan_present") is False) or (str(deconc.get("plan_status") or "") == "CANCELLED")
     rem = cockpit.get("reconciliation_reminder") or {}
     sub_zh = router.get("sub_strategies_zh") or {}
     hard_l2_pct = 13.5 if is_gradual else (
@@ -401,7 +403,15 @@ def _build_v3_cockpit_sections(
     reload_txt = f"{_tick_price(reload_target_val)} 元" if isinstance(reload_target_val, (int, float)) else "待确认"
 
     deconc_next = []
-    if is_grind25:
+    if deconc_cancelled:
+        if align.get("enabled"):
+            if int(align.get("unmanaged_legacy_after_cents") or 0) > 0:
+                deconc_next.append("次日继续按单日换手平滑上限出清剩余非目标持仓，并按目标权益上限分批配置底盘与国债蓄水池")
+            else:
+                deconc_next.append("风险权益权重偏离达到漂移带或市场双锚切换档位时触发组合双向对齐")
+        else:
+            deconc_next.append("风险权益权重偏离目标或市场双锚切换档位时触发组合双向对齐")
+    elif is_grind25:
         if open_excess:
             if deconc.get("rebound_trigger_cny") is not None:
                 deconc_next.append(f"超额份额反弹 +8% 减仓价 {_tick_price(deconc['rebound_trigger_cny'])} 元")
@@ -447,7 +457,7 @@ def _build_v3_cockpit_sections(
     )
     change_condition = (
         "触发任意以下条件即更新动作："
-        + ("；".join(deconc_next) if deconc_next else "159558.SZ 达到分批减仓条件")
+        + ("；".join(deconc_next) if deconc_next else ("组合权重偏离触发双向对齐阈值" if deconc_cancelled else "159558.SZ 达到分批减仓条件"))
         + f"，或账户自动态高水位回撤达到 {active_l2_txt} 生命线。"
     )
     if is_actionable and action_lines:
@@ -594,34 +604,50 @@ def _build_v3_cockpit_sections(
         },
         (
             {
-                "label": "② 159558.SZ 25%底仓与震荡磨底降本状态机",
+                "label": "② 组合仓位与双向对齐进度",
                 "observation": (
-                    (
-                        f"{cur_shares_txt}目标保留 25% 核心底仓 {deconc.get('target_keep_shares', 20600)} 份，"
-                        f"已执行 {exec_cnt}/{len(tranches) or 4} 批超额减仓（余量拆分：{tranche_desc}）；"
-                        f"60日均线10日斜率 {slope_txt}（{'走平允许观察' if gg.get('ma60_flat_ready') else '下行期禁止左侧接飞刀'}），"
-                        f"折价7%参考位 {reload_txt}。"
-                    )
-                    if open_excess
-                    else (
-                        f"{cur_shares_txt}目标 25% 核心底仓 {deconc.get('target_keep_shares', 20600)} 份，"
-                        f"当前机动降本持仓 {int(deconc.get('tactical_shares') or 0)} 份（已闭环降本波段 {int(deconc.get('completed_swing_count') or 0)} 轮）；"
-                        f"60日均线10日斜率 {slope_txt}，折价7%回补目标位 {reload_txt}。"
-                    )
+                    f"非目标遗留仓位由 {_fmt_money(align.get('unmanaged_legacy_before_cents'))} 压降至 "
+                    f"{_fmt_money(align.get('unmanaged_legacy_after_cents'))}，动作后风险权益占比 "
+                    f"{_fmt_pct((align.get('post_action_risk_equity_bps') or 0) / 100.0, 1)}（当前上限 "
+                    f"{_fmt_pct((align.get('target_equity_cap_bps') or 0) / 100.0, 0)}，目标底盘配置 {int(align.get('chassis_target_count') or 0)} 只）。"
+                    if align.get("enabled")
+                    else "已启用无条件目标组合双向对齐引擎，历史集中度换马计划已终止。"
                 ),
-                "why": "取消低位月度强卖，长期留存25%核心半导体设备底仓弹性；仅在60日均线走平+深折价超卖+右侧企稳四门槛齐备时启用单槽+10%战术回补（不设窄幅噪点止损），规避越做越亏风险。",
-                "rule_note": ("；".join(deconc_next) if deconc_next else "按四门槛持续观察") + f"（持仓占比降至30%及以下且超额归零后恢复{hard_l2_txt}标准熔断线）。",
+                "why": "取消单一持仓分批豁免，统一按当前市场档位目标组合与无状态两日收敛上限执行双向对齐，避免遗留仓位继续暴露或反向叠加新仓越过风险上限。",
+                "rule_note": ("；".join(deconc_next) if deconc_next else "当市场档位切换或持仓偏离达漂移带时触发双向再平衡") + "。",
             }
-            if is_grind25
-            else {
-                "label": "② 159558.SZ 四批换马状态机",
-                "observation": (
-                    f"{cur_shares_txt}已执行 {exec_cnt}/{len(tranches) or 4} 批，目标保留底仓 {deconc.get('target_keep_shares', 15000)} 份；"
-                    f"拆分计划：{tranche_desc}。"
-                ),
-                "why": "持久化锁定分批份数避免每日无状态重复卖出，在保留核心半导体设备底仓弹性的同时有序降低单一标的集中暴露。",
-                "rule_note": "下一批触发条件：" + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
-            }
+            if deconc_cancelled
+            else (
+                {
+                    "label": "② 159558.SZ 25%底仓与震荡磨底降本状态机",
+                    "observation": (
+                        (
+                            f"{cur_shares_txt}目标保留 25% 核心底仓 {deconc.get('target_keep_shares', 20600)} 份，"
+                            f"已执行 {exec_cnt}/{len(tranches) or 4} 批超额减仓（余量拆分：{tranche_desc}）；"
+                            f"60日均线10日斜率 {slope_txt}（{'走平允许观察' if gg.get('ma60_flat_ready') else '下行期禁止左侧接飞刀'}），"
+                            f"折价7%参考位 {reload_txt}。"
+                        )
+                        if open_excess
+                        else (
+                            f"{cur_shares_txt}目标 25% 核心底仓 {deconc.get('target_keep_shares', 20600)} 份，"
+                            f"当前机动降本持仓 {int(deconc.get('tactical_shares') or 0)} 份（已闭环降本波段 {int(deconc.get('completed_swing_count') or 0)} 轮）；"
+                            f"60日均线10日斜率 {slope_txt}，折价7%回补目标位 {reload_txt}。"
+                        )
+                    ),
+                    "why": "取消低位月度强卖，长期留存25%核心半导体设备底仓弹性；仅在60日均线走平+深折价超卖+右侧企稳四门槛齐备时启用单槽+10%战术回补（不设窄幅噪点止损），规避越做越亏风险。",
+                    "rule_note": ("；".join(deconc_next) if deconc_next else "按四门槛持续观察") + f"（持仓占比降至30%及以下且超额归零后恢复{hard_l2_txt}标准熔断线）。",
+                }
+                if is_grind25
+                else {
+                    "label": "② 159558.SZ 四批换马状态机",
+                    "observation": (
+                        f"{cur_shares_txt}已执行 {exec_cnt}/{len(tranches) or 4} 批，目标保留底仓 {deconc.get('target_keep_shares', 15000)} 份；"
+                        f"拆分计划：{tranche_desc}。"
+                    ),
+                    "why": "持久化锁定分批份数避免每日无状态重复卖出，在保留核心半导体设备底仓弹性的同时有序降低单一标的集中暴露。",
+                    "rule_note": "下一批触发条件：" + ("；".join(deconc_next) if deconc_next else "按月度窗口顺延") + "。",
+                }
+            )
         ),
         {
             "label": "③ 账户仓位水位与增量资金预算",
@@ -643,7 +669,7 @@ def _build_v3_cockpit_sections(
         close_px = _tick_price(quote.get("close_cny")) if quote.get("close_cny") is not None else "—"
         chg = quote.get("pct_chg")
         chg_txt = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "—"
-        if ts_code == "159558.SZ":
+        if ts_code == "159558.SZ" and not deconc_cancelled:
             has_159558_act = is_actionable and any("159558.SZ" in l for l in action_lines)
             if is_grind25:
                 if has_159558_act and any("159558.SZ" in l and ("买入" in l or "回补" in l) for l in action_lines):
@@ -655,6 +681,9 @@ def _build_v3_cockpit_sections(
             else:
                 judgment = "执行减仓" if has_159558_act else "按四批换马持有观察"
             basis = f"收盘 {close_px} 元（{chg_txt}），权重 {_fmt_pct((h.get('weight') or 0) * 100)}；{deconc_line}"
+        elif deconc_cancelled and is_actionable and any(ts_code in l and "卖出" in l for l in action_lines):
+            judgment = "按目标对齐规则有序出清"
+            basis = f"收盘 {close_px} 元（{chg_txt}），权重 {_fmt_pct((h.get('weight') or 0) * 100)}；不在当前目标组合内，按单日换手平滑上限分批回笼。"
         else:
             judgment = "继续持有并随组合跟踪"
             basis = f"收盘 {close_px} 元（{chg_txt}），权重 {_fmt_pct((h.get('weight') or 0) * 100)}。"
@@ -734,7 +763,11 @@ def _build_v3_cockpit_sections(
         if preemptive_active
         else f"{_ymd(next_date)}：盯防动态高水位 {active_l2_txt} 熔断生命线 {_fmt_money(router.get('lifeline_nav_cents'))}，破线无条件压仓至 15% 以下。{gradual_guard_note}"
     )
-    deconc_cond_prefix = "159558.SZ 25%底仓与磨底降本观察位——" if is_grind25 else "159558.SZ 四批换马触发位——"
+    deconc_cond_prefix = (
+        "组合双向对齐跟踪——"
+        if deconc_cancelled
+        else ("159558.SZ 25%底仓与磨底降本观察位——" if is_grind25 else "159558.SZ 四批换马触发位——")
+    )
     conditions: List[str] = [
         f"{_ymd(next_date)}：{deconc_cond_prefix}" + ("；".join(deconc_next) if deconc_next else "待触发") + "。",
         lifeline_text,

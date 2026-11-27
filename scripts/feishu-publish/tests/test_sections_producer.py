@@ -606,3 +606,110 @@ class TestV3CockpitSections(unittest.TestCase):
         self.assertEqual(check_forbidden(vis_normal), [])
         self.assertEqual(check_internal_tokens(vis_normal), [])
         self.assertIn("13.5% 熔断生命线", vis_normal)
+
+    def test_v331_cancelled_deconc_and_align_actions_clean(self):
+        from feishu_render import check_forbidden, check_internal_tokens, check_markdown_leak, render_xml, strip_tags
+
+        bundle = self._v3_bundle(actionable=True)
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["policy_release"] = {
+            "version": "v3.3.1",
+            "deconcentration_plan_enabled": False,
+            "regime_target_enforced_on_existing_holdings": True,
+            "defensive_bond_reservoir_etf": "159649.SZ",
+        }
+        cockpit["router"].update({
+            "policy_version": "v3.3.1",
+            "deconcentration_preemptive_active": False,
+            "l2_trigger_drawdown_bps": 1350,
+            "drawdown_control_mode": "TWO_STAGE_GRADUAL",
+        })
+        cockpit["deconcentration"].update({
+            "plan_present": False,
+            "plan_status": "CANCELLED",
+            "status_summary_zh": "集中度换马计划已终止，统一交由目标组合双向对齐引擎管理。",
+        })
+        cockpit["align_summary"] = {
+            "enabled": True,
+            "align_due": True,
+            "carryover_cap_bps": 3500,
+            "pre_sell_excess_cents": 7180000,
+            "target_glide_sell_cents": 3680000,
+            "p0_sold_cents": 0,
+            "p3_sold_cents": 3680000,
+            "unmanaged_legacy_before_cents": 7180000,
+            "unmanaged_legacy_after_cents": 3500000,
+            "post_action_risk_equity_bps": 3500,
+            "target_equity_cap_bps": 1500,
+            "chassis_target_count": 2,
+            "target_slots": [],
+        }
+        bundle["portfolio"]["first_section"]["actions"] = [
+            {
+                "priority": "P0",
+                "code": "P0-DRAWDOWN-CAP-SELL-159558.SZ",
+                "kind": "REDUCE",
+                "title": "触发渐进回撤降仓线（权益上限 50%）：减仓 半导体设备ETF（159558.SZ）",
+                "reasons": ["按两段渐进风控将风险权益压降至 50% 以内。"],
+                "legs": [
+                    {
+                        "side": "SELL",
+                        "ts_code": "159558.SZ",
+                        "quantity": 10000,
+                        "price_milli": 1000,
+                        "fees_cents": 500,
+                        "reason": "P0_DRAWDOWN_GRADUAL_CAP",
+                    }
+                ],
+                "fees_cents": 500,
+            },
+            {
+                "priority": "P3",
+                "code": "P3-REGIME-ALIGN-SELL-159241.SZ",
+                "kind": "REDUCE",
+                "title": "组合目标对齐清出非目标持仓：卖出 航空航天ETF（159241.SZ）",
+                "reasons": ["当前档位下不在目标组合内，按单日换手平滑上限有序清出。"],
+                "legs": [
+                    {
+                        "side": "SELL",
+                        "ts_code": "159241.SZ",
+                        "quantity": 1500,
+                        "price_milli": 1000,
+                        "fees_cents": 500,
+                        "reason": "P3_REGIME_ALIGN_CLEAR_NON_TARGET",
+                    }
+                ],
+                "fees_cents": 500,
+            },
+            {
+                "priority": "P3",
+                "code": "P3-SUPER-ETF-REBALANCE",
+                "kind": "ROTATE",
+                "title": "底盘超级基金与防御蓄水池配置：1 笔买入",
+                "reasons": ["防御桶中尚未配置到国债基金的闲置资金转入 159649.SZ 蓄水池。"],
+                "legs": [
+                    {
+                        "side": "BUY",
+                        "ts_code": "159649.SZ",
+                        "quantity": 30000,
+                        "price_milli": 1000,
+                        "fees_cents": 750,
+                        "reason": "P3_DEFENSIVE_BOND_RESERVOIR",
+                    }
+                ],
+                "fees_cents": 750,
+            },
+        ]
+        sections = build_sections(bundle, generated_at="2026-11-27 19:30")
+        self.assertEqual(validate_sections(sections), [])
+        xml = render_xml(sections)
+        vis = strip_tags(xml)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertEqual(check_markdown_leak(vis), [])
+        self.assertIn("组合仓位与双向对齐进度", vis)
+        self.assertNotIn("四批换马状态机", vis)
+        self.assertNotIn("25%底仓与震荡磨底降本状态机", vis)
+        self.assertNotIn("按四批换马持有观察", vis)
+        self.assertNotIn("159649.SZ（免五", vis)
+        self.assertNotIn("159649.SZ 免五", vis)

@@ -505,6 +505,55 @@ export function calibrateDeconcentrationPlan(
   };
 }
 
+/**
+ * 显式取消存量重仓降浓计划：将 ACTIVE 行安全更新为 CANCELLED（保留历史行与批次记录，绝不删除）。
+ */
+export function cancelDeconcentrationPlan(
+  portfolioDb: DatabaseSync,
+  accountId: string,
+  tsCode = '159558.SZ',
+  reason = 'cancelled_by_operator',
+): {
+  cancelled: boolean;
+  updated_count: number;
+  plan_ids: string[];
+  account_id: string;
+  ts_code: string;
+  reason: string;
+  status: 'CANCELLED';
+} {
+  ensurePortfolioV3Schema(portfolioDb);
+  const activeRows = portfolioDb.prepare(
+    "SELECT plan_id FROM deconcentration_plan WHERE account_id = ? AND ts_code = ? AND status = 'ACTIVE' ORDER BY created_at DESC",
+  ).all(accountId, tsCode) as Array<{ plan_id: string }>;
+  const planIds = activeRows.map(r => String(r.plan_id));
+  if (planIds.length > 0) {
+    const cancelledAt = new Date().toISOString();
+    inPortfolioTransaction(portfolioDb, () => {
+      portfolioDb.prepare(
+        "UPDATE deconcentration_plan SET status = 'CANCELLED' WHERE account_id = ? AND ts_code = ? AND status = 'ACTIVE'",
+      ).run(accountId, tsCode);
+      if (portfolioTableExists(portfolioDb, 'account_meta')) {
+        portfolioDb.prepare(
+          'INSERT INTO account_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+        ).run(
+          `v3_deconc_cancelled:${accountId}:${tsCode}`,
+          JSON.stringify({ plan_ids: planIds, reason, cancelled_at: cancelledAt }),
+        );
+      }
+    });
+  }
+  return {
+    cancelled: planIds.length > 0,
+    updated_count: planIds.length,
+    plan_ids: planIds,
+    account_id: accountId,
+    ts_code: tsCode,
+    reason,
+    status: 'CANCELLED',
+  };
+}
+
 function loadEtfQfqCloses(
   marketDb: DatabaseSync | null | undefined,
   tsCode: string,
@@ -935,6 +984,21 @@ function uninitializedEvaluation(
   };
 }
 
+function cancelledEvaluation(
+  accountId: string,
+  tsCode: string,
+  asOf: string,
+  currentShares: number,
+  sellableShares: number,
+  currentCloseMilli: number | null,
+): DeconcentrationEvaluation {
+  return {
+    ...uninitializedEvaluation(accountId, tsCode, asOf, currentShares, sellableShares, currentCloseMilli),
+    plan_status: 'CANCELLED',
+    status_summary_zh: `${tsCode} 存量降浓计划已取消，改由组合双向目标对齐统一调仓。`,
+  };
+}
+
 export function evaluateDeconcentrationPlan(input: {
   portfolioDb?: DatabaseSync | null;
   marketDb?: DatabaseSync | null;
@@ -948,8 +1012,14 @@ export function evaluateDeconcentrationPlan(input: {
   availableCashCents?: number;
   circuitBreakerStatus?: 'NORMAL' | 'L1_WARN' | 'L2_LOCKED';
   marketRegime: MarketRegimeTier;
+  planEnabled?: boolean;
 }): DeconcentrationEvaluation {
   const tsCode = input.tsCode ?? '159558.SZ';
+  if (input.planEnabled === false) {
+    return cancelledEvaluation(
+      input.accountId, tsCode, input.asOf, input.currentShares, input.sellableShares, input.currentCloseMilli,
+    );
+  }
   if (
     !input.portfolioDb
     || !portfolioTableExists(input.portfolioDb, 'deconcentration_plan')
@@ -965,6 +1035,14 @@ export function evaluateDeconcentrationPlan(input: {
   ).get(input.accountId, tsCode) as DeconcentrationPlanRow | undefined;
 
   if (!rawPlan) {
+    const cancelledRow = input.portfolioDb.prepare(
+      "SELECT 1 FROM deconcentration_plan WHERE account_id = ? AND ts_code = ? AND status = 'CANCELLED' LIMIT 1",
+    ).get(input.accountId, tsCode);
+    if (cancelledRow) {
+      return cancelledEvaluation(
+        input.accountId, tsCode, input.asOf, input.currentShares, input.sellableShares, input.currentCloseMilli,
+      );
+    }
     return uninitializedEvaluation(
       input.accountId, tsCode, input.asOf, input.currentShares, input.sellableShares, input.currentCloseMilli,
     );

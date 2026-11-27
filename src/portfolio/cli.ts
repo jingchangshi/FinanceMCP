@@ -29,7 +29,7 @@ import { buildBenchmarkComparison } from './benchmarks.js';
 import { runFeeCommand, FEE_USAGE } from './feeCli.js';
 import { runRiskPolicyCommand, RISK_POLICY_USAGE } from './riskPolicyCli.js';
 import { parseTradeCsv } from './tradeImport.js';
-import { calibrateDeconcentrationPlan } from './deconcentrationPlan.js';
+import { cancelDeconcentrationPlan, calibrateDeconcentrationPlan } from './deconcentrationPlan.js';
 import { loadFeeContext } from './fees.js';
 import { trustedEvidencePolicy, verifyTrustedRotation } from './trustedEvidence.js';
 import {
@@ -114,10 +114,11 @@ ${RISK_POLICY_USAGE}
                                                        受控撤回（VERIFIED→REVOKED，追加审计事件，不改写原记录）
   portfolio-evidence-history --id ID [--db PATH]       查看某条证据的状态变更历史
   portfolio-deconcentration-calibrate --account ID [--ts-code CODE] --confirm [--db PATH]
+        [--cancel] [--reason TEXT]
         [--mode STANDARD|BOTTOM_GRIND_25] [--target-keep-bps 2500] [--tactical-slot-bps 1000]
         [--support-floor-milli 厘] [--anchor-price-milli 厘 --anchor-trade-date YYYYMMDD]
         [--trade-date YYYYMMDD] [--market-db PATH] [--reset-triggered]
-                                                       校准减仓/磨底降本状态机模式、目标底仓比例、防守位与剩余拆分份数；
+                                                       校准或取消减仓/磨底降本状态机（--cancel 安全置 CANCELLED 保留历史）；
                                                        修改锚定价必须同时给出价格基准交易日
 
   收盘日报与研究候选（D1/C2/C6）：
@@ -848,6 +849,16 @@ export function runPortfolioCommand(command: string, h: PortfolioCliHelpers): bo
       const db = openPortfolioDb(h.arg('db'));
       try {
         const resolvedAcc = resolveAccountId(db, accountId).account_id;
+        if (h.flag('cancel')) {
+          const cancelled = cancelDeconcentrationPlan(
+            db,
+            resolvedAcc,
+            tsCode,
+            h.arg('reason') ?? 'operator_cancelled',
+          );
+          h.print({ ...cancelled, db: portfolioDbPath() });
+          return true;
+        }
         let currentShares: number | undefined;
         let currentPriceMilli: number | undefined;
         let navCents: number | undefined;

@@ -843,7 +843,11 @@ function renderSectionB(r: DailyReportResult): string {
     }
   } else if (c) {
     const dec = c.deconcentration;
-    if (dec.plan_mode === 'BOTTOM_GRIND_25') {
+    if (!dec.plan_present || dec.plan_status === 'CANCELLED') {
+      items.push(
+        `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值，继续按目标组合权重持有并监控动态高水位 ${fmtPctNum(c.router.l2_trigger_drawdown_bps / 100)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
+      );
+    } else if (dec.plan_mode === 'BOTTOM_GRIND_25') {
       items.push(
         `【可考虑的交易决策】当前处于${c.market_regime.regime_label_zh}（${c.market_regime.style_label_zh}），未触发规则买卖阈值；`
         + `${zh(dec.status_summary_zh)}，动态高水位 ${fmtPctNum(c.router.l2_trigger_drawdown_bps / 100)}% 熔断生命线 ${yuan(c.router.lifeline_nav_cents)} 元。`,
@@ -1173,12 +1177,22 @@ function renderSectionF(r: DailyReportResult, view: RenderView, annotations: Ann
   lines.push('**结论**：没有可靠优势支持换仓或新增交易；唯一有数据支撑的比较是"集中度 vs 反弹参与度"，它属于风险管理决策，依据是你的风险政策，而不是新的行情信息。');
   if (r.v3_cockpit) {
     const c = r.v3_cockpit;
+    const deconcCancelled = !c.deconcentration.plan_present || c.deconcentration.plan_status === 'CANCELLED';
     const execCnt = c.deconcentration.tranches.filter(t => t.status === 'EXECUTED').length;
     const totalCnt = c.deconcentration.tranches.length || 4;
     const batchDesc = c.deconcentration.tranches.map(t => `第${t.tranche_no}批 ${t.planned_shares} 份`).join('、');
     lines.push('');
     lines.push('**攻防引擎核心轨道进展**');
-    if (c.deconcentration.plan_mode === 'BOTTOM_GRIND_25') {
+    if (deconcCancelled) {
+      const alignNote = c.align_summary?.enabled
+        ? (c.align_summary.unmanaged_legacy_after_cents > 0
+            ? `；非目标遗留仓位仍有待平滑回笼，完成后目标风险权益上限 ${(c.align_summary.target_equity_cap_bps / 100).toFixed(0)}%`
+            : `；当前目标风险权益配置上限 ${(c.align_summary.target_equity_cap_bps / 100).toFixed(0)}%`)
+        : '';
+      lines.push(
+        `- **组合仓位与双向对齐进度**：已启用无条件目标组合双向对齐引擎（历史分批换马计划已终止，不再单独挂起旧持仓）${alignNote}。`,
+      );
+    } else if (c.deconcentration.plan_mode === 'BOTTOM_GRIND_25') {
       const gg = c.deconcentration.grind_guards;
       const reloadPriceTxt = gg?.reload_target_cny !== null && gg?.reload_target_cny !== undefined
         ? `；7% 折价回补目标价 ${gg.reload_target_cny.toFixed(3)} 元（60日均线斜率 ${gg.ma60_slope10_pct !== null ? `${gg.ma60_slope10_pct.toFixed(2)}%` : '—'}）`
@@ -1526,6 +1540,13 @@ function buildTechnicalSections(
         amount20_yi: c.amount20_yi,
         circ_mv_yi: c.circ_mv_yi,
       })),
+      align_summary_numbers: r.v3_cockpit.align_summary
+        ? {
+            target_equity_cap_pct: r.v3_cockpit.align_summary.target_equity_cap_bps / 100,
+            post_action_risk_equity_pct: r.v3_cockpit.align_summary.post_action_risk_equity_bps / 100,
+            chassis_target_count: r.v3_cockpit.align_summary.chassis_target_count,
+          }
+        : null,
     } : null,
   };
   return {

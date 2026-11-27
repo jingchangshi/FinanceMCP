@@ -452,6 +452,11 @@ export interface V3CockpitSummary {
     recovery_overlay_enabled?: boolean;
     sector_pioneer_enabled?: boolean;
     lowvol_core_permanent_share_bps?: number;
+    deconcentration_plan_enabled?: boolean;
+    regime_target_enforced_on_existing_holdings?: boolean;
+    align_glide_carryover_bps?: number;
+    equity_align_drift_band_bps?: number;
+    chassis_single_etf_per_style_bucket?: boolean;
   };
   principal: {
     initial_principal_cents: number;
@@ -554,6 +559,7 @@ export interface V3CockpitSummary {
   cross_border_monitor: V3ActionEngineOutput['cross_border_monitor'];
   stock_swing_candidates: V3ActionEngineOutput['stock_swing_candidates'];
   sector_pioneer_candidates?: V3ActionEngineOutput['sector_pioneer_candidates'];
+  align_summary?: V3ActionEngineOutput['align_summary'];
   actions_summary: Array<{
     priority: ActionEnginePlan['priority'];
     code: string;
@@ -2037,6 +2043,16 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
           + downsideClause,
         );
       }
+    } else if (engineOut.align_summary?.enabled) {
+      if (engineOut.align_summary.unmanaged_legacy_after_cents > 0) {
+        v3Triggers.push(
+          '组合双向对齐推进中：按单日换手平滑上限有序出清非目标持仓，待风控额度释放后分批配置目标底盘与国债蓄水池',
+        );
+      } else {
+        v3Triggers.push(
+          `组合双向对齐监控：当前目标风险权益上限 ${(engineOut.align_summary.target_equity_cap_bps / 100).toFixed(0)}%，持仓偏离达 ${(v3Policy.equity_align_drift_band_bps / 100).toFixed(0)}% 漂移带时触发双向再平衡`,
+        );
+      }
     }
     const anc = engineOut.router.anchor_snapshot;
     const rawL2Pct = engineOut.router.l2_trigger_drawdown_bps / 100;
@@ -2238,6 +2254,11 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
             recovery_overlay_enabled: approvedPolicy.recovery_overlay_enabled,
             sector_pioneer_enabled: approvedPolicy.sector_pioneer_enabled,
             lowvol_core_permanent_share_bps: approvedPolicy.lowvol_core_permanent_share_bps,
+            deconcentration_plan_enabled: approvedPolicy.deconcentration_plan_enabled,
+            regime_target_enforced_on_existing_holdings: approvedPolicy.regime_target_enforced_on_existing_holdings,
+            align_glide_carryover_bps: approvedPolicy.align_glide_carryover_bps,
+            equity_align_drift_band_bps: approvedPolicy.equity_align_drift_band_bps,
+            chassis_single_etf_per_style_bucket: approvedPolicy.chassis_single_etf_per_style_bucket,
           },
           principal: {
           initial_principal_cents: engineOut.router.anchor_snapshot.initial_principal_cents,
@@ -2350,6 +2371,7 @@ export function buildDailyReport(input: DailyReportInput): DailyReportResult {
         cross_border_monitor: engineOut.cross_border_monitor,
         stock_swing_candidates: engineOut.stock_swing_candidates,
         sector_pioneer_candidates: engineOut.sector_pioneer_candidates,
+        ...(engineOut.align_summary ? { align_summary: engineOut.align_summary } : {}),
         actions_summary: executionActions.map((act, idx) => ({
           priority: act.priority ?? engineOut.actions[idx]?.priority ?? 'P3',
           code: act.code,

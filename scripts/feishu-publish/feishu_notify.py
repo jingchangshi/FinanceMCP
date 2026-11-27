@@ -205,8 +205,9 @@ def build_notification_markdown(
     safety_summary = "，".join(buf_bits) if buf_bits else humanize_text(cb_label)
     lines.append(f"- **账户总资产**：{_fmt_yuan(total_cents)}（{humanize_text(cb_label)}｜{safety_summary}）")
 
+    deconc_cancelled = (deconc.get("plan_present") is False) or (str(deconc.get("plan_status") or "") == "CANCELLED")
     tranches = [t for t in (deconc.get("tranches") or []) if isinstance(t, dict)]
-    if tranches:
+    if tranches and not deconc_cancelled:
         exec_cnt = sum(1 for t in tranches if t.get("status") == "EXECUTED")
         trig_bits: list[str] = []
         if deconc.get("rebound_trigger_cny") is not None:

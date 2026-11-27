@@ -314,6 +314,214 @@ export interface ApprovedV3Policy {
   sector_pioneer_max_weight_bps: number;
   stock_bp1_min_investable_nav_cny: number;
   stock_bp1_block_during_deconcentration: boolean;
+  // ---- v3.3.1 执行架构 2.0 字段（未配置时保持 v3.1.0–v3.3.0 100% 回归不变）
+  deconcentration_plan_enabled: boolean;
+  regime_target_enforced_on_existing_holdings: boolean;
+  align_glide_carryover_bps: number;
+  equity_align_drift_band_bps: number;
+  chassis_single_etf_per_style_bucket: boolean;
+  p1_etf_trailing_sleeves: string[];
+}
+
+const VALID_BP_STATUSES = new Set(['ENABLED', 'DISABLED', 'DROPPED_NEGATIVE_OOS']);
+const VALID_DECONC_MODES = new Set(['STANDARD', 'BOTTOM_GRIND_25']);
+const VALID_DD_MODES = new Set(['HARD_STEP_LOCK', 'TWO_STAGE_GRADUAL', 'CPPI_F15_M5']);
+const VALID_P1_ETF_SLEEVES = new Set([
+  'ALL',
+  'NONE',
+  'SECTOR_PIONEER',
+  'CHASSIS_LOWVOL',
+  'CHASSIS_VALUE',
+  'CHASSIS_GROWTH',
+  'BOND_RESERVOIR',
+  'UNMANAGED_LEGACY',
+]);
+
+export function isVersionAtLeast331(version: string): boolean {
+  const clean = version.trim().replace(/^v/i, '');
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(clean);
+  if (!m) return false;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  const patch = Number(m[3]);
+  if (major !== 3) return major > 3;
+  if (minor !== 3) return minor > 3;
+  return patch >= 1;
+}
+
+function parseStrictInt(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const text = raw.trim();
+  if (!/^-?\d+$/.test(text)) return null;
+  const n = Number(text);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function parseStrictBool(raw: string | undefined): boolean | null {
+  if (raw === undefined) return null;
+  const v = raw.trim().toLowerCase();
+  if (v === 'true' || v === '1') return true;
+  if (v === 'false' || v === '0') return false;
+  return null;
+}
+
+function parseSleeveList(raw: string | undefined, fallback: string[]): { sleeves: string[]; valid: boolean } {
+  if (raw === undefined) return { sleeves: fallback, valid: false };
+  const parts = raw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  if (parts.length === 0) return { sleeves: fallback, valid: false };
+  for (const tok of parts) {
+    if (!VALID_P1_ETF_SLEEVES.has(tok)) return { sleeves: fallback, valid: false };
+  }
+  if (parts.includes('NONE')) {
+    if (parts.length > 1) return { sleeves: fallback, valid: false };
+    return { sleeves: [], valid: true };
+  }
+  if (parts.includes('ALL') && parts.length > 1) {
+    return { sleeves: fallback, valid: false };
+  }
+  return { sleeves: [...new Set(parts)], valid: true };
+}
+
+/**
+ * v3.3.1+ 严格 Schema 校验：
+ * - 全部被读取的关键参数键必须显式存在且类型合法；
+ * - 枚举遇未知值直接报错（严禁静默回退）；
+ * - 冗余别名键若同时存在必须相等。
+ */
+export function validateV331Parameters(p: Record<string, string>): string[] {
+  const errors: string[] = [];
+
+  const reqInt = (key: string, min?: number, max?: number): number | null => {
+    const val = parseStrictInt(p[key]);
+    if (val === null) {
+      errors.push(`missing_or_invalid_int:${key}`);
+      return null;
+    }
+    if (min !== undefined && val < min) errors.push(`int_below_min:${key}:${val}<${min}`);
+    if (max !== undefined && val > max) errors.push(`int_above_max:${key}:${val}>${max}`);
+    return val;
+  };
+  const reqBool = (key: string): boolean | null => {
+    const val = parseStrictBool(p[key]);
+    if (val === null) {
+      errors.push(`missing_or_invalid_bool:${key}`);
+      return null;
+    }
+    return val;
+  };
+  const reqStr = (key: string): string | null => {
+    const val = p[key]?.trim();
+    if (!val) {
+      errors.push(`missing_or_empty_string:${key}`);
+      return null;
+    }
+    return val;
+  };
+  const reqEnum = (key: string, allowed: ReadonlySet<string>): string | null => {
+    const val = p[key]?.trim();
+    if (!val || !allowed.has(val)) {
+      errors.push(`invalid_enum:${key}:${val ?? 'MISSING'}`);
+      return null;
+    }
+    return val;
+  };
+  const checkAliasPair = (keyA: string, keyB: string, requireAtLeastOne: boolean): void => {
+    const hasA = p[keyA] !== undefined;
+    const hasB = p[keyB] !== undefined;
+    if (requireAtLeastOne && !hasA && !hasB) {
+      errors.push(`missing_alias_pair:${keyA}_or_${keyB}`);
+      return;
+    }
+    const valA = hasA ? parseStrictInt(p[keyA]) : null;
+    const valB = hasB ? parseStrictInt(p[keyB]) : null;
+    if (hasA && valA === null) errors.push(`missing_or_invalid_int:${keyA}`);
+    if (hasB && valB === null) errors.push(`missing_or_invalid_int:${keyB}`);
+    if (hasA && hasB && valA !== null && valB !== null && valA !== valB) {
+      errors.push(`alias_mismatch:${keyA}=${valA}!=${keyB}=${valB}`);
+    }
+  };
+
+  reqEnum('bp1_pullback_status', VALID_BP_STATUSES);
+  reqEnum('bp2_breakout_status', VALID_BP_STATUSES);
+  const deconcEnabled = reqBool('deconcentration_plan_enabled');
+  reqEnum('deconcentration_mode', VALID_DECONC_MODES);
+  const ddMode = reqEnum('drawdown_control_mode', VALID_DD_MODES);
+
+  reqInt('stock_max_positions', 1);
+  reqInt('stock_max_single_weight_bps', 0, 10000);
+  reqInt('stock_risk_budget_per_trade_bps', 1, 10000);
+
+  const l1Warn = reqInt('l1_warn_drawdown_bps', 0, 10000);
+  reqInt('l2_preemptive_trigger_drawdown_bps', 0, 10000);
+  reqInt('l2_lock_trade_days', 1);
+
+  checkAliasPair('drawdown_lock_trigger_bps', 'l2_normal_trigger_drawdown_bps', true);
+  checkAliasPair('drawdown_lock_trigger_bps', 'l2_hard_lifeline_drawdown_bps', false);
+  checkAliasPair('l2_normal_post_breaker_equity_bps', 'drawdown_normal_post_lock_cap_bps', true);
+  checkAliasPair('l2_deconcentration_post_breaker_equity_bps', 'drawdown_conc_post_lock_cap_bps', deconcEnabled === true);
+
+  reqStr('defensive_bond_reservoir_etf');
+  reqInt('defensive_bond_reservoir_drift_band_bps', 0, 10000);
+
+  if (deconcEnabled === true) {
+    reqInt('deconcentration_keep_weight_bps', 0, 10000);
+    reqInt('deconcentration_support_breakdown_confirm_days', 1);
+    reqInt('grind_tactical_slot_bps', 0, 10000);
+    reqInt('grind_reload_min_discount_bps', 0, 10000);
+    reqInt('grind_reload_rsi14_max', 0, 100);
+    reqInt('grind_reload_bias20_max_bps', -10000, 10000);
+    reqInt('grind_take_profit_bps', 0, 10000);
+    reqInt('grind_drift_harvest_trigger_bps', 0, 10000);
+  }
+
+  reqBool('recovery_overlay_enabled');
+  reqInt('recovery_equity_bps', 0, 10000);
+  reqInt('recovery_icepoint_pct_ma60_max_bps', 0, 10000);
+  reqInt('recovery_icepoint_pct_ma20_max_bps', 0, 10000);
+  reqInt('recovery_icepoint_lookback_days', 1);
+  reqInt('recovery_thrust_pct_ma20_min_bps', 0, 10000);
+  reqInt('recovery_thrust_5d_jump_min_bps', 0, 10000);
+  reqInt('recovery_thrust_floor_pct_ma20_bps', 0, 10000);
+  reqInt('recovery_min_amount_vs_ma20_bps', 0);
+  reqInt('recovery_false_breakout_cooldown_days', 0);
+
+  reqInt('lowvol_core_permanent_share_bps', 0, 10000);
+
+  const stage1Bps = reqInt('drawdown_stage1_bps', 0, 10000);
+  reqInt('drawdown_stage1_cap_bps', 0, 10000);
+  reqInt('drawdown_stage2_bps', 0, 10000);
+  reqInt('drawdown_stage2_cap_bps', 0, 10000);
+  if (ddMode === 'TWO_STAGE_GRADUAL') {
+    reqInt('drawdown_lock_trigger_bps', 0, 10000);
+    if (l1Warn !== null && stage1Bps !== null && l1Warn !== stage1Bps) {
+      errors.push(`alias_mismatch:l1_warn_drawdown_bps=${l1Warn}!=drawdown_stage1_bps=${stage1Bps}`);
+    }
+  } else if (p.l1_warn_drawdown_bps !== undefined && p.drawdown_stage1_bps !== undefined && l1Warn !== null && stage1Bps !== null && l1Warn !== stage1Bps) {
+    errors.push(`alias_mismatch:l1_warn_drawdown_bps=${l1Warn}!=drawdown_stage1_bps=${stage1Bps}`);
+  }
+  reqBool('drawdown_unlock_reanchor_enabled');
+  reqInt('drawdown_unlock_ramp_trade_days', 0);
+
+  reqBool('sector_pioneer_enabled');
+  reqInt('sector_pioneer_top_k', 1);
+  reqInt('sector_pioneer_max_weight_bps', 0, 10000);
+  reqInt('stock_bp1_min_investable_nav_cny', 0);
+  reqBool('stock_bp1_block_during_deconcentration');
+
+  // v3.3.1 执行架构 2.0 显式键
+  reqBool('regime_target_enforced_on_existing_holdings');
+  reqInt('align_glide_carryover_bps', 0, 10000);
+  reqInt('equity_align_drift_band_bps', 0, 10000);
+  reqBool('chassis_single_etf_per_style_bucket');
+  const parsedSleeves = parseSleeveList(p.p1_etf_trailing_sleeves, ['SECTOR_PIONEER']);
+  if (!parsedSleeves.valid) {
+    errors.push(`invalid_enum_list:p1_etf_trailing_sleeves:${p.p1_etf_trailing_sleeves ?? 'MISSING'}`);
+  }
+  if (p.l2_lock_allow_m2_early_release !== undefined) {
+    errors.push('unsupported_param:l2_lock_allow_m2_early_release');
+  }
+
+  return errors;
 }
 
 function intParam(params: Record<string, string>, key: string, fallback: number): number {
@@ -407,6 +615,17 @@ function tryLoadOverrideRelease(overridePath: string, embedded: StrategyRelease)
       diagnostics: [`v3_policy_override_environment_mismatch:${release.applicability.environment}`],
       blocksNewBuys: true,
     };
+  }
+  if (isVersionAtLeast331(release.strategy.version)) {
+    const schemaErrors = validateV331Parameters(release.parameters);
+    if (schemaErrors.length > 0) {
+      return {
+        release: null,
+        hash: null,
+        diagnostics: schemaErrors.map(err => `v3_policy_override_schema_invalid:${err}`),
+        blocksNewBuys: true,
+      };
+    }
   }
   return { release, hash: verifiedHash, diagnostics: [], blocksNewBuys: false };
 }
@@ -542,9 +761,17 @@ export function loadApprovedV3Policy(options: { accountId?: string; asOf?: strin
       'l2_normal_trigger_drawdown_bps',
       intParam(p, 'drawdown_lock_trigger_bps', intParam(p, 'l2_hard_lifeline_drawdown_bps', 1500)),
     ),
-    l2_normal_post_breaker_equity_bps: intParam(p, 'l2_normal_post_breaker_equity_bps', 1500),
+    l2_normal_post_breaker_equity_bps: intParam(
+      p,
+      'l2_normal_post_breaker_equity_bps',
+      intParam(p, 'drawdown_normal_post_lock_cap_bps', 1500),
+    ),
     l2_preemptive_deconcentration_trigger_drawdown_bps: intParam(p, 'l2_preemptive_trigger_drawdown_bps', 1200),
-    l2_deconcentration_post_breaker_equity_bps: intParam(p, 'l2_deconcentration_post_breaker_equity_bps', 0),
+    l2_deconcentration_post_breaker_equity_bps: intParam(
+      p,
+      'l2_deconcentration_post_breaker_equity_bps',
+      intParam(p, 'drawdown_conc_post_lock_cap_bps', 0),
+    ),
     l2_lock_trade_days: intParam(p, 'l2_lock_trade_days', 15),
     defensive_bond_reservoir_etf: p.defensive_bond_reservoir_etf || '511010.SH',
     defensive_bond_reservoir_fallback_etf: p.defensive_bond_reservoir_fallback_etf?.trim() || null,
@@ -575,7 +802,7 @@ export function loadApprovedV3Policy(options: { accountId?: string; asOf?: strin
     drawdown_stage1_cap_bps: intParam(p, 'drawdown_stage1_cap_bps', 5000),
     drawdown_stage2_bps: intParam(p, 'drawdown_stage2_bps', 1100),
     drawdown_stage2_cap_bps: intParam(p, 'drawdown_stage2_cap_bps', 2500),
-    drawdown_lock_trigger_bps: intParam(p, 'drawdown_lock_trigger_bps', 1350),
+    drawdown_lock_trigger_bps: intParam(p, 'drawdown_lock_trigger_bps', intParam(p, 'l2_normal_trigger_drawdown_bps', 1350)),
     drawdown_unlock_reanchor_enabled: boolParam(p, 'drawdown_unlock_reanchor_enabled', false),
     drawdown_unlock_ramp_trade_days: intParam(p, 'drawdown_unlock_ramp_trade_days', 0),
     sector_pioneer_enabled: boolParam(p, 'sector_pioneer_enabled', false),
@@ -583,5 +810,11 @@ export function loadApprovedV3Policy(options: { accountId?: string; asOf?: strin
     sector_pioneer_max_weight_bps: intParam(p, 'sector_pioneer_max_weight_bps', 2000),
     stock_bp1_min_investable_nav_cny: intParam(p, 'stock_bp1_min_investable_nav_cny', 0),
     stock_bp1_block_during_deconcentration: boolParam(p, 'stock_bp1_block_during_deconcentration', false),
+    deconcentration_plan_enabled: boolParam(p, 'deconcentration_plan_enabled', true),
+    regime_target_enforced_on_existing_holdings: boolParam(p, 'regime_target_enforced_on_existing_holdings', false),
+    align_glide_carryover_bps: intParam(p, 'align_glide_carryover_bps', 0),
+    equity_align_drift_band_bps: intParam(p, 'equity_align_drift_band_bps', 500),
+    chassis_single_etf_per_style_bucket: boolParam(p, 'chassis_single_etf_per_style_bucket', false),
+    p1_etf_trailing_sleeves: parseSleeveList(p.p1_etf_trailing_sleeves, ['ALL']).sleeves,
   };
 }

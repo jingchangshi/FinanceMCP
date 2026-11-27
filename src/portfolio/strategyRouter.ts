@@ -54,6 +54,7 @@ export interface StrategyRouterResult {
   ramp_until_trade_date: string | null;
   ramp_factor_bps: number;
   locked_until_trade_date: string | null;
+  just_unlocked: boolean;
   l2_trigger_drawdown_bps: number;
   post_breaker_equity_bps: number;
   deconcentration_preemptive_active: boolean;
@@ -183,6 +184,20 @@ export function readInitialPrincipalCents(
   if (!row?.value) return null;
   const parsed = Number(row.value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function readLastUnlockDate(
+  portfolioDb: DatabaseSync | null | undefined,
+  accountId: string,
+): string | null {
+  if (!portfolioDb || !portfolioTableExists(portfolioDb, 'account_meta')) return null;
+  try {
+    const row = portfolioDb.prepare('SELECT value FROM account_meta WHERE key = ?')
+      .get(`v3_last_unlock_date:${accountId}`) as { value?: string } | undefined;
+    return row?.value ? String(row.value) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function readRiskAnchor(
@@ -644,7 +659,7 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
   const displayNavCents = input.displayNavCents ?? input.currentNavCents;
 
   const v3Policy = input.policy ?? loadApprovedV3Policy({ accountId: input.accountId, asOf: input.asOf });
-  const deconcActive = Boolean(input.deconcentrationActive);
+  const deconcActive = v3Policy.deconcentration_plan_enabled ? Boolean(input.deconcentrationActive) : false;
   const l2TriggerBps = deconcActive
     ? v3Policy.l2_preemptive_deconcentration_trigger_drawdown_bps
     : v3Policy.l2_normal_trigger_drawdown_bps;
@@ -673,13 +688,15 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     && existing.locked_until_trade_date
     && existing.locked_until_trade_date >= input.asOf,
   );
-  const justUnlocked = Boolean(
+  const rawJustUnlocked = Boolean(
     existing
     && input.asOf >= existing.updated_at
     && existing.circuit_breaker_status === 'L2_LOCKED'
     && existing.locked_until_trade_date
     && existing.locked_until_trade_date < input.asOf,
   );
+  const lastUnlockDate = readLastUnlockDate(input.portfolioDb, input.accountId);
+  const justUnlocked = rawJustUnlocked || lastUnlockDate === input.asOf;
 
   // 工作高水位（v3.3.0 解锁再锚定）；全历史 true_peak 仍严格保留在 effectiveHwmCents/effectiveHwmDate。
   let workHwmNavCents = effectiveHwmCents;
@@ -689,7 +706,7 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     if (existing && (existing.work_hwm_nav_cents == null || !existing.work_hwm_date)) {
       shouldPersistAnchor = true;
     }
-    if (justUnlocked && v3Policy.drawdown_unlock_reanchor_enabled) {
+    if (rawJustUnlocked && v3Policy.drawdown_unlock_reanchor_enabled) {
       workHwmNavCents = comparisonNavCents;
       workHwmDate = input.asOf;
       rampUntilTradeDate = v3Policy.drawdown_unlock_ramp_trade_days > 0
@@ -908,6 +925,7 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     ramp_until_trade_date: rampUntilTradeDate,
     ramp_factor_bps: rampFactorBps,
     locked_until_trade_date: lockedUntil,
+    just_unlocked: justUnlocked,
     l2_trigger_drawdown_bps: l2TriggerBps,
     post_breaker_equity_bps: postBreakerEquityBps,
     deconcentration_preemptive_active: deconcActive,
@@ -942,14 +960,16 @@ export function evaluateStrategyRouter(input: EvaluateStrategyRouterInput): Stra
     },
     targets,
     sub_strategies: {
-      s_deconcentrate: sDeconcentrate,
+      s_deconcentrate: v3Policy.deconcentration_plan_enabled ? sDeconcentrate : 'STOP_ONLY',
       s_base_super_etf: sBaseSuperEtf,
       s_stock_swing: sStockSwing,
     },
     sub_strategies_zh: {
-      deconcentrate_label: input.deconcentrationMode === 'BOTTOM_GRIND_25'
-        ? '存量重仓 25%底仓与震荡磨底降本状态机：运行中'
-        : '存量重仓四批换马状态机：运行中',
+      deconcentrate_label: !v3Policy.deconcentration_plan_enabled
+        ? '存量降浓状态机：已停用（由组合双向目标对齐统一管理）'
+        : input.deconcentrationMode === 'BOTTOM_GRIND_25'
+          ? '存量重仓 25%底仓与震荡磨底降本状态机：运行中'
+          : '存量重仓四批换马状态机：运行中',
       base_etf_label: sBaseSuperEtf === 'REDUCE_ONLY'
         ? '底盘超级 ETF 桶：熔断期间只降不加'
         : '底盘超级 ETF 桶：正常运行',
@@ -1091,6 +1111,11 @@ export function persistRiskAnchor(
         writeHwm,
         writeHwm,
       );
+    }
+    if (router.just_unlocked && portfolioTableExists(portfolioDb, 'account_meta')) {
+      portfolioDb.prepare(
+        'INSERT INTO account_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      ).run(`v3_last_unlock_date:${router.account_id}`, router.as_of_trade_date);
     }
     return true;
   } catch (err: any) {

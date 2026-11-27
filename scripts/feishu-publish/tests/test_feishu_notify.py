@@ -356,6 +356,27 @@ class TestFeishuNotify(unittest.TestCase):
         self.assertIn("冰点复苏试探档", md)
         self.assertIn("12%前置 / 13.5%硬生命线", md)
 
+    def test_v331_cancelled_deconc_hides_159558_progress_line(self):
+        pub_entry = {
+            "trade_date": "20261127",
+            "document_id": "doc-v331",
+            "document_url": "https://my.feishu.cn/docx/doc-v331",
+        }
+        bundle = self._helper._v3_bundle(actionable=False)
+        cockpit = bundle["portfolio"]["v3_cockpit"]
+        cockpit["policy_release"] = {"version": "v3.3.1", "deconcentration_plan_enabled": False}
+        cockpit["router"]["policy_version"] = "v3.3.1"
+        cockpit["router"]["drawdown_control_mode"] = "TWO_STAGE_GRADUAL"
+        cockpit["router"]["deconcentration_preemptive_active"] = False
+        cockpit["deconcentration"]["plan_present"] = False
+        cockpit["deconcentration"]["plan_status"] = "CANCELLED"
+        md, _ = build_notification_markdown(bundle, pub_entry)
+        vis = _URL_RE.sub("", md)
+        self.assertEqual(check_forbidden(vis), [])
+        self.assertEqual(check_internal_tokens(vis), [])
+        self.assertNotIn("159558 换马进度", md)
+        self.assertIn("v3.3.1", md)
+
 
 if __name__ == "__main__":
     unittest.main()
